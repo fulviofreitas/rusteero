@@ -1,0 +1,11 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:05Z" },
+  "data": {
+    "user": { "id": "user-0001", "email": "user@example.com" },
+    "networks": {
+      "data": [
+        { "id": "network-0001", "url": "/2.2/networks/network-0001" }
+      ]
+    }
+  }
+}

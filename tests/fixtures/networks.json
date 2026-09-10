@@ -1,0 +1,33 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:15Z" },
+  "data": [
+    {
+      "id": "network-0001",
+      "url": "/2.2/networks/network-0001",
+      "name": "Test Network",
+      "status": "connected",
+      "wan_ip": "203.0.113.10",
+      "timezone": "UTC",
+      "band_steering": true,
+      "wpa3": true,
+      "upnp": false,
+      "thread": false,
+      "sqm": true,
+      "guest_network": {
+        "enabled": true,
+        "name": "Test Network Guest",
+        "password": "guestpass000"
+      },
+      "speed": {
+        "down": { "value": 500.0, "units": "Mbps" },
+        "up": { "value": 50.0, "units": "Mbps" }
+      }
+    },
+    {
+      "id": "network-0002",
+      "url": "/2.2/networks/network-0002",
+      "name": "Second Network",
+      "status": "offline"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:25Z" },
+  "data": [
+    {
+      "url": "/2.2/networks/network-0001/devices/device-0001",
+      "mac": "AA:BB:CC:00:00:01",
+      "manufacturer": "Test Manufacturer",
+      "hostname": "test-phone",
+      "nickname": "Test Phone",
+      "ip": "192.168.4.101",
+      "connected": true,
+      "blocked": false,
+      "prioritized": false,
+      "wireless": true,
+      "connection_type": "wireless",
+      "source": { "location": "Living Room" }
+    },
+    {
+      "url": "/2.2/networks/network-0001/devices/device-0002",
+      "mac": "AA:BB:CC:00:00:02",
+      "manufacturer": "Other Manufacturer",
+      "hostname": "test-laptop",
+      "nickname": null,
+      "ip": "192.168.4.102",
+      "connected": true,
+      "blocked": false,
+      "wireless": false
+    }
+  ]
+}

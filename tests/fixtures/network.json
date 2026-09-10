@@ -1,0 +1,28 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:20Z" },
+  "data": {
+    "id": "network-0001",
+    "url": "/2.2/networks/network-0001",
+    "name": "Test Network",
+    "status": "connected",
+    "wan_ip": "203.0.113.10",
+    "gateway_ip": "192.168.4.1",
+    "timezone": "UTC",
+    "guest_network": {
+      "enabled": true,
+      "name": "Test Network Guest",
+      "password": "guestpass000"
+    },
+    "dns_caching": true,
+    "ipv6_upstream": true,
+    "band_steering": true,
+    "thread": false,
+    "upnp": false,
+    "wpa3": true,
+    "premium_status": "active",
+    "speed": {
+      "down": { "value": 500.0, "units": "Mbps" },
+      "up": { "value": 50.0, "units": "Mbps" }
+    }
+  }
+}

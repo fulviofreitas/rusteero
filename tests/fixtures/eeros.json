@@ -1,0 +1,27 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:35Z" },
+  "data": [
+    {
+      "url": "/2.2/networks/network-0001/eeros/eero-0001",
+      "serial": "TESTSERIAL0001",
+      "mac_address": "AA:BB:CC:00:01:01",
+      "model": "eero Pro 6E",
+      "location": "Living Room",
+      "led_on": true,
+      "nightlight": { "enabled": false, "schedule": null },
+      "status": "green",
+      "gateway": true,
+      "connected_clients_count": 3
+    },
+    {
+      "url": "/2.2/networks/network-0001/eeros/eero-0002",
+      "serial": "TESTSERIAL0002",
+      "mac_address": "AA:BB:CC:00:01:02",
+      "model": "eero Beacon",
+      "location": "Bedroom",
+      "status": "green",
+      "gateway": false,
+      "nightlight": { "enabled": true, "brightness": 50 }
+    }
+  ]
+}
