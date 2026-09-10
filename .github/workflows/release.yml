@@ -1,0 +1,110 @@
+# ============================================================================
+# 🚀 Automated Semantic Release
+# ============================================================================
+# Chain: CI → Release (tag + GitHub release + Cargo.toml bump) → [crates.io publish: DISABLED]
+#
+# crates.io publishing is intentionally disabled (decision D-15): nothing is
+# published until the library is fully tested and validated against a live
+# account and the author signs off. When that happens, flip
+# `PUBLISH_ENABLED` to "true", create the `crates-io` GitHub Environment with
+# branch protection, and configure crates.io Trusted Publishing for this repo.
+# ============================================================================
+
+name: 🚀 Release
+
+on:
+  workflow_run:
+    workflows: ["🧪 CI Pipeline"]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "🧪 Dry-run mode (no actual release)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  PUBLISH_ENABLED: "false"
+
+jobs:
+  release:
+    name: 🚀 Semantic Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      !contains(github.event.workflow_run.head_commit.message, '[skip ci]') &&
+      !contains(github.event.workflow_run.head_commit.message, 'chore(release)'))
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: 🔑 Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.RENOVATE_APP_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
+      - name: 🦀 Setup Rust (for `cargo update` in prepareCmd)
+        uses: dtolnay/rust-toolchain@stable
+      - name: 🚀 Run semantic-release
+        id: release
+        uses: fulviofreitas/workflow-arsenal/.github/actions/semantic-release@master
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          dry-run: ${{ github.event.inputs.dry_run || 'false' }}
+
+  publish-crates-io:
+    name: 📦 Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: release
+    # Disabled until D-15 is lifted. Keep the job so the wiring is reviewed now.
+    if: |
+      false &&
+      success() &&
+      needs.release.outputs.released == 'true' &&
+      needs.release.outputs.version != '' &&
+      github.event.inputs.dry_run != 'true'
+    timeout-minutes: 15
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/rusteero
+    permissions:
+      id-token: write # crates.io Trusted Publishing (OIDC)
+      contents: read
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 1
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: 🔑 Authenticate with crates.io (Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: 📤 cargo publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

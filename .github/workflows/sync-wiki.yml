@@ -1,0 +1,37 @@
+# ============================================================================
+# 📚 Sync Wiki
+# ============================================================================
+# Syncs the wiki/ directory to the GitHub Wiki.
+# Uses the reusable wiki-sync action.
+# ============================================================================
+
+name: 📚 Sync Wiki
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "wiki/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync-wiki:
+    name: 📖 Sync Wiki to GitHub Wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v7
+
+      - name: 🔄 Sync wiki
+        uses: fulviofreitas/workflow-arsenal/.github/actions/wiki-sync@master
+        with:
+          wiki-path: wiki/

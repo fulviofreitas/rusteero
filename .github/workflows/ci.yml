@@ -1,0 +1,211 @@
+# ============================================================================
+# 🧪 Continuous Integration Pipeline
+# ============================================================================
+# Chain: Commit Lint → Format & Lint → [Test matrix ‖ Docs ‖ Supply chain ‖ MSRV] → CI Success
+#
+# Shared actions (commitlint) come from fulviofreitas/workflow-arsenal.
+# Rust-specific steps are inline for now and move to workflow-arsenal
+# composite actions once the pipeline is proven (decision D-10).
+# ============================================================================
+
+name: 🧪 CI Pipeline
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+
+jobs:
+  # ============================================================================
+  # 1️⃣ Commit Lint (Gate 1)
+  # ============================================================================
+  commitlint:
+    name: 📝 Commit Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: 📝 Validate commits
+        uses: fulviofreitas/workflow-arsenal/.github/actions/commitlint@master
+        with:
+          from-sha: ${{ github.event.pull_request.base.sha }}
+          to-sha: ${{ github.event.pull_request.head.sha }}
+
+  # ============================================================================
+  # 2️⃣ Format & Lint (Gate 2)
+  # ============================================================================
+  lint:
+    name: 🧹 Format & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: commitlint
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: 💾 Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: 🎨 rustfmt
+        run: cargo fmt --all -- --check
+      - name: 🧹 clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: 🧹 clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  # ============================================================================
+  # 3️⃣ Test matrix (Parallel)
+  # ============================================================================
+  test:
+    name: 🧪 Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: 💾 Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: 🧪 cargo test (all features)
+        run: cargo test --all-features
+      - name: 🧪 cargo test (no default features)
+        run: cargo test --no-default-features
+      - name: 📊 Coverage
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov --all-features --lcov --output-path lcov.info
+      - name: 📤 Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # ============================================================================
+  # 3️⃣ Docs (Parallel)
+  # ============================================================================
+  docs:
+    name: 📚 Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: lint
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: 💾 Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: 📚 cargo doc
+        run: cargo doc --no-deps --all-features
+
+  # ============================================================================
+  # 3️⃣ Supply chain (Parallel)
+  # ============================================================================
+  deny:
+    name: 🛡️ Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: lint
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+      - name: 🛡️ cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # ============================================================================
+  # 3️⃣ MSRV (Parallel) — rust-version in Cargo.toml (stable minus two, D-12)
+  # ============================================================================
+  msrv:
+    name: 🧱 MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+      - name: 🔎 Read rust-version
+        id: msrv
+        run: echo "version=$(grep -E '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+      - name: 🦀 Setup Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: 💾 Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: 🧱 cargo check on MSRV
+        run: cargo check --all-features
+
+  # ============================================================================
+  # 4️⃣ CI Success Gate
+  # ============================================================================
+  ci-success:
+    name: ✅ CI Success
+    runs-on: ubuntu-latest
+    needs: [commitlint, lint, test, docs, deny, msrv]
+    if: always()
+    steps:
+      - name: 🔍 Check all jobs passed
+        run: |
+          COMMITLINT="${{ needs.commitlint.result }}"
+          LINT="${{ needs.lint.result }}"
+          TEST="${{ needs.test.result }}"
+          DOCS="${{ needs.docs.result }}"
+          DENY="${{ needs.deny.result }}"
+          MSRV="${{ needs.msrv.result }}"
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🧪 CI Pipeline Summary
+
+          | Stage | Job | Status |
+          |:------|:----|:-------|
+          | 1️⃣ | 📝 Commit Lint | ${COMMITLINT} |
+          | 2️⃣ | 🧹 Format & Lint | ${LINT} |
+          | 3️⃣ | 🧪 Tests | ${TEST} |
+          | 3️⃣ | 📚 Docs | ${DOCS} |
+          | 3️⃣ | 🛡️ Supply chain | ${DENY} |
+          | 3️⃣ | 🧱 MSRV | ${MSRV} |
+
+          EOF
+
+          if [[ "$COMMITLINT" == "success" && "$LINT" == "success" && "$TEST" == "success" && "$DOCS" == "success" && "$DENY" == "success" && "$MSRV" == "success" ]]; then
+            echo "> [!NOTE]" >> $GITHUB_STEP_SUMMARY
+            echo "> ### ✅ All Required Checks Passed" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
+            echo "> ### ❌ Some Required Checks Failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
