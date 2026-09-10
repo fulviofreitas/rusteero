@@ -1,3 +1,1097 @@
 //! Request core: status mapping, response size cap, redirect refusal, refresh retry.
 //!
-//! Ported from `eero-api`'s `src/eero/api/base.py`.
+//! Ported from `eero-api`'s `src/eero/api/base.py` (see
+//! `.claude/tasks/briefs/base.md` for the full behaviour brief) and, for the refresh handshake
+//! only, `src/eero/api/auth.py` (`.claude/tasks/briefs/auth.md`). [`Transport`] is the single
+//! place that turns an HTTP status/body into either an `Envelope` or a typed `Error` — every
+//! endpoint module built on top of it (phase 3) is expected to be a thin wrapper that supplies a
+//! [`crate::routes::Route`] and path/query/body values and nothing else.
+//!
+//! # Locking
+//!
+//! The current [`crate::auth::Session`] lives behind a `std::sync::RwLock`, not a
+//! `tokio::sync::RwLock`. Every critical section that touches it (`session_snapshot`,
+//! `current_token`, `replace_session`, `set_session`) is a handful of clones/comparisons with no
+//! `.await` inside — an async lock would only add executor overhead for no benefit here. No lock
+//! guard is ever held across an `.await` point anywhere in this module; the async methods
+//! (`send`, `send_with_query`, `send_raw`, `refresh_session`) always take a session snapshot (or
+//! replace it) in its own statement, before or after any network call, never around one.
+//!
+//! # The refresh-retry divergence (task brief gotcha G1)
+//!
+//! `eero-api`'s 401-triggered refresh retry re-sends the retried request with the *original,
+//! pre-refresh* token (`api/base.py:296-298`), which immediately clobbers the fresh cookie the
+//! refresh itself just set on the same shared cookie jar — so in the real Python library the
+//! retry can never actually benefit from a successful refresh. `rusteero` deliberately does not
+//! reproduce this: [`Transport::send_with_query`] re-reads the session from the shared state
+//! *after* calling [`Transport::refresh_session`] and retries with the refreshed token. See the
+//! comment at the retry call site for the exact citation.
+
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::{Duration, SystemTime};
+
+use reqwest::header::{COOKIE, HeaderMap, LOCATION, RETRY_AFTER, SET_COOKIE};
+use reqwest::redirect::Policy;
+use reqwest::{Client, Method, StatusCode};
+use secrecy::{ExposeSecret, SecretString};
+use serde_json::{Value, json};
+use url::Url;
+
+use crate::auth::Session;
+use crate::consts;
+use crate::envelope::Envelope;
+use crate::error::{self, Error};
+use crate::routes::{self, ApiVersion, Route};
+use crate::storage::CredentialStore;
+
+/// The request core shared by every authenticated and unauthenticated Eero cloud API call.
+///
+/// Build one with [`Transport::builder`]. See the module docs for the locking discipline and
+/// the deliberate refresh-retry divergence from `eero-api`.
+#[derive(Debug)]
+pub struct Transport {
+    http: Client,
+    base_22: Url,
+    base_23: Url,
+    session: RwLock<Option<Session>>,
+    store: Option<Arc<dyn CredentialStore>>,
+}
+
+impl Transport {
+    /// Starts building a [`Transport`] with [`TransportBuilder`]'s defaults: the real Eero
+    /// cloud hosts, reqwest's own `User-Agent`, no session, no credential store, and the
+    /// timeouts from `consts`.
+    #[must_use]
+    pub fn builder() -> TransportBuilder {
+        TransportBuilder::default()
+    }
+
+    /// Returns a snapshot of the currently configured session, if any.
+    ///
+    /// This is a clone of the in-memory state at the moment of the call; it does not reach out
+    /// to the credential store and does not re-validate expiry beyond what `Session::is_valid`
+    /// already encodes.
+    #[must_use]
+    pub fn session(&self) -> Option<Session> {
+        self.session_snapshot()
+    }
+
+    /// Replaces the in-memory session and, if a credential store is configured, persists the
+    /// change: `Some(session)` calls `CredentialStore::save`, `None` calls
+    /// `CredentialStore::clear`. There is no direct Python equivalent — this is the single
+    /// primitive the not-yet-built `auth::flow`/`Client` layer composes into `login`/`verify`/
+    /// `logout`/`set_session_token`-shaped operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Storage` if a configured credential store failed to persist the change.
+    /// The in-memory session is updated regardless of whether persistence succeeds.
+    pub fn set_session(&self, session: Option<Session>) -> Result<(), Error> {
+        if let Some(store) = &self.store {
+            match &session {
+                Some(s) => store.save(s)?,
+                None => store.clear()?,
+            }
+        }
+        self.replace_session(session);
+        Ok(())
+    }
+
+    /// Whether a session is configured, has a non-empty token, and has not passed its
+    /// client-fabricated expiry — purely a local check, matching `Session::is_valid`. Never
+    /// makes a network call and never attempts a refresh (contrast with `eero-api`'s
+    /// `ensure_authenticated()`, which is a client-layer, not transport-layer, concern here).
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.session_snapshot()
+            .is_some_and(|session| session.is_valid())
+    }
+
+    /// Sends an authenticated request with no query-string parameters. Equivalent to
+    /// `send_with_query(route, path_params, &[], body)`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Transport::send_with_query`].
+    pub async fn send(
+        &self,
+        route: &Route,
+        path_params: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Result<Envelope, Error> {
+        self.send_with_query(route, path_params, &[], body).await
+    }
+
+    /// Sends an authenticated request, attaching `Cookie: s=<token>` from the current session.
+    ///
+    /// Performs the one-shot server-driven refresh retry described in the module docs: on a
+    /// `401` whose body carries `meta.error == "error.session.refresh"`
+    /// (`api/base.py:220-256`), calls [`Transport::refresh_session`] and, if it reports success,
+    /// retries the identical request exactly once with the refreshed token before giving up.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any network call is made (`api/base.py`'s per-method `get_auth_token()` preamble,
+    /// reproduced here since every endpoint method funnels through this one call site). Returns
+    /// whatever status-mapped error the request produces otherwise (see the crate's `Error`
+    /// docs), or propagates a refresh failure unmodified if the refresh hook itself errors.
+    pub async fn send_with_query(
+        &self,
+        route: &Route,
+        path_params: &[(&str, &str)],
+        query: &[(&str, String)],
+        body: Option<Value>,
+    ) -> Result<Envelope, Error> {
+        let token = self.current_token().ok_or_else(not_authenticated)?;
+        let url = self.render_url(route, path_params)?;
+
+        let exchange = self
+            .execute_raw(
+                route.method.clone(),
+                url.clone(),
+                query,
+                body.as_ref(),
+                Some(&token),
+            )
+            .await?;
+
+        if exchange.status.as_u16() == 401 && refresh_signal_detected(&exchange.body) {
+            let refreshed = self.refresh_session().await?;
+            if refreshed {
+                // Divergence from eero-api (api/base.py:296-298; task brief gotcha G1): Python
+                // re-passes the *original, pre-refresh* token into the retried request, which
+                // then clobbers the fresh cookie the refresh itself just set on the shared
+                // cookie jar — the retry never actually benefits from the refresh. rusteero
+                // re-reads the session from the shared state *after* the refresh completes and
+                // retries with the refreshed token instead of reproducing that bug.
+                let retry_token = self.current_token().ok_or_else(not_authenticated)?;
+                let retry = self
+                    .execute_raw(
+                        route.method.clone(),
+                        url.clone(),
+                        query,
+                        body.as_ref(),
+                        Some(&retry_token),
+                    )
+                    .await?;
+                return status_to_envelope(
+                    retry.status,
+                    &retry.body,
+                    &retry.url,
+                    retry.retry_after,
+                );
+            }
+            // `refreshed == false`: fall through and raise the original 401 below, exactly like
+            // Python's "Session refresh returned False; raising auth exception" path.
+        }
+
+        status_to_envelope(
+            exchange.status,
+            &exchange.body,
+            &exchange.url,
+            exchange.retry_after,
+        )
+    }
+
+    /// Sends an unauthenticated (or explicit-token) request: no "not authenticated" precondition,
+    /// no refresh retry. Used by the login handshake (`LoginFlow`/`PendingLogin`, a later phase)
+    /// and internally by [`Transport::refresh_session`].
+    ///
+    /// The returned value's `set_cookie_session` surfaces any `Set-Cookie: s=...` header the
+    /// server sent on this response — `rusteero` has no implicit cookie jar to catch it the way
+    /// `eero-api`'s aiohttp session does (task brief gotcha #11), so this is the only place such
+    /// a cookie can ever become visible to a caller.
+    pub(crate) async fn send_raw(
+        &self,
+        route: &Route,
+        path_params: &[(&str, &str)],
+        query: &[(&str, String)],
+        body: Option<Value>,
+        token: Option<&SecretString>,
+    ) -> Result<RawResponse, Error> {
+        let url = self.render_url(route, path_params)?;
+        let exchange = self
+            .execute_raw(route.method.clone(), url, query, body.as_ref(), token)
+            .await?;
+        let envelope = status_to_envelope(
+            exchange.status,
+            &exchange.body,
+            &exchange.url,
+            exchange.retry_after,
+        )?;
+        Ok(RawResponse {
+            envelope,
+            set_cookie_session: exchange.set_cookie_session,
+        })
+    }
+
+    /// Attempts to refresh the current session, ported from `AuthAPI.refresh_session`
+    /// (`api/auth.py:279-340`; see `.claude/tasks/briefs/auth.md` for the full behaviour brief
+    /// this reproduces, including the exception-hierarchy subtlety noted at the terminal-error
+    /// match arm below).
+    ///
+    /// Tries `routes::LOGIN_REFRESH` then `routes::ACCOUNT_REFRESH`, in that order, with body
+    /// `{"refresh_token": <current refresh token>}` and no attached cookie (mirroring
+    /// `api/auth.py:301-304`, which omits `auth_token` for this call). On success, reads
+    /// `data.session_token` (a *different* wire key from the login/verify handshake's
+    /// `user_token`) and `data.refresh_token`, updates the in-memory session, and persists
+    /// through the configured credential store if any — a store failure here is logged at WARN
+    /// and never masks a successful refresh (decision D-13).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("No refresh token available")` if the current session has
+    /// no refresh token (the literal, unwrapped Python message, `api/auth.py:295-296`) — in
+    /// practice this is the common case, since a normal login/verify never yields one (task
+    /// brief finding (d)). Propagates a network/timeout error, or a `401`/`429`/other
+    /// non-`404` status from *either* refresh route unmodified once past that precondition. A
+    /// terminal `404`-from-both-routes or a terminal non-`404` `Error::Api` from either route is
+    /// **not** propagated as an error: both instead clear the local session (persisting the
+    /// clear, best-effort) and return `Ok(false)`, exactly matching `api/auth.py:305-338`.
+    pub async fn refresh_session(&self) -> Result<bool, Error> {
+        let current = self.session_snapshot();
+        let refresh_token = current
+            .as_ref()
+            .and_then(Session::refresh_token)
+            .map(ExposeSecret::expose_secret)
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned);
+
+        let Some(refresh_token) = refresh_token else {
+            return Err(Error::Authentication(
+                "No refresh token available".to_owned(),
+            ));
+        };
+
+        let body = json!({ "refresh_token": refresh_token });
+
+        for route in [&routes::LOGIN_REFRESH, &routes::ACCOUNT_REFRESH] {
+            match self
+                .send_raw(route, &[], &[], Some(body.clone()), None)
+                .await
+            {
+                Ok(raw) => {
+                    let data = raw.envelope.data();
+                    let Some(new_token) = data
+                        .get(consts::SESSION_TOKEN_KEY)
+                        .and_then(Value::as_str)
+                        .filter(|token| !token.is_empty())
+                    else {
+                        // `SESSION_TOKEN_KEY` missing or empty: Python returns `False` without
+                        // clearing or persisting anything (`api/auth.py:332`).
+                        return Ok(false);
+                    };
+                    let new_refresh_token =
+                        data.get(consts::REFRESH_TOKEN_KEY).and_then(Value::as_str);
+                    let refreshed = build_refreshed_session(new_token, new_refresh_token)?;
+                    self.replace_session(Some(refreshed.clone()));
+                    self.persist_warn_only(&refreshed).await;
+                    return Ok(true);
+                }
+                // A 404 from this route: try the next one in the tuple order.
+                Err(Error::Api { status: 404, .. }) => {}
+                // Any other `Error::Api` (400, 403, 5xx, ...) is the direct analogue of a
+                // generic `EeroAPIException` in Python — terminal, clears local state, and
+                // returns `Ok(false)` rather than propagating (`api/auth.py:312-316`). A `401`
+                // is *not* `Error::Api` in this crate's type (it is `Error::Authentication`,
+                // mirroring `EeroAuthenticationException`'s separate class in Python), so it
+                // falls to the `Err(other)` arm below and propagates unmodified — reproducing
+                // the same sibling-exception-hierarchy gap the task brief documents for
+                // `login`/`verify`/`resend_verification_code` (brief gotcha #1), which applies
+                // here too since `refresh_session` never catches `Error::Authentication` either.
+                Err(Error::Api {
+                    status, message, ..
+                }) => {
+                    tracing::error!(status, %message, "session refresh failed");
+                    self.replace_session(Some(Session::empty()));
+                    self.persist_warn_only(&Session::empty()).await;
+                    return Ok(false);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        tracing::error!("session refresh failed: no refresh endpoint was accepted by the server");
+        self.replace_session(Some(Session::empty()));
+        self.persist_warn_only(&Session::empty()).await;
+        Ok(false)
+    }
+
+    /// Clones the in-memory session out from behind the lock. The guard never survives past this
+    /// one statement, so it is never held across an `.await` by any caller.
+    fn session_snapshot(&self) -> Option<Session> {
+        self.session
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Returns the current session's token, but only if the session is present and
+    /// `Session::is_valid`. This is the exact gate `send`/`send_with_query` use for the
+    /// "Not authenticated" precondition.
+    fn current_token(&self) -> Option<SecretString> {
+        self.session_snapshot()
+            .filter(Session::is_valid)
+            .map(|session| session.token().clone())
+    }
+
+    /// Overwrites the in-memory session without touching the credential store. Used internally
+    /// by `refresh_session` (which has its own, warn-only persistence policy) and by
+    /// `set_session` (which persists synchronously right after calling this).
+    fn replace_session(&self, session: Option<Session>) {
+        let mut guard = self.session.write().unwrap_or_else(PoisonError::into_inner);
+        *guard = session;
+    }
+
+    /// Persists `session` to the configured credential store, if any, via
+    /// `tokio::task::spawn_blocking` (the store's trait is intentionally synchronous — see
+    /// `crate::storage`'s docs). A failure here is logged at WARN and never returned to the
+    /// caller: per decision D-13, a store failure must never mask a successful refresh.
+    async fn persist_warn_only(&self, session: &Session) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let session = session.clone();
+        match tokio::task::spawn_blocking(move || store.save(&session)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "failed to persist session to credential store");
+            }
+            Err(join_err) => {
+                tracing::warn!(error = %join_err, "credential store task panicked");
+            }
+        }
+    }
+
+    /// Returns the configured base `Url` for `version`: the real Eero host by default, or the
+    /// host derived from `TransportBuilder::base_url` when one was supplied.
+    fn base_for(&self, version: ApiVersion) -> &Url {
+        match version {
+            ApiVersion::V2_2 => &self.base_22,
+            ApiVersion::V2_3 => &self.base_23,
+        }
+    }
+
+    /// Renders `route`'s path template against `params` into a full request `Url`, using this
+    /// transport's configured base for the route's API version.
+    ///
+    /// This intentionally duplicates the (small) segment-substitution loop from
+    /// `routes::Route::render` rather than calling it directly: `Route::render` always builds
+    /// against the *real* Eero host baked into `ApiVersion::base_url`, with no way to substitute
+    /// a test double, which is exactly what `TransportBuilder::base_url` needs in order to point
+    /// a single wiremock server at both API versions. Percent-encoding and placeholder semantics
+    /// are identical to `Route::render` (see that function's docs for the `.`/`..`-segment
+    /// caveat); the only difference is which base `Url` the segments are pushed onto.
+    fn render_url(&self, route: &Route, params: &[(&str, &str)]) -> Result<Url, Error> {
+        let mut url = self.base_for(route.version).clone();
+        {
+            let mut segments = url.path_segments_mut().map_err(|()| Error::Validation {
+                field: "base_url".to_owned(),
+                message: "configured base URL cannot be used as a path base".to_owned(),
+            })?;
+            for part in route.path.split('/') {
+                if part.is_empty() {
+                    // Leading/trailing/doubled slashes in a template contribute no segment.
+                    continue;
+                }
+                if let Some(name) = part.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                    let value = params
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| *value)
+                        .ok_or_else(|| Error::Validation {
+                            field: name.to_owned(),
+                            message: "missing value for path parameter".to_owned(),
+                        })?;
+                    segments.push(value);
+                } else {
+                    segments.push(part);
+                }
+            }
+        }
+        Ok(url)
+    }
+
+    /// Sends one HTTP request and returns its status, body, and any incidental headers this
+    /// crate cares about (`Set-Cookie: s=...`, `Retry-After`) — everything *before*
+    /// status-code-specific interpretation, which is `status_to_envelope`'s job.
+    ///
+    /// Handles, in order: attaching the `Cookie: s=<token>` header when `token` is `Some`
+    /// (`api/base.py:148-152`); sending the request; logging method + rendered path + status
+    /// only, never headers, cookies, or bodies (see the crate-level security rules); refusing
+    /// any `3xx` redirect immediately, before the body is streamed at all
+    /// (`api/base.py:158-186`); and streaming the body with the 10 MiB cap.
+    async fn execute_raw(
+        &self,
+        method: Method,
+        url: Url,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        token: Option<&SecretString>,
+    ) -> Result<RawExchange, Error> {
+        // Query parameters are appended directly onto the `Url` via `url`'s own percent-encoding
+        // (`Url::query_pairs_mut`) rather than `reqwest::RequestBuilder::query`, which requires
+        // reqwest's `query` cargo feature — not enabled for this crate (no new dependencies /
+        // feature flags without an explicit decision). `url::form_urlencoded` (which backs
+        // `query_pairs_mut`) is already pulled in transitively by the `url` crate, an existing
+        // direct dependency.
+        let mut url = url;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+
+        let mut request = self.http.request(method.clone(), url.clone());
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        if let Some(token) = token {
+            request = request.header(
+                COOKIE,
+                format!("{}={}", consts::SESSION_COOKIE_NAME, token.expose_secret()),
+            );
+        }
+
+        let response = request.send().await.map_err(map_reqwest_error)?;
+        let status = response.status();
+
+        // Method, rendered path, and status only — never headers, cookies, or bodies, so a
+        // session token can never reach a log line via this instrumentation.
+        tracing::debug!(
+            method = %method,
+            path = url.path(),
+            status = status.as_u16(),
+            "eero transport request"
+        );
+
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty());
+            let message = location.map_or_else(
+                || {
+                    format!(
+                        "Redirect not followed: {} (no Location header)",
+                        status.as_u16()
+                    )
+                },
+                |loc| format!("Redirect not followed: {} -> {loc}", status.as_u16()),
+            );
+            return Err(Error::Api {
+                status: status.as_u16(),
+                message,
+                url: Some(url.to_string()),
+            });
+        }
+
+        let set_cookie_session = extract_set_cookie_session(&response);
+        let retry_after = parse_retry_after(response.headers());
+        let body_text = read_capped_body(response).await?;
+
+        Ok(RawExchange {
+            status,
+            body: body_text,
+            set_cookie_session,
+            retry_after,
+            url,
+        })
+    }
+}
+
+/// Response of an unauthenticated call, including any fresh session cookie.
+pub(crate) struct RawResponse {
+    pub envelope: Envelope,
+    // `auth::flow` (owned by a future phase, not yet implemented) is the intended consumer of a
+    // fresh session cookie surfaced here; until it lands this field is only ever constructed,
+    // never read, which a plain `cargo clippy` flags as dead code.
+    #[allow(dead_code)]
+    pub set_cookie_session: Option<SecretString>,
+}
+
+/// The ingredients of one HTTP exchange, before status-code interpretation.
+struct RawExchange {
+    status: StatusCode,
+    body: String,
+    set_cookie_session: Option<SecretString>,
+    retry_after: Option<Duration>,
+    /// The exact URL requested, including any query string appended in `Transport::execute_raw`
+    /// — used for error messages instead of the pre-query `Url` the caller originally rendered.
+    url: Url,
+}
+
+/// The literal `Error::Authentication("Not authenticated")` guard every authenticated call
+/// raises when no valid session is configured — factored out since it is constructed at two
+/// call sites (the initial precondition and the post-refresh retry).
+fn not_authenticated() -> Error {
+    Error::Authentication("Not authenticated".to_owned())
+}
+
+/// Turns a response status and (already fully read) body into an `Envelope` or the matching
+/// `Error`, reproducing `api/base.py:207-269`'s status-code chain exactly (see
+/// `.claude/tasks/briefs/base.md` §9-10 for the line-by-line citation this implements):
+///
+/// - `204`, or any `2xx` with an empty/whitespace-only body, becomes `Envelope::empty()` — the
+///   `204` check short-circuits *before* the whitespace check, so a (spec-violating) `204` with
+///   a non-empty body still yields `{}` without ever attempting to parse it.
+/// - Any other `2xx` is parsed as JSON; invalid JSON becomes `Error::Api` (not `Error::Json`,
+///   which is reserved for `Envelope::data_as`) with message `"Invalid JSON response: ..."`.
+/// - `401` becomes `Error::Authentication("Authentication failed: ...")`.
+/// - `404` becomes `Error::Api` with `"Resource not found: .... URL: ..."`.
+/// - `429` becomes `Error::RateLimit { retry_after }` (`retry_after` is an addition on top of
+///   the Python contract, which discards the response body and never reads this header at all).
+/// - Every other non-`2xx` becomes `Error::Api` with the truncated body as `message`.
+///
+/// Every body embedded in an error message is passed through this crate's shared truncation
+/// helper first, matching `_truncate_for_error` exactly.
+fn status_to_envelope(
+    status: StatusCode,
+    body: &str,
+    url: &Url,
+    retry_after: Option<Duration>,
+) -> Result<Envelope, Error> {
+    let code = status.as_u16();
+
+    if (200..300).contains(&code) {
+        if status == StatusCode::NO_CONTENT || body.trim().is_empty() {
+            return Ok(Envelope::empty());
+        }
+        return serde_json::from_str::<Value>(body)
+            .map(Envelope::from_value)
+            .map_err(|_| Error::Api {
+                status: code,
+                message: format!("Invalid JSON response: {}", error::truncate_for_error(body)),
+                url: Some(url.to_string()),
+            });
+    }
+
+    match code {
+        401 => Err(Error::Authentication(format!(
+            "Authentication failed: {}",
+            error::truncate_for_error(body)
+        ))),
+        404 => Err(Error::Api {
+            status: 404,
+            message: format!(
+                "Resource not found: {}. URL: {url}",
+                error::truncate_for_error(body)
+            ),
+            url: Some(url.to_string()),
+        }),
+        429 => Err(Error::RateLimit { retry_after }),
+        _ => Err(Error::Api {
+            status: code,
+            message: error::truncate_for_error(body),
+            url: Some(url.to_string()),
+        }),
+    }
+}
+
+/// Streams `response`'s body with a running size check, matching `eero-api`'s streamed,
+/// cap-checked read (`api/base.py:188-205`): as soon as the accumulated length would *exceed*
+/// `consts::MAX_RESPONSE_BYTES`, this aborts immediately without appending the chunk that pushed
+/// it over — a body of exactly the cap succeeds, one byte more does not. Unlike Python's fixed
+/// `65536`-byte chunker, this reads whatever chunk size `reqwest`'s `Response::chunk` yields
+/// from the underlying transport; the cap check runs after every chunk regardless of its size,
+/// so the strictly-greater-than semantics are identical either way.
+///
+/// Returns `Error::Api` (carrying the response's real status, not a synthetic one, matching
+/// `api/base.py:198-201`) on an oversized body, and on a body that is not valid UTF-8 — the
+/// latter has no Python equivalent (a raw `UnicodeDecodeError` would propagate uncaught there,
+/// per the task brief); this crate cannot leave a body undecoded, so it surfaces the same error
+/// shape instead of panicking or losing the failure.
+async fn read_capped_body(mut response: reqwest::Response) -> Result<String, Error> {
+    let status = response.status();
+    let mut buffer: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+        if buffer.len() + chunk.len() > consts::MAX_RESPONSE_BYTES {
+            return Err(Error::Api {
+                status: status.as_u16(),
+                message: format!(
+                    "Response body exceeded max size of {} bytes",
+                    consts::MAX_RESPONSE_BYTES
+                ),
+                url: Some(response.url().to_string()),
+            });
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(buffer).map_err(|err| Error::Api {
+        status: status.as_u16(),
+        message: format!("Response body is not valid UTF-8: {err}"),
+        url: Some(response.url().to_string()),
+    })
+}
+
+/// Extracts the value of a `Set-Cookie: s=...` header from `response`, if the server sent one.
+///
+/// No application code in `eero-api` ever reads this header explicitly (task brief gotcha #11);
+/// `rusteero` has no implicit cookie jar to catch it silently, so this is the one place a fresh
+/// session cookie can surface to a caller at all — used only by `Transport::send_raw`'s
+/// `RawResponse`, for the not-yet-built login/verify handshake.
+fn extract_set_cookie_session(response: &reqwest::Response) -> Option<SecretString> {
+    response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|raw| {
+            let (name, rest) = raw.split_once('=')?;
+            if name.trim() != consts::SESSION_COOKIE_NAME {
+                return None;
+            }
+            let value = rest.split(';').next().unwrap_or("").trim();
+            (!value.is_empty()).then(|| SecretString::from(value.to_owned()))
+        })
+}
+
+/// Parses a `Retry-After` header value into a `Duration`, accepting both the delta-seconds form
+/// (a bare integer number of seconds) and the HTTP-date form (RFC 1123, e.g. `"Wed, 21 Oct 2015
+/// 07:28:00 GMT"`). Returns `None` when the header is absent or its value matches neither form —
+/// this must never itself become an error: `eero-api` never reads this header at all, so there
+/// is no upstream behaviour to preserve, only a new addition to keep conservative
+/// (`Error::RateLimit::retry_after`'s docs).
+///
+/// A `Retry-After` date already in the past parses to `Some(Duration::ZERO)` rather than `None`,
+/// keeping the "absent or unparseable -> `None`" contract literal: a valid, if stale, date is
+/// neither of those two cases.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim().to_owned();
+
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let naive = jiff::civil::DateTime::strptime("%a, %d %b %Y %H:%M:%S GMT", &raw).ok()?;
+    let zoned = naive.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+    let target = SystemTime::from(zoned);
+    Some(
+        target
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+/// Defensively checks whether a `401` response body carries the server-driven refresh signal
+/// (`meta.error == "error.session.refresh"`, ported from `api/base.py:284-293`). Any parse
+/// failure — invalid JSON, a `meta` that is not a JSON object, or a missing `error` key —
+/// degrades silently to `false` rather than propagating an error; this sniff must never itself
+/// raise, matching Python's own bare `try: ... except Exception: body = None`.
+fn refresh_signal_detected(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value
+        .get("meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("error"))
+        .and_then(Value::as_str)
+        == Some(consts::REFRESH_ERROR_CODE)
+}
+
+/// Maps a transport-level `reqwest::Error` onto this crate's `Error`, matching `eero-api`'s
+/// split between `asyncio.TimeoutError` -> `Error::Timeout` and `aiohttp.ClientError` ->
+/// `Error::Network` (`api/base.py:270-275`).
+fn map_reqwest_error(err: reqwest::Error) -> Error {
+    if err.is_timeout() {
+        Error::Timeout
+    } else {
+        Error::Network(err)
+    }
+}
+
+/// Builds a `Session` carrying `new_token` and `new_refresh_token`, with a fresh `+30`-day
+/// expiry fabricated the same way `Session::from_token` does.
+///
+/// `auth::session`'s on-disk representation type keeps its fields private to that module by
+/// design (decision D-5's wire-format guarantee), so a session with *both* a fresh token and a
+/// fresh refresh token cannot be assembled by touching private state from here. Instead this
+/// round-trips through the same public JSON wire contract `Session::to_json`/`Session::from_json`
+/// use for storage: fabricate a token-only session (which computes the correct expiry), splice
+/// the refresh token into its serialized form, then re-parse. This never reaches into a private
+/// field and stays entirely inside `Session`'s public contract.
+fn build_refreshed_session(
+    new_token: &str,
+    new_refresh_token: Option<&str>,
+) -> Result<Session, Error> {
+    let base = Session::from_token(new_token);
+    let mut value: Value = serde_json::from_str(&base.to_json()?)?;
+    value["refresh_token"] = match new_refresh_token {
+        Some(rt) => Value::String(rt.to_owned()),
+        None => Value::Null,
+    };
+    Ok(Session::from_json(&value.to_string())?)
+}
+
+/// Parses a base URL string into a `Url` validated to be usable as a path base (i.e.
+/// `Url::path_segments_mut` will succeed on it), for use by `TransportBuilder::build`.
+fn parse_base(raw: &str) -> Result<Url, Error> {
+    let mut url = Url::parse(raw).map_err(|err| Error::Validation {
+        field: "base_url".to_owned(),
+        message: format!("not a valid URL: {err}"),
+    })?;
+    if url.path_segments_mut().is_err() {
+        return Err(Error::Validation {
+            field: "base_url".to_owned(),
+            message: "must be an absolute URL that can be used as a base".to_owned(),
+        });
+    }
+    Ok(url)
+}
+
+/// Builds a [`Transport`].
+///
+/// Every setter takes `self` by value and returns `Self`, so calls chain naturally; `build` is
+/// the only fallible step. See each setter's docs for its default when unset.
+#[derive(Debug)]
+pub struct TransportBuilder {
+    http: Option<Client>,
+    base_root: Option<String>,
+    user_agent: Option<String>,
+    session: Option<Session>,
+    store: Option<Arc<dyn CredentialStore>>,
+    timeout: Duration,
+    read_timeout: Duration,
+}
+
+impl Default for TransportBuilder {
+    fn default() -> Self {
+        Self {
+            http: None,
+            base_root: None,
+            user_agent: None,
+            session: None,
+            store: None,
+            timeout: consts::REQUEST_TIMEOUT,
+            read_timeout: consts::READ_TIMEOUT,
+        }
+    }
+}
+
+impl TransportBuilder {
+    /// Supplies a fully-configured `reqwest::Client` instead of letting `build` construct one.
+    ///
+    /// When set, `user_agent`, `timeout`, and `read_timeout` are ignored entirely — the supplied
+    /// client is used exactly as given, which is the intended escape hatch for tests that need
+    /// full control over the HTTP layer.
+    #[must_use]
+    pub fn http(mut self, client: Client) -> Self {
+        self.http = Some(client);
+        self
+    }
+
+    /// Overrides the base host for *both* API versions, deriving each from `base_url` by
+    /// stripping any trailing `/` and appending `/2.2` or `/2.3` respectively — e.g.
+    /// `base_url("http://127.0.0.1:9999")` yields `http://127.0.0.1:9999/2.2` and
+    /// `http://127.0.0.1:9999/2.3`. This lets a single wiremock server stand in for both real
+    /// Eero cloud hosts in tests. When unset, `build` uses the real hosts
+    /// (`consts::API_BASE_22`/`consts::API_BASE_23`) unchanged.
+    #[must_use]
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_root = Some(base_url.into());
+        self
+    }
+
+    /// Sets the `User-Agent` header reqwest sends. `None` (the default) means "send reqwest's
+    /// own default `User-Agent`" — this crate deliberately does not send `eero-api`'s unused
+    /// mobile-style `User-Agent` constant (decision D-7); pass `Some(..)` to opt into a custom
+    /// value instead.
+    #[must_use]
+    pub fn user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    /// Seeds the transport with an initial session. `None` (the default) starts with no
+    /// session, matching every `send`/`send_with_query` call failing with
+    /// `Error::Authentication("Not authenticated")` until one is set via
+    /// `Transport::set_session` or a successful refresh.
+    #[must_use]
+    pub fn session(mut self, session: Option<Session>) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// Sets the credential store used by `Transport::set_session` and the persistence side of
+    /// `Transport::refresh_session`. `None` (the default) means no persistence at all — the
+    /// session only ever lives in memory.
+    #[must_use]
+    pub fn store(mut self, store: Option<Arc<dyn CredentialStore>>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Overrides the overall request timeout (`consts::REQUEST_TIMEOUT` by default). Ignored if
+    /// `http` was also called.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Overrides the per-read timeout (`consts::READ_TIMEOUT` by default). Ignored if `http` was
+    /// also called.
+    #[must_use]
+    pub fn read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
+        self
+    }
+
+    /// Builds the `Transport`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation` if `base_url` was set to a string that does not parse as an
+    /// absolute URL usable as a path base. Returns `Error::Network` if constructing the
+    /// underlying `reqwest::Client` fails (only reachable when `http` was not called; failure
+    /// here is exceedingly rare and generally indicates a broken TLS backend).
+    pub fn build(self) -> Result<Transport, Error> {
+        let (base_22, base_23) = self.build_bases()?;
+
+        let http = if let Some(client) = self.http {
+            client
+        } else {
+            let mut builder = Client::builder()
+                .timeout(self.timeout)
+                .read_timeout(self.read_timeout)
+                .redirect(Policy::none());
+            if let Some(user_agent) = self.user_agent {
+                builder = builder.user_agent(user_agent);
+            }
+            builder.build().map_err(Error::Network)?
+        };
+
+        Ok(Transport {
+            http,
+            base_22,
+            base_23,
+            session: RwLock::new(self.session),
+            store: self.store,
+        })
+    }
+
+    /// Computes the effective 2.2/2.3 base `Url`s: the real Eero hosts by default, or both
+    /// derived from `base_root` per `TransportBuilder::base_url`'s doc comment when set.
+    fn build_bases(&self) -> Result<(Url, Url), Error> {
+        let (raw_22, raw_23) = match &self.base_root {
+            Some(root) => {
+                let trimmed = root.trim_end_matches('/');
+                (format!("{trimmed}/2.2"), format!("{trimmed}/2.3"))
+            }
+            None => (
+                consts::API_BASE_22.to_owned(),
+                consts::API_BASE_23.to_owned(),
+            ),
+        };
+        Ok((parse_base(&raw_22)?, parse_base(&raw_23)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use reqwest::Method;
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    use super::{Route, Transport, parse_retry_after, refresh_signal_detected};
+    use crate::error::Error;
+    use crate::routes::{ACCOUNT, ApiVersion};
+
+    // ===================== parse_retry_after =====================
+
+    #[test]
+    fn retry_after_parses_delta_seconds_form() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("120"));
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds_form_with_surrounding_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("  30  "));
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn retry_after_parses_http_date_form_in_the_future() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Thu, 01 Jan 2099 00:00:00 GMT"),
+        );
+        let parsed = parse_retry_after(&headers).expect("valid HTTP-date form parses");
+        assert!(parsed > Duration::from_secs(0));
+    }
+
+    #[test]
+    fn retry_after_http_date_in_the_past_is_zero_not_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 01 Jan 2003 00:00:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_after_absent_header_is_none() {
+        let headers = HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_garbage_value_is_none_not_an_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("not a retry-after value"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_negative_number_is_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("-5"));
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    // ===================== refresh_signal_detected =====================
+
+    #[test]
+    fn refresh_signal_detected_on_exact_match() {
+        assert!(refresh_signal_detected(
+            r#"{"meta":{"code":401,"error":"error.session.refresh"}}"#
+        ));
+    }
+
+    #[test]
+    fn refresh_signal_not_detected_on_a_different_error_value() {
+        assert!(!refresh_signal_detected(
+            r#"{"meta":{"code":401,"error":"invalid_credentials"}}"#
+        ));
+    }
+
+    #[test]
+    fn refresh_signal_not_detected_when_meta_is_absent() {
+        assert!(!refresh_signal_detected(r#"{"data":{}}"#));
+    }
+
+    #[test]
+    fn refresh_signal_not_detected_when_meta_is_not_an_object() {
+        for bad_meta in ["\"oops\"", "42", "[1,2]", "null"] {
+            let body = format!(r#"{{"meta":{bad_meta}}}"#);
+            assert!(!refresh_signal_detected(&body), "meta = {bad_meta}");
+        }
+    }
+
+    #[test]
+    fn refresh_signal_not_detected_on_invalid_json() {
+        assert!(!refresh_signal_detected("not json at all"));
+    }
+
+    #[test]
+    fn refresh_signal_not_detected_when_error_key_is_missing() {
+        assert!(!refresh_signal_detected(r#"{"meta":{"code":401}}"#));
+    }
+
+    // ===================== render_url / base selection =====================
+
+    fn v2_3_route() -> Route {
+        Route {
+            method: Method::PUT,
+            version: ApiVersion::V2_3,
+            path: "networks/{network_id}/devices/{device_id}",
+        }
+    }
+
+    #[test]
+    fn default_bases_render_the_real_eero_hosts() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let url = transport
+            .render_url(&ACCOUNT, &[])
+            .expect("no placeholders needed");
+        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/account");
+    }
+
+    #[test]
+    fn overridden_base_url_is_used_for_both_api_versions() {
+        let transport = Transport::builder()
+            .base_url("http://127.0.0.1:9999")
+            .build()
+            .expect("builds with an overridden base");
+
+        let v22 = transport
+            .render_url(&ACCOUNT, &[])
+            .expect("v2.2 route renders");
+        assert_eq!(v22.as_str(), "http://127.0.0.1:9999/2.2/account");
+
+        let route = v2_3_route();
+        let v23 = transport
+            .render_url(&route, &[("network_id", "123"), ("device_id", "aa:bb")])
+            .expect("v2.3 route renders");
+        assert_eq!(
+            v23.as_str(),
+            "http://127.0.0.1:9999/2.3/networks/123/devices/aa:bb"
+        );
+    }
+
+    #[test]
+    fn overridden_base_url_trailing_slash_is_not_doubled() {
+        let transport = Transport::builder()
+            .base_url("http://127.0.0.1:9999/")
+            .build()
+            .expect("builds with a trailing-slash base");
+        let url = transport.render_url(&ACCOUNT, &[]).expect("route renders");
+        assert_eq!(url.as_str(), "http://127.0.0.1:9999/2.2/account");
+    }
+
+    #[test]
+    fn render_url_missing_placeholder_is_a_validation_error() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let route = v2_3_route();
+        let err = transport
+            .render_url(&route, &[("network_id", "123")])
+            .expect_err("device_id is missing");
+        assert!(matches!(err, Error::Validation { field, .. } if field == "device_id"));
+    }
+
+    #[test]
+    fn invalid_base_url_is_rejected_at_build_time() {
+        let err = Transport::builder()
+            .base_url("not a url")
+            .build()
+            .expect_err("malformed base URL must fail fast");
+        assert!(matches!(err, Error::Validation { field, .. } if field == "base_url"));
+    }
+
+    // ===================== session snapshot / is_authenticated =====================
+
+    #[test]
+    fn no_session_means_not_authenticated_and_no_snapshot() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        assert!(!transport.is_authenticated());
+        assert!(transport.session().is_none());
+    }
+
+    #[test]
+    fn set_session_updates_the_snapshot_and_authentication_state() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        transport
+            .set_session(Some(crate::auth::Session::from_token("tok-123")))
+            .expect("no store configured, cannot fail");
+        assert!(transport.is_authenticated());
+        assert!(transport.session().is_some());
+
+        transport
+            .set_session(None)
+            .expect("clearing with no store cannot fail");
+        assert!(!transport.is_authenticated());
+        assert!(transport.session().is_none());
+    }
+}
