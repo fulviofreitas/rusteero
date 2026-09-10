@@ -31,6 +31,7 @@ tracing = "0.1"
 url = "2.5"
 bytes = "1.12"
 keyring = { version = "4.2", optional = true }
+jiff = "0.2.35"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full", "test-util"] }

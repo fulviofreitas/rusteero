@@ -13,8 +13,20 @@
 //!
 //! ## Status
 //!
-//! Phase 0 (bootstrap). No endpoints are implemented yet. See `PARITY.md` in the repository
-//! for the per-method checklist against `eero-api`.
+//! Under construction. See `PARITY.md` in the repository for the per-method checklist against
+//! `eero-api`.
+
+#![forbid(unsafe_code)]
+
+pub mod auth;
+pub mod consts;
+pub mod envelope;
+pub mod error;
+pub mod redact;
+pub mod routes;
+pub mod storage;
+pub mod transport;
+pub mod util;
 
 /// Crate version, as compiled from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
