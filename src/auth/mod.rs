@@ -3,7 +3,7 @@
 //! a later phase.
 //!
 //! Ported from `eero-api`'s `src/eero/api/auth.py`.
-mod flow;
+pub mod flow;
 pub mod session;
 
 pub use session::Session;
