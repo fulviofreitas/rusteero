@@ -275,10 +275,11 @@ impl AuthApi {
 /// `auth.py:427-428`: only `session_id` and `session_expiry` are reset) — both Python methods
 /// leave `refresh_token` untouched, just with a different `base`.
 ///
-/// Goes through the same public JSON wire round trip `crate::transport`'s
-/// `build_refreshed_session` uses, for the same reason: [`session::StoredSession`]'s fields are
-/// private to the `session` module, so a session with a *specific* combination of `base`'s fields
-/// and a preserved refresh token cannot be assembled by touching private state from here.
+/// Goes through the same crate-internal JSON wire round trip (`Session::to_json`, `pub(crate)`
+/// per finding F7) `crate::transport`'s `build_refreshed_session` uses, for the same reason:
+/// [`session::StoredSession`]'s fields are private to the `session` module, so a session with a
+/// *specific* combination of `base`'s fields and a preserved refresh token cannot be assembled by
+/// touching private state from here.
 fn session_preserving_refresh_token(
     base: &Session,
     current: Option<&Session>,

@@ -21,7 +21,10 @@
 
 use std::time::Duration;
 
+use serde_json::Value;
+
 use crate::consts::MAX_ERROR_BODY_CHARS;
+use crate::redact;
 
 /// The crate's error type.
 ///
@@ -245,11 +248,9 @@ pub enum StorageError {
 /// Truncation happens on `char` (Unicode scalar value) boundaries, matching Python's `str`
 /// slicing by code point, so this never panics on a multi-byte UTF-8 boundary the way a naive
 /// byte-index slice (`&text[..MAX_ERROR_BODY_CHARS]`) could.
-// `transport.rs` (owned by a concurrent task, not yet implemented) is the intended non-test
-// caller, per the plan's mapping of `_truncate_for_error` call sites onto `Error::Api`/
-// `Error::Authentication` construction; until it lands this function is only exercised by the
-// tests below, which would otherwise make a plain `cargo clippy` flag it as dead code.
-#[allow(dead_code)]
+/// Called from `transport.rs`'s `status_to_envelope` at every site that embeds a response body
+/// in an `Error::Api`/`Error::Authentication` message (four call sites as of this writing: the
+/// invalid-JSON-on-2xx, `401`, `404`, and generic non-`2xx` arms).
 pub(crate) fn truncate_for_error(text: &str) -> String {
     let char_count = text.chars().count();
     if char_count <= MAX_ERROR_BODY_CHARS {
@@ -257,6 +258,71 @@ pub(crate) fn truncate_for_error(text: &str) -> String {
     }
     let truncated: String = text.chars().take(MAX_ERROR_BODY_CHARS).collect();
     format!("{truncated}... [truncated, {char_count} chars total]")
+}
+
+/// Case-insensitive substring markers used by [`sanitize_body_for_error`]'s fallback path for a
+/// response body that does not parse as JSON at all.
+///
+/// A deliberately small, independently-maintained list rather than a re-export of
+/// [`crate::redact`]'s own (private) `SENSITIVE_PATTERNS`: `redact.rs` is owned by a different
+/// task in this port and out of scope here, and its list is tuned for *structured* (parsed)
+/// JSON keys, not for scanning raw, possibly-truncated text. Keeping this list conservative and
+/// separate means a body that merely fails to parse is still protected without reaching into
+/// another module's private surface.
+const RAW_TEXT_SENSITIVE_MARKERS: &[&str] = &[
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "session_id",
+    "session_token",
+    "credential",
+    "cookie",
+    "authorization",
+    "bearer",
+    "private",
+];
+
+/// Returns `true` if `text`, matched case-insensitively as a substring, contains anything that
+/// looks like a credential — the fallback heuristic [`sanitize_body_for_error`] applies to a body
+/// it cannot structurally parse.
+fn looks_sensitive(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    RAW_TEXT_SENSITIVE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Prepares a response body for embedding in an [`Error::Api`] or [`Error::Authentication`]
+/// message (security finding F5): unlike [`truncate_for_error`], this never embeds a credential
+/// verbatim.
+///
+/// - If `body` parses as JSON, it is run through [`crate::redact::redact_sensitive`] first and
+///   the *redacted* rendering is truncated and returned. A typical error body (e.g.
+///   `{"meta":{"code":404,"error":"..."}}`) contains none of `redact_sensitive`'s sensitive-key
+///   substrings, so it comes back unchanged in substance — only its exact byte layout changes
+///   (compact re-serialization, and `serde_json::Map`'s default key ordering), which is a
+///   deliberate, documented divergence from Python's verbatim-body messages (see this crate's
+///   `notes` for this change, recorded for `PARITY.md`).
+/// - If `body` does not parse as JSON at all (the only way `status_to_envelope`'s
+///   invalid-JSON-on-2xx arm can be reached in the first place, since any syntactically valid
+///   JSON on a 2xx succeeds as an `Envelope` instead of becoming an error), a body that is
+///   irrecoverably malformed cannot be redacted field-by-field. [`looks_sensitive`] is a
+///   conservative substring scan of the *raw* text as a fallback: if it fires, the entire body is
+///   replaced with a fixed marker rather than truncated verbatim, since a truncated prefix of a
+///   credential-carrying body can still itself carry the credential (see the `login`/`refresh`
+///   scenario this guards against). Otherwise the raw text is truncated exactly as before.
+///
+/// [`truncate_for_error`]'s truncation still applies in every branch.
+pub(crate) fn sanitize_body_for_error(body: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let redacted = redact::redact_sensitive(&value);
+        return truncate_for_error(&redacted.to_string());
+    }
+    if looks_sensitive(body) {
+        return "[response body omitted: contains data that looks sensitive]".to_owned();
+    }
+    truncate_for_error(body)
 }
 
 #[cfg(test)]
@@ -501,6 +567,49 @@ mod tests {
     fn truncate_for_error_boundary_exactly_at_limit_is_unchanged() {
         let body = "a".repeat(512);
         assert_eq!(truncate_for_error(&body), body);
+    }
+
+    // ===================== sanitize_body_for_error (finding F5) =====================
+
+    #[test]
+    fn sanitize_body_for_error_redacts_a_parseable_json_body() {
+        let body = r#"{"meta":{"code":200},"data":{"session_token":"eyJsecret-value"}}"#;
+        let sanitized = super::sanitize_body_for_error(body);
+        // `redact::redact_sensitive` keeps a short, fixed-length visible prefix (matching
+        // Python's `_redact_value`); the point of this test is that the *full* credential is
+        // gone, not that every leading character is.
+        assert!(!sanitized.contains("eyJsecret-value"));
+        assert!(sanitized.contains("REDACTED"));
+    }
+
+    #[test]
+    fn sanitize_body_for_error_leaves_a_typical_error_body_unaffected_in_substance() {
+        let body = r#"{"meta":{"code":404,"error":"resource not found"}}"#;
+        let sanitized = super::sanitize_body_for_error(body);
+        let value: serde_json::Value = serde_json::from_str(&sanitized).expect("still valid json");
+        assert_eq!(value["meta"]["code"], 404);
+        assert_eq!(value["meta"]["error"], "resource not found");
+    }
+
+    #[test]
+    fn sanitize_body_for_error_omits_an_unparseable_body_that_looks_sensitive() {
+        // Deliberately truncated/malformed, exactly like a cut-off `login/refresh` response —
+        // the scenario security finding F5 exists to close.
+        let body = concat!(
+            r#"{"meta":{"code":200},"data":{"session_token":"eyJsecret-session-value","#,
+            r#""refresh_token":"eyJsecret-refresh-value"#,
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
+        let sanitized = super::sanitize_body_for_error(body);
+        assert!(!sanitized.contains("eyJsecret"));
+        assert!(!sanitized.contains("session-value"));
+        assert!(!sanitized.contains("refresh-value"));
+    }
+
+    #[test]
+    fn sanitize_body_for_error_truncates_an_unparseable_body_with_nothing_sensitive() {
+        let body = "no such account";
+        assert_eq!(super::sanitize_body_for_error(body), body);
     }
 
     // ===================== #[from] conversions =====================

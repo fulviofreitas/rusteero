@@ -13,9 +13,17 @@
 //!   a later phase of the port; see the "Phase 2" marker below for where they extend this
 //!   module.
 
+pub mod chained;
+pub mod file;
+#[cfg(feature = "keyring")]
+pub mod keyring;
 pub mod memory;
 
 pub use crate::error::StorageError;
+pub use chained::ChainedStore;
+pub use file::FileStore;
+#[cfg(feature = "keyring")]
+pub use keyring::KeyringStore;
 pub use memory::MemoryStore;
 
 use crate::auth::Session;

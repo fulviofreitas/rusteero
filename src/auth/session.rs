@@ -12,7 +12,7 @@
 //! wire-compatible shape (`{"session_id", "refresh_token", "session_expiry"}`, shared with
 //! `eero-api`'s cookie file and keyring blob per decision D-5) is expressed by the
 //! [`StoredSession`] type instead, which has no public constructor and is reached only through
-//! [`Session::to_json`] / [`Session::from_json`]. This keeps the on-disk format defined in
+//! `Session::to_json` / [`Session::from_json`]. This keeps the on-disk format defined in
 //! exactly one place, so Phase 2's `FileStore` and `KeyringStore` (`src/storage/*`) can both
 //! build on it without duplicating the (de)serialization logic.
 
@@ -267,8 +267,15 @@ impl Session {
     /// Serializes this session to the exact `eero-api`-compatible JSON shape.
     ///
     /// This is the one place the on-disk format is produced; Phase 2's `FileStore` and
-    /// `KeyringStore` (`src/storage/*`) call this rather than reimplementing serialization.
-    pub fn to_json(&self) -> Result<String, StorageError> {
+    /// `KeyringStore` (`src/storage/*`) call this rather than reimplementing serialization —
+    /// both live inside this crate, so `pub(crate)` is all the visibility they need.
+    ///
+    /// `pub(crate)`, not `pub` (documentation finding F7): the on-disk JSON shape embeds the raw
+    /// token string in plain text (`session_id`). Keeping this crate-private is what makes
+    /// [`Session::token`]'s doc claim — that a crate-private helper is the *only* place the raw
+    /// token string is ever exposed as a bare string — actually true; a `pub` `to_json` would be
+    /// a second, external exposure path that claim did not account for.
+    pub(crate) fn to_json(&self) -> Result<String, StorageError> {
         let json = serde_json::to_string(&self.to_stored())?;
         Ok(json)
     }
@@ -386,16 +393,48 @@ fn parse_naive_local(s: &str) -> Option<SystemTime> {
 /// (`#[serde(skip_serializing)]`) and is only consulted as a fallback source for `session_id`
 /// when deserializing, mirroring the legacy-cookie-file migration path at
 /// `auth_storage.py:74`. This type has no public constructor — values of it are produced and
-/// consumed only through [`Session::to_json`] and [`Session::from_json`]; it is public so that
+/// consumed only through `Session::to_json` (crate-private, finding F7) and
+/// [`Session::from_json`]; it is public so that
 /// Phase 2's `FileStore` and `KeyringStore` (`src/storage/*`) can name the wire format precisely
 /// in their own documentation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredSession {
     session_id: Option<String>,
     refresh_token: Option<String>,
     session_expiry: Option<String>,
     #[serde(default, skip_serializing)]
     user_token: Option<String>,
+}
+
+impl fmt::Debug for StoredSession {
+    /// Redacts `session_id`, `refresh_token`, and `user_token` unconditionally; `session_expiry`
+    /// is not a secret and is rendered as-is.
+    ///
+    /// Security finding F2: this type previously derived `Debug`, which rendered these three
+    /// plaintext credential fields verbatim — directly contradicting [`Session`]'s own
+    /// module-level guarantee ("can never be printed, logged, or otherwise leaked through
+    /// `Debug`/`Display`") and this crate's rule against logging tokens. `StoredSession` is the
+    /// exact type Phase 2's `FileStore` and `KeyringStore` will handle, so a single
+    /// `tracing::debug!(?stored)` there would otherwise have dumped live credentials. Written by
+    /// hand, like [`Session`]'s own `Debug` impl, rather than derived, so the redaction is
+    /// guaranteed by this type's contract and does not silently regress if a field is ever added.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredSession")
+            .field(
+                "session_id",
+                &self.session_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("session_expiry", &self.session_expiry)
+            .field(
+                "user_token",
+                &self.user_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +613,42 @@ mod tests {
         let session = Session::from_token("super-secret-token");
         let display = format!("{session}");
         assert!(!display.contains("super-secret-token"));
+    }
+
+    // ===================== StoredSession Debug redaction (finding F2) =====================
+
+    #[test]
+    fn stored_session_debug_never_prints_session_id_refresh_token_or_user_token() {
+        let stored = super::StoredSession {
+            session_id: Some("super-secret-session-id".to_owned()),
+            refresh_token: Some("super-secret-refresh-token".to_owned()),
+            session_expiry: Some("2099-01-01T00:00:00".to_owned()),
+            user_token: Some("super-secret-user-token".to_owned()),
+        };
+        let debug = format!("{stored:?}");
+        assert!(!debug.contains("super-secret-session-id"));
+        assert!(!debug.contains("super-secret-refresh-token"));
+        assert!(!debug.contains("super-secret-user-token"));
+        assert!(
+            debug.contains("2099-01-01T00:00:00"),
+            "session_expiry is not a secret and must remain visible: {debug}"
+        );
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn stored_session_debug_with_no_fields_set_still_redacts_cleanly() {
+        let stored = super::StoredSession {
+            session_id: None,
+            refresh_token: None,
+            session_expiry: None,
+            user_token: None,
+        };
+        let debug = format!("{stored:?}");
+        assert!(
+            !debug.contains("REDACTED"),
+            "None fields have nothing to redact: {debug}"
+        );
     }
 
     // ===================== from_env =====================

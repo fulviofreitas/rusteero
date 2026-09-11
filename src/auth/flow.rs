@@ -49,6 +49,20 @@ impl LoginFlow {
     /// this crate's defaults instead (redirects refused, the timeouts in [`crate::consts`],
     /// reqwest's own `User-Agent` per decision D-7).
     ///
+    /// # Warning
+    ///
+    /// A caller-supplied client silently discards two of this crate's safety guarantees: redirect
+    /// refusal (`reqwest::redirect::Policy::none()`) and the request/read timeouts in
+    /// [`crate::consts`] — see [`crate::transport::TransportBuilder::http`]'s own `# Warning` for
+    /// the full hazard this creates (a same-host-same-port `3xx` is followed instead of surfacing
+    /// an error, and there is no ceiling on a hung request). `Transport::send_raw`'s own
+    /// response-URL check (security finding F4) still refuses a *followed* redirect before its
+    /// body is ever read, regardless of which client is injected here, but a `Some(client)` this
+    /// constructor receives is otherwise used exactly as given: build your own client with
+    /// `.redirect(reqwest::redirect::Policy::none())` and explicit `.timeout(..)` /
+    /// `.read_timeout(..)` calls before passing it here if you need both custom configuration
+    /// *and* this crate's default guarantees.
+    ///
     /// # Errors
     ///
     /// Propagates [`crate::transport::TransportBuilder::build`]'s error unmodified — in
