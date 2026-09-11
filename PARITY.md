@@ -4,21 +4,21 @@ Per-method checklist against `fulviofreitas/eero-api` at commit `e7bcfd9` (2026-
 
 Status values: `planned` → `ported` (with test) · `changed` · `renamed` · `identical` · `dropped`.
 
-**Summary:** 119 rows — changed: 3, dropped: 7, identical: 2, planned: 105, renamed: 2.
+**Summary:** 127 rows — changed: 9, dropped: 7, identical: 2, planned: 95, ported: 12, renamed: 2. Phases 1 and 2 (transport, errors, envelope, routes, auth, credential storage) are complete; the remaining `planned` rows are the endpoint modules delivered in phases 3 and 5.
 
 | Module | Python | Rust | Verb | Path | Status | Test | Note |
 |---|---|---|---|---|---|---|---|
-| auth (AuthAPI) | `is_authenticated` | `is_authenticated` | — | `local` | planned | — |  |
-| auth (AuthAPI) | `login` | `LoginFlow::start` | POST | `2.2/login` | planned | — | separable from Client |
-| auth (AuthAPI) | `verify` | `PendingLogin::verify` | POST | `2.2/login/verify` | planned | — | confirm fresh `s` Set-Cookie by live capture |
-| auth (AuthAPI) | `resend_verification_code` | `PendingLogin::resend` | POST | `2.2/login/resend` | planned | — |  |
-| auth (AuthAPI) | `logout` | `logout` | POST | `2.2/logout` | planned | — |  |
-| auth (AuthAPI) | `refresh_session` | `refresh_session` | POST | `2.2/login/refresh → 2.2/account/refresh` | planned | — | practically dead upstream; kept |
-| auth (AuthAPI) | `ensure_authenticated` | `ensure_authenticated` | — | `local` | planned | — |  |
+| auth (AuthAPI) | `is_authenticated` | `is_authenticated` | — | `local` | ported | `auth::tests` | local only: token set and now <= expiry |
+| auth (AuthAPI) | `login` | `LoginFlow::start` | POST | `2.2/login` | ported | `tests/auth.rs` | separable from Client |
+| auth (AuthAPI) | `verify` | `PendingLogin::verify` | POST | `2.2/login/verify` | ported | `tests/auth.rs` | **provisional** — both Set-Cookie branches implemented and tested; needs live confirmation (plan 7.2, D-16) |
+| auth (AuthAPI) | `resend_verification_code` | `PendingLogin::resend` | POST | `2.2/login/resend` | ported | `tests/auth.rs` |  |
+| auth (AuthAPI) | `logout` | `logout` | POST | `2.2/logout` | changed | `tests/auth.rs` | always clears local session and store, on every outcome; Python skips cleanup on 429/network error (auth.py:239-277) despite its own comment at :269 |
+| auth (AuthAPI) | `refresh_session` | `refresh_session` | POST | `2.2/login/refresh → 2.2/account/refresh` | changed | `tests/transport.rs` | retry uses the REFRESHED token; Python re-passes the stale one and clobbers the fresh cookie (base.py:296-298), so its refresh cannot succeed. Route order and 404-fallthrough are as Python |
+| auth (AuthAPI) | `ensure_authenticated` | `ensure_authenticated` | — | `local` | ported | `auth::tests` | local check; Python's refresh branch is unreachable, same observable behaviour |
 | auth (AuthAPI) | `get_auth_token` | `Client::session` | — | `local` | renamed | — | returns Session (SecretString), not a bare string |
-| auth (AuthAPI) | `clear_auth_data` | `clear_auth_data` | — | `local` | planned | — |  |
-| auth (AuthAPI) | `set_session_token` | `set_session_token / Session::from_token` | — | `local` | planned | — |  |
-| auth (AuthAPI) | `clear_session_token` | `clear_session_token` | — | `local` | planned | — |  |
+| auth (AuthAPI) | `clear_auth_data` | `clear_auth_data` | — | `local` | ported | `tests/auth.rs` | clears store too; honours StorageFailures |
+| auth (AuthAPI) | `set_session_token` | `set_session_token / Session::from_token` | — | `local` | ported | `tests/auth.rs` | preserves an existing refresh token, as Python does |
+| auth (AuthAPI) | `clear_session_token` | `clear_session_token` | — | `local` | ported | `tests/auth.rs` | leaves the refresh token in place, unlike clear_auth_data |
 | EeroAPI | `EeroAPI(session, cookie_file, use_keyring)` | `EeroApi::new(transport)` | — | `—` | changed | — | storage moves to Client::builder().store() |
 | EeroAPI | `__aenter__/__aexit__` | `(none)` | — | `—` | dropped | — | no context manager in Rust |
 | EeroAPI | `is_authenticated / login / verify / logout` | `same on Client` | — | `—` | identical | — |  |
@@ -127,3 +127,16 @@ Status values: `planned` → `ported` (with test) · `changed` · `renamed` · `
 | misc | `redact_sensitive` | `redact::redact_sensitive` | — | `local` | planned | — | Value only |
 | misc | `get_secure_logger / SecureLoggerAdapter` | `(none)` | — | `—` | dropped | — | Python-logging specific; tracing + SecretString |
 | misc | `const.py enums (EeroDeviceType, …)` | `(none)` | — | `—` | dropped | — | unused in Python |
+
+## Credential storage (phase 2, `api/auth_storage.py`)
+
+| Python | Rust | Status | Test | Note |
+|---|---|---|---|---|
+| `AuthCredentials` | `Session` + `StoredSession` | ported | `auth::session::tests`, `tests/storage.rs` | same JSON keys, naive 19-char ISO 8601 expiry, legacy `user_token` accepted on read (D-5) |
+| `CredentialStorage` (ABC) | `CredentialStore` trait | ported | `storage::*` | sync on purpose; async callers use the `spawn_blocking` adapters |
+| `MemoryStorage` | `MemoryStore` | ported | `storage::memory::tests` | |
+| `FileStorage` | `FileStore` | changed | `tests/storage.rs`, `storage::file::tests` | 0600 applied atomically at open; Python chmods after write (`auth_storage.py:215-224`), leaving a world-readable window. Unique temp name per write, temp removed on every error path, `clear()` also removes an orphaned temp |
+| `KeyringStorage` | `KeyringStore` | changed | `storage::keyring::tests` | same service `eero-api` / account `auth-tokens` (D-5). Returns `StorageError` instead of swallowing every exception at DEBUG (`auth_storage.py:142-145,152-155`) |
+| `ChainedStorage` | `ChainedStore` | changed | `tests/storage.rs`, `storage::chained::tests` | save fallback actually fires, because `KeyringStore::save` can return `Err`; Python's never can. A failed primary save clears the stale primary. `clear()` attempts both and reports `Err` if either fails, so a partial erase is never reported as success |
+| `create_storage(use_keyring, cookie_file)` | `create_storage(&StorageConfig)` | ported | `storage::tests`, `tests/storage.rs` | same four-way matrix; degrades to file-then-memory without the `keyring` feature |
+| swallowed storage exceptions | `StorageFailures {Warn, Fatal}` | changed | `tests/storage.rs`, `auth::tests` | D-13. Warn is the default. On `TransportBuilder` for now; `Client::builder()` forwards to it in phase 4 |
