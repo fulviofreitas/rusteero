@@ -8,18 +8,21 @@
 
 mod common;
 
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::Method;
-use rusteero::auth::Session;
+use reqwest::header::COOKIE;
+use rusteero::auth::{AuthApi, Session};
 use rusteero::consts::MAX_RESPONSE_BYTES;
 use rusteero::error::Error;
 use rusteero::routes::{ACCOUNT, ApiVersion, Route};
 use rusteero::transport::Transport;
+use secrecy::ExposeSecret;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, session_cookie_for};
 
@@ -73,6 +76,39 @@ fn transport_with_refresh_token(mock: &MockEero, token: &str, refresh_token: &st
         .session(Some(session_with_refresh_token(token, refresh_token)))
         .build()
         .expect("a MockServer's own URI is always a valid base URL")
+}
+
+/// A `Transport` pointed at `mock`, seeded with a valid session carrying `token` (no refresh
+/// token), with both the overall and per-read timeout raised to a generous 60 seconds.
+///
+/// Used by the 10 MiB body-cap tests below (task item 6, the flake investigation): those tests
+/// stream a genuinely large body over a real loopback socket, and the crate's default 10-second
+/// `read_timeout` leaves very little margin under heavy CPU contention — a scheduler-starved
+/// `tokio` runtime can stall a single chunk read for longer than that even though every byte is
+/// already sitting in the local socket buffer, which would misreport as `Error::Timeout`/
+/// `Error::Network` instead of the cap-exceeded `Error::Api` these tests assert on. A 60-second
+/// budget for a same-host transfer of ~10 MiB is not "tight" by any realistic measure, so this
+/// removes the flake risk without weakening what the test actually proves.
+fn transport_with_generous_timeouts(mock: &MockEero, token: &str) -> Transport {
+    Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(token)))
+        .timeout(Duration::from_secs(60))
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .expect("a MockServer's own URI is always a valid base URL")
+}
+
+/// Matches a request that carries no `Cookie` header at all.
+///
+/// Used by the refresh-cluster tests to pin the negative half of task brief finding
+/// `auth.md:212-215`: `Transport::refresh_session` passes `token = None` deliberately for both
+/// `login/refresh` and `account/refresh`, so neither request may carry the session cookie —
+/// every other route in this suite only ever asserts the *positive* shape
+/// (`session_cookie()`/`session_cookie_for()`); nothing pinned this absence, so a regression that
+/// started attaching the cookie to a refresh call would pass the whole suite silently.
+fn no_cookie_header(request: &Request) -> bool {
+    !request.headers.contains_key(COOKIE)
 }
 
 /// The fixed, non-padding overhead of the JSON document `json_body_of_exact_length` builds
@@ -482,7 +518,10 @@ async fn body_larger_than_the_cap_is_an_api_error() -> anyhow::Result<()> {
         .mount(&mock.server)
         .await;
 
-    let transport = mock.transport_with_token(TEST_TOKEN);
+    // Generous, explicit timeouts (task item 6): see `transport_with_generous_timeouts`'s docs
+    // for why the crate's default 10-second read timeout is too tight a margin for a 10 MiB
+    // transfer under heavy CI contention.
+    let transport = transport_with_generous_timeouts(&mock, TEST_TOKEN);
     let err = transport
         .send(&ACCOUNT, &[], None)
         .await
@@ -504,7 +543,8 @@ async fn body_exactly_at_the_cap_is_accepted() -> anyhow::Result<()> {
         .mount(&mock.server)
         .await;
 
-    let transport = mock.transport_with_token(TEST_TOKEN);
+    // Generous, explicit timeouts (task item 6): see `transport_with_generous_timeouts`'s docs.
+    let transport = transport_with_generous_timeouts(&mock, TEST_TOKEN);
     let env = transport
         .send(&ACCOUNT, &[], None)
         .await
@@ -646,34 +686,51 @@ async fn query_parameters_are_sent_via_send_with_query() -> anyhow::Result<()> {
 #[tokio::test]
 async fn query_string_is_never_logged_in_the_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
+    // No `.expect(n)` here: the retry loop below may send this request more than once.
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
         .and(query_param("since", "1700000000"))
         .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
-        .expect(1)
         .mount(&mock.server)
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = PathCapturingSubscriber(Arc::clone(&captured));
 
-    {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        transport
-            .send_with_query(&ACCOUNT, &[], &[("since", "1700000000".to_owned())], None)
-            .await?;
+    // `tracing`'s per-callsite interest cache is a *process-global* cache shared by every test
+    // in this integration-test binary: dozens of the other tests in this file exercise the exact
+    // same `tracing::debug!` call site in `Transport::execute_raw` concurrently, with no
+    // subscriber of their own, and can race the moment this test installs `subscriber` below,
+    // re-caching that callsite's interest as "never" before this test's own request is even
+    // sent — silently dropping the event this test needs to observe, with no code-level bug
+    // involved. Installing a fresh subscriber (which itself forces `tracing` to rebuild the
+    // interest cache, per `tracing_core::callsite`'s own docs) and retrying a bounded number of
+    // times turns an occasional lost race into an astronomically unlikely one, without weakening
+    // the actual security assertion below.
+    let mut logged_paths: Vec<String> = Vec::new();
+    for _ in 0..25 {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = PathCapturingSubscriber(Arc::clone(&captured));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            transport
+                .send_with_query(&ACCOUNT, &[], &[("since", "1700000000".to_owned())], None)
+                .await?;
+        }
+        logged_paths = Arc::try_unwrap(captured)
+            .expect("the guard's scope has already ended; no other reference survives")
+            .into_inner()
+            .expect("capture mutex is never held across a panic");
+        if !logged_paths.is_empty() {
+            break;
+        }
     }
 
-    let logged_paths = captured
-        .lock()
-        .expect("capture mutex is never held across a panic");
     assert!(
         !logged_paths.is_empty(),
-        "expected at least one logged request path to have been captured"
+        "expected at least one logged request path to have been captured after repeated attempts"
     );
-    for logged in logged_paths.iter() {
+    for logged in &logged_paths {
         assert!(
             !logged.contains("since") && !logged.contains('?'),
             "logged path leaked the query string: {logged}"
@@ -969,5 +1026,485 @@ async fn a_mutating_put_that_401s_is_resent_with_its_original_body_after_a_succe
         )
         .await?;
     assert_eq!(env.into_value(), json!({}));
+    Ok(())
+}
+
+// ===================== Transport::refresh_session called directly =====================
+//
+// Everything above this banner only ever exercises `refresh_session` indirectly, via the 401
+// retry inside `send`/`send_with_query`. The tests below call it directly, covering the branches
+// documented on `Transport::refresh_session` itself (task item 1).
+
+#[tokio::test]
+async fn refresh_session_direct_call_with_no_refresh_token_is_the_universal_real_world_case()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // Deliberately no `Mock` registered at all: `received_requests()` below proves the
+    // precondition fires before any I/O, not merely that no *registered* matcher happened to be
+    // hit. `Session::from_token` never carries a refresh token, matching every real
+    // login/verify session (port plan §1.3(5)) — this is the universal, real-world shape of this
+    // call, not an edge case.
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let err = transport
+        .refresh_session()
+        .await
+        .expect_err("no refresh token means the precondition fires before any network call");
+    assert!(matches!(
+        err,
+        Error::Authentication(ref msg) if msg == "No refresh token available"
+    ));
+
+    let received = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is on by default");
+    assert!(received.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_session_direct_call_falls_through_a_404_to_route_2_and_installs_the_new_token()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let transport = transport_with_refresh_token(&mock, "initial-token", "old-refresh-token");
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/account/refresh"))
+        .and(body_json(json!({ "refresh_token": "old-refresh-token" })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({ "meta": { "code": 200 }, "data": { "session_token": "direct-new-token" } })
+                    .to_string(),
+            ),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let refreshed = transport.refresh_session().await?;
+    assert!(refreshed, "route 2's success must report Ok(true)");
+
+    let session = transport
+        .session()
+        .expect("a successful refresh leaves a session installed");
+    assert_eq!(session.token().expose_secret(), "direct-new-token");
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_session_direct_call_terminal_500_never_tries_route_2_and_clears_the_session()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let transport = transport_with_refresh_token(&mock, "initial-token", "old-refresh-token");
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/account/refresh"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let refreshed = transport.refresh_session().await?;
+    assert!(
+        !refreshed,
+        "a terminal non-404 refresh failure reports Ok(false), it never propagates"
+    );
+
+    // `Transport::refresh_session`'s own docs: a terminal failure clears the local session
+    // (persisting the clear, best-effort) rather than leaving the stale token installed.
+    let session = transport
+        .session()
+        .expect("refresh_session installs Session::empty() on this arm, not None");
+    assert!(!session.is_valid());
+    assert!(!transport.is_authenticated());
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_session_response_missing_session_token_returns_false_and_changes_nothing()
+-> anyhow::Result<()> {
+    // Pins `Transport::refresh_session`'s own documented contract for this arm exactly:
+    // "`SESSION_TOKEN_KEY` missing or empty: Python returns `False` without clearing or
+    // persisting anything" — unlike the terminal-error arm above, this must leave the existing
+    // session (token *and* refresh token) completely untouched.
+    let mock = MockEero::start().await;
+    let transport = transport_with_refresh_token(&mock, "initial-token", "old-refresh-token");
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(json!({ "meta": { "code": 200 }, "data": {} }).to_string()),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/account/refresh"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let refreshed = transport.refresh_session().await?;
+    assert!(
+        !refreshed,
+        "a 200 refresh response with no `session_token` in `data` must return Ok(false)"
+    );
+
+    let session = transport
+        .session()
+        .expect("this arm changes nothing: the prior session must still be installed");
+    assert_eq!(session.token().expose_secret(), "initial-token");
+    assert_eq!(
+        session
+            .refresh_token()
+            .expect("refresh token must be untouched")
+            .expose_secret(),
+        "old-refresh-token"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_session_response_with_a_new_refresh_token_replaces_the_old_one()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let transport = transport_with_refresh_token(&mock, "initial-token", "old-refresh-token");
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({
+                    "meta": { "code": 200 },
+                    "data": {
+                        "session_token": "rotated-token",
+                        "refresh_token": "rotated-refresh-token"
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let refreshed = transport.refresh_session().await?;
+    assert!(refreshed);
+
+    let session = transport
+        .session()
+        .expect("a successful refresh leaves a session installed");
+    assert_eq!(session.token().expose_secret(), "rotated-token");
+    assert_eq!(
+        session
+            .refresh_token()
+            .expect("a new refresh token in the response replaces the old one")
+            .expose_secret(),
+        "rotated-refresh-token"
+    );
+    Ok(())
+}
+
+// ===================== refresh requests never carry a Cookie header =====================
+
+#[tokio::test]
+async fn refresh_requests_carry_no_cookie_header_on_either_route() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let transport = transport_with_refresh_token(&mock, "initial-token", "old-refresh-token");
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(no_cookie_header)
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/account/refresh"))
+        .and(no_cookie_header)
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({ "meta": { "code": 200 }, "data": { "session_token": "no-cookie-token" } })
+                    .to_string(),
+            ),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    // If either request actually carried a `Cookie` header, the `no_cookie_header` matcher above
+    // would never match it: wiremock would then have no responder for that request, and each
+    // mock's own `.expect(1)` verification (checked when `mock.server` is dropped at the end of
+    // this test) would fail with zero recorded matches instead of one.
+    let refreshed = transport.refresh_session().await?;
+    assert!(refreshed);
+    Ok(())
+}
+
+// ===================== AuthApi::refresh_session =====================
+
+#[tokio::test]
+async fn auth_api_refresh_session_with_no_refresh_token_delegates_and_makes_no_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let auth = mock.auth_api_with_token(TEST_TOKEN);
+
+    let err = auth.refresh_session().await.expect_err(
+        "AuthApi::refresh_session must surface Transport::refresh_session's own precondition error",
+    );
+    assert!(matches!(
+        err,
+        Error::Authentication(ref msg) if msg == "No refresh token available"
+    ));
+
+    let received = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is on by default");
+    assert!(received.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_api_refresh_session_reports_success_and_updates_the_wrapped_sessions_token()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let auth = AuthApi::new(transport_with_refresh_token(
+        &mock,
+        "initial-token",
+        "old-refresh-token",
+    ));
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            json!({ "meta": { "code": 200 }, "data": { "session_token": "authapi-new-token" } })
+                .to_string(),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let refreshed = auth.refresh_session().await?;
+    assert!(refreshed);
+
+    let session = auth
+        .session()
+        .expect("a successful refresh leaves a session installed");
+    assert_eq!(session.token().expose_secret(), "authapi-new-token");
+    Ok(())
+}
+
+// ===================== map_reqwest_error: Timeout and Network =====================
+
+#[tokio::test]
+async fn a_response_slower_than_the_configured_timeout_is_error_timeout() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // A ~17x margin between the configured timeout (300 ms) and the server's delay (5 s):
+    // generous enough that a heavily loaded CI host cannot accidentally make the *client* time
+    // out before the delay even starts to matter, nor accidentally let the delayed response
+    // arrive before the client gives up (task item 6: no assumption that a delay is tight).
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("account.json"))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .timeout(Duration::from_millis(300))
+        .read_timeout(Duration::from_millis(300))
+        .build()
+        .expect("a MockServer's own URI is always a valid base URL");
+
+    let err = transport
+        .send(&ACCOUNT, &[], None)
+        .await
+        .expect_err("a response far slower than the configured timeout must time out");
+    assert!(
+        matches!(err, Error::Timeout),
+        "expected Error::Timeout, got {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_closed_local_port_surfaces_as_error_network() -> anyhow::Result<()> {
+    // Fully offline and deterministic: no external host, no DNS lookup. Binding to port 0 asks
+    // the OS for an ephemeral free port; dropping the listener immediately frees it again while
+    // keeping the number reserved from the OS's short-term reuse pool long enough for the
+    // following connection attempt, which reliably gets an immediate connection-refused rather
+    // than a connect timeout.
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+
+    let transport = Transport::builder()
+        .base_url(format!("http://127.0.0.1:{port}"))
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .build()
+        .expect("a loopback base URL is always valid");
+
+    let err = transport
+        .send(&ACCOUNT, &[], None)
+        .await
+        .expect_err("connecting to a closed local port must fail at the transport level");
+    assert!(
+        matches!(err, Error::Network(_)),
+        "expected Error::Network, got {err:?}"
+    );
+    Ok(())
+}
+
+// ===================== malformed JSON on a 2xx never leaks a credential in Display =====================
+
+#[tokio::test]
+async fn malformed_json_2xx_body_carrying_a_session_token_never_leaks_it_in_the_error_display()
+-> anyhow::Result<()> {
+    // Deliberately truncated / malformed: the exact shape a cut-off `login/refresh` or
+    // `account/refresh` response would have, legitimately carrying a live credential inside a
+    // body that `status_to_envelope`'s invalid-JSON-on-2xx arm turns into an `Error::Api`.
+    let credential_carrying_body = concat!(
+        r#"{"meta":{"code":200},"data":{"session_token":"eyJsecret-session-value","#,
+        r#""refresh_token":"eyJsecret-refresh-value"#,
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(credential_carrying_body).is_err(),
+        "sanity: the fixture must actually be malformed JSON, matching the real hazard"
+    );
+
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(credential_carrying_body))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let transport = mock.transport_with_token(TEST_TOKEN);
+    let err = transport
+        .send(&ACCOUNT, &[], None)
+        .await
+        .expect_err("malformed JSON on a 2xx must not parse as an envelope");
+
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains("eyJsecret-session-value"),
+        "leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains("eyJsecret-refresh-value"),
+        "leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains("eyJ"),
+        "leaked a token-shaped prefix: {rendered}"
+    );
+    Ok(())
+}
+
+// ===================== injected redirect-following client (finding F4) =====================
+
+#[tokio::test]
+async fn injected_redirect_following_client_never_returns_the_followed_hops_body()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/2.2/elsewhere", mock.uri())),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/elsewhere"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    // A caller-supplied client that keeps reqwest's default redirect-following policy — exactly
+    // the hazard `TransportBuilder::http`'s `# Warning` section documents. `src/transport.rs`'s
+    // own unit test (`injected_client_that_follows_redirects_is_still_refused`) already pins the
+    // error *variant* in isolation; this integration-level test additionally pins the exact
+    // message shape and, most importantly, proves the followed hop's fixture body never reaches
+    // a caller as a successful envelope.
+    //
+    // Note this is deliberately *not* the same contract as the `Policy::none()` path (see
+    // `redirect_is_refused_and_never_reaches_the_location_host` above): by the time `Transport`
+    // observes this response the injected client has already followed the redirect over the
+    // network, so the status here is the *final* hop's (200), and the message says so honestly
+    // ("followed", not "not followed") — see `execute_raw`'s doc comment on the `response.url()
+    // != &url` guard.
+    let following_client = reqwest::Client::builder()
+        .build()
+        .expect("a default reqwest client always builds");
+
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .http(following_client)
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .build()
+        .expect("builds with an injected client");
+
+    let err = transport
+        .send(&ACCOUNT, &[], None)
+        .await
+        .expect_err("a followed redirect must surface as an error, not the hop's body");
+
+    let Error::Api {
+        status, message, ..
+    } = &err
+    else {
+        panic!("expected Error::Api, got {err:?}");
+    };
+    // The security property this test guards: the hop's fixture body (`account.json`) must never
+    // reach the caller as a successful envelope. Asserting `Err` above already proves that; this
+    // additionally proves the message never embeds the body either.
+    assert_eq!(*status, 200, "the final hop's status, not the original 302");
+    assert!(
+        message.starts_with("Redirect followed by a caller-supplied client: "),
+        "unexpected message: {message}"
+    );
+    assert!(
+        message.contains(&format!("{}/2.2/account", mock.uri())),
+        "message must name the originally requested URL: {message}"
+    );
+    assert!(
+        message.contains(&format!("{}/2.2/elsewhere", mock.uri())),
+        "message must name the final, followed-to URL: {message}"
+    );
+    assert!(
+        !message.contains(&fixture("account.json")),
+        "message must never embed the followed hop's body: {message}"
+    );
     Ok(())
 }

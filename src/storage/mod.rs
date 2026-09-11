@@ -1,17 +1,28 @@
 //! Pluggable credential storage.
 //!
 //! Ported from `eero-api`'s `src/eero/api/auth_storage.py`. See
-//! `rusteero-context/claude/tasks/briefs/const.md` §3 for the full behaviour brief of the
-//! `CredentialStorage` abstract base class this trait mirrors, and the port plan §3.4
-//! (decisions D-4, D-5, D-13) for the design rationale.
+//! `rusteero-context/claude/tasks/briefs/const.md` §3-8 for the full behaviour brief of the
+//! `CredentialStorage` abstract base class this trait mirrors (and each concrete backend below),
+//! and the port plan §3.4 (decisions D-4, D-5, D-13) for the design rationale.
 //!
 //! # Backends
 //!
-//! - [`memory::MemoryStore`] — in this file's sibling module, ported from `MemoryStorage`
-//!   (`auth_storage.py:240-261`).
-//! - `FileStore`, `ChainedStore`, and `KeyringStore` (behind `feature = "keyring"`) are added by
-//!   a later phase of the port; see the "Phase 2" marker below for where they extend this
-//!   module.
+//! - [`MemoryStore`] — ported from `MemoryStorage` (`auth_storage.py:240-261`): in-process only,
+//!   never touches disk or the OS keyring.
+//! - [`FileStore`] — ported from `FileStorage` (`auth_storage.py:169-237`): a single JSON file,
+//!   written atomically with owner-only (`0600`) permissions.
+//! - [`ChainedStore`] — ported from `ChainedStorage` (`auth_storage.py:264-315`): a primary
+//!   backend with a fallback, read-through and write-through.
+//! - `KeyringStore` (behind `feature = "keyring"`, default-on) — ported from `KeyringStorage`
+//!   (`auth_storage.py:121-166`): the OS-native credential store, sharing an entry with `eero-api`
+//!   (decision D-5).
+//!
+//! [`create_storage`] selects among all four with the same four-way matrix as
+//! `auth_storage.py:318-344`'s `create_storage()`. Async callers reach any `Arc<dyn
+//! CredentialStore>` without blocking their own worker thread via `load_async`, `save_async`,
+//! and `clear_async` — thin `tokio::task::spawn_blocking` adapters shared by `transport` (and,
+//! in a later round, `auth::mod`'s own inline `spawn_blocking` call sites, which this phase does
+//! not touch).
 
 pub mod chained;
 pub mod file;
@@ -25,6 +36,9 @@ pub use file::FileStore;
 #[cfg(feature = "keyring")]
 pub use keyring::KeyringStore;
 pub use memory::MemoryStore;
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::auth::Session;
 
@@ -83,10 +97,431 @@ pub trait CredentialStore: Send + Sync + std::fmt::Debug {
     fn clear(&self) -> Result<(), StorageError>;
 }
 
-// Phase 2 extends this module with:
-//   - `FileStore`, `ChainedStore`, and `KeyringStore` (`feature = "keyring"`) modules, declared
-//     alongside `pub mod memory;` above.
-//   - An async adapter that runs any `Arc<dyn CredentialStore>` via
-//     `tokio::task::spawn_blocking` for use from `transport`/`Client`.
-//   - `create_storage(...)`, a factory mirroring `auth_storage.py:318-344`'s matrix (both →
-//     `ChainedStore`; keyring only; file only; neither → `MemoryStore`).
+// ===================== async spawn_blocking adapters =====================
+
+/// Maps a panicked/cancelled blocking task's `JoinError` onto a [`StorageError`].
+///
+/// [`CredentialStore`]'s methods are synchronous by design (this module's own docs), so
+/// [`load_async`]/[`save_async`]/[`clear_async`] run them via `tokio::task::spawn_blocking`; a
+/// `JoinError` there means the store implementation itself panicked (or the runtime is shutting
+/// down), never that it returned an ordinary `Err`. This is surfaced as a
+/// [`StorageError::Backend`] rather than propagating the panic into the caller's own task —
+/// `JoinError`'s `Display` never carries a credential (it describes the *task's* failure, not
+/// any data the task was operating on), so it is safe to embed verbatim.
+fn join_error_to_storage_error(join_err: &tokio::task::JoinError) -> StorageError {
+    StorageError::Backend {
+        backend: "credential-store-task".to_owned(),
+        message: format!("blocking credential-store task failed: {join_err}"),
+    }
+}
+
+/// Runs `store.load()` on a blocking thread via `tokio::task::spawn_blocking`, so an async
+/// caller (`transport`, and — in a later round — `auth::mod`) never blocks its own worker thread
+/// on a synchronous backend call (a native OS keyring API, in particular, always blocks).
+///
+/// # Errors
+///
+/// Propagates the store's own [`StorageError`] unchanged. If the blocking task itself panics,
+/// the panic is converted to a `StorageError::Backend` instead of taking down the caller's task
+/// — see [`join_error_to_storage_error`].
+// No call site yet within this crate as of this round: `transport`'s only async store call this
+// phase is a save (`Transport::persist_session`, wired to `save_async` below), and `auth::mod`'s
+// own inline `spawn_blocking` load call site is explicitly out of scope this round (see this
+// module's doc comment). Exercised directly by this module's own tests; the intended landing
+// spot is `auth::mod`'s refactor and phase 4's `Client`.
+#[allow(dead_code)]
+pub(crate) async fn load_async(store: Arc<dyn CredentialStore>) -> Result<Session, StorageError> {
+    match tokio::task::spawn_blocking(move || store.load()).await {
+        Ok(result) => result,
+        Err(join_err) => Err(join_error_to_storage_error(&join_err)),
+    }
+}
+
+/// Runs `store.save(&session)` on a blocking thread. See [`load_async`]'s docs for the rationale
+/// and the panic-handling contract this shares.
+///
+/// # Errors
+///
+/// See [`load_async`].
+pub(crate) async fn save_async(
+    store: Arc<dyn CredentialStore>,
+    session: Session,
+) -> Result<(), StorageError> {
+    match tokio::task::spawn_blocking(move || store.save(&session)).await {
+        Ok(result) => result,
+        Err(join_err) => Err(join_error_to_storage_error(&join_err)),
+    }
+}
+
+/// Runs `store.clear()` on a blocking thread. See [`load_async`]'s docs for the rationale and the
+/// panic-handling contract this shares.
+///
+/// # Errors
+///
+/// See [`load_async`].
+// See `load_async`'s identical justification above: no call site yet within this crate this
+// round for the same reason (`auth::mod`'s `clear_local_and_store_warn_only` is the eventual
+// caller, but its refactor is out of scope this round). Exercised directly by this module's own
+// tests.
+#[allow(dead_code)]
+pub(crate) async fn clear_async(store: Arc<dyn CredentialStore>) -> Result<(), StorageError> {
+    match tokio::task::spawn_blocking(move || store.clear()).await {
+        Ok(result) => result,
+        Err(join_err) => Err(join_error_to_storage_error(&join_err)),
+    }
+}
+
+// ===================== create_storage factory =====================
+
+/// Configuration for [`create_storage`]'s backend-selection matrix.
+///
+/// Mirrors `create_storage()`'s two parameters (`auth_storage.py:318-320`,
+/// `use_keyring: bool = True, cookie_file: Optional[str] = None`) as fields rather than function
+/// arguments, so a caller can build one with struct-update syntax and so the not-yet-built
+/// `Client::builder()` (phase 4) has a single value to thread through. Unlike Python's default
+/// (`use_keyring=True`), [`StorageConfig::default`] is the conservative, explicit-opt-in Rust
+/// idiom: both fields default to "off" (`Default::default()` derives `false`/`None`, which
+/// [`create_storage`] maps to a bare [`MemoryStore`]) — a library should not silently reach for
+/// the OS keyring unless a caller asks for it.
+#[derive(Debug, Clone, Default)]
+pub struct StorageConfig {
+    /// Whether to prefer the OS keyring as the primary (or sole) backend.
+    ///
+    /// Ignored under `--no-default-features` (no `keyring` feature, hence no `KeyringStore`
+    /// to build): [`create_storage`] degrades to the next-best backend instead of failing to
+    /// compile or panicking — see that function's docs for the exact degradation.
+    pub use_keyring: bool,
+    /// An optional file path used as the fallback backend (when [`Self::use_keyring`] is also
+    /// `true`) or the sole backend (when it is `false`).
+    pub cookie_file: Option<PathBuf>,
+}
+
+impl StorageConfig {
+    /// Equivalent to [`StorageConfig::default`]: both fields off, yielding a bare [`MemoryStore`]
+    /// from [`create_storage`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Builds the [`CredentialStore`] backend selected by `config`, mirroring `create_storage()`'s
+/// four-way matrix (`auth_storage.py:318-344`), evaluated in the same order:
+///
+/// | `use_keyring` | `cookie_file` | Result |
+/// |---|---|---|
+/// | `true` | `Some` | [`ChainedStore`] with `KeyringStore` primary, [`FileStore`] fallback |
+/// | `true` | `None` | bare `KeyringStore` |
+/// | `false` | `Some` | bare [`FileStore`] |
+/// | `false` | `None` | bare [`MemoryStore`] |
+///
+/// Never fails and never panics — like the Python original, this is a total function over its
+/// input.
+///
+/// # Feature `keyring`
+///
+/// Under `--no-default-features` there is no `KeyringStore` to build at all, so
+/// `config.use_keyring` is ignored and the matrix degrades to whichever non-keyring backend the
+/// row would otherwise have included: the `true`+`Some` row becomes a bare `FileStore` (no
+/// keyring to chain in front of it) and the `true`+`None` row becomes a bare `MemoryStore` (no
+/// keyring, and nothing to fall back to).
+#[cfg(feature = "keyring")]
+#[must_use]
+pub fn create_storage(config: &StorageConfig) -> Arc<dyn CredentialStore> {
+    match (config.use_keyring, &config.cookie_file) {
+        (true, Some(path)) => Arc::new(ChainedStore::new(
+            Arc::new(KeyringStore::new()),
+            Arc::new(FileStore::new(path.clone())),
+        )),
+        (true, None) => Arc::new(KeyringStore::new()),
+        (false, Some(path)) => Arc::new(FileStore::new(path.clone())),
+        (false, None) => Arc::new(MemoryStore::new()),
+    }
+}
+
+/// See the `#[cfg(feature = "keyring")]` overload's docs for the full matrix and the
+/// degradation this `--no-default-features` build applies.
+#[cfg(not(feature = "keyring"))]
+#[must_use]
+pub fn create_storage(config: &StorageConfig) -> Arc<dyn CredentialStore> {
+    match &config.cookie_file {
+        Some(path) => Arc::new(FileStore::new(path.clone())),
+        None => Arc::new(MemoryStore::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{
+        CredentialStore, StorageConfig, StorageError, clear_async, create_storage, load_async,
+        save_async,
+    };
+    use crate::auth::Session;
+
+    // ===================== StorageConfig =====================
+
+    #[test]
+    fn storage_config_default_and_new_are_both_off() {
+        let default = StorageConfig::default();
+        assert!(!default.use_keyring);
+        assert!(default.cookie_file.is_none());
+
+        let via_new = StorageConfig::new();
+        assert!(!via_new.use_keyring);
+        assert!(via_new.cookie_file.is_none());
+    }
+
+    // ===================== create_storage matrix — feature = "keyring" =====================
+    //
+    // The `true`+`None` and `true`+`Some` rows deliberately never call `.save`/`.load`/`.clear`
+    // on the resulting store: `KeyringStore::new()` uses the *shared* `eero-api` entry (decision
+    // D-5, `SERVICE_NAME`/`ACCOUNT_NAME`), and this container happens to have no reachable
+    // keyring backend (see `keyring.rs`'s own tests), but a real backend on a developer's
+    // machine would make an actual OS call against a real, shared credential entry. Constructing
+    // a `KeyringStore` never touches the OS (only `load`/`save`/`clear` open an `Entry`), so
+    // identifying it via `Debug` (which just prints the two field strings, never opens an entry)
+    // is representative and safe regardless of the environment this test runs in.
+    #[cfg(feature = "keyring")]
+    mod keyring_feature_matrix {
+        use std::path::PathBuf;
+
+        use super::{Session, StorageConfig, create_storage};
+
+        #[test]
+        fn neither_yields_a_working_memory_store() {
+            let store = create_storage(&StorageConfig::default());
+            assert!(format!("{store:?}").contains("MemoryStore"));
+            store
+                .save(&Session::from_token("tok"))
+                .expect("MemoryStore never fails");
+            assert_eq!(
+                store.load().expect("load never fails").expose_token(),
+                "tok"
+            );
+        }
+
+        #[test]
+        fn file_only_yields_a_working_file_store() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("cookies.json");
+            let store = create_storage(&StorageConfig {
+                use_keyring: false,
+                cookie_file: Some(path.clone()),
+            });
+            let debug = format!("{store:?}");
+            assert!(debug.contains("FileStore"));
+            assert!(!debug.contains("ChainedStore"));
+            store
+                .save(&Session::from_token("tok"))
+                .expect("file save succeeds");
+            assert!(path.exists());
+            assert_eq!(
+                store.load().expect("file load succeeds").expose_token(),
+                "tok"
+            );
+        }
+
+        #[test]
+        fn keyring_only_yields_a_bare_keyring_store_with_no_file_fallback() {
+            let store = create_storage(&StorageConfig {
+                use_keyring: true,
+                cookie_file: None,
+            });
+            let debug = format!("{store:?}");
+            assert!(debug.contains("KeyringStore"));
+            assert!(!debug.contains("ChainedStore"));
+            assert!(!debug.contains("FileStore"));
+        }
+
+        #[test]
+        fn both_yields_a_chained_store_of_keyring_primary_and_file_fallback() {
+            let store = create_storage(&StorageConfig {
+                use_keyring: true,
+                cookie_file: Some(PathBuf::from("/tmp/rusteero-test-does-not-touch-disk.json")),
+            });
+            let debug = format!("{store:?}");
+            assert!(debug.contains("ChainedStore"));
+            assert!(debug.contains("KeyringStore"));
+            assert!(debug.contains("FileStore"));
+        }
+    }
+
+    // ===================== create_storage matrix — --no-default-features =====================
+    //
+    // With no `KeyringStore` to build at all, every row here is a `MemoryStore` or `FileStore` —
+    // both perfectly safe to exercise for real (no shared OS state).
+    #[cfg(not(feature = "keyring"))]
+    mod no_keyring_feature_matrix {
+        use super::{Session, StorageConfig, create_storage};
+
+        #[test]
+        fn neither_yields_a_working_memory_store() {
+            let store = create_storage(&StorageConfig::default());
+            assert!(format!("{store:?}").contains("MemoryStore"));
+            store
+                .save(&Session::from_token("tok"))
+                .expect("MemoryStore never fails");
+            assert_eq!(
+                store.load().expect("load never fails").expose_token(),
+                "tok"
+            );
+        }
+
+        #[test]
+        fn file_only_yields_a_working_file_store() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("cookies.json");
+            let store = create_storage(&StorageConfig {
+                use_keyring: false,
+                cookie_file: Some(path.clone()),
+            });
+            store
+                .save(&Session::from_token("tok"))
+                .expect("file save succeeds");
+            assert!(path.exists());
+        }
+
+        #[test]
+        fn keyring_requested_with_no_file_degrades_to_a_working_memory_store() {
+            let store = create_storage(&StorageConfig {
+                use_keyring: true,
+                cookie_file: None,
+            });
+            assert!(format!("{store:?}").contains("MemoryStore"));
+            store
+                .save(&Session::from_token("tok"))
+                .expect("MemoryStore never fails");
+            assert_eq!(
+                store.load().expect("load never fails").expose_token(),
+                "tok"
+            );
+        }
+
+        #[test]
+        fn keyring_requested_with_a_file_degrades_to_a_working_file_store() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("cookies.json");
+            let store = create_storage(&StorageConfig {
+                use_keyring: true,
+                cookie_file: Some(path.clone()),
+            });
+            assert!(format!("{store:?}").contains("FileStore"));
+            store
+                .save(&Session::from_token("tok"))
+                .expect("file save succeeds");
+            assert!(path.exists());
+        }
+    }
+
+    // ===================== async adapters: happy path =====================
+
+    #[tokio::test]
+    async fn save_load_clear_async_round_trip_through_a_shared_store() {
+        let store: Arc<dyn CredentialStore> = Arc::new(super::MemoryStore::new());
+        save_async(Arc::clone(&store), Session::from_token("tok-async"))
+            .await
+            .expect("save succeeds");
+        let loaded = load_async(Arc::clone(&store)).await.expect("load succeeds");
+        assert_eq!(loaded.expose_token(), "tok-async");
+
+        clear_async(Arc::clone(&store))
+            .await
+            .expect("clear succeeds");
+        assert!(!load_async(store).await.expect("load succeeds").is_valid());
+    }
+
+    /// A [`CredentialStore`] whose every method returns an ordinary `Err` — isolates an
+    /// unexceptional store failure (this test) from a panicking store (the `JoinError` tests
+    /// below), which take a different branch inside `load_async`/`save_async`/`clear_async`.
+    #[derive(Debug, Default)]
+    struct AlwaysFailsStore;
+
+    impl CredentialStore for AlwaysFailsStore {
+        fn load(&self) -> Result<Session, StorageError> {
+            Err(StorageError::Backend {
+                backend: "always-fails".to_owned(),
+                message: "deliberate test failure".to_owned(),
+            })
+        }
+
+        fn save(&self, _session: &Session) -> Result<(), StorageError> {
+            Err(StorageError::Backend {
+                backend: "always-fails".to_owned(),
+                message: "deliberate test failure".to_owned(),
+            })
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            Err(StorageError::Backend {
+                backend: "always-fails".to_owned(),
+                message: "deliberate test failure".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn save_async_propagates_the_stores_own_error_unchanged() {
+        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailsStore);
+        let err = save_async(store, Session::from_token("tok"))
+            .await
+            .expect_err("the store always fails");
+        assert!(matches!(err, StorageError::Backend { backend, .. } if backend == "always-fails"));
+    }
+
+    // ===================== async adapters: JoinError path =====================
+
+    /// A [`CredentialStore`] whose every method panics, isolating the `JoinError` branch of
+    /// `load_async`/`save_async`/`clear_async` (a panicked blocking task) from an ordinary `Err`
+    /// returned by the store itself ([`AlwaysFailsStore`], above).
+    #[derive(Debug, Default)]
+    struct PanickingStore;
+
+    impl CredentialStore for PanickingStore {
+        fn load(&self) -> Result<Session, StorageError> {
+            panic!("PanickingStore::load always panics");
+        }
+
+        fn save(&self, _session: &Session) -> Result<(), StorageError> {
+            panic!("PanickingStore::save always panics");
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            panic!("PanickingStore::clear always panics");
+        }
+    }
+
+    #[tokio::test]
+    async fn load_async_converts_a_panicking_store_into_a_storage_error() {
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingStore);
+        let err = load_async(store)
+            .await
+            .expect_err("a panicking store must not take down the caller's task");
+        assert!(
+            matches!(err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+        );
+    }
+
+    #[tokio::test]
+    async fn save_async_converts_a_panicking_store_into_a_storage_error() {
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingStore);
+        let err = save_async(store, Session::from_token("tok"))
+            .await
+            .expect_err("a panicking store must not take down the caller's task");
+        assert!(
+            matches!(err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_async_converts_a_panicking_store_into_a_storage_error() {
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingStore);
+        let err = clear_async(store)
+            .await
+            .expect_err("a panicking store must not take down the caller's task");
+        assert!(
+            matches!(err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+        );
+    }
+}

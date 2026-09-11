@@ -55,6 +55,31 @@ pub struct Transport {
     base_23: Url,
     session: RwLock<Option<Session>>,
     store: Option<Arc<dyn CredentialStore>>,
+    storage_failures: StorageFailures,
+}
+
+/// How a [`Transport`] treats a failed write to its configured credential store (decision D-13).
+///
+/// Set via [`TransportBuilder::storage_failures`]; honoured at every credential-store call site
+/// in this module ([`Transport::set_session`], and the persistence step of
+/// [`Transport::refresh_session`]). This is unrelated to whether the *in-memory* session is
+/// updated: that happens unconditionally and before persistence is even attempted, regardless of
+/// this setting — see [`Transport::set_session`]'s own docs for that separate guarantee.
+///
+/// The port plan places this switch on the not-yet-built `Client::builder()` (phase 4); it lives
+/// on [`TransportBuilder`] for now, and `Client::builder()` is expected to forward to it once
+/// built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageFailures {
+    /// Log the failure at `WARN` and proceed as though the operation had succeeded. This is the
+    /// default, matching every Python `eero-api` backend's own swallow-and-log ergonomics
+    /// (albeit at a louder level, since this crate surfaces the failure as a typed
+    /// [`crate::error::StorageError`] at all, unlike Python's silent `DEBUG`-only backends — see
+    /// [`crate::storage::CredentialStore`]'s own docs).
+    #[default]
+    Warn,
+    /// Return [`Error::Storage`] immediately instead of swallowing the failure.
+    Fatal,
 }
 
 impl Transport {
@@ -84,8 +109,12 @@ impl Transport {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Storage` if a configured credential store failed to persist the change.
-    /// The in-memory session is updated regardless of whether persistence succeeds.
+    /// Honours this transport's [`StorageFailures`] policy (decision D-13,
+    /// [`TransportBuilder::storage_failures`]): under the default [`StorageFailures::Warn`], a
+    /// configured credential store failing to persist the change is logged at `WARN` and this
+    /// returns `Ok(())` regardless; under [`StorageFailures::Fatal`], it returns
+    /// `Error::Storage` instead. Either way, the in-memory session is updated regardless of
+    /// whether persistence succeeds — see the security note in this method's body.
     pub fn set_session(&self, session: Option<Session>) -> Result<(), Error> {
         // Security finding F3: the in-memory session must update *before* this method returns,
         // and unconditionally of the store's outcome — `AuthApi::logout`/`clear_auth_data`/
@@ -95,7 +124,8 @@ impl Transport {
         // headless host), even though the caller was told the in-memory session no longer holds
         // it. `store.save`/`store.clear` only need a borrow, so `session` is computed against
         // first and *then* moved into `replace_session` on every path — including the failure
-        // path, via `result?` running only after the move.
+        // path, which is only inspected (and possibly turned into an `Err`) after the move. This
+        // ordering is identical under either `StorageFailures` policy.
         let Some(store) = &self.store else {
             self.replace_session(session);
             return Ok(());
@@ -105,8 +135,16 @@ impl Transport {
             None => store.clear(),
         };
         self.replace_session(session);
-        result?;
-        Ok(())
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => match self.storage_failures {
+                StorageFailures::Warn => {
+                    tracing::warn!(error = %err, "failed to persist session to credential store");
+                    Ok(())
+                }
+                StorageFailures::Fatal => Err(err.into()),
+            },
+        }
     }
 
     /// Whether a session is configured, has a non-empty token, and has not passed its
@@ -248,8 +286,13 @@ impl Transport {
     /// `api/auth.py:301-304`, which omits `auth_token` for this call). On success, reads
     /// `data.session_token` (a *different* wire key from the login/verify handshake's
     /// `user_token`) and `data.refresh_token`, updates the in-memory session, and persists
-    /// through the configured credential store if any — a store failure here is logged at WARN
-    /// and never masks a successful refresh (decision D-13).
+    /// through the configured credential store if any, honouring this transport's
+    /// [`StorageFailures`] policy (decision D-13, [`TransportBuilder::storage_failures`]): under
+    /// the default [`StorageFailures::Warn`], a store failure here is logged at WARN and never
+    /// masks a successful refresh; under [`StorageFailures::Fatal`], a persistence failure here
+    /// returns `Error::Storage` even though the in-memory session already reflects the refresh
+    /// (and the remote refresh itself succeeded) — see [`Transport::set_session`]'s docs for the
+    /// same in-memory-first ordering guarantee this shares.
     ///
     /// # Errors
     ///
@@ -260,7 +303,9 @@ impl Transport {
     /// non-`404` status from *either* refresh route unmodified once past that precondition. A
     /// terminal `404`-from-both-routes or a terminal non-`404` `Error::Api` from either route is
     /// **not** propagated as an error: both instead clear the local session (persisting the
-    /// clear, best-effort) and return `Ok(false)`, exactly matching `api/auth.py:305-338`.
+    /// clear, best-effort) and return `Ok(false)`, exactly matching `api/auth.py:305-338` — unless
+    /// that best-effort persistence itself fails under `StorageFailures::Fatal`, in which case
+    /// this returns `Error::Storage` instead of `Ok(false)`.
     ///
     /// **Divergence from eero-api (documentation finding F7, `api/auth.py:308-311`)**: a
     /// network/timeout failure from either refresh route surfaces here as this crate's ordinary
@@ -308,7 +353,7 @@ impl Transport {
                         data.get(consts::REFRESH_TOKEN_KEY).and_then(Value::as_str);
                     let refreshed = build_refreshed_session(new_token, new_refresh_token)?;
                     self.replace_session(Some(refreshed.clone()));
-                    self.persist_warn_only(&refreshed).await;
+                    self.persist_session(&refreshed).await?;
                     return Ok(true);
                 }
                 // A 404 from this route: try the next one in the tuple order.
@@ -331,7 +376,7 @@ impl Transport {
                     // line. `status` is a bare status code and carries nothing sensitive.
                     tracing::error!(status, "session refresh failed");
                     self.replace_session(Some(Session::empty()));
-                    self.persist_warn_only(&Session::empty()).await;
+                    self.persist_session(&Session::empty()).await?;
                     return Ok(false);
                 }
                 Err(other) => return Err(other),
@@ -340,7 +385,7 @@ impl Transport {
 
         tracing::error!("session refresh failed: no refresh endpoint was accepted by the server");
         self.replace_session(Some(Session::empty()));
-        self.persist_warn_only(&Session::empty()).await;
+        self.persist_session(&Session::empty()).await?;
         Ok(false)
     }
 
@@ -371,22 +416,30 @@ impl Transport {
     }
 
     /// Persists `session` to the configured credential store, if any, via
-    /// `tokio::task::spawn_blocking` (the store's trait is intentionally synchronous — see
-    /// `crate::storage`'s docs). A failure here is logged at WARN and never returned to the
-    /// caller: per decision D-13, a store failure must never mask a successful refresh.
-    async fn persist_warn_only(&self, session: &Session) {
+    /// `crate::storage`'s shared `save_async` adapter (`tokio::task::spawn_blocking` under the
+    /// hood — the store's trait is intentionally synchronous, see that module's docs), honouring
+    /// this transport's [`StorageFailures`] policy. Used only by [`Transport::refresh_session`]'s
+    /// three persistence points; see that method's own docs for the exact contract under each
+    /// policy.
+    ///
+    /// # Errors
+    ///
+    /// Under [`StorageFailures::Warn`] (the default), a store failure is logged at `WARN` and
+    /// this always returns `Ok(())`. Under [`StorageFailures::Fatal`], a store failure is
+    /// returned as `Error::Storage`.
+    async fn persist_session(&self, session: &Session) -> Result<(), Error> {
         let Some(store) = self.store.clone() else {
-            return;
+            return Ok(());
         };
-        let session = session.clone();
-        match tokio::task::spawn_blocking(move || store.save(&session)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "failed to persist session to credential store");
-            }
-            Err(join_err) => {
-                tracing::warn!(error = %join_err, "credential store task panicked");
-            }
+        match crate::storage::save_async(store, session.clone()).await {
+            Ok(()) => Ok(()),
+            Err(err) => match self.storage_failures {
+                StorageFailures::Warn => {
+                    tracing::warn!(error = %err, "failed to persist session to credential store");
+                    Ok(())
+                }
+                StorageFailures::Fatal => Err(err.into()),
+            },
         }
     }
 
@@ -508,15 +561,21 @@ impl Transport {
         // `Cookie: s=<token>` attached and replays a live session token in cleartext over an
         // unencrypted hop. This defends uniformly, regardless of which client was injected: if
         // the URL the response actually came from differs from the URL we asked for, a redirect
-        // was followed, so refuse it here with the same error shape the `is_redirection` arm
-        // below produces for a `Policy::none()` client's un-followed `3xx` — before the body
-        // (which could be the redirect target's, not the requested resource's) is ever read.
+        // was followed, so refuse it here — before the body (which is the redirect target's, not
+        // the requested resource's) is ever read.
+        //
+        // This is *not* the same situation the `status.is_redirection()` arm below handles, and
+        // must not reuse its "Redirect not followed" wording: by the time this branch is
+        // reachable, the redirect *was* followed, by the injected client, not refused by this
+        // crate — `status` here is the final hop's status (e.g. `200`), not the original `3xx`,
+        // which this crate never even saw. Saying "not followed" would be a lie. `eero-api` has
+        // no equivalent of this path at all (`allow_redirects=False` unconditionally), so there
+        // is no Python wording to match here.
         if response.url() != &url {
             return Err(Error::Api {
                 status: status.as_u16(),
                 message: format!(
-                    "Redirect not followed: {} -> {}",
-                    status.as_u16(),
+                    "Redirect followed by a caller-supplied client: {url} -> {}",
                     response.url()
                 ),
                 url: Some(url.to_string()),
@@ -821,6 +880,7 @@ pub struct TransportBuilder {
     user_agent: Option<String>,
     session: Option<Session>,
     store: Option<Arc<dyn CredentialStore>>,
+    storage_failures: StorageFailures,
     timeout: Duration,
     read_timeout: Duration,
 }
@@ -833,6 +893,7 @@ impl Default for TransportBuilder {
             user_agent: None,
             session: None,
             store: None,
+            storage_failures: StorageFailures::default(),
             timeout: consts::REQUEST_TIMEOUT,
             read_timeout: consts::READ_TIMEOUT,
         }
@@ -850,9 +911,13 @@ impl TransportBuilder {
     ///
     /// A caller-supplied client silently discards two of this crate's safety guarantees: redirect
     /// refusal (`reqwest::redirect::Policy::none()`) and the request/read timeouts in
-    /// [`crate::consts`]. With such a client, a same-host-same-port `3xx` response is followed
-    /// instead of surfacing `Error::Api` with a `"Redirect not followed: ..."` message, and there
-    /// is no 30-second ceiling on a hung request. Build your own client with
+    /// [`crate::consts`]. With such a client, a `3xx` response is followed *inside* the client
+    /// before this crate ever sees it, and the resulting body is refused with `Error::Api` and a
+    /// `"Redirect followed by a caller-supplied client: ..."` message rather than a
+    /// `"Redirect not followed: ..."` one (the latter is reserved for a `3xx` this crate's own
+    /// `Policy::none()` client received directly) — either way the hop's body never reaches the
+    /// caller as a successful envelope, but the follow itself already happened over the network.
+    /// There is also no 30-second ceiling on a hung request. Build your own client with
     /// `.redirect(reqwest::redirect::Policy::none())` and explicit `.timeout(..)` /
     /// `.read_timeout(..)` calls before passing it here if you need both custom configuration
     /// *and* these guarantees.
@@ -903,6 +968,21 @@ impl TransportBuilder {
         self
     }
 
+    /// Sets this transport's policy for a failed credential-store operation (decision D-13).
+    /// [`StorageFailures::Warn`] (the default) logs at `WARN` and proceeds;
+    /// [`StorageFailures::Fatal`] returns `Error::Storage` instead. Honoured at every
+    /// credential-store call site in this module ([`Transport::set_session`], and the
+    /// persistence step of [`Transport::refresh_session`]) — see [`StorageFailures`]'s own docs.
+    ///
+    /// The port plan places this switch on the not-yet-built `Client::builder()` (phase 4);
+    /// `Client::builder()` is expected to forward to this setter once built, so it lives here
+    /// for now.
+    #[must_use]
+    pub fn storage_failures(mut self, storage_failures: StorageFailures) -> Self {
+        self.storage_failures = storage_failures;
+        self
+    }
+
     /// Overrides the overall request timeout (`consts::REQUEST_TIMEOUT` by default). Ignored if
     /// `http` was also called.
     #[must_use]
@@ -949,6 +1029,7 @@ impl TransportBuilder {
             base_23,
             session: RwLock::new(self.session),
             store: self.store,
+            storage_failures: self.storage_failures,
         })
     }
 
@@ -1003,7 +1084,7 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use url::Url;
 
-    use super::{Route, Transport, parse_retry_after, refresh_signal_detected};
+    use super::{Route, StorageFailures, Transport, parse_retry_after, refresh_signal_detected};
     use crate::error::Error;
     use crate::routes::{ACCOUNT, ApiVersion};
     use crate::storage::{CredentialStore, StorageError};
@@ -1398,10 +1479,16 @@ mod tests {
 
     #[test]
     fn set_session_clears_memory_even_when_the_store_fails_to_persist() {
+        // `StorageFailures::Fatal` is opted into explicitly: the default is now `Warn` (P2.5),
+        // so pinning finding F3's "in-memory session updates unconditionally, regardless of the
+        // store's outcome" guarantee under `Fatal` (where the store failure *does* propagate)
+        // needs an explicit opt-in. See `set_session_default_policy_warns_and_succeeds_when_the_
+        // store_fails_to_clear` below for the same guarantee under the default `Warn` policy.
         let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
         let transport = Transport::builder()
             .session(Some(crate::auth::Session::from_token("tok-123")))
             .store(Some(store))
+            .storage_failures(StorageFailures::Fatal)
             .build()
             .expect("builds with an initial session and a store");
         assert!(transport.is_authenticated());
@@ -1422,9 +1509,12 @@ mod tests {
 
     #[test]
     fn set_session_installs_a_new_session_in_memory_even_when_the_store_fails_to_save() {
+        // See the sibling `..._fails_to_persist` test above for why `Fatal` is opted into
+        // explicitly here.
         let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
         let transport = Transport::builder()
             .store(Some(store))
+            .storage_failures(StorageFailures::Fatal)
             .build()
             .expect("builds with a store but no initial session");
         assert!(!transport.is_authenticated());
@@ -1438,6 +1528,88 @@ mod tests {
             transport.is_authenticated(),
             "in-memory session must be installed even though the store failed to persist it"
         );
+    }
+
+    // ===================== StorageFailures (P2.5, decision D-13) =====================
+
+    #[test]
+    fn set_session_default_policy_warns_and_succeeds_when_the_store_fails_to_clear() {
+        // No `.storage_failures(..)` call: exercises the default, `StorageFailures::Warn`.
+        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
+        let transport = Transport::builder()
+            .session(Some(crate::auth::Session::from_token("tok-123")))
+            .store(Some(store))
+            .build()
+            .expect("builds with an initial session and a store");
+        assert!(transport.is_authenticated());
+
+        transport
+            .set_session(None)
+            .expect("the default Warn policy swallows the store's failure and returns Ok");
+
+        // Finding F3 still holds under the default policy: the in-memory session is cleared
+        // regardless of the store's outcome.
+        assert!(!transport.is_authenticated());
+        assert!(transport.session().is_none());
+    }
+
+    #[test]
+    fn set_session_default_policy_warns_and_succeeds_when_the_store_fails_to_save() {
+        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
+        let transport = Transport::builder()
+            .store(Some(store))
+            .build()
+            .expect("builds with a store but no initial session, default Warn policy");
+        assert!(!transport.is_authenticated());
+
+        transport
+            .set_session(Some(crate::auth::Session::from_token("tok-456")))
+            .expect("the default Warn policy swallows the store's failure and returns Ok");
+
+        assert!(
+            transport.is_authenticated(),
+            "in-memory session must be installed even though the store failed to persist it"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_session_fatal_policy_propagates_a_persistence_failure_but_keeps_the_refreshed_session_in_memory()
+    -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/2.2/login/refresh"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+                r#"{"meta":{"code":200},"data":{"session_token":"new-tok","refresh_token":"new-rt"}}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = crate::auth::Session::from_json(
+            r#"{"session_id":"tok","refresh_token":"rt-1","session_expiry":"2099-01-01T00:00:00"}"#,
+        )?;
+        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
+        let transport = Transport::builder()
+            .base_url(server.uri())
+            .session(Some(session))
+            .store(Some(store))
+            .storage_failures(StorageFailures::Fatal)
+            .build()
+            .expect("a MockServer's own URI is always a valid base URL");
+
+        let err = transport
+            .refresh_session()
+            .await
+            .expect_err("Fatal policy must propagate the persistence failure");
+        assert!(matches!(err, Error::Storage(_)));
+
+        // The remote refresh itself succeeded and the in-memory session already reflects it —
+        // only persistence failed — matching `set_session`'s same in-memory-first guarantee.
+        let current = transport
+            .session()
+            .expect("the refreshed session is installed in memory regardless of persistence");
+        assert_eq!(current.expose_token(), "new-tok");
+        Ok(())
     }
 
     // ===================== injected client / redirect defence (finding F4) =====================
@@ -1478,9 +1650,18 @@ mod tests {
             .send(&ACCOUNT, &[], None)
             .await
             .expect_err("a followed redirect must surface as an error, not the hop's body");
+        let Error::Api {
+            status, message, ..
+        } = &err
+        else {
+            panic!("expected Error::Api, got {err:?}");
+        };
+        // The final hop's status (200), not the original 302, and the honest "followed" wording
+        // — not the "Redirect not followed: ..." message the `Policy::none()` path produces.
+        assert_eq!(*status, 200);
         assert!(
-            matches!(err, Error::Api { .. }),
-            "expected Error::Api, got {err:?}"
+            message.starts_with("Redirect followed by a caller-supplied client: "),
+            "unexpected message: {message}"
         );
     }
 }
