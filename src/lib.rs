@@ -20,6 +20,8 @@
 
 pub mod api;
 pub mod auth;
+pub mod cache;
+pub mod client;
 pub mod consts;
 pub mod endpoints;
 pub mod envelope;
