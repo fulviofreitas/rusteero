@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime};
 use reqwest::header::{COOKIE, HeaderMap, LOCATION, RETRY_AFTER, SET_COOKIE};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method, StatusCode};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use url::Url;
 
@@ -253,8 +253,7 @@ impl Transport {
         let current = self.session_snapshot();
         let refresh_token = current
             .as_ref()
-            .and_then(Session::refresh_token)
-            .map(ExposeSecret::expose_secret)
+            .and_then(Session::expose_refresh_token)
             .filter(|token| !token.is_empty())
             .map(str::to_owned);
 
@@ -300,10 +299,14 @@ impl Transport {
                 // the same sibling-exception-hierarchy gap the task brief documents for
                 // `login`/`verify`/`resend_verification_code` (brief gotcha #1), which applies
                 // here too since `refresh_session` never catches `Error::Authentication` either.
-                Err(Error::Api {
-                    status, message, ..
-                }) => {
-                    tracing::error!(status, %message, "session refresh failed");
+                Err(Error::Api { status, .. }) => {
+                    // `message` is intentionally never logged here (finding 1): it is either the
+                    // raw truncated response body or "Invalid JSON response: " + the truncated
+                    // body, and a successful refresh response legitimately carries
+                    // `data.session_token`/`data.refresh_token`. A malformed-JSON 200 from this
+                    // very refresh call would otherwise put live credentials into an ERROR log
+                    // line. `status` is a bare status code and carries nothing sensitive.
+                    tracing::error!(status, "session refresh failed");
                     self.replace_session(Some(Session::empty()));
                     self.persist_warn_only(&Session::empty()).await;
                     return Ok(false);
@@ -446,9 +449,17 @@ impl Transport {
             request = request.json(body);
         }
         if let Some(token) = token {
+            // The crate's controlled exposure point for a token that isn't (necessarily) part of
+            // a `Session` — this call site is shared with `auth::flow::PendingLogin`'s
+            // pre-`Session` login token, see `Session::expose_secret_token`'s docs; every other
+            // consumer of a token must go through `secrecy::ExposeSecret` explicitly.
             request = request.header(
                 COOKIE,
-                format!("{}={}", consts::SESSION_COOKIE_NAME, token.expose_secret()),
+                format!(
+                    "{}={}",
+                    consts::SESSION_COOKIE_NAME,
+                    Session::expose_secret_token(token)
+                ),
             );
         }
 
@@ -777,6 +788,17 @@ impl TransportBuilder {
     /// When set, `user_agent`, `timeout`, and `read_timeout` are ignored entirely — the supplied
     /// client is used exactly as given, which is the intended escape hatch for tests that need
     /// full control over the HTTP layer.
+    ///
+    /// # Warning
+    ///
+    /// A caller-supplied client silently discards two of this crate's safety guarantees: redirect
+    /// refusal (`reqwest::redirect::Policy::none()`) and the request/read timeouts in
+    /// [`crate::consts`]. With such a client, a same-host-same-port `3xx` response is followed
+    /// instead of surfacing `Error::Api` with a `"Redirect not followed: ..."` message, and there
+    /// is no 30-second ceiling on a hung request. Build your own client with
+    /// `.redirect(reqwest::redirect::Policy::none())` and explicit `.timeout(..)` /
+    /// `.read_timeout(..)` calls before passing it here if you need both custom configuration
+    /// *and* these guarantees.
     #[must_use]
     pub fn http(mut self, client: Client) -> Self {
         self.http = Some(client);
@@ -879,7 +901,10 @@ impl TransportBuilder {
         let (raw_22, raw_23) = match &self.base_root {
             Some(root) => {
                 let trimmed = root.trim_end_matches('/');
-                (format!("{trimmed}/2.2"), format!("{trimmed}/2.3"))
+                (
+                    format!("{trimmed}/{}", version_segment(ApiVersion::V2_2)),
+                    format!("{trimmed}/{}", version_segment(ApiVersion::V2_3)),
+                )
             }
             None => (
                 consts::API_BASE_22.to_owned(),
@@ -890,14 +915,37 @@ impl TransportBuilder {
     }
 }
 
+/// The version path segment (e.g. `"2.2"`) baked into `version`'s production base URL
+/// ([`ApiVersion::base_url`]) — `TransportBuilder::build_bases`'s single source of truth for
+/// deriving a caller-supplied override base, instead of re-stating `"2.2"`/`"2.3"` as a second
+/// literal that could silently drift from `consts::API_BASE_22`/`consts::API_BASE_23` (finding
+/// 3: routes.rs/consts.rs must be the only place wire paths exist). Slices the `'static` base
+/// URL string itself rather than parsing it into a `Url`, so no allocation is needed and the
+/// returned segment borrows straight from the `'static` constant.
+///
+/// # Panics
+///
+/// Never in practice: [`ApiVersion::base_url`] always returns one of `consts::API_BASE_22` /
+/// `consts::API_BASE_23`, both of which are non-empty absolute URLs, so `rsplit('/').next()`
+/// always yields at least one item (pinned by
+/// `consts::tests::base_urls_are_versioned_variants_of_the_same_host`).
+fn version_segment(version: ApiVersion) -> &'static str {
+    version
+        .base_url()
+        .rsplit('/')
+        .next()
+        .expect("base_url is a non-empty static string; rsplit always yields at least one item")
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use reqwest::Method;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use reqwest::{Method, StatusCode};
+    use url::Url;
 
-    use super::{Route, Transport, parse_retry_after, refresh_signal_detected};
+    use super::{Route, Transport, parse_retry_after, refresh_signal_detected, status_to_envelope};
     use crate::error::Error;
     use crate::routes::{ACCOUNT, ApiVersion};
 
@@ -959,6 +1007,45 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("-5"));
         assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    // ===================== refresh_session error-arm log field (finding 1) =====================
+
+    #[test]
+    fn refresh_failure_log_field_never_carries_the_response_body() {
+        // Reproduces the exact `Error::Api` a malformed/truncated 200 response from
+        // `login/refresh` or `account/refresh` would produce: invalid JSON whose truncated body
+        // legitimately carries `data.session_token`/`data.refresh_token` — a live credential.
+        // `refresh_session`'s error arm must log only `status`, never `message`.
+        let credential_carrying_body = concat!(
+            r#"{"meta":{"code":200},"data":{"session_token":"eyJsecret-session-value","#,
+            r#""refresh_token":"eyJsecret-refresh-value"#, // deliberately truncated / malformed
+        );
+        let url =
+            Url::parse("https://api-user.e2ro.com/2.2/login/refresh").expect("valid literal url");
+
+        let err = status_to_envelope(StatusCode::OK, credential_carrying_body, &url, None)
+            .expect_err("malformed JSON on a 2xx becomes Error::Api");
+        let Error::Api {
+            status, message, ..
+        } = err
+        else {
+            panic!("expected Error::Api, got {err:?}");
+        };
+
+        // Sanity: this really is the credential-carrying scenario the finding describes — if
+        // this assertion ever fails, the rest of the test is not exercising the real hazard.
+        assert!(message.contains("eyJsecret-session-value"));
+
+        // What `refresh_session`'s `Err(Error::Api { status, .. })` arm actually passes into the
+        // `tracing::error!` field is `status` alone (see the comment at that call site) — assert
+        // directly on that value, since a tracing-capture harness would need a new dependency.
+        let logged_field = status;
+        let rendered = logged_field.to_string();
+        assert!(!rendered.contains("eyJsecret"));
+        assert!(!rendered.contains("session-value"));
+        assert!(!rendered.contains("refresh-value"));
+        assert_eq!(rendered, "200");
     }
 
     // ===================== refresh_signal_detected =====================
@@ -1038,6 +1125,58 @@ mod tests {
         assert_eq!(
             v23.as_str(),
             "http://127.0.0.1:9999/2.3/networks/123/devices/aa:bb"
+        );
+    }
+
+    #[test]
+    fn overridden_base_and_production_base_share_the_same_version_segments() {
+        // Finding 3: `build_bases` used to re-derive "2.2"/"2.3" by string formatting instead of
+        // from `ApiVersion`, so the override base and the production base could silently
+        // desync from `consts::API_BASE_22`/`consts::API_BASE_23` on a future version bump. This
+        // pins both bases to derive the *same* version segment at runtime, so a future bump that
+        // updates only one of the two call sites fails this test instead of passing silently.
+        let production = Transport::builder().build().expect("builds with defaults");
+        let overridden = Transport::builder()
+            .base_url("http://127.0.0.1:9999")
+            .build()
+            .expect("builds with an overridden base");
+
+        let version_segment = |url: &Url| -> String {
+            url.path_segments()
+                .and_then(|mut segments| segments.next().map(str::to_owned))
+                .expect("rendered URL always has a version path segment")
+        };
+
+        let prod_22 = production
+            .render_url(&ACCOUNT, &[])
+            .expect("v2.2 route renders against the production base");
+        let over_22 = overridden
+            .render_url(&ACCOUNT, &[])
+            .expect("v2.2 route renders against the overridden base");
+        assert_eq!(
+            version_segment(&prod_22),
+            version_segment(&over_22),
+            "a consts::API_BASE_22 version bump must not desync the override base from production"
+        );
+
+        let route_23 = v2_3_route();
+        let path_params: &[(&str, &str)] = &[("network_id", "1"), ("device_id", "2")];
+        let prod_23 = production
+            .render_url(&route_23, path_params)
+            .expect("v2.3 route renders against the production base");
+        let over_23 = overridden
+            .render_url(&route_23, path_params)
+            .expect("v2.3 route renders against the overridden base");
+        assert_eq!(
+            version_segment(&prod_23),
+            version_segment(&over_23),
+            "a consts::API_BASE_23 version bump must not desync the override base from production"
+        );
+
+        assert_ne!(
+            version_segment(&prod_22),
+            version_segment(&prod_23),
+            "2.2 and 2.3 must remain distinct API versions"
         );
     }
 

@@ -163,19 +163,50 @@ impl Session {
 
     /// Exposes the raw token string.
     ///
-    /// This is the **only** place in the crate allowed to turn the token back into a bare
-    /// `&str`, and exists for exactly one reason: building the `Cookie: s=<token>` header
-    /// (`api/base.py:148-152`) has no use for a `SecretString` — `reqwest` needs a `&str`/
-    /// `String` to build the header value. Every other consumer of a session must go through
-    /// [`Session::token`] and `secrecy`'s `ExposeSecret` trait explicitly, keeping accidental
-    /// exposure auditable to this one call site.
-    // `transport.rs` (owned by a concurrent task, not yet implemented) is the intended non-test
-    // caller, for building the `Cookie: s=<token>` header; until it lands this method is only
-    // exercised by this module's and `storage::memory`'s tests, which would otherwise make a
-    // plain `cargo clippy` flag it as dead code.
+    /// One of the crate's two designated places allowed to turn a token back into a bare `&str`
+    /// (the other is [`Session::expose_secret_token`]); both exist for exactly one reason:
+    /// building the `Cookie: s=<token>` header (`api/base.py:148-152`) has no use for a
+    /// `SecretString` — `reqwest` needs a `&str`/`String` to build the header value. This one
+    /// takes `&self`, for a caller that already holds a full `Session`; it cannot be used at
+    /// `Transport::execute_raw`'s actual Cookie-header call site, because that call site is
+    /// shared with `auth::flow::PendingLogin`'s pre-`Session` login token (its unverified
+    /// handshake, before `verify()` ever produces a `Session`) — see
+    /// [`Session::expose_secret_token`] for that production caller. Every other consumer of a
+    /// session must go through [`Session::token`] and `secrecy`'s `ExposeSecret` trait
+    /// explicitly, keeping accidental exposure auditable to these two accessors.
+    // Exercised only by this module's, `auth::mod`'s, and `storage::memory`'s tests — inspecting
+    // a session's own token value in a test never needs to go through the production
+    // Cookie-header call site — which would otherwise make a plain `cargo clippy` (the lib
+    // target, built without `cfg(test)`) flag this as dead code.
     #[allow(dead_code)]
+    #[must_use]
     pub(crate) fn expose_token(&self) -> &str {
         self.token.expose_secret()
+    }
+
+    /// Exposes a token's raw string value without requiring a `Session`.
+    ///
+    /// Sibling of [`Session::expose_token`] for the crate's one production exposure call site
+    /// that cannot hold a full `Session`: `Transport::execute_raw`'s `Cookie: s=<token>` header,
+    /// shared between an authenticated session's own token (`Transport::send_with_query`) and a
+    /// login token that predates any `Session` (`auth::flow::PendingLogin`'s unverified
+    /// handshake). Every other consumer of a token must go through [`Session::token`] and
+    /// `secrecy`'s `ExposeSecret` trait explicitly.
+    #[must_use]
+    pub(crate) fn expose_secret_token(token: &SecretString) -> &str {
+        token.expose_secret()
+    }
+
+    /// Exposes the refresh token's raw string value, if one is present.
+    ///
+    /// Sibling of [`Session::expose_token`] for the one production call site that already holds
+    /// a full `Session` rather than a bare `SecretString`: `Transport::refresh_session`'s
+    /// refresh-request body (`api/auth.py:301-304`), which needs `data.refresh_token` as a plain
+    /// string to embed in the JSON payload. Every other consumer of a refresh token must go
+    /// through [`Session::refresh_token`] and `secrecy`'s `ExposeSecret` trait explicitly.
+    #[must_use]
+    pub(crate) fn expose_refresh_token(&self) -> Option<&str> {
+        self.refresh_token.as_ref().map(ExposeSecret::expose_secret)
     }
 
     /// Converts to the on-disk representation, ready to serialize.

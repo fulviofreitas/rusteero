@@ -11,7 +11,6 @@ pub use session::Session;
 
 use std::sync::Arc;
 
-use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use crate::envelope::Envelope;
@@ -176,16 +175,15 @@ impl AuthApi {
     /// `now + `[`crate::consts::SESSION_LIFETIME_DAYS`]` days` (`auth.py:411-413`, the same rule
     /// [`Session::from_token`] applies), installs it as the current session, and persists it
     /// through the configured credential store — mirroring `_save_credentials()`
-    /// (`auth.py:416`). Equivalent to [`Session::from_token`] followed by
-    /// [`Transport::set_session`].
+    /// (`auth.py:416`).
     ///
-    /// Unlike Python, this does **not** carry over a refresh token already held by the current
-    /// session (`auth.py:410-413` never touches `refresh_token`; brief lines 315-317): per the
-    /// port plan §7.2/D-16, a normal login/verify never populates one in the first place, so in
-    /// practice there is nothing to preserve. This is a deliberate simplification for this port,
-    /// not an oversight — contrast with [`AuthApi::clear_session_token`], which does have to
-    /// reproduce the preservation exactly, since that is the one place the brief calls out as
-    /// load-bearing.
+    /// Preserves any refresh token already held by the current session: Python's
+    /// `set_session_token()` only ever assigns `session_id` and `session_expiry`
+    /// (`auth.py:411-413`) and never touches `refresh_token` at all (brief lines 315-317), so
+    /// whatever was already in memory survives untouched — the same preservation
+    /// [`AuthApi::clear_session_token`] has to reproduce for the same reason. A session with no
+    /// prior refresh token (the common case, since a normal login/verify never populates one)
+    /// still ends up with `refresh_token: None`, matching [`Session::from_token`] directly.
     ///
     /// # Errors
     ///
@@ -200,7 +198,10 @@ impl AuthApi {
                 message: EMPTY_TOKEN_MESSAGE.to_owned(),
             });
         }
-        self.transport.set_session(Some(Session::from_token(token)))
+        let current = self.transport.session();
+        let session =
+            session_preserving_refresh_token(&Session::from_token(token), current.as_ref())?;
+        self.transport.set_session(Some(session))
     }
 
     /// Clears only the session token and its expiry, leaving any refresh token in place.
@@ -217,7 +218,7 @@ impl AuthApi {
     /// the in-memory session is updated regardless (see [`Transport::set_session`]'s docs).
     pub fn clear_session_token(&self) -> Result<(), Error> {
         let current = self.transport.session();
-        let cleared = session_clearing_token_only(current.as_ref())?;
+        let cleared = session_preserving_refresh_token(&Session::empty(), current.as_ref())?;
         self.transport.set_session(Some(cleared))
     }
 
@@ -265,20 +266,27 @@ impl AuthApi {
     }
 }
 
-/// Builds a session that preserves `current`'s refresh token (if any) while nulling the session
-/// token and expiry, matching `clear_session_token()`'s inline field assignments exactly
-/// (`auth.py:427-428`): only `session_id` and `session_expiry` are reset, `refresh_token` is left
-/// untouched.
+/// Splices `current`'s refresh token (if any) into `base`'s serialized form, producing a session
+/// that combines `base`'s token/expiry with `current`'s preserved refresh token.
+///
+/// Shared by [`AuthApi::set_session_token`] (`base` is a fresh [`Session::from_token`],
+/// `auth.py:411-413` never touches `refresh_token`) and [`AuthApi::clear_session_token`] (`base`
+/// is [`Session::empty`], matching `clear_session_token()`'s inline field assignments exactly,
+/// `auth.py:427-428`: only `session_id` and `session_expiry` are reset) — both Python methods
+/// leave `refresh_token` untouched, just with a different `base`.
 ///
 /// Goes through the same public JSON wire round trip `crate::transport`'s
 /// `build_refreshed_session` uses, for the same reason: [`session::StoredSession`]'s fields are
-/// private to the `session` module, so a session with a *specific* combination of nulled fields
+/// private to the `session` module, so a session with a *specific* combination of `base`'s fields
 /// and a preserved refresh token cannot be assembled by touching private state from here.
-fn session_clearing_token_only(current: Option<&Session>) -> Result<Session, Error> {
+fn session_preserving_refresh_token(
+    base: &Session,
+    current: Option<&Session>,
+) -> Result<Session, Error> {
     let refresh_token = current
-        .and_then(Session::refresh_token)
-        .map(|rt| rt.expose_secret().to_owned());
-    let mut value: Value = serde_json::from_str(&Session::empty().to_json()?)?;
+        .and_then(Session::expose_refresh_token)
+        .map(str::to_owned);
+    let mut value: Value = serde_json::from_str(&base.to_json()?)?;
     value["refresh_token"] = match refresh_token {
         Some(rt) => Value::String(rt),
         None => Value::Null,
@@ -344,11 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn set_session_token_does_not_carry_over_an_existing_refresh_token() {
-        // Unlike `clear_session_token`, `set_session_token` is a plain
-        // `Session::from_token` + `Transport::set_session` (see that method's doc comment for
-        // why this simplification is deliberate) — any refresh token the previous session held
-        // is dropped, not preserved.
+    fn set_session_token_preserves_an_existing_refresh_token() {
+        // Finding 2 / Python parity (`auth.py:411-413`, brief lines 315-317):
+        // `set_session_token()` only ever assigns `session_id` and `session_expiry`, never
+        // `refresh_token` — so a refresh token already held by the current session must survive
+        // the call, exactly like `clear_session_token`.
         let transport = Transport::builder()
             .session(Some(session_with_refresh_token()))
             .build()
@@ -360,7 +368,13 @@ mod tests {
 
         let session = auth.session().expect("session installed");
         assert_eq!(session.expose_token(), "new-token");
-        assert!(session.refresh_token().is_none());
+        assert_eq!(
+            session
+                .refresh_token()
+                .expect("refresh token preserved")
+                .expose_secret(),
+            "rt-1"
+        );
         assert!(session.is_valid());
     }
 
