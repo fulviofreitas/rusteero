@@ -105,13 +105,30 @@ pub trait CredentialStore: Send + Sync + std::fmt::Debug {
 /// [`load_async`]/[`save_async`]/[`clear_async`] run them via `tokio::task::spawn_blocking`; a
 /// `JoinError` there means the store implementation itself panicked (or the runtime is shutting
 /// down), never that it returned an ordinary `Err`. This is surfaced as a
-/// [`StorageError::Backend`] rather than propagating the panic into the caller's own task —
-/// `JoinError`'s `Display` never carries a credential (it describes the *task's* failure, not
-/// any data the task was operating on), so it is safe to embed verbatim.
+/// [`StorageError::Backend`] rather than propagating the panic into the caller's own task.
+///
+/// # Security (phase-2 storage review, finding S4)
+///
+/// The message deliberately records only [`tokio::task::JoinError::id`],
+/// [`tokio::task::JoinError::is_panic`] and [`tokio::task::JoinError::is_cancelled`] — **never**
+/// `join_err`'s own `Display`. A previous version of this function interpolated `join_err`
+/// directly, on the premise that `JoinError`'s `Display` never carries a credential; that premise
+/// is false for the tokio version this crate pins (1.53.1), whose `JoinError::Display` renders a
+/// panicking task's payload verbatim (`task {id} panicked with message {panic_str:?}`,
+/// `tokio-1.53.1/src/runtime/task/error.rs:139-146`). `CredentialStore` is a public,
+/// third-party-implementable trait, so a backend that panics via `unwrap()`/`expect()` on a value
+/// carrying the serialized session would put that text straight into this error's `message`,
+/// which this crate may log at WARN or return to a caller. Interpolating the `Display` here would
+/// reopen exactly the credential-leak path this module otherwise guards against.
 fn join_error_to_storage_error(join_err: &tokio::task::JoinError) -> StorageError {
     StorageError::Backend {
         backend: "credential-store-task".to_owned(),
-        message: format!("blocking credential-store task failed: {join_err}"),
+        message: format!(
+            "blocking credential-store task {} failed: panicked={}, cancelled={}",
+            join_err.id(),
+            join_err.is_panic(),
+            join_err.is_cancelled()
+        ),
     }
 }
 
@@ -499,7 +516,11 @@ mod tests {
             .await
             .expect_err("a panicking store must not take down the caller's task");
         assert!(
-            matches!(err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+            matches!(&err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+        );
+        assert!(
+            err.to_string().contains("panicked=true"),
+            "expected the panic flag recorded in the message, got {err}"
         );
     }
 
@@ -510,7 +531,11 @@ mod tests {
             .await
             .expect_err("a panicking store must not take down the caller's task");
         assert!(
-            matches!(err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+            matches!(&err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+        );
+        assert!(
+            err.to_string().contains("panicked=true"),
+            "expected the panic flag recorded in the message, got {err}"
         );
     }
 
@@ -521,7 +546,48 @@ mod tests {
             .await
             .expect_err("a panicking store must not take down the caller's task");
         assert!(
-            matches!(err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+            matches!(&err, StorageError::Backend { backend, .. } if backend == "credential-store-task")
+        );
+        assert!(
+            err.to_string().contains("panicked=true"),
+            "expected the panic flag recorded in the message, got {err}"
+        );
+    }
+
+    // ===================== async adapters: finding S4 =====================
+
+    /// A [`CredentialStore`] whose panic payload is a distinctive, easy-to-grep string, so the
+    /// test below can assert it never reaches a [`StorageError`]'s `Display`/`Debug` output.
+    #[derive(Debug, Default)]
+    struct PanickingWithCredentialLikePayloadStore;
+
+    impl CredentialStore for PanickingWithCredentialLikePayloadStore {
+        fn load(&self) -> Result<Session, StorageError> {
+            panic!("session_token=leaked-secret-should-never-appear-in-storage-error");
+        }
+
+        fn save(&self, _session: &Session) -> Result<(), StorageError> {
+            panic!("session_token=leaked-secret-should-never-appear-in-storage-error");
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            panic!("session_token=leaked-secret-should-never-appear-in-storage-error");
+        }
+    }
+
+    #[tokio::test]
+    async fn load_async_never_lets_the_panic_payload_reach_the_storage_error() {
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingWithCredentialLikePayloadStore);
+        let err = load_async(store)
+            .await
+            .expect_err("a panicking store must not take down the caller's task");
+
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains("leaked-secret") && !debug.contains("leaked-secret"),
+            "the JoinError's own Display must never be interpolated into a StorageError (S4): \
+             display={display:?} debug={debug:?}"
         );
     }
 }

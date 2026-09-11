@@ -275,6 +275,15 @@ impl Session {
     /// [`Session::token`]'s doc claim — that a crate-private helper is the *only* place the raw
     /// token string is ever exposed as a bare string — actually true; a `pub` `to_json` would be
     /// a second, external exposure path that claim did not account for.
+    ///
+    /// Known follow-up (security finding T5, not applied here to avoid an unreviewed signature
+    /// change to `src/storage/file.rs`/`src/storage/keyring.rs`'s call sites): the returned
+    /// plaintext `String` is never zeroized on drop. `secrecy` (already a dependency) re-exports
+    /// `zeroize`, so this could return a zeroizing wrapper (e.g. `secrecy::SecretString`)
+    /// instead; both call sites would then need one extra `secrecy::ExposeSecret::expose_secret()`
+    /// call before handing the bytes to `write_private_atomically`/`Entry::set_password`
+    /// respectively — a small, mechanical change, but one that belongs to whoever owns those two
+    /// files at the time it lands.
     pub(crate) fn to_json(&self) -> Result<String, StorageError> {
         let json = serde_json::to_string(&self.to_stored())?;
         Ok(json)
@@ -290,6 +299,35 @@ impl Session {
     pub fn from_json(json: &str) -> Result<Self, StorageError> {
         let stored: StoredSession = serde_json::from_str(json)?;
         Ok(Self::from_stored(stored))
+    }
+
+    /// Builds a session combining `base`'s token and expiry with a specific refresh-token
+    /// override (`Some(rt)` to set one, `None` to clear it), without ever producing JSON text.
+    ///
+    /// Security finding T5: `transport::build_refreshed_session` and
+    /// `auth::session_preserving_refresh_token` both need to splice a *specific* refresh token
+    /// onto an otherwise-fresh `base` session (they cannot construct a [`Session`] directly —
+    /// its fields are private to this module). Both previously did so by round-tripping through
+    /// [`Session::to_json`]/[`Session::from_json`] with a `serde_json::Value` mutated in
+    /// between: `to_json`'s `String`, the parsed `Value::String`, and `.to_string()`'s second
+    /// `String` were each an un-zeroized plaintext copy of the token that could outlive the call
+    /// on the heap — `secrecy::SecretString` only protects the fields it directly wraps, not
+    /// derived buffers built from them. This goes directly from one [`StoredSession`] to another
+    /// via [`Session::to_stored`]/[`Session::from_stored`] (both already crate-private and
+    /// infallible), which is the smallest surface the on-disk contract allows: no JSON text is
+    /// produced or parsed for this call shape at all, and unlike the JSON round trip this can
+    /// never fail.
+    ///
+    /// This does not, by itself, close finding T5 in full: [`StoredSession`]'s own fields are
+    /// still plain, un-zeroized `String`s (the wire-format struct every `CredentialStore` write
+    /// path already has to materialise one of), so the single copy built here is unavoidable
+    /// without also changing [`Session::to_json`]'s public (crate-visible) return type — see that
+    /// method's docs and this crate's `PARITY.md`/task notes for why that further step is left
+    /// for coordinated follow-up with `src/storage/{file,keyring}.rs`.
+    pub(crate) fn with_refresh_token(base: &Session, refresh_token: Option<&str>) -> Self {
+        let mut stored = base.to_stored();
+        stored.refresh_token = refresh_token.map(str::to_owned);
+        Self::from_stored(stored)
     }
 }
 

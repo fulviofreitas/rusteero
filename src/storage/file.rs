@@ -9,6 +9,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::auth::Session;
 use crate::error::StorageError;
@@ -41,6 +42,15 @@ use super::CredentialStore;
 /// permissions/ACL the OS applies, and this crate does not attempt to further restrict them.
 /// Callers on Windows should not rely on the stored file being owner-only — treat the containing
 /// directory's own ACLs as the real access boundary there.
+///
+/// # Security: no orphaned plaintext credential (phase-2 storage review, finding S3)
+///
+/// The temporary file above is given a name that is unique for the lifetime of this process
+/// (see `unique_temp_path`), and every error path in the create/write/sync/rename sequence
+/// removes it before returning (see `write_private_atomically`) — a crash *between* those
+/// steps is the only way a temp file can survive, and [`FileStore::clear`] proactively removes
+/// any such orphan for `path` (see `remove_orphaned_temp_files`), so a stale, fully-valid
+/// plaintext credential can never outlive an explicit `clear()` call.
 #[derive(Debug)]
 pub struct FileStore {
     path: PathBuf,
@@ -92,14 +102,21 @@ impl CredentialStore for FileStore {
     }
 
     fn clear(&self) -> Result<(), StorageError> {
-        match fs::remove_file(&self.path) {
+        let result = match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             // Mirrors the tolerant `os.path.exists(...)` guard before `os.remove`
             // (`auth_storage.py:230-237`): removing an entry that was never there is not an
             // error.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(StorageError::Io(err)),
-        }
+        };
+        // Security fix (phase-2 storage review, finding S3(a)): also remove any temporary file
+        // `write_private_atomically` may have left behind after a crash between creating it and
+        // renaming it into place — otherwise a full plaintext credential can survive at a
+        // predictable path even after `clear()` reports success. Best-effort: a missing (or
+        // already-removed) orphan is not an error, matching the tolerance above.
+        remove_orphaned_temp_files(&self.path);
+        result
     }
 }
 
@@ -108,29 +125,106 @@ impl CredentialStore for FileStore {
 ///
 /// Writes to a sibling temporary file first (same directory as `path`, so the final
 /// [`fs::rename`] is guaranteed to be on the same filesystem and therefore atomic), then renames
-/// it over `path`. Any stale temporary file left behind by a previous crashed write is removed
-/// before creating a fresh one, so the mode is always applied to a newly created inode rather
-/// than silently inheriting an existing file's permissions.
+/// it over `path`.
+///
+/// # Security (phase-2 storage review, finding S3(b))
+///
+/// If any step of the create/write/sync/rename sequence fails, the temporary file is removed
+/// before the error is returned (see [`write_to_temp_and_rename`]) — no error path here can
+/// leave a complete plaintext credential sitting at a predictable location. The one case this
+/// cannot cover is a hard crash (SIGKILL, power loss) *during* that sequence, which no code
+/// running in-process can react to; [`FileStore::clear`] cleans up any such orphan instead (see
+/// [`remove_orphaned_temp_files`]).
 fn write_private_atomically(path: &Path, contents: &[u8]) -> Result<(), StorageError> {
-    let tmp_path = sibling_temp_path(path);
-    let _ = fs::remove_file(&tmp_path);
-    let mut file = create_private_file(&tmp_path)?;
+    let tmp_path = unique_temp_path(path);
+    let result = write_to_temp_and_rename(&tmp_path, path, contents);
+    if result.is_err() {
+        // Best-effort: the cleanup's own outcome is discarded — the error the caller needs to
+        // see is the original write failure, not a follow-up removal failure.
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result.map_err(StorageError::Io)
+}
+
+/// The create-write-sync-rename sequence [`write_private_atomically`] wraps with temp-file
+/// cleanup on every error path. Kept separate so every early return via `?` funnels through one
+/// `Result`, giving the caller a single place to react to *any* failure in the sequence.
+fn write_to_temp_and_rename(tmp_path: &Path, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = create_private_file(tmp_path)?;
     file.write_all(contents)?;
     file.sync_all()?;
-    fs::rename(&tmp_path, path)?;
+    fs::rename(tmp_path, path)?;
     Ok(())
 }
 
-/// Builds the sibling path used for the temporary file in [`write_private_atomically`], by
-/// appending a `.tmp` suffix to `path`'s file name (falling back to a fixed name for the
-/// pathological case where `path` has no file-name component at all, e.g. `.` or `/`).
-fn sibling_temp_path(path: &Path) -> PathBuf {
+/// A process-wide counter mixed into every temporary file name [`unique_temp_path`] produces.
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The fixed prefix shared by every temporary file [`unique_temp_path`] can ever produce for
+/// `path`: `path`'s own file name followed by a `.`. [`remove_orphaned_temp_files`] uses this
+/// (together with the fixed `.tmp` suffix) to recognise an orphan without needing to reconstruct
+/// its exact process-id/counter middle section.
+fn temp_file_prefix(path: &Path) -> String {
     let base = path
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("rusteero-session"));
-    let mut file_name = base.to_os_string();
-    file_name.push(".tmp");
+    format!("{}.", base.to_string_lossy())
+}
+
+/// Builds a fresh, unpredictable sibling path for the temporary file [`write_private_atomically`]
+/// stages content in, by mixing the current process id and a monotonically increasing
+/// in-process counter into `path`'s file name, ahead of a fixed `.tmp` suffix.
+///
+/// # Security (phase-2 storage review, finding S3(c))
+///
+/// The previous implementation used a single fixed `<name>.tmp` sibling for every save, cleaned
+/// up with an unconditional `fs::remove_file` at the start of each write. Two processes (or two
+/// overlapping saves in the same process) sharing one cookie file could therefore unlink each
+/// other's in-flight temporary file at that exact path. Mixing in [`std::process::id`] and a
+/// monotonic [`AtomicU64`] counter — both from `std`, no new dependency — makes every temporary
+/// file name unique for the lifetime of this process, so two concurrent writers can never target
+/// the same sibling path. Because the exact name is now unpredictable from the outside,
+/// [`FileStore::clear`] cannot reconstruct it to remove an orphan left by a *different*,
+/// now-dead process; instead it pattern-matches on the shared [`temp_file_prefix`]/`.tmp`
+/// suffix via [`remove_orphaned_temp_files`].
+fn unique_temp_path(path: &Path) -> PathBuf {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = format!(
+        "{}{}-{counter}.tmp",
+        temp_file_prefix(path),
+        std::process::id()
+    );
     path.with_file_name(file_name)
+}
+
+/// Best-effort removes every temporary file [`unique_temp_path`] may have left behind for
+/// `path` — e.g. one orphaned by a crash between [`create_private_file`] and the [`fs::rename`]
+/// in [`write_to_temp_and_rename`]. Every entry in `path`'s parent directory whose name starts
+/// with [`temp_file_prefix`] and ends with `.tmp` is treated as such an orphan and removed; a
+/// missing parent directory, or the absence of any matching entry, is not an error.
+///
+/// This is a directory scan rather than a single [`fs::remove_file`] on one reconstructed name
+/// because [`unique_temp_path`] deliberately makes that name unpredictable from the outside (see
+/// that function's docs) — the only way to find one left behind is to look for anything matching
+/// the shared prefix/suffix.
+fn remove_orphaned_temp_files(path: &Path) {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let prefix = temp_file_prefix(path);
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let has_tmp_extension = Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"));
+        if name.starts_with(&prefix) && has_tmp_extension {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Creates `path` exclusively, with permissions restricted to the owner (`0600`) set atomically
@@ -161,6 +255,9 @@ fn create_private_file(path: &Path) -> std::io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+
     use secrecy::ExposeSecret;
 
     use super::{CredentialStore, FileStore};
@@ -347,6 +444,65 @@ mod tests {
         store.clear().expect("clear succeeds");
 
         assert!(!path.exists());
+    }
+
+    // ===================== clear(): finding S3 =====================
+
+    #[test]
+    fn clear_removes_a_stale_temporary_file_left_by_a_crashed_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        let store = FileStore::new(&path);
+        store
+            .save(&Session::from_token("tok"))
+            .expect("save succeeds");
+        // Simulate the temporary file `write_private_atomically` would have used had the
+        // process been killed between creating it and renaming it into place.
+        let orphan = dir.path().join("cookies.json.99999-7.tmp");
+        fs_write(&orphan, "leftover plaintext credential");
+
+        store.clear().expect("clear succeeds");
+
+        assert!(!path.exists());
+        assert!(
+            !orphan.exists(),
+            "clear() must remove orphaned temp files too, not just the main file"
+        );
+    }
+
+    #[test]
+    fn clear_with_no_file_and_no_orphan_is_still_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileStore::new(dir.path().join("does-not-exist.json"));
+
+        store
+            .clear()
+            .expect("clearing with nothing on disk at all is not an error");
+    }
+
+    #[test]
+    fn failed_write_leaves_no_temporary_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        // Force the final `fs::rename` to fail: a file cannot be renamed onto an existing
+        // directory.
+        fs::create_dir(&path).expect("create a directory at the target path");
+        let store = FileStore::new(&path);
+
+        store
+            .save(&Session::from_token("tok"))
+            .expect_err("rename onto an existing directory must fail");
+
+        let leftovers: Vec<OsString> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![OsString::from("cookies.json")],
+            "a failed write must not leave any temporary file behind, got {leftovers:?}"
+        );
     }
 
     // ===================== Debug redaction =====================

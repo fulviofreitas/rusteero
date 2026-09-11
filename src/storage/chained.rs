@@ -57,6 +57,35 @@ impl ChainedStore {
             ),
         }
     }
+
+    /// Wraps a "primary failed, fallback succeeded" [`clear`](CredentialStore::clear) outcome.
+    ///
+    /// `backend: "chained-primary"` names *which* backend still holds the credential a caller
+    /// asked to destroy, so a caller (or its logs) can distinguish this from
+    /// [`Self::fallback_only_failed`] and [`Self::both_failed`] without parsing the message.
+    fn primary_only_failed(primary_err: &StorageError) -> StorageError {
+        StorageError::Backend {
+            backend: "chained-primary".to_owned(),
+            message: format!(
+                "primary storage failed to clear (fallback cleared successfully, but a copy \
+                 of the credential may still be at rest in primary): {primary_err}"
+            ),
+        }
+    }
+
+    /// Wraps a "fallback failed, primary succeeded" [`clear`](CredentialStore::clear) outcome.
+    ///
+    /// See [`Self::primary_only_failed`] for why this is a distinct backend name rather than
+    /// reusing [`Self::both_failed`].
+    fn fallback_only_failed(fallback_err: &StorageError) -> StorageError {
+        StorageError::Backend {
+            backend: "chained-fallback".to_owned(),
+            message: format!(
+                "fallback storage failed to clear (primary cleared successfully, but a copy \
+                 of the credential may still be at rest in fallback): {fallback_err}"
+            ),
+        }
+    }
 }
 
 impl CredentialStore for ChainedStore {
@@ -149,6 +178,17 @@ impl CredentialStore for ChainedStore {
     /// below actually activates. See this module's tests for coverage proving the fallback
     /// fires on a primary error.
     ///
+    /// # Security fix (phase-2 storage review, finding S2)
+    ///
+    /// Before writing to `fallback`, this also best-effort clears `primary` — discarding that
+    /// `clear`'s own error — so a stale credential left behind by the failed `primary.save()`
+    /// is invalidated rather than left readable. Without this, [`CredentialStore::load`]'s
+    /// unconditional preference for `primary` (see this trait's own `load` docs above) would
+    /// keep handing back the *old* token indefinitely once `primary` becomes reachable again —
+    /// even though a newer credential (including the emptied "logged out" session written by a
+    /// caller like `logout`/`refresh`) had already superseded it in `fallback`. The chain must
+    /// never serve a credential a later write superseded.
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError`] only if **both** `primary` and `fallback` fail to save;
@@ -158,31 +198,64 @@ impl CredentialStore for ChainedStore {
     fn save(&self, session: &Session) -> Result<(), StorageError> {
         match self.primary.save(session) {
             Ok(()) => Ok(()),
-            Err(primary_err) => match self.fallback.save(session) {
-                Ok(()) => Ok(()),
-                Err(fallback_err) => Err(Self::both_failed(&primary_err, &fallback_err)),
-            },
+            Err(primary_err) => {
+                // Best-effort: invalidate whatever `primary` was still holding so a later
+                // `load()` (which unconditionally prefers `primary`) can never resurrect a
+                // credential this write was meant to supersede. Its own failure is discarded —
+                // if `primary` cannot be written to right now, it may well be unreachable for
+                // clearing too, and either way the fallback write below must still happen.
+                let _ = self.primary.clear();
+                match self.fallback.save(session) {
+                    Ok(()) => Ok(()),
+                    Err(fallback_err) => Err(Self::both_failed(&primary_err, &fallback_err)),
+                }
+            }
         }
     }
 
-    /// Clears both `primary` and `fallback` unconditionally.
+    /// Clears both `primary` and `fallback` unconditionally, reporting an error if **either**
+    /// fails.
     ///
     /// Mirrors `ChainedStorage.clear()` (`auth_storage.py:312-315`), which awaits both
     /// backends' `clear()` in sequence with no exception handling at all, relying on each
-    /// backend's own `clear()` being swallow-all. This port cannot rely on that (per this
-    /// trait's own `save`/`clear` documentation, a Rust backend may legitimately return `Err`),
-    /// so the chosen semantics are: **both backends are always given a chance to clear** (a
-    /// `primary` failure never skips the attempt on `fallback`, and vice versa — clearing
-    /// credentials must be as thorough as possible), and an error is reported only if **both**
-    /// fail. If only one backend fails, that is treated as an overall success, since the
-    /// credential no longer exists in at least one place and — for the shipped
-    /// keyring-primary/file-fallback configuration — the more sensitive of the two locations is
-    /// no worse off than before.
+    /// backend's own `clear()` being swallow-all.
+    ///
+    /// # Security fix (phase-2 storage review, finding S1)
+    ///
+    /// This method previously reported success as soon as *either* backend cleared
+    /// successfully — the inverse of the guarantee a caller destroying a credential actually
+    /// needs. `clear_auth_data()` makes no network call, so a live, unexpired token left behind
+    /// in the backend that failed to clear would remain valid server-side for the rest of its
+    /// natural (30-day) life while the caller believed it had been erased; if the surviving
+    /// copy happened to be in `fallback`, the *next* [`CredentialStore::load`] would even
+    /// migrate it back into `primary`, fully resurrecting the very session `clear()` was meant
+    /// to destroy.
+    ///
+    /// Both backends are still always given the chance to clear — a `primary` failure never
+    /// skips the attempt on `fallback`, and vice versa, so clearing remains as thorough as
+    /// possible — but the overall result is now `Ok(())` **only when both succeed**. When
+    /// exactly one backend fails, the returned [`StorageError::Backend`] names which one is
+    /// still holding a copy of the credential via its `backend` field: `"chained-primary"`
+    /// (primary failed, fallback cleared — see `primary_only_failed`) or `"chained-fallback"`
+    /// (fallback failed, primary cleared — see `fallback_only_failed`); `"chained"` is reserved
+    /// for the case where both backends failed (see `both_failed`). A caller can inspect this
+    /// field to decide whether the surviving copy matters enough to retry or surface to the
+    /// user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Backend`] if either `primary` or `fallback` (or both) failed to
+    /// clear; see the `backend` field discussion above for how to tell them apart.
     fn clear(&self) -> Result<(), StorageError> {
+        // Both backends are always attempted, unconditionally and independently — never
+        // short-circuited by the other's outcome — so clearing stays as thorough as possible
+        // regardless of which one (if either) fails.
         let primary_result = self.primary.clear();
         let fallback_result = self.fallback.clear();
         match (primary_result, fallback_result) {
-            (Ok(()), _) | (_, Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary_err), Ok(())) => Err(Self::primary_only_failed(&primary_err)),
+            (Ok(()), Err(fallback_err)) => Err(Self::fallback_only_failed(&fallback_err)),
             (Err(primary_err), Err(fallback_err)) => {
                 Err(Self::both_failed(&primary_err, &fallback_err))
             }
@@ -246,6 +319,29 @@ mod tests {
 
         fn clear(&self) -> Result<(), StorageError> {
             Ok(())
+        }
+    }
+
+    /// A [`CredentialStore`] test double that always fails to save but otherwise delegates to
+    /// a real [`MemoryStore`] — isolates finding S2 (a failed `primary.save()` must clear
+    /// whatever `primary` was still holding) from [`SaveFailsStore`] above, which has no
+    /// internal state of its own to observe being cleared.
+    #[derive(Debug)]
+    struct SaveFailsDelegatingStore {
+        inner: Arc<MemoryStore>,
+    }
+
+    impl CredentialStore for SaveFailsDelegatingStore {
+        fn load(&self) -> Result<Session, StorageError> {
+            self.inner.load()
+        }
+
+        fn save(&self, _session: &Session) -> Result<(), StorageError> {
+            Err(AlwaysFailsStore::error())
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            self.inner.clear()
         }
     }
 
@@ -387,10 +483,45 @@ mod tests {
         assert!(matches!(err, StorageError::Backend { .. }));
     }
 
+    // ===================== save: finding S2 =====================
+
+    #[test]
+    fn save_failure_on_primary_clears_the_stale_primary_credential_before_writing_fallback() {
+        let inner_primary = Arc::new(MemoryStore::new());
+        inner_primary
+            .save(&Session::from_token("stale-token"))
+            .expect("seed save never fails");
+        let primary: Arc<dyn CredentialStore> = Arc::new(SaveFailsDelegatingStore {
+            inner: Arc::clone(&inner_primary),
+        });
+        let fallback = store(None);
+
+        let chained = ChainedStore::new(primary, Arc::clone(&fallback) as _);
+        chained
+            .save(&Session::from_token("new-token"))
+            .expect("fallback save succeeds even though primary failed");
+
+        // The stale primary entry must have been invalidated, not merely left in place —
+        // otherwise a later reachable primary would keep serving it forever (finding S2).
+        assert!(
+            !inner_primary.load().expect("load never fails").is_valid(),
+            "a failed primary save must clear whatever primary was still holding"
+        );
+
+        // A subsequent chained load must not resurrect the stale primary credential: with
+        // primary now empty, it must fall through to fallback and return the newer session.
+        let loaded = chained.load().expect("load never fails");
+        assert_eq!(
+            loaded.expose_token(),
+            "new-token",
+            "load must never resurrect a credential a later write superseded"
+        );
+    }
+
     // ===================== clear =====================
 
     #[test]
-    fn clear_clears_both_backends() {
+    fn clear_succeeds_only_when_both_backends_succeed() {
         let primary = store(Some("primary-token"));
         let fallback = store(Some("fallback-token"));
 
@@ -404,25 +535,46 @@ mod tests {
     }
 
     #[test]
-    fn clear_succeeds_if_only_one_backend_fails() {
+    fn clear_attempts_both_backends_and_fails_when_only_primary_fails() {
         let primary: Arc<dyn CredentialStore> = Arc::new(AlwaysFailsStore);
         let fallback = store(Some("fallback-token"));
 
         let chained = ChainedStore::new(primary, Arc::clone(&fallback) as _);
-        chained
+        let err = chained
             .clear()
-            .expect("clearing is as thorough as possible: one success is enough");
+            .expect_err("a caller destroying a credential must see that a copy survived (S1)");
+        assert!(
+            matches!(err, StorageError::Backend { ref backend, .. } if backend == "chained-primary")
+        );
 
+        // Fallback must still have been attempted (and succeeded) despite primary failing.
         assert!(!fallback.load().expect("load never fails").is_valid());
     }
 
     #[test]
-    fn clear_returns_error_only_when_both_backends_fail() {
+    fn clear_attempts_both_backends_and_fails_when_only_fallback_fails() {
+        let primary = store(Some("primary-token"));
+        let fallback: Arc<dyn CredentialStore> = Arc::new(AlwaysFailsStore);
+
+        let chained = ChainedStore::new(Arc::clone(&primary) as _, fallback);
+        let err = chained
+            .clear()
+            .expect_err("a caller destroying a credential must see that a copy survived (S1)");
+        assert!(
+            matches!(err, StorageError::Backend { ref backend, .. } if backend == "chained-fallback")
+        );
+
+        // Primary must still have been attempted (and succeeded) despite fallback failing.
+        assert!(!primary.load().expect("load never fails").is_valid());
+    }
+
+    #[test]
+    fn clear_fails_when_both_backends_fail() {
         let primary: Arc<dyn CredentialStore> = Arc::new(AlwaysFailsStore);
         let fallback: Arc<dyn CredentialStore> = Arc::new(AlwaysFailsStore);
 
         let chained = ChainedStore::new(primary, fallback);
         let err = chained.clear().expect_err("both backends failed");
-        assert!(matches!(err, StorageError::Backend { .. }));
+        assert!(matches!(err, StorageError::Backend { ref backend, .. } if backend == "chained"));
     }
 }

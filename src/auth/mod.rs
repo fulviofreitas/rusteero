@@ -11,12 +11,12 @@ pub use session::Session;
 
 use std::sync::Arc;
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::envelope::Envelope;
-use crate::error::Error;
+use crate::error::{Error, StorageError};
 use crate::routes;
-use crate::transport::Transport;
+use crate::transport::{StorageFailures, Transport};
 
 /// The exact validation message Python raises for an empty token
 /// (`exceptions.py:85`, called with `("token", "must be a non-empty string")` at
@@ -107,10 +107,22 @@ impl AuthApi {
     ///
     /// Propagates whatever [`Transport::send`] produces, including
     /// `Error::Authentication("Not authenticated")` if no valid session is configured, before any
-    /// network call is made. A failure to persist the cleared session to the configured
-    /// credential store is logged at `WARN` and never returned from here, and never masks the
-    /// network outcome (decision D-13): the in-memory session is always cleared regardless of
-    /// whether persistence succeeds.
+    /// network call is made. The in-memory session is always cleared regardless of the network
+    /// outcome or of whether persisting that clear succeeds (decision D-13) — but what this
+    /// method *returns* when persistence fails now depends on the configured
+    /// [`crate::transport::StorageFailures`] policy (security finding T2, fixed after a review
+    /// found the previous version silently discarded a `Fatal`-policy storage failure here,
+    /// leaving an operator who explicitly opted into "storage failures are fatal" with no
+    /// programmatic way to learn the at-rest copy still held the old session):
+    ///
+    /// - If the network call succeeded but the configured store failed to persist the clear
+    ///   under [`crate::transport::StorageFailures::Fatal`], this returns that `Error::Storage`
+    ///   instead of the network `Ok`.
+    /// - If the network call itself failed, that error is always what is returned — even if the
+    ///   storage cleanup also failed under `Fatal` — since it is the more actionable failure and
+    ///   the storage failure is already logged by this method's internal cleanup helper.
+    /// - Under the default [`crate::transport::StorageFailures::Warn`], a storage failure never
+    ///   changes what this method returns, matching the previous behaviour exactly.
     pub async fn logout(&self) -> Result<Envelope, Error> {
         let outcome = self
             .transport
@@ -121,9 +133,18 @@ impl AuthApi {
         // citation. Clear the in-memory session and persist that clear unconditionally, on every
         // outcome, rather than reproducing Python's exception-hierarchy gap that skips cleanup on
         // a 429 or a network failure.
-        self.clear_local_and_store_warn_only().await;
+        let cleanup = self.clear_local_and_store().await;
 
-        outcome
+        match (outcome, cleanup) {
+            (Ok(envelope), Ok(())) => Ok(envelope),
+            // Security finding T2: a successful logout call must not hide a `Fatal`-policy
+            // storage failure — see this method's doc comment.
+            (Ok(_), Err(storage_err)) => Err(storage_err),
+            // The network/auth outcome is the more actionable failure; return it even if the
+            // storage cleanup also failed (already logged by `clear_local_and_store`) rather than
+            // masking the reason the request itself failed with a storage error.
+            (Err(network_err), Ok(()) | Err(_)) => Err(network_err),
+        }
     }
 
     /// Attempts to refresh the current session.
@@ -200,7 +221,7 @@ impl AuthApi {
         }
         let current = self.transport.session();
         let session =
-            session_preserving_refresh_token(&Session::from_token(token), current.as_ref())?;
+            session_preserving_refresh_token(&Session::from_token(token), current.as_ref());
         self.transport.set_session(Some(session))
     }
 
@@ -218,7 +239,7 @@ impl AuthApi {
     /// the in-memory session is updated regardless (see [`Transport::set_session`]'s docs).
     pub fn clear_session_token(&self) -> Result<(), Error> {
         let current = self.transport.session();
-        let cleared = session_preserving_refresh_token(&Session::empty(), current.as_ref())?;
+        let cleared = session_preserving_refresh_token(&Session::empty(), current.as_ref());
         self.transport.set_session(Some(cleared))
     }
 
@@ -247,27 +268,62 @@ impl AuthApi {
     /// synchronous (see `crate::storage`'s docs) — used only by [`AuthApi::logout`]'s
     /// unconditional cleanup.
     ///
-    /// A failure to persist is logged at `WARN` and never propagated: per decision D-13, a store
-    /// failure must never mask the outcome of the network call that triggered this cleanup. This
-    /// mirrors [`Transport::refresh_session`]'s own `persist_warn_only` helper.
-    async fn clear_local_and_store_warn_only(&self) {
+    /// Honours this transport's configured [`StorageFailures`] policy (decision D-13, security
+    /// finding T2): under the default [`StorageFailures::Warn`], a persistence failure —
+    /// including the blocking task itself panicking or being cancelled — is logged at `WARN` and
+    /// this returns `Ok(())`, matching [`Transport::set_session`]'s own contract exactly; under
+    /// [`StorageFailures::Fatal`], the failure is returned as `Error::Storage` instead, so a
+    /// caller who explicitly opted into "storage failures are fatal" can actually learn the
+    /// at-rest copy was not overwritten. Either way, the in-memory session is cleared
+    /// unconditionally and immediately — [`Transport::set_session`]'s own in-memory-first
+    /// ordering guarantee (security finding T4) already covers that half; this method never
+    /// weakens it.
+    ///
+    /// # Errors
+    ///
+    /// See above: only returns `Err` under [`StorageFailures::Fatal`].
+    async fn clear_local_and_store(&self) -> Result<(), Error> {
         let transport = Arc::clone(&self.transport);
         match tokio::task::spawn_blocking(move || transport.set_session(Some(Session::empty())))
             .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, "failed to persist cleared session to credential store");
-            }
+            Ok(result) => result,
             Err(join_err) => {
-                tracing::warn!(error = %join_err, "credential store task panicked");
+                // Security finding T3: `JoinError`'s `Display` *and* `Debug` can carry a
+                // panicking task's payload verbatim in the tokio version this crate pins
+                // (1.53.1's `runtime::task::error` renders `task {id} panicked with message
+                // {panic_str:?}` for both — this is not a "Display only" hazard).
+                // `CredentialStore` is a public, pluggable trait, so a third-party backend that
+                // panics (e.g. via `unwrap()`/`expect()`) on a value derived from the session it
+                // was asked to persist could leak that text through this join error. Only
+                // `is_panic()`/`is_cancelled()`/`id()` are ever read below — never `join_err`
+                // itself, in any format.
+                let message = format!(
+                    "blocking session-clear task {} failed: panicked={}, cancelled={}",
+                    join_err.id(),
+                    join_err.is_panic(),
+                    join_err.is_cancelled()
+                );
+                match self.transport.storage_failures() {
+                    StorageFailures::Warn => {
+                        tracing::warn!(
+                            detail = %message,
+                            "credential store task panicked or was cancelled"
+                        );
+                        Ok(())
+                    }
+                    StorageFailures::Fatal => Err(Error::Storage(StorageError::Backend {
+                        backend: "credential-store-task".to_owned(),
+                        message,
+                    })),
+                }
             }
         }
     }
 }
 
-/// Splices `current`'s refresh token (if any) into `base`'s serialized form, producing a session
-/// that combines `base`'s token/expiry with `current`'s preserved refresh token.
+/// Splices `current`'s refresh token (if any) into `base`, producing a session that combines
+/// `base`'s token/expiry with `current`'s preserved refresh token.
 ///
 /// Shared by [`AuthApi::set_session_token`] (`base` is a fresh [`Session::from_token`],
 /// `auth.py:411-413` never touches `refresh_token`) and [`AuthApi::clear_session_token`] (`base`
@@ -275,24 +331,16 @@ impl AuthApi {
 /// `auth.py:427-428`: only `session_id` and `session_expiry` are reset) — both Python methods
 /// leave `refresh_token` untouched, just with a different `base`.
 ///
-/// Goes through the same crate-internal JSON wire round trip (`Session::to_json`, `pub(crate)`
-/// per finding F7) `crate::transport`'s `build_refreshed_session` uses, for the same reason:
-/// [`session::StoredSession`]'s fields are private to the `session` module, so a session with a
-/// *specific* combination of `base`'s fields and a preserved refresh token cannot be assembled by
-/// touching private state from here.
-fn session_preserving_refresh_token(
-    base: &Session,
-    current: Option<&Session>,
-) -> Result<Session, Error> {
-    let refresh_token = current
-        .and_then(Session::expose_refresh_token)
-        .map(str::to_owned);
-    let mut value: Value = serde_json::from_str(&base.to_json()?)?;
-    value["refresh_token"] = match refresh_token {
-        Some(rt) => Value::String(rt),
-        None => Value::Null,
-    };
-    Ok(Session::from_json(&value.to_string())?)
+/// Defers to [`Session::with_refresh_token`] (security finding T5), which builds the result
+/// directly from one [`session::StoredSession`] to another and is infallible — this function used
+/// to round-trip through [`Session::to_json`]/[`Session::from_json`] and a mutated
+/// `serde_json::Value` instead, the same pattern `crate::transport::build_refreshed_session` used
+/// to share, for the same underlying reason: [`session::StoredSession`]'s fields are private to
+/// the `session` module, so a session with a *specific* combination of `base`'s fields and a
+/// preserved refresh token cannot be assembled by touching private state from here.
+fn session_preserving_refresh_token(base: &Session, current: Option<&Session>) -> Session {
+    let refresh_token = current.and_then(Session::expose_refresh_token);
+    Session::with_refresh_token(base, refresh_token)
 }
 
 #[cfg(test)]
@@ -302,9 +350,9 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::AuthApi;
-    use crate::error::Error;
+    use crate::error::{Error, StorageError};
     use crate::storage::{CredentialStore, MemoryStore};
-    use crate::transport::Transport;
+    use crate::transport::{StorageFailures, Transport};
 
     use super::Session;
 
@@ -506,5 +554,177 @@ mod tests {
             persisted.refresh_token().is_none(),
             "logout's cleanup clears the refresh token too (clear_all(), auth.py:270)"
         );
+    }
+
+    // ===================== logout under StorageFailures::Fatal (security finding T2) =====================
+
+    /// A [`CredentialStore`] whose `save`/`clear` always fail, for pinning security finding T2:
+    /// `logout()` must surface a `Fatal`-policy storage failure instead of silently returning the
+    /// network `Ok` while the at-rest copy still holds the old session.
+    #[derive(Debug)]
+    struct AlwaysFailingStore;
+
+    impl CredentialStore for AlwaysFailingStore {
+        fn load(&self) -> Result<Session, StorageError> {
+            Ok(Session::empty())
+        }
+
+        fn save(&self, _session: &Session) -> Result<(), StorageError> {
+            Err(StorageError::Backend {
+                backend: "always-failing-test-store".to_owned(),
+                message: "deliberate failure".to_owned(),
+            })
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            Err(StorageError::Backend {
+                backend: "always-failing-test-store".to_owned(),
+                message: "deliberate failure".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_under_fatal_policy_surfaces_a_storage_failure_instead_of_hiding_it() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/2.2/logout"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"{"meta":{"code":200},"data":{}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
+        let transport = Transport::builder()
+            .base_url(server.uri())
+            .session(Some(session_with_refresh_token()))
+            .store(Some(store))
+            .storage_failures(StorageFailures::Fatal)
+            .build()
+            .expect("builds with a session, a failing store, and Fatal policy");
+        let auth = AuthApi::new(transport);
+
+        let err = auth.logout().await.expect_err(
+            "Fatal policy must surface the store's failure even though the network call succeeded",
+        );
+        assert!(matches!(err, Error::Storage(_)));
+
+        // The other half of finding T2: the in-memory session must still be cleared
+        // unconditionally, exactly as under the default Warn policy.
+        assert!(
+            !auth.is_authenticated(),
+            "in-memory session must be cleared even though persisting the clear failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_under_default_warn_policy_still_returns_the_network_outcome_when_storage_fails()
+    {
+        // No `.storage_failures(..)` call: exercises the default, `StorageFailures::Warn` — the
+        // sibling of the `Fatal` test above, pinning that Warn's observable behaviour is
+        // unchanged by the T2 fix.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/2.2/logout"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"{"meta":{"code":200},"data":{}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
+        let transport = Transport::builder()
+            .base_url(server.uri())
+            .session(Some(session_with_refresh_token()))
+            .store(Some(store))
+            .build()
+            .expect("builds with a session and a failing store");
+        let auth = AuthApi::new(transport);
+
+        auth.logout().await.expect(
+            "the default Warn policy swallows the store failure and returns the network Ok",
+        );
+
+        assert!(
+            !auth.is_authenticated(),
+            "in-memory session must be cleared regardless of the store's outcome"
+        );
+    }
+
+    // ===================== clear_local_and_store JoinError handling (security finding T3) =====================
+
+    /// A [`CredentialStore`] whose `save`/`clear` panic with a distinctive, credential-shaped
+    /// payload, isolating the `JoinError` branch of `AuthApi::clear_local_and_store` (security
+    /// finding T3) from an ordinary `Err` returned by the store itself (`AlwaysFailingStore`,
+    /// above).
+    #[derive(Debug)]
+    struct PanickingStore;
+
+    impl CredentialStore for PanickingStore {
+        fn load(&self) -> Result<Session, StorageError> {
+            Ok(Session::empty())
+        }
+
+        fn save(&self, _session: &Session) -> Result<(), StorageError> {
+            panic!("session_token=leaked-secret-should-never-appear-anywhere");
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            panic!("session_token=leaked-secret-should-never-appear-anywhere");
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_local_and_store_under_fatal_never_leaks_the_panic_payload_and_still_clears_memory()
+     {
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingStore);
+        let transport = Transport::builder()
+            .session(Some(Session::from_token("tok-123")))
+            .store(Some(store))
+            .storage_failures(StorageFailures::Fatal)
+            .build()
+            .expect("builds with a panicking store");
+        let auth = AuthApi::new(transport);
+
+        let err = auth
+            .clear_local_and_store()
+            .await
+            .expect_err("Fatal policy surfaces the panicked task as an error");
+        assert!(matches!(err, Error::Storage(_)));
+
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains("leaked-secret") && !debug.contains("leaked-secret"),
+            "the join error's own Display/Debug must never reach the returned error (T3): \
+             display={display:?} debug={debug:?}"
+        );
+
+        assert!(
+            !auth.is_authenticated(),
+            "the in-memory session must be cleared even though the backend panicked"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_local_and_store_under_warn_swallows_the_panic_and_still_clears_memory() {
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingStore);
+        let transport = Transport::builder()
+            .session(Some(Session::from_token("tok-123")))
+            .store(Some(store))
+            .build()
+            .expect("builds with a panicking store");
+        let auth = AuthApi::new(transport);
+
+        auth.clear_local_and_store()
+            .await
+            .expect("the default Warn policy swallows the panicked task and returns Ok");
+
+        assert!(!auth.is_authenticated());
     }
 }

@@ -119,22 +119,29 @@ impl Transport {
         // Security finding F3: the in-memory session must update *before* this method returns,
         // and unconditionally of the store's outcome — `AuthApi::logout`/`clear_auth_data`/
         // `clear_session_token`'s own docs, and this method's own doc comment above, promise
-        // exactly that. Persisting first and `?`-returning on failure would leave a live token
-        // in memory whenever the configured store errors (routine for a keyring backend on a
-        // headless host), even though the caller was told the in-memory session no longer holds
-        // it. `store.save`/`store.clear` only need a borrow, so `session` is computed against
-        // first and *then* moved into `replace_session` on every path — including the failure
-        // path, which is only inspected (and possibly turned into an `Err`) after the move. This
-        // ordering is identical under either `StorageFailures` policy.
+        // exactly that.
+        //
+        // Security finding T4: the in-memory update must also land *before* the (potentially
+        // slow or hung) blocking store call even starts, not merely before this method returns.
+        // A hung Secret Service / D-Bus call or a slow fsync must not leave a stale token
+        // observable via `is_authenticated()`/`session()` — or attached as `Cookie: s=<old
+        // token>` by a concurrent in-flight request — for the duration of that call. `session`
+        // is cloned once up front purely so the store call below still has an owned/borrowed
+        // value to work with after the original is moved into `replace_session`; the clone
+        // itself is not the fix, the *ordering* is: `replace_session` now runs strictly before
+        // `store.save`/`store.clear`, on every path, including the failure path, which is only
+        // inspected (and possibly turned into an `Err`) afterwards. This ordering is identical
+        // under either `StorageFailures` policy.
         let Some(store) = &self.store else {
             self.replace_session(session);
             return Ok(());
         };
-        let result = match &session {
+        let for_store = session.clone();
+        self.replace_session(session);
+        let result = match &for_store {
             Some(s) => store.save(s),
             None => store.clear(),
         };
-        self.replace_session(session);
         match result {
             Ok(()) => Ok(()),
             Err(err) => match self.storage_failures {
@@ -155,6 +162,18 @@ impl Transport {
     pub fn is_authenticated(&self) -> bool {
         self.session_snapshot()
             .is_some_and(|session| session.is_valid())
+    }
+
+    /// This transport's configured [`StorageFailures`] policy.
+    ///
+    /// `pub(crate)`: the only consumer outside this module is `auth::AuthApi`'s own
+    /// spawn-blocking cleanup helper (security finding T2), which needs to apply the *same*
+    /// policy to a `JoinError` from the blocking task itself (a failure `set_session`'s own
+    /// internal branching never sees, since it happens one layer up) as `set_session` already
+    /// applies to an ordinary store error.
+    #[must_use]
+    pub(crate) fn storage_failures(&self) -> StorageFailures {
+        self.storage_failures
     }
 
     /// Sends an authenticated request with no query-string parameters. Equivalent to
@@ -351,7 +370,7 @@ impl Transport {
                     };
                     let new_refresh_token =
                         data.get(consts::REFRESH_TOKEN_KEY).and_then(Value::as_str);
-                    let refreshed = build_refreshed_session(new_token, new_refresh_token)?;
+                    let refreshed = build_refreshed_session(new_token, new_refresh_token);
                     self.replace_session(Some(refreshed.clone()));
                     self.persist_session(&refreshed).await?;
                     return Ok(true);
@@ -834,23 +853,16 @@ fn map_reqwest_error(err: reqwest::Error) -> Error {
 ///
 /// `auth::session`'s on-disk representation type keeps its fields private to that module by
 /// design (decision D-5's wire-format guarantee), so a session with *both* a fresh token and a
-/// fresh refresh token cannot be assembled by touching private state from here. Instead this
-/// round-trips through the same crate-internal JSON wire contract `Session::to_json`
-/// (`pub(crate)`, finding F7) / `Session::from_json` use for storage: fabricate a token-only
-/// session (which computes the correct expiry), splice the refresh token into its serialized
-/// form, then re-parse. This never reaches into a private field, and stays inside `Session`'s
-/// contract because `transport` and `session` are both part of this same crate.
-fn build_refreshed_session(
-    new_token: &str,
-    new_refresh_token: Option<&str>,
-) -> Result<Session, Error> {
+/// fresh refresh token cannot be assembled by touching private state from here. This defers to
+/// `Session::with_refresh_token` for the splice — see that method's docs (security finding T5)
+/// for why it no longer round-trips through `Session::to_json`/`Session::from_json` and a
+/// `serde_json::Value` the way this function used to: each hop in that chain was an un-zeroized
+/// plaintext copy of the token, and the direct `StoredSession`-to-`StoredSession` splice
+/// `with_refresh_token` performs instead is also infallible, which is why this function no
+/// longer returns a `Result`.
+fn build_refreshed_session(new_token: &str, new_refresh_token: Option<&str>) -> Session {
     let base = Session::from_token(new_token);
-    let mut value: Value = serde_json::from_str(&base.to_json()?)?;
-    value["refresh_token"] = match new_refresh_token {
-        Some(rt) => Value::String(rt.to_owned()),
-        None => Value::Null,
-    };
-    Ok(Session::from_json(&value.to_string())?)
+    Session::with_refresh_token(&base, new_refresh_token)
 }
 
 /// Parses a base URL string into a `Url` validated to be usable as a path base (i.e.
@@ -1197,32 +1209,47 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    /// Fails the Explore verification's "a test that cannot fail" finding: the previous version
-    /// of this test never called `refresh_session` and never reached the `tracing::error!` call
-    /// site at all — it asserted on a bare `u16` it had constructed itself. This version drives
-    /// `refresh_session` for real, over a local mock server, down its `Err(Error::Api)` arm with
-    /// a credential-carrying malformed 200 body, and inspects the *actual* captured tracing
-    /// output via [`FieldCapturingSubscriber`].
+    /// Security finding T1 (this is the *second* time this test was found to be unable to
+    /// fail): the previous fixture drove a malformed **2xx** body containing the substring
+    /// `"token"` through `refresh_session`'s invalid-JSON-on-2xx arm. That arm builds its
+    /// `Error::Api.message` via `status_to_envelope` -> `error::sanitize_body_for_error`, whose
+    /// `looks_sensitive` fallback (triggered because the raw text cannot be parsed as JSON, and
+    /// contains `"token"`) replaces the *entire* body with a fixed, credential-free marker
+    /// string before `refresh_session`'s `tracing::error!(status, ...)` call site is even
+    /// reached — so the credential was already gone regardless of whether that call site logs
+    /// `message`. Re-adding `message = %message` there would still pass every assertion the old
+    /// test made.
+    ///
+    /// This version drives a **non-2xx** response whose credential-shaped value sits under a
+    /// **non-sensitive** JSON key (`"detail"`, which contains none of
+    /// [`crate::redact::redact_sensitive`]'s substring markers), so the value survives
+    /// `sanitize_body_for_error` intact and lands verbatim in `Error::Api.message`. The sanity
+    /// assertion below proves that premise directly against `sanitize_body_for_error` itself,
+    /// *before* the network round trip even runs: if a future change to redaction ever makes
+    /// this fixture stop surviving sanitisation, this test fails loudly there instead of quietly
+    /// stopping to test anything, which is exactly how the previous version regressed unnoticed.
+    /// The only thing left standing between the credential and the log line, in this version, is
+    /// that `refresh_session`'s `tracing::error!` call logs `status` only — never `message`.
     #[tokio::test]
     async fn refresh_failure_log_field_never_carries_the_response_body() {
-        // Deliberately truncated / malformed: reproduces the exact body a cut-off response from
-        // `login/refresh` or `account/refresh` would produce, legitimately carrying
-        // `data.session_token`/`data.refresh_token` — a live credential — inside an `Error::Api`
-        // that `status_to_envelope`'s invalid-JSON-on-2xx arm constructs.
-        let credential_carrying_body = concat!(
-            r#"{"meta":{"code":200},"data":{"session_token":"eyJsecret-session-value","#,
-            r#""refresh_token":"eyJsecret-refresh-value"#,
+        let credential_carrying_body = r#"{"detail":"eyJsecret-refresh-value-must-never-log"}"#;
+        assert!(
+            serde_json::from_str::<serde_json::Value>(credential_carrying_body).is_ok(),
+            "sanity: the fixture must be well-formed JSON, so it reaches the generic non-2xx \
+             arm (not the invalid-JSON arm, which has its own, stronger fallback redaction)"
         );
         assert!(
-            serde_json::from_str::<serde_json::Value>(credential_carrying_body).is_err(),
-            "sanity: the fixture must actually be malformed JSON, matching the real hazard"
+            crate::error::sanitize_body_for_error(credential_carrying_body)
+                .contains("eyJsecret-refresh-value-must-never-log"),
+            "sanity: this fixture's credential must survive sanitisation under a non-sensitive \
+             key, or this test proves nothing about the tracing::error! call site itself"
         );
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/2.2/login/refresh"))
             .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_string(credential_carrying_body),
+                wiremock::ResponseTemplate::new(500).set_body_string(credential_carrying_body),
             )
             .expect(1)
             .mount(&server)
@@ -1250,7 +1277,7 @@ mod tests {
         };
         assert!(
             !refreshed,
-            "a malformed refresh response must not be reported as a successful refresh"
+            "a failed refresh response must not be reported as a successful refresh"
         );
 
         let logged = captured
@@ -1261,8 +1288,10 @@ mod tests {
             !logged.contains("eyJsecret"),
             "logged fields leaked the credential-carrying body: {logged}"
         );
-        assert!(!logged.contains("session-value"), "logged: {logged}");
-        assert!(!logged.contains("refresh-value"), "logged: {logged}");
+        assert!(
+            !logged.contains("refresh-value-must-never-log"),
+            "logged: {logged}"
+        );
     }
 
     // ===================== refresh_signal_detected =====================

@@ -219,20 +219,65 @@ mod tests {
         assert!(debug.contains("acct"));
     }
 
-    // ===================== behaviour without a working keyring backend =====================
+    // ===================== behaviour without a *reachable* keyring backend =====================
     //
-    // There is no Secret Service, Keychain, or Credential Manager reachable in the container
-    // this crate is developed and CI'd in (`DBUS_SESSION_BUS_ADDRESS=disabled:` in this
-    // container; CI runners are headless Linux with no D-Bus session bus at all). These tests
-    // pin the actual, observed behaviour on such a machine: opening an `Entry` and calling
-    // `load`/`save`/`clear` on it fails fast with a `StorageError::Backend` (backend name
-    // `"keyring"`, a non-empty message, never a credential value) rather than panicking or
-    // hanging — never a silently-empty session, since that would hide a real backend outage
-    // from `ChainedStore`, unlike the Python behaviour this module deliberately diverges from
-    // (see `CredentialStore::load`'s doc comment above).
+    // Corrected justification (phase-2 storage review, finding S5): the previous comment here
+    // claimed "CI runners are headless Linux with no D-Bus session bus at all" as a blanket
+    // justification for expecting every one of these tests to fail fast with a typed error.
+    // That is false for 2 of the 3 runners in `ci.yml`'s matrix (`ubuntu-latest`, `macos-latest`,
+    // `windows-latest`): `keyring` 4.2's default `v1` feature registers
+    // `apple_native_keyring_store::keychain::Store::new()` on macOS — an **infallible**
+    // constructor — and an analogous native, generally-available Windows Credential Manager
+    // backend on Windows. On those two platforms `Entry::new()` always succeeds and
+    // `get_password`/`set_password`/`delete_credential` talk to a *real*, working credential
+    // store; only on Linux (this container, and — as far as this crate can verify — ordinary
+    // `ubuntu-latest` runners, which have no desktop session, D-Bus session bus, or Secret
+    // Service running) does the backend construction/call itself fail.
+    //
+    // What this container actually does: `DBUS_SESSION_BUS_ADDRESS=disabled:` — there is no
+    // Secret Service reachable at all, so `KeyringStore::entry()` fails before any
+    // `get_password`/`set_password`/`delete_credential` call is even attempted, and every method
+    // below returns `StorageError::Backend` immediately.
+    //
+    // What is expected on each `ci.yml` runner:
+    //   - `ubuntu-latest`: same as this container — no D-Bus session bus, so `Entry::new()`
+    //     fails and every method returns `StorageError::Backend`.
+    //   - `macos-latest` / `windows-latest`: a real, working native backend is reachable, so
+    //     `load`/`save`/`clear` against a service/account pair that has never been used before
+    //     succeed for real, exactly as they would for an end user's own credential.
+    //
+    // The tests below therefore assert only the property that holds on *every* platform (never
+    // panics, and either a clean `StorageError` or an outcome indistinguishable from "nothing
+    // stored"), with the stronger, machine-specific assertion gated behind
+    // `#[cfg(target_os = "linux")]`. `save` additionally guarantees it never leaves a credential
+    // behind on a host that does have a genuinely working backend — see its own test's doc
+    // comment for how.
 
     #[test]
-    fn load_without_a_working_backend_fails_cleanly_with_no_credential_in_the_message() {
+    fn load_never_panics_and_never_fabricates_a_valid_session() {
+        let store = KeyringStore::with_entry(
+            "rusteero-test-service-no-backend",
+            "rusteero-test-account-no-backend",
+        );
+        match store.load() {
+            // Reachable on macOS/Windows CI runners (infallible native backend, never-used
+            // entry) and also possible on Linux if `Entry::new()` succeeds but the entry is
+            // simply absent.
+            Ok(session) => assert!(!session.is_valid()),
+            Err(StorageError::Backend { backend, message }) => {
+                assert_eq!(backend, BACKEND_NAME);
+                assert!(!message.is_empty());
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// Stronger assertion for the one environment this crate is actually developed and CI'd
+    /// against with no reachable backend at all: Linux with no D-Bus session bus (see this
+    /// section's corrected comment above for why this is Linux-only, not "every CI runner").
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_without_a_dbus_session_bus_fails_cleanly_with_no_credential_in_the_message() {
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
             "rusteero-test-account-no-backend",
@@ -243,13 +288,55 @@ mod tests {
                 assert!(!message.is_empty());
             }
             other => panic!(
-                "expected StorageError::Backend on a machine with no keyring backend, got {other:?}"
+                "expected StorageError::Backend on Linux with no D-Bus session bus, got {other:?}"
             ),
         }
     }
 
+    /// Removes whatever [`KeyringStore::with_entry`]'s test-only service/account pair may hold,
+    /// on drop — including when a later assertion panics. Exists so tests that call
+    /// [`CredentialStore::save`] against this entry can never leave a real credential behind on
+    /// a host with a genuinely working native backend (macOS Keychain, Windows Credential
+    /// Manager), per finding S5's requirement that a test must never leave a credential behind.
+    struct ClearEntryOnDrop<'a>(&'a KeyringStore);
+
+    impl Drop for ClearEntryOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.clear();
+        }
+    }
+
     #[test]
-    fn save_without_a_working_backend_fails_cleanly_with_no_credential_in_the_message() {
+    fn save_never_leaves_a_credential_behind_on_any_platform() {
+        let store = KeyringStore::with_entry(
+            "rusteero-test-service-no-backend",
+            "rusteero-test-account-no-backend",
+        );
+        // Constructed before the save so it is armed regardless of which branch below runs,
+        // and so an assertion failure inside this test still triggers the cleanup.
+        let _cleanup = ClearEntryOnDrop(&store);
+
+        let session = Session::from_token("should-never-appear-in-any-error-message");
+        match store.save(&session) {
+            // Reachable on macOS/Windows CI runners: the write itself is not the bug this
+            // finding is about (a genuinely working backend doing genuine work is correct
+            // behaviour) — only leaving it behind afterwards would be, and `_cleanup` above
+            // removes it unconditionally when this test returns.
+            Ok(()) => {}
+            Err(StorageError::Backend { backend, message }) => {
+                assert_eq!(backend, BACKEND_NAME);
+                assert!(!message.contains("should-never-appear-in-any-error-message"));
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// Stronger assertion for Linux with no D-Bus session bus — see this section's corrected
+    /// comment above. Needs no cleanup guard: on this platform the save never succeeds, so there
+    /// is never anything to remove.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_without_a_dbus_session_bus_fails_cleanly_with_no_credential_in_the_message() {
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
             "rusteero-test-account-no-backend",
@@ -261,7 +348,7 @@ mod tests {
                 assert!(!message.contains("should-never-appear-in-any-error-message"));
             }
             other => panic!(
-                "expected StorageError::Backend on a machine with no keyring backend, got {other:?}"
+                "expected StorageError::Backend on Linux with no D-Bus session bus, got {other:?}"
             ),
         }
     }
@@ -272,7 +359,8 @@ mod tests {
         // here depending on how the platform store reports "not available" vs. "not found"; the
         // one thing that must never happen is a panic, and the one thing a genuine backend
         // failure must never do is print a credential (there is none passed to `clear`, but the
-        // message must still be checked for shape).
+        // message must still be checked for shape). This is also exactly the outcome expected
+        // on macOS/Windows CI runners, where the entry genuinely does not exist yet.
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
             "rusteero-test-account-no-backend",
