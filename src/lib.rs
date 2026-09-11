@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod auth;
 pub mod consts;
 pub mod endpoints;
@@ -28,6 +29,18 @@ pub mod routes;
 pub mod storage;
 pub mod transport;
 pub mod util;
+
+// Crate-root re-exports, so a consumer can write `use rusteero::{EeroApi, Envelope, Error,
+// Session};` without reaching into individual modules. These are additive: every module above
+// stays `pub` in its own right (e.g. `rusteero::auth::Session` and `rusteero::endpoints::*`
+// still work) — nothing here is hidden behind the flat re-export surface.
+pub use api::EeroApi;
+pub use auth::Session;
+pub use envelope::{Envelope, Meta};
+pub use error::{Error, StorageError};
+#[cfg(feature = "keyring")]
+pub use storage::KeyringStore;
+pub use storage::{ChainedStore, CredentialStore, FileStore, MemoryStore};
 
 /// Crate version, as compiled from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -30,8 +30,11 @@ const EMPTY_TOKEN_MESSAGE: &str = "must be a non-empty string";
 /// Build one with [`AuthApi::new`], wrapping any already-configured [`Transport`] — the same
 /// `Transport` a [`flow::LoginFlow`] can be pointed at, so a `Session` obtained from
 /// [`flow::PendingLogin::verify`] and handed to `Transport::set_session` is immediately usable
-/// here too. `AuthApi` holds the `Transport` behind an `Arc` internally so that
-/// [`AuthApi::logout`] can move a handle onto a `tokio::task::spawn_blocking` task for its
+/// here too. Use [`AuthApi::from_shared`] instead when the caller already holds an `Arc<Transport>`
+/// it needs to keep sharing with other consumers (e.g. the `EeroApi` aggregator's 25 domain
+/// modules) — both constructors produce an `AuthApi` backed by the exact same allocation the
+/// caller passed in, never a copy. `AuthApi` holds the `Transport` behind an `Arc` internally so
+/// that [`AuthApi::logout`] can move a handle onto a `tokio::task::spawn_blocking` task for its
 /// credential-store write without requiring `Transport` itself to be `Clone`.
 #[derive(Debug)]
 pub struct AuthApi {
@@ -39,17 +42,30 @@ pub struct AuthApi {
 }
 
 impl AuthApi {
-    /// Wraps `transport` as an `AuthApi`.
+    /// Wraps `transport` as an `AuthApi`, allocating a new `Arc` around it.
+    ///
+    /// For a `Transport` that must also be shared with other consumers (so that, e.g., `logout`
+    /// actually affects the session everyone else observes), build the `Arc<Transport>` once and
+    /// use [`AuthApi::from_shared`] instead.
     #[must_use]
     pub fn new(transport: Transport) -> Self {
-        Self {
-            transport: Arc::new(transport),
-        }
+        Self::from_shared(Arc::new(transport))
     }
 
-    /// Borrows the underlying [`Transport`], for callers (e.g. the not-yet-built `EeroApi`
-    /// aggregator, phase 3) that need to issue their own requests through the same transport this
-    /// `AuthApi` uses.
+    /// Wraps an already-shared `transport` as an `AuthApi`, without allocating a new `Arc`.
+    ///
+    /// This is the constructor every other endpoint module's own `XxxApi::new(Arc<Transport>)`
+    /// already uses; `AuthApi` gains it so that a caller holding one `Arc<Transport>` — the
+    /// `EeroApi` aggregator, in particular — can hand the very same allocation to `AuthApi` and
+    /// to every domain module, rather than being forced to give `AuthApi` a detached, separately
+    /// configured `Transport` that nothing else can observe.
+    #[must_use]
+    pub fn from_shared(transport: Arc<Transport>) -> Self {
+        Self { transport }
+    }
+
+    /// Borrows the underlying [`Transport`], for callers (e.g. the `EeroApi` aggregator) that
+    /// need to issue their own requests through the same transport this `AuthApi` uses.
     #[must_use]
     pub fn transport(&self) -> &Transport {
         &self.transport

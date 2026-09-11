@@ -29,3 +29,33 @@ pub mod support;
 pub mod thread;
 pub mod transfer;
 pub mod updates;
+
+// Re-exports so a consumer (and `crate::api`, the `EeroApi` aggregator) can write
+// `endpoints::NetworksApi` instead of `endpoints::networks::NetworksApi`. The `pub mod`
+// declarations above are kept as-is — these re-exports are additive, not a replacement for the
+// 1:1 file map this module's own docs describe.
+pub use ac_compat::ACCompatApi;
+pub use backup::BackupApi;
+pub use blacklist::BlacklistApi;
+pub use burst_reporters::BurstReportersApi;
+pub use data_usage::DataUsageApi;
+pub use devices::DevicesApi;
+pub use diagnostics::DiagnosticsApi;
+pub use dns::DnsApi;
+pub use eeros::EerosApi;
+pub use forwards::ForwardsApi;
+pub use insights::InsightsApi;
+pub use networks::NetworksApi;
+pub use ouicheck::OUICheckApi;
+pub use password::PasswordApi;
+pub use profiles::ProfilesApi;
+pub use reservations::ReservationsApi;
+pub use routing::RoutingApi;
+pub use schedule::ScheduleApi;
+pub use security::SecurityApi;
+pub use settings::SettingsApi;
+pub use sqm::SqmApi;
+pub use support::SupportApi;
+pub use thread::ThreadApi;
+pub use transfer::TransferApi;
+pub use updates::UpdatesApi;
