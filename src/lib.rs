@@ -20,6 +20,7 @@
 
 pub mod auth;
 pub mod consts;
+pub mod endpoints;
 pub mod envelope;
 pub mod error;
 pub mod redact;
