@@ -1,6 +1,6 @@
 //! P5 settings-mutation suite: the write halves of `NetworksApi`, `DnsApi`, `SecurityApi` and
 //! `SqmApi` (`src/endpoints/networks.rs`, `dns.rs`, `security.rs`, `sqm.rs`), all against a
-//! local `wiremock` server per `.claude/rules/testing.md`.
+//! local `wiremock` server per the crate's testing conventions.
 //!
 //! None of these four modules has a committed fixture for its write responses, so every
 //! response body here is a small, obviously-synthetic `{"meta": …, "data": …}` value built

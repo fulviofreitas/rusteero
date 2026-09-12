@@ -6,7 +6,7 @@
 //! The headline requirement this file exists to satisfy is the Phase 2 exit criterion: **"Storage
 //! format round-trips with a real eero-api cookies.json fixture."** `fixtures/cookies.json` and
 //! `fixtures/cookies_legacy.json` are not derived from this crate's own `Session`/`FileStore`
-//! code — their shape is taken from `.claude/tasks/briefs/const.md`'s line-cited behaviour brief
+//! code — their shape is taken from the const behaviour notes' line-cited behaviour brief
 //! for `eero-api`'s `AuthCredentials.to_dict()`/`from_dict()` (`auth_storage.py:50-80`), so a
 //! green test here is evidence this port can read what the Python library actually writes, not
 //! merely what this port itself writes.
@@ -33,7 +33,7 @@ use rusteero::transport::{StorageFailures, Transport};
 /// `cookies.json` inside `dir`, returning the new path.
 ///
 /// Every storage test in this file that needs a file on disk goes through this (or writes
-/// directly into a `tempfile::tempdir()`), per `.claude/rules/testing.md`'s "Never write outside
+/// directly into a `tempfile::tempdir()`), per the crate's testing conventions' "Never write outside
 /// a temp dir" rule — `FileStore` would happily overwrite the checked-in fixture itself if a test
 /// pointed it there directly.
 fn copy_fixture_into(dir: &Path, fixture_name: &str) -> PathBuf {
@@ -238,7 +238,7 @@ fn chained_store_save_falls_back_to_a_working_store_when_the_primary_directory_c
     // A regular file standing where the primary's parent directory would need to be created:
     // `fs::create_dir_all` on this path fails with a real `io::Error` — a genuine backend
     // failure, not a test double, exercising the documented divergence from `eero-api`
-    // (`.claude/tasks/briefs/const.md` §7, gotcha #7): unlike Python's `KeyringStorage.save()`,
+    // (the const behaviour notes §7, gotcha #7): unlike Python's `KeyringStorage.save()`,
     // which never raises, this port's stores can surface a real error, so `ChainedStore`'s
     // fallback branch actually activates instead of being dead code.
     let dir = tempfile::tempdir()?;
@@ -386,7 +386,7 @@ fn expired_session_loaded_from_a_store_leaves_a_transport_unauthenticated() -> a
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("cookies.json");
     // Mirrors the shape of eero-api's own `expired_session_data` test fixture
-    // (`.claude/tasks/briefs/const.md`, "Fixture payloads"), with a fixed past date instead of a
+    // (the const behaviour notes, "Fixture payloads"), with a fixed past date instead of a
     // wall-clock-relative one so this test can never become flaky.
     std::fs::write(
         &path,

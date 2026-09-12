@@ -2,7 +2,7 @@
 //! `fallback` backend.
 //!
 //! Ported from `ChainedStorage` (`eero-api`'s `src/eero/api/auth_storage.py:264-315`). See
-//! `rusteero-context/claude/tasks/briefs/const.md` §7 for the full line-cited behaviour brief
+//! the const behaviour notes §7 for the full line-cited behaviour brief
 //! this module implements, and the port plan §3.4 (decisions D-4, D-5) for the design
 //! rationale. The shipped Python configuration wraps a `KeyringStorage` primary around a
 //! `FileStorage` fallback (`auth_storage.py:318-344`'s `create_storage(use_keyring=True,

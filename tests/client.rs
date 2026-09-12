@@ -1,6 +1,6 @@
 //! P4 `Client` integration suite: the cache actually working end to end.
 //!
-//! Covers, against a local `wiremock` server per `.claude/rules/testing.md`: the eight cached
+//! Covers, against a local `wiremock` server per the crate's testing conventions: the eight cached
 //! getters serving a second call from cache; `refresh_cache`/`cache_ttl(Duration::ZERO)`
 //! bypassing that cache; TTL expiry (via `tokio::time::pause()`/`advance()`, never a real
 //! `sleep`); the falsy-value rule end to end (`src/cache.rs`'s `is_falsy` — a real Python quirk,
@@ -13,7 +13,7 @@
 //!
 //! Every caching test asserts on the wiremock `.expect(n)` call count, not just the returned
 //! value — a caching test that only checks the envelope is not testing caching at all (see
-//! `.claude/rules/testing.md`'s "Assertion Patterns"). Two tests below (`logout_...` and
+//! the crate's testing conventions' "Assertion Patterns"). Two tests below (`logout_...` and
 //! `clear_session_token_...`) restore a session directly at the `EeroApi` layer via
 //! [`Client::api`] rather than through `Client::set_session_token` — deliberately, so that
 //! restoring the ability to make a second request never itself clears the cache and masks a

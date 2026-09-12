@@ -234,7 +234,7 @@ impl ProfilesApi {
     /// (`profiles.py:201-217`) exactly, including the drop-not-reject behaviour for a *single*
     /// unrecognized key mixed in with valid ones — Python logs a warning and continues rather
     /// than raising, and so does this port (minus the log line; see
-    /// `.claude/rules/security-review.md` on this crate's logging discipline). Keys are otherwise
+    /// the crate's security guidelines on this crate's logging discipline). Keys are otherwise
     /// passed through in the order given, and duplicate keys keep `filters`' own last-write-wins
     /// order, matching Python's `dict` iteration.
     ///

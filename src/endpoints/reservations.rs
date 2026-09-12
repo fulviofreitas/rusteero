@@ -11,7 +11,7 @@
 //! below duplicates that guard.
 //!
 //! Reservation objects carry device MACs and internal IP addresses; nothing in this module logs
-//! a response body (see `.claude/rules/security-review.md`).
+//! a response body (see the crate's security guidelines).
 
 use std::sync::Arc;
 

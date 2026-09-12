@@ -10,7 +10,7 @@
 //! `test_support.py`) but with obviously synthetic MACs (`aa:bb:cc:00:00:0N`) and IPs drawn
 //! from the `192.0.2.0/24` documentation range (RFC 5737) rather than anything real.
 //!
-//! Per `.claude/rules/testing.md`, every test pins the exact verb, path and session cookie
+//! Per the crate's testing conventions, every test pins the exact verb, path and session cookie
 //! against a local `wiremock` server, and asserts the returned `Envelope` is byte-identical to
 //! the body it was served via `into_value()` — the raw wire payload is the contract, never a
 //! reshaped view of it. The two `get_transfer_stats` tests each additionally mount a

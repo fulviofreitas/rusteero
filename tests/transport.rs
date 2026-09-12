@@ -1,7 +1,7 @@
 //! P1.9 transport suite: `Transport::send`/`send_with_query`'s status-code mapping, the 10 MiB
 //! response cap, redirect refusal, exact `Cookie` header shape, routing across `ApiVersion::V2_2`
 //! / `ApiVersion::V2_3`, and — the largest cluster — the server-driven refresh retry, all against
-//! a local `wiremock` server per `.claude/rules/testing.md`. `Transport`'s own unit tests (in
+//! a local `wiremock` server per the crate's testing conventions. `Transport`'s own unit tests (in
 //! `src/transport.rs`) already cover `parse_retry_after`, `refresh_signal_detected`, and
 //! `render_url` in isolation; this file exercises the same logic end-to-end, over real HTTP,
 //! through the public `send`/`send_with_query` entry points only.

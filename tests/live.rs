@@ -4,7 +4,7 @@
 //! [`live_credentials`]/its callers at runtime before doing anything network-visible, so a plain
 //! `cargo test` (no flags) never touches the network, and even an explicit
 //! `cargo test --test live -- --ignored` run with the required environment unset skips cleanly
-//! (prints a message, returns `Ok(())`) instead of failing. Per `.claude/rules/testing.md`, run
+//! (prints a message, returns `Ok(())`) instead of failing. Per the crate's testing conventions, run
 //! deliberately, by a human, never in CI:
 //!
 //! ```text

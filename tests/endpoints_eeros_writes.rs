@@ -5,7 +5,7 @@
 //!
 //! Every test below pins the HTTP verb, the exact path and the exact JSON body via
 //! `wiremock`'s `body_json` matcher plus an `.expect(n)` call count, per
-//! `.claude/rules/testing.md`.
+//! the crate's testing conventions.
 
 mod common;
 

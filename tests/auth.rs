@@ -1,12 +1,12 @@
 //! P1.9 auth suite: the interactive login handshake (`LoginFlow`/`PendingLogin`) and the
 //! network-facing half of `AuthApi` (`login`/`resend`/`verify`, `logout`, `refresh`-adjacent
 //! local checks, the three `clear_*`/`set_session_token` scopes), all against a local wiremock
-//! server per `.claude/rules/testing.md`.
+//! server per the crate's testing conventions.
 //!
 //! Two tests below (`pending_login_verify_without_set_cookie_uses_the_login_token_d16_branch_a`
 //! and `pending_login_verify_with_a_fresh_set_cookie_uses_the_new_token_d16_branch_b`) pin the
 //! one open question phase 1 has not yet resolved by live capture: whether the real server sets
-//! a fresh `Set-Cookie: s=...` on `login/verify` (`.claude/tasks/rust-port-plan.md` §7.2,
+//! a fresh `Set-Cookie: s=...` on `login/verify` (the port plan §7.2,
 //! decision D-16). Both branches are exercised so that whichever the live capture confirms,
 //! `resolve_session_token` (`src/auth/flow.rs`) already has a passing test for it.
 
@@ -427,7 +427,7 @@ async fn auth_api_set_session_token_installs_a_session_and_persists_it_to_the_st
 
 #[tokio::test]
 async fn auth_api_set_session_token_preserves_an_existing_refresh_token() -> anyhow::Result<()> {
-    // Python parity (`auth.py:411-413`, `.claude/tasks/briefs/auth.md:315-317`):
+    // Python parity (`auth.py:411-413`, `the auth behaviour notes:315-317`):
     // `set_session_token()` only ever assigns `session_id`/`session_expiry`, never touching
     // `refresh_token` — so a refresh token already held by the current session must survive.
     let mock = MockEero::start().await;

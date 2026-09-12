@@ -2,7 +2,7 @@
 //!
 //! This file is a *module*, not its own integration-test binary: it lives at
 //! `tests/common/mod.rs` rather than `tests/common.rs` specifically so cargo never tries to run
-//! it as a standalone test target (see `.claude/rules/testing.md`'s "File Structure" section).
+//! it as a standalone test target (see the crate's testing conventions' "File Structure" section).
 //! Any file directly under `tests/` pulls it in with `mod common;`.
 //!
 //! [`MockEero`] answers one design question up front, correctly, for every one of the ~150 tests

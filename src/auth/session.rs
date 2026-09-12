@@ -3,8 +3,8 @@
 //! Ported from `AuthCredentials` (`eero-api`'s `src/eero/api/auth_storage.py:23-91`) and the
 //! naive-local, `+30`-day expiry convention applied at `login/verify`, `refresh_session()` and
 //! `set_session_token()` (`src/eero/api/auth.py:180-182,323-325,411-413`). See
-//! `rusteero-context/claude/tasks/briefs/const.md` §2 and
-//! `rusteero-context/claude/tasks/briefs/auth.md` for the full behaviour briefs this module
+//! the const behaviour notes §2 and
+//! the auth behaviour notes for the full behaviour briefs this module
 //! implements, and the port plan §3.4/§3.5 (decisions D-5, D-13, D-17) for the design
 //! rationale.
 //!

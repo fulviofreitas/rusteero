@@ -1,8 +1,8 @@
 //! The crate error type.
 //!
 //! Ported 1:1 from `eero-api`'s `src/eero/exceptions.py`. See
-//! `rusteero-context/claude/tasks/briefs/exceptions.md` for the full behaviour brief this
-//! module implements, and `rusteero-context/claude/docs/architecture.md` §7 for the mapping
+//! the exceptions behaviour notes for the full behaviour brief this
+//! module implements, and the crate's architecture notes §7 for the mapping
 //! table reproduced below.
 //!
 //! | Python | Rust |

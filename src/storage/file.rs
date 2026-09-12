@@ -1,7 +1,7 @@
 //! Filesystem credential store.
 //!
 //! Ported from `FileStorage` (`eero-api`'s `src/eero/api/auth_storage.py:169-237`). See
-//! `rusteero-context/claude/tasks/briefs/const.md` §5 for the full behaviour brief this module
+//! the const behaviour notes §5 for the full behaviour brief this module
 //! implements, and `security-review.md`'s rule for this repo for the one deliberate improvement
 //! over the Python original (atomic, mode-on-create file permissions instead of a
 //! write-then-`chmod` sequence).

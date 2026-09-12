@@ -3,7 +3,7 @@
 //! authentication API ([`AuthApi`]).
 //!
 //! Ported from `eero-api`'s `src/eero/api/auth.py`. See
-//! `.claude/tasks/briefs/auth.md` for the full behaviour brief this module implements.
+//! the auth behaviour notes for the full behaviour brief this module implements.
 pub mod flow;
 pub mod session;
 
@@ -95,7 +95,7 @@ impl AuthApi {
 
     /// Logs the current session out.
     ///
-    /// Ported from `logout()` (`api/auth.py:239-277`; see `.claude/tasks/briefs/auth.md` lines
+    /// Ported from `logout()` (`api/auth.py:239-277`; see the auth behaviour notes lines
     /// 171-202 for the full behaviour brief). Sends `POST` [`crate::routes::LOGOUT`] with body
     /// `{}` (`auth.py:256`, "Empty payload for logout"), through [`Transport::send`] — which
     /// already implements the "not authenticated" precondition (`auth.py:248-250`) and every
@@ -110,7 +110,7 @@ impl AuthApi {
     /// (`auth.py:259-266`): a 429 ([`Error::RateLimit`]) or a network/timeout failure
     /// ([`Error::Network`] / [`Error::Timeout`]) is **not** caught by any of `logout()`'s three
     /// `except` clauses and propagates straight out, **skipping** the cleanup block entirely
-    /// (`.claude/tasks/briefs/auth.md` lines 189-193) — contradicting both Python's own "Always
+    /// (the auth behaviour notes lines 189-193) — contradicting both Python's own "Always
     /// clear local credentials regardless of API response" comment (`auth.py:269`) and this
     /// port's plan. `rusteero` always clears the in-memory session and persists that clear to the
     /// credential store, regardless of the outcome of the network call (including the local

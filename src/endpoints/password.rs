@@ -11,7 +11,7 @@
 //! module through a dedicated `SecureLoggerAdapter` (`src/eero/logging.py`) that redacts every
 //! log call automatically; this crate has no such adapter (`tracing` plus
 //! `secrecy::SecretString` replace it elsewhere for token handling — see
-//! `.claude/tasks/rust-port-plan.md` §3.7), so [`PasswordApi::get_password`] deliberately emits
+//! the port plan §3.7), so [`PasswordApi::get_password`] deliberately emits
 //! no `tracing` call of its own: the only logging this method's request produces is the shared,
 //! header/body-free `method + path + status` line `Transport::send` already emits for every
 //! request. See that method's own doc comment for the discipline this places on *callers* of

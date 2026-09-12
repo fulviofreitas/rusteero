@@ -10,7 +10,7 @@
 //! below duplicates that guard.
 //!
 //! Port-forward objects carry device MACs and internal IP addresses; nothing in this module
-//! logs a response body (see `.claude/rules/security-review.md`).
+//! logs a response body (see the crate's security guidelines).
 
 use std::sync::Arc;
 

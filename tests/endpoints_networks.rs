@@ -1,5 +1,5 @@
 //! P3 `NetworksApi` suite: the read-only (`GET`) half of `eero-api`'s `NetworksAPI`, plus
-//! `get_account`, all against a local `wiremock` server per `.claude/rules/testing.md`.
+//! `get_account`, all against a local `wiremock` server per the crate's testing conventions.
 //!
 //! One test per method pins the exact verb, path and session cookie, and asserts the returned
 //! [`rusteero::envelope::Envelope`] is byte-identical to its fixture. A dedicated

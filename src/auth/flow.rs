@@ -2,7 +2,7 @@
 //! [`crate::storage::CredentialStore`].
 //!
 //! Ported from the session-establishing half of `eero-api`'s `AuthAPI`
-//! (`src/eero/api/auth.py:87-237`; see `.claude/tasks/briefs/auth.md` for the full behaviour
+//! (`src/eero/api/auth.py:87-237`; see the auth behaviour notes for the full behaviour
 //! brief this module implements). `AuthAPI` is a single stateful object: `login()` stashes an
 //! unverified token straight into `self._credentials.session_id` (`auth.py:131`), and nothing
 //! stops a caller from attempting an authenticated request with it before `verify()` ever runs
@@ -182,7 +182,7 @@ impl PendingLogin {
     /// this port does the same via [`Session::from_token`], which fabricates the identical
     /// expiry.
     ///
-    /// **PROVISIONAL**, pending live confirmation (`.claude/tasks/rust-port-plan.md` §7.2,
+    /// **PROVISIONAL**, pending live confirmation (the port plan §7.2,
     /// decision D-16): it is not yet confirmed whether the live server issues a fresh `s` cookie
     /// on this response. `eero-api` cannot observe this either way — it never reads
     /// `Set-Cookie` explicitly (brief gotcha #11) — but `rusteero` has no implicit cookie jar to
@@ -271,7 +271,7 @@ fn extract_user_token(envelope: &Envelope) -> Result<SecretString, Error> {
 /// Chooses the session token to use after a successful [`PendingLogin::verify`] call: the fresh
 /// `Set-Cookie` session token if the server sent one, otherwise the original login token. See
 /// [`PendingLogin::verify`]'s doc comment for the full PROVISIONAL rationale
-/// (`.claude/tasks/rust-port-plan.md` §7.2, decision D-16) — this function is factored out so
+/// (the port plan §7.2, decision D-16) — this function is factored out so
 /// each branch is directly unit-testable ahead of the wiremock tests that exercise it end to
 /// end.
 fn resolve_session_token(

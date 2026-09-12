@@ -1,7 +1,7 @@
 //! The `Client` facade: [`EeroApi`] plus a [`Cache`] plus in-memory preferred-network state.
 //!
 //! Ported from `eero-api`'s `EeroClient` (`src/eero/client.py`). See
-//! `.claude/tasks/briefs/client.md` for the full behaviour brief this module implements — every
+//! the client behaviour notes for the full behaviour brief this module implements — every
 //! non-obvious decision below cites it, plus the exact `client.py` line range it replaces.
 //!
 //! # Scope: phases 4 and 5
@@ -39,7 +39,7 @@
 //! `EeroApi`, so it inherits this gap: a `Client` is always constructed *already carrying*
 //! whatever session it will use ([`ClientBuilder::session`], or one loaded from a configured
 //! [`crate::storage::CredentialStore`] — see [`ClientBuilder::build`]), matching
-//! `.claude/docs/architecture.md`'s own request-flow sketch, `Client::builder().session(s)
+//! the architecture notes' own request-flow sketch, `Client::builder().session(s)
 //! .store(st).build()`. The brief's instruction to "wire `clear_cache` into the places Python
 //! calls it: after verify, logout, `set_session_token` and `clear_session_token`" is honoured for
 //! the three of those four that exist on this `Client` ([`Client::logout`],
@@ -2872,7 +2872,7 @@ mod tests {
     //! ([`extract_networks_list`], [`extract_network_id`], [`extract_account_networks`],
     //! [`non_empty`]). HTTP-level behaviour (cache hits, the `/account` fallback end to end,
     //! network-id resolution against a live mock, `ClientBuilder::build`'s credential-store load)
-    //! is covered by `tests/client.rs`, per `.claude/rules/testing.md`.
+    //! is covered by `tests/client.rs`, per the crate's testing conventions.
 
     use super::{extract_account_networks, extract_network_id, extract_networks_list, non_empty};
     use serde_json::json;

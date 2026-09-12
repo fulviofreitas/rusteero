@@ -1,7 +1,7 @@
 //! Pluggable credential storage.
 //!
 //! Ported from `eero-api`'s `src/eero/api/auth_storage.py`. See
-//! `rusteero-context/claude/tasks/briefs/const.md` §3-8 for the full behaviour brief of the
+//! the const behaviour notes §3-8 for the full behaviour brief of the
 //! `CredentialStorage` abstract base class this trait mirrors (and each concrete backend below),
 //! and the port plan §3.4 (decisions D-4, D-5, D-13) for the design rationale.
 //!

@@ -4,7 +4,7 @@
 //! Ported from `eero-api`'s `EeroAPI` class (`src/eero/api/__init__.py:36-123`). `EeroApi` is
 //! the layer the not-yet-built `Client` facade (phase 4) sits on top of, adding a cache and
 //! network-id resolution; a consumer who wants neither uses `EeroApi` directly, exactly like the
-//! Python split described in `.claude/docs/architecture.md` §2.
+//! Python split described in the crate's architecture notes §2.
 //!
 //! # Composition, not endpoint logic
 //!

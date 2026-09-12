@@ -10,7 +10,7 @@
 //! (`tests/api/test_<module>.py::Test<Module>APIGet<Method>::test_get_<method>_returns_raw_response`).
 //! No real MACs, serials, IPs or names appear in any fixture here.
 //!
-//! Per `.claude/rules/testing.md`, every test pins the exact verb, path and session cookie
+//! Per the crate's testing conventions, every test pins the exact verb, path and session cookie
 //! against a local `wiremock` server, and asserts the returned `Envelope` is byte-identical to
 //! the body served via `into_value()` — the raw wire payload is the contract, never a reshaped
 //! view of it. A dedicated test additionally pins the security guarantee that matters most for

@@ -12,7 +12,7 @@
 //! `Transport::render_url` (surfaced here as an `Err(Error::Validation { .. })` from the
 //! endpoint method) *before* any HTTP request is sent — a catch-all `wiremock::matchers::any()`
 //! mock with `.expect(0)` fails loudly if a hostile value ever escapes to the wire. Per
-//! `.claude/rules/testing.md`, this is covered for at least one route per shape: a DELETE-by-id
+//! the crate's testing conventions, this is covered for at least one route per shape: a DELETE-by-id
 //! (`BlacklistApi::remove_from_blacklist`), a PUT-by-id on `/2.3` (`DevicesApi::pause_device`),
 //! and a GET-by-id (`EerosApi::get_eero`) — proving the fix on the destructive verbs
 //! specifically, not just reads.

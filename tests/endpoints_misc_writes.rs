@@ -8,7 +8,7 @@
 //! (`src/endpoints/ouicheck.rs`), `SupportApi::request_support` (`src/endpoints/support.rs`) and
 //! `BurstReportersApi::create_burst_reporter` (`src/endpoints/burst_reporters.rs`).
 //!
-//! Per `.claude/rules/testing.md`, every test pins the exact verb, path, JSON body (via
+//! Per the crate's testing conventions, every test pins the exact verb, path, JSON body (via
 //! `body_json`) and session cookie against a local `wiremock` server, with `.expect(n)` call
 //! counts verified when the mock server is dropped. Bodies use obviously-synthetic MACs
 //! (`aa:bb:cc:00:00:0N`) and IPs drawn from the `192.0.2.0/24` documentation range (RFC 5737) —

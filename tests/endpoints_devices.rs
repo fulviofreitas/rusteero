@@ -2,7 +2,7 @@
 //! `get_devices`, `get_device`, the `404` status mapping, and the path-segment safety of a
 //! `device_id` that contains a `/`.
 //!
-//! Per `.claude/rules/testing.md`, every test here pins the exact verb, path and session cookie
+//! Per the crate's testing conventions, every test here pins the exact verb, path and session cookie
 //! against a local `wiremock` server, and asserts the returned `Envelope` is byte-identical to
 //! its fixture via `into_value()` — the raw wire payload is the contract, never a reshaped view
 //! of it.

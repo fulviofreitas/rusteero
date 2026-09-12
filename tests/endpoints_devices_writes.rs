@@ -2,7 +2,7 @@
 //! (`src/endpoints/devices.rs`, `src/endpoints/blacklist.rs`): `set_device_nickname`,
 //! `pause_device`, `block_device`, `add_to_blacklist`, `remove_from_blacklist`.
 //!
-//! Per `.claude/rules/testing.md`, every test here pins the exact verb, path, JSON body and
+//! Per the crate's testing conventions, every test here pins the exact verb, path, JSON body and
 //! session cookie against a local `wiremock` server. Two tests in this file additionally guard
 //! against the two regressions this phase exists to prevent:
 //!

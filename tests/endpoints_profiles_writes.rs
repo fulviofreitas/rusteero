@@ -3,7 +3,7 @@
 //! `update_profile_block_list`, `set_blocked_applications`, `create_profile`,
 //! `rename_profile`, `delete_profile`, `set_profile_schedule`, `clear_profile_schedule`,
 //! `enable_bedtime`, `set_weekday_bedtime`, `set_weekend_bedtime`), per
-//! `.claude/rules/testing.md`.
+//! the crate's testing conventions.
 //!
 //! Every test pins the exact verb, path and JSON body (`body_json`) `wiremock` receives, plus
 //! the session cookie, with a `.expect(n)` call count — a wrong verb, path, or body shape fails

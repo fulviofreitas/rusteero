@@ -1,6 +1,6 @@
 //! P3 suite for the four "awkward" read-only endpoint modules plus `ScheduleApi`:
 //! `DataUsageApi`, `InsightsApi`, `DiagnosticsApi`, `OUICheckApi` and `ScheduleApi`, all against
-//! a local `wiremock` server per `.claude/rules/testing.md`.
+//! a local `wiremock` server per the crate's testing conventions.
 //!
 //! Three request-shape regressions get dedicated coverage here because they are the ones most
 //! likely to silently regress:

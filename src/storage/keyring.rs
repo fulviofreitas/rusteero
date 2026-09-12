@@ -1,7 +1,7 @@
 //! OS keyring credential store.
 //!
 //! Ported from `KeyringStorage` (`eero-api`'s `src/eero/api/auth_storage.py:121-166`). See
-//! `rusteero-context/claude/tasks/briefs/const.md` §4 for the full behaviour brief this module
+//! the const behaviour notes §4 for the full behaviour brief this module
 //! implements, and the port plan's decision D-5 for why the service/account pair below must
 //! stay byte-for-byte identical to the Python constants.
 //!

@@ -36,7 +36,7 @@
 //! # The falsy-value rule
 //!
 //! **This is a faithful port of a real Python quirk — do not "fix" it.** See
-//! `.claude/tasks/rust-port-plan.md` §1.5 ("Falsy cached values are never served (`if cached:`
+//! the port plan §1.5 ("Falsy cached values are never served (`if cached:`
 //! guards)."). `eero-api` guards every cached read with `if cached:` (e.g. `client.py:249-250,
 //! 275-276, 352-353, 381-382, 456-457, 487-488, 599-600, 630-631`) — a Python truthiness check —
 //! so a cached value that is falsy is treated as a cache miss and silently refetched, even though
@@ -74,7 +74,7 @@
 //! — nothing in this crate calls `invalidate` on those keys either; that is a `client.rs`-level
 //! fact about which methods it calls, not something `Cache` enforces.
 //!
-//! Two behaviours are intentionally **safer** than `eero-api`, per `.claude/tasks/rust-port-plan.md`
+//! Two behaviours are intentionally **safer** than `eero-api`, per the port plan
 //! §3.8's "what's new" list. Both are marked `Divergence from eero-api:` at the exact point they
 //! apply:
 //!
@@ -278,7 +278,7 @@ impl fmt::Display for CacheKey {
 /// A stored value plus the instant it was written, so [`Cache::get`] can compare it against the
 /// cache's TTL. Uses [`tokio::time::Instant`] rather than [`std::time::Instant`] specifically so
 /// tests can drive expiry deterministically with `tokio::time::pause()` / `advance()` instead of
-/// a real `sleep` (`.claude/rules/testing.md` forbids `sleep` in TTL tests). Outside of a paused
+/// a real `sleep` (the crate's testing conventions forbid `sleep` in TTL tests). Outside of a paused
 /// test clock this behaves identically to `std::time::Instant`.
 struct Entry {
     value: Envelope,
@@ -287,7 +287,7 @@ struct Entry {
 
 /// An in-memory, TTL-bounded cache of [`Envelope`] values, keyed by [`CacheKey`].
 ///
-/// This is a hand-written map rather than a crate like `moka`: `.claude/tasks/rust-port-plan.md`
+/// This is a hand-written map rather than a crate like `moka`: the port plan
 /// §3.8 rejected `moka` as overkill for eight key shapes with no eviction policy beyond TTL
 /// (Python has none either — the map is bounded by how many networks/devices/profiles exist).
 ///
@@ -497,7 +497,7 @@ impl fmt::Debug for Cache {
 
 /// Returns `true` if `value`'s wire payload is "falsy" in the Python sense this cache
 /// reproduces. See the module-level "falsy-value rule" docs and
-/// `.claude/tasks/rust-port-plan.md` §1.5 — **this is a deliberate port of a real Python quirk,
+/// the port plan §1.5 — **this is a deliberate port of a real Python quirk,
 /// not a bug to clean up.**
 fn is_falsy(value: &Envelope) -> bool {
     match value.as_value() {
@@ -604,7 +604,7 @@ mod tests {
     fn each_falsy_shape_is_treated_as_a_miss() {
         // The five shapes the task brief calls out verbatim, plus JSON `false` for full parity
         // with Python's `if cached:` truthiness (see the module-level "falsy-value rule" docs
-        // and `.claude/tasks/rust-port-plan.md` §1.5). Every one of these must be a miss even
+        // and the port plan §1.5). Every one of these must be a miss even
         // though the entry is freshly written and well within the TTL.
         let falsy_shapes = [
             ("null", json!(null)),

@@ -7,7 +7,7 @@
 //!
 //! `logging.py` also defines `SecureLoggerAdapter` and `get_secure_logger`, a
 //! `logging.LoggerAdapter` subclass that transparently redacts every log call's arguments. Those
-//! are **not** ported (`.claude/tasks/rust-port-plan.md` §3.7): this crate uses `tracing` for
+//! are **not** ported (the port plan §3.7): this crate uses `tracing` for
 //! structured logging and `secrecy::SecretString` for token storage, which together remove the
 //! need for an ambient auto-redacting logger. Call [`redact_sensitive`] explicitly wherever a raw
 //! JSON body must be included in a log line.

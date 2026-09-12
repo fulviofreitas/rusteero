@@ -1,6 +1,6 @@
 //! P5.12 `Client` integration suite: mutating pass-throughs and cache invalidation.
 //!
-//! Covers, against a local `wiremock` server per `.claude/rules/testing.md`: a representative
+//! Covers, against a local `wiremock` server per the crate's testing conventions: a representative
 //! mutation reaching the correct endpoint for each of the four per-network cache buckets (eeros,
 //! devices, profiles, network); the core claim of this phase — that a successful write
 //! invalidates exactly the cache entries the behaviour brief's §2 table says it should, no more
@@ -13,7 +13,7 @@
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not
-//! testing caching at all (`.claude/rules/testing.md`'s "Assertion Patterns").
+//! testing caching at all (the crate's testing conventions' "Assertion Patterns").
 
 mod common;
 

@@ -10,7 +10,7 @@
 //! below duplicates that guard.
 //!
 //! A support request can carry account details; nothing in this module logs a response body
-//! (see `.claude/rules/security-review.md`).
+//! (see the crate's security guidelines).
 
 use std::sync::Arc;
 

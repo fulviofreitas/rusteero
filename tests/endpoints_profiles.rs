@@ -1,5 +1,5 @@
 //! HTTP integration tests for `ProfilesApi`'s read-only methods (`get_profiles`, `get_profile`,
-//! `get_profile_devices`, `get_blocked_applications`), per `.claude/rules/testing.md`.
+//! `get_profile_devices`, `get_blocked_applications`), per the crate's testing conventions.
 //!
 //! The methods `get_profile`, `get_profile_devices` and `get_blocked_applications` all hit the
 //! exact same wire endpoint (`GET networks/{network_id}/profiles/{profile_id}`) and must return

@@ -1,7 +1,7 @@
 //! HTTP integration tests for the read-only half of three small `eero-api` domain modules —
 //! `BackupApi`, `BlacklistApi` and `BurstReportersApi` (`src/endpoints/backup.rs`,
 //! `src/endpoints/blacklist.rs`, `src/endpoints/burst_reporters.rs`) — against a local
-//! `wiremock` server per `.claude/rules/testing.md`.
+//! `wiremock` server per the crate's testing conventions.
 //!
 //! None of these three modules has a committed fixture file, so every response body here is a
 //! small, obviously-synthetic `{"meta": …, "data": …}` value built inline with

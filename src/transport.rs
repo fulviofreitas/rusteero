@@ -1,8 +1,8 @@
 //! Request core: status mapping, response size cap, redirect refusal, refresh retry.
 //!
 //! Ported from `eero-api`'s `src/eero/api/base.py` (see
-//! `.claude/tasks/briefs/base.md` for the full behaviour brief) and, for the refresh handshake
-//! only, `src/eero/api/auth.py` (`.claude/tasks/briefs/auth.md`). [`Transport`] is the single
+//! the base behaviour notes for the full behaviour brief) and, for the refresh handshake
+//! only, `src/eero/api/auth.py` (the auth behaviour notes). [`Transport`] is the single
 //! place that turns an HTTP status/body into either an `Envelope` or a typed `Error` — every
 //! endpoint module built on top of it (phase 3) is expected to be a thin wrapper that supplies a
 //! [`crate::routes::Route`] and path/query/body values and nothing else.
@@ -296,7 +296,7 @@ impl Transport {
     }
 
     /// Attempts to refresh the current session, ported from `AuthAPI.refresh_session`
-    /// (`api/auth.py:279-340`; see `.claude/tasks/briefs/auth.md` for the full behaviour brief
+    /// (`api/auth.py:279-340`; see the auth behaviour notes for the full behaviour brief
     /// this reproduces, including the exception-hierarchy subtlety noted at the terminal-error
     /// match arm below).
     ///
@@ -681,7 +681,7 @@ fn not_authenticated() -> Error {
 
 /// Turns a response status and (already fully read) body into an `Envelope` or the matching
 /// `Error`, reproducing `api/base.py:207-269`'s status-code chain exactly (see
-/// `.claude/tasks/briefs/base.md` §9-10 for the line-by-line citation this implements):
+/// the base behaviour notes §9-10 for the line-by-line citation this implements):
 ///
 /// - `204`, or any `2xx` with an empty/whitespace-only body, becomes `Envelope::empty()` — the
 ///   `204` check short-circuits *before* the whitespace check, so a (spec-violating) `204` with
