@@ -18,7 +18,7 @@
 //! below).
 //!
 //! [`Route::render`] is total: for any `path` and any `params`, it returns either `Ok(Url)` or
-//! `Err(RenderError)`, and never panics. Two design choices worth calling out:
+//! `Err(RenderError)`, and never panics. Design choices worth calling out:
 //!
 //! - **Missing placeholder → `Err`, not left unsubstituted.** If a template segment is
 //!   `{name}` and `params` has no entry for `name`, rendering fails with
@@ -26,21 +26,44 @@
 //!   request URL would send a malformed, likely-404 request to the real API with no compile-time
 //!   or type-level signal that a caller forgot a parameter; failing fast is safer and matches
 //!   this crate's "every fallible operation returns `Result`" convention.
+//! - **Every substituted value is validated before it reaches the encoder**, by
+//!   `validate_segment` — see the "Path traversal" section below for why this check exists
+//!   and exactly what it rejects.
 //! - **Percent-encoding uses only the `url` crate's own segment-builder**, [`Url::path_segments_mut`],
-//!   never hand-rolled string concatenation. Each segment (literal or substituted) is pushed
-//!   through [`url::PathSegmentsMut::push`], which percent-encodes it for the path-segment
-//!   position — including `%`, `/`, and `?`, none of which can therefore ever terminate the
-//!   segment early or introduce a new path segment, query string, or fragment. This is what
-//!   makes device MACs, network ids, or any other user/API-controlled string safe to interpolate
-//!   directly.
+//!   never hand-rolled string concatenation. Each segment (literal or substituted) that passes
+//!   validation is pushed through [`url::PathSegmentsMut::push`], which percent-encodes it for
+//!   the path-segment position — including `%`, `/`, and `?`, none of which can therefore ever
+//!   terminate the segment early or introduce a new path segment, query string, or fragment.
 //!
-//! One quirk inherited from the `url` crate (and, transitively, the WHATWG URL spec) is worth
-//! documenting rather than working around: a segment value that is exactly `"."` or `".."` is
-//! *dropped* by [`Url::path_segments_mut`] rather than appended (dot-segment removal). A `{id}`
-//! placeholder filled with `".."` therefore does not error and does not escape into the parent
-//! path — it simply vanishes, shortening the rendered path by one segment. Real Eero identifiers
-//! (integers, UUIDs, MAC addresses) never take this value, so this is a documented edge case, not
-//! a mitigation for a realistic input.
+//! ## Path traversal (formerly documented, incorrectly, as impossible)
+//!
+//! An earlier revision of this module claimed that a `".."` placeholder value "does not error
+//! and does not escape into the parent path" because [`Url::path_segments_mut`] drops a segment
+//! that is *exactly* `"."` or `".."` rather than appending it. That claim was false for any
+//! value that is not already, byte-for-byte, `"."` or `".."`.
+//!
+//! `url` 2.5.8's path parser strips every ASCII tab, carriage return, and line feed from a
+//! segment **before** applying dot-segment removal. A value such as `"..\n"` is therefore not
+//! `".."` when `validate_segment` (or, pre-fix, nothing at all) sees it, but *is* `".."` by the
+//! time the encoder's dot-segment check runs — so it collapses the rendered path exactly as a
+//! literal `".."` would, silently walking a destructive verb (a `DELETE` or a `/2.3` `PUT`) onto
+//! the parent collection instead of the one item the caller named. A stray trailing newline on
+//! an id read from a file, an environment variable, or `$(cat …)` is enough to trigger this —
+//! no attacker input is required. A second, related gap: an **empty** substituted value collapses
+//! a per-item route onto its collection while keeping the same verb (`DELETE
+//! .../blacklist/{id}` with `id = ""` renders `DELETE .../blacklist/`), which — if the server
+//! treats that path as "the collection" — turns a "remove one" into "remove all".
+//!
+//! What is actually guaranteed today: `validate_segment` runs on every substituted value
+//! before it is pushed onto the URL, and rejects it outright — the request is never sent — if
+//! the value is empty, contains any ASCII control character (`0x00`-`0x1F` or `0x7F`, which
+//! already covers every byte the encoder's tab/CR/LF-stripping pass would otherwise remove), or
+//! is exactly `"."` or `".."` after that stripping. [`Route::render`] and `Transport`'s own
+//! renderer (`transport.rs`) share this exact rule by calling the same function, so the
+//! guarantee holds identically for both. A value containing an *already-encoded* dot segment
+//! (e.g. `"%2e%2e"`), a slash (`"a/b"`), or non-ASCII look-alike dots (e.g. fullwidth `"．．"`)
+//! is unaffected by this check and continues to be percent-encoded into a single opaque segment
+//! as before — none of those can reach the parser's dot-segment logic at all.
 
 use crate::consts;
 use reqwest::Method;
@@ -92,6 +115,90 @@ pub struct Route {
     pub path: &'static str,
 }
 
+/// Why `validate_segment` rejected a value before it could be substituted into a rendered
+/// path segment.
+///
+/// This is the single validation rule shared by [`Route::render`] and `Transport`'s own
+/// renderer (`transport.rs`'s `render_url`) — see the module docs' "Path traversal" section for
+/// the vulnerability this closes and exactly what each variant means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentError {
+    /// The value is empty.
+    ///
+    /// An empty substituted value would otherwise render as *no segment at all*, collapsing a
+    /// per-item route onto its parent collection while keeping the same (potentially
+    /// destructive) HTTP verb.
+    Empty,
+    /// The value contains an ASCII control character (`0x00`-`0x1F` or `0x7F`).
+    ///
+    /// This already covers every ASCII tab, carriage return, and line feed — the exact bytes
+    /// `url` 2.5.8 strips from a path segment before applying dot-segment removal, which is what
+    /// makes a value such as `"..\n"` behave as `".."` once it reaches the encoder.
+    ControlCharacter,
+    /// The value, with every ASCII tab, carriage return, and line feed removed, is exactly `"."`
+    /// or `".."`.
+    ///
+    /// A value that already contains one of those bytes is rejected earlier, as
+    /// [`SegmentError::ControlCharacter`]; this variant catches the remaining case — a literal
+    /// `"."` or `".."` with no whitespace at all — which the `url` crate would otherwise drop
+    /// silently instead of treating as an error.
+    DotSegment,
+}
+
+impl std::fmt::Display for SegmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "must not be empty"),
+            Self::ControlCharacter => {
+                write!(f, "must not contain an ASCII control character")
+            }
+            Self::DotSegment => write!(f, "must not be a \".\" or \"..\" path segment"),
+        }
+    }
+}
+
+impl std::error::Error for SegmentError {}
+
+/// Validates that `value` is safe to substitute into a single rendered path segment.
+///
+/// The one place a caller-supplied value is checked before either renderer in this crate
+/// ([`Route::render`] and `Transport`'s own `render_url`) hands it to
+/// [`Url::path_segments_mut`]. Validating the *raw* value here, rather than trusting the `url`
+/// crate's own encoder to make any value safe, is deliberate: the encoder strips ASCII
+/// tab/CR/LF bytes from a segment *before* percent-encoding and dot-segment removal run, so a
+/// value that is not literally `".."` can still be treated as `".."` by the time it is written
+/// into the URL. See the module docs' "Path traversal" section for the full mechanism and a
+/// concrete example.
+///
+/// # Errors
+///
+/// Returns [`SegmentError::Empty`] for an empty value, [`SegmentError::ControlCharacter`] for a
+/// value containing any ASCII control character (`0x00`-`0x1F` or `0x7F`), or
+/// [`SegmentError::DotSegment`] if the value is exactly `"."` or `".."` once every ASCII tab,
+/// carriage return, and line feed has been removed from it. A value that does not trip any of
+/// these checks is otherwise unrestricted — including one containing `/`, `%`, `?`, `#`, or a
+/// non-ASCII character — and is percent-encoded into a single opaque segment exactly as before.
+pub(crate) fn validate_segment(value: &str) -> Result<(), SegmentError> {
+    if value.is_empty() {
+        return Err(SegmentError::Empty);
+    }
+    if value.bytes().any(|b| matches!(b, 0x00..=0x1F | 0x7F)) {
+        return Err(SegmentError::ControlCharacter);
+    }
+    // Reached only when `value` contains no ASCII tab/CR/LF at all (the loop above already
+    // rejected any value that does, since those bytes fall inside `0x00..=0x1F`), so this
+    // strip is a no-op in practice — kept explicit so the rule matches, byte for byte, the
+    // "tab/CR/LF-stripped form" wording this check is documented (and audited) against.
+    let stripped: String = value
+        .chars()
+        .filter(|&c| c != '\t' && c != '\r' && c != '\n')
+        .collect();
+    if stripped == "." || stripped == ".." {
+        return Err(SegmentError::DotSegment);
+    }
+    Ok(())
+}
+
 /// Error produced by [`Route::render`] when a path template cannot be turned into a request
 /// [`Url`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +208,14 @@ pub enum RenderError {
     ///
     /// Carries the placeholder's name, without the surrounding braces.
     MissingPlaceholder(String),
+    /// A `{name}` placeholder's substituted value was rejected by `validate_segment` before it
+    /// could be written into the rendered path.
+    InvalidSegment {
+        /// The placeholder's name, without the surrounding braces.
+        name: String,
+        /// Why the value was rejected.
+        reason: SegmentError,
+    },
     /// The route's base URL ([`ApiVersion::base_url`]) failed to parse as a [`Url`].
     ///
     /// Unreachable for every [`Route`] defined in this module — both base URLs are fixed,
@@ -125,6 +240,9 @@ impl std::fmt::Display for RenderError {
                     "route path is missing a value for placeholder `{{{name}}}`"
                 )
             }
+            Self::InvalidSegment { name, reason } => {
+                write!(f, "value for placeholder `{{{name}}}` is invalid: {reason}")
+            }
             Self::InvalidBaseUrl => write!(f, "route base URL failed to parse"),
             Self::CannotExtendBase => write!(f, "route base URL cannot be used as a path base"),
         }
@@ -139,17 +257,18 @@ impl Route {
     /// request [`Url`] (base host + rendered path).
     ///
     /// `params` is searched linearly; with the handful of placeholders any real route template
-    /// has, this is both simpler and faster than building a map. Every path segment — literal or
-    /// substituted — is percent-encoded for the path-segment position via
-    /// [`Url::path_segments_mut`]; see the module docs for exactly what that guarantees and the
-    /// one documented edge case (`"."` / `".."` segments are dropped, not escaped).
+    /// has, this is both simpler and faster than building a map. Every substituted value is
+    /// first checked by `validate_segment` — see the module docs' "Path traversal" section for
+    /// exactly what that guarantees. A value that passes validation is percent-encoded for the
+    /// path-segment position via [`Url::path_segments_mut`], same as every literal segment.
     ///
     /// # Errors
     ///
     /// Returns [`RenderError::MissingPlaceholder`] if the template references a name absent from
-    /// `params`. Returns [`RenderError::InvalidBaseUrl`] or [`RenderError::CannotExtendBase`] only
-    /// if [`ApiVersion::base_url`] itself is malformed, which cannot happen for any `Route`
-    /// defined in this module.
+    /// `params`. Returns [`RenderError::InvalidSegment`] if a substituted value fails
+    /// `validate_segment`. Returns [`RenderError::InvalidBaseUrl`] or
+    /// [`RenderError::CannotExtendBase`] only if [`ApiVersion::base_url`] itself is malformed,
+    /// which cannot happen for any `Route` defined in this module.
     ///
     /// This function never panics for any `path` or `params` value.
     pub fn render(&self, params: &[(&str, &str)]) -> Result<Url, RenderError> {
@@ -173,6 +292,10 @@ impl Route {
                         .find(|(key, _)| *key == name)
                         .map(|(_, value)| *value)
                         .ok_or_else(|| RenderError::MissingPlaceholder(name.to_owned()))?;
+                    validate_segment(value).map_err(|reason| RenderError::InvalidSegment {
+                        name: name.to_owned(),
+                        reason,
+                    })?;
                     segments.push(value);
                 } else {
                     segments.push(part);
@@ -2097,5 +2220,150 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    // ------------------------- validate_segment / traversal rejection -------------------
+
+    use super::{SegmentError, validate_segment};
+
+    #[test]
+    fn validate_segment_rejects_empty_value() {
+        assert_eq!(validate_segment(""), Err(SegmentError::Empty));
+    }
+
+    #[test]
+    fn validate_segment_rejects_control_characters() {
+        assert_eq!(
+            validate_segment("..\n"),
+            Err(SegmentError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_segment(".\t."),
+            Err(SegmentError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_segment("\t.."),
+            Err(SegmentError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_segment("..\t"),
+            Err(SegmentError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_segment("..\r\n"),
+            Err(SegmentError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_segment("\u{0}"),
+            Err(SegmentError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_segment("a\u{7f}b"),
+            Err(SegmentError::ControlCharacter)
+        );
+    }
+
+    #[test]
+    fn validate_segment_rejects_literal_dot_segments() {
+        assert_eq!(validate_segment("."), Err(SegmentError::DotSegment));
+        assert_eq!(validate_segment(".."), Err(SegmentError::DotSegment));
+    }
+
+    #[test]
+    fn validate_segment_accepts_legitimate_and_already_safe_values() {
+        for value in [
+            "device-0001",
+            "aa:bb:cc:00:00:01",
+            "a/b",
+            "%2e%2e",
+            "..%2f..",
+            "．．", // fullwidth dots (U+FF0E) — not ASCII '.', never trips dot-segment removal
+            "a?b",
+            "a#b",
+        ] {
+            assert_eq!(
+                validate_segment(value),
+                Ok(()),
+                "value {value:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn render_rejects_a_hostile_placeholder_value_before_building_the_url() {
+        // The concrete reproduction from the security finding: a trailing-newline id must not
+        // collapse `.../networks/{network_id}/blacklist/{mac_or_device_id}` onto
+        // `.../networks/{network_id}/blacklist/`.
+        let route = Route {
+            method: Method::DELETE,
+            version: ApiVersion::V2_2,
+            path: "networks/{network_id}/blacklist/{mac_or_device_id}",
+        };
+
+        let err = route
+            .render(&[("network_id", "100"), ("mac_or_device_id", "..\n")])
+            .expect_err("a value that becomes \"..\" after tab/CR/LF stripping must be rejected");
+        assert_eq!(
+            err,
+            RenderError::InvalidSegment {
+                name: "mac_or_device_id".to_owned(),
+                reason: SegmentError::ControlCharacter,
+            }
+        );
+    }
+
+    #[test]
+    fn render_rejects_an_empty_placeholder_value() {
+        let route = Route {
+            method: Method::DELETE,
+            version: ApiVersion::V2_2,
+            path: "networks/{network_id}/profiles/{profile_id}",
+        };
+
+        let err = route
+            .render(&[("network_id", "100"), ("profile_id", "")])
+            .expect_err("an empty value must not collapse the route onto its collection");
+        assert_eq!(
+            err,
+            RenderError::InvalidSegment {
+                name: "profile_id".to_owned(),
+                reason: SegmentError::Empty,
+            }
+        );
+    }
+
+    /// Security review finding F1: a real destructive route
+    /// ([`super::REMOVE_FROM_BLACKLIST`]), not a hand-built fixture, must reject a literal
+    /// `".."` placeholder value rather than silently rendering
+    /// `DELETE /2.2/networks/100/blacklist` (the whole collection) instead of one item. See
+    /// `tests/path_safety.rs` for the same guarantee proven end to end, with a mock server
+    /// verifying zero requests are ever sent.
+    #[test]
+    fn remove_from_blacklist_rejects_a_literal_dot_dot_id() {
+        let err = super::REMOVE_FROM_BLACKLIST
+            .render(&[("network_id", "100"), ("mac_or_device_id", "..")])
+            .expect_err("a literal \"..\" id must not collapse the route onto its collection");
+        assert_eq!(
+            err,
+            RenderError::InvalidSegment {
+                name: "mac_or_device_id".to_owned(),
+                reason: SegmentError::DotSegment,
+            }
+        );
+    }
+
+    /// Same as [`remove_from_blacklist_rejects_a_literal_dot_dot_id`], for a bare `"."`.
+    #[test]
+    fn remove_from_blacklist_rejects_a_literal_single_dot_id() {
+        let err = super::REMOVE_FROM_BLACKLIST
+            .render(&[("network_id", "100"), ("mac_or_device_id", ".")])
+            .expect_err("a literal \".\" id must not collapse the route onto its collection");
+        assert_eq!(
+            err,
+            RenderError::InvalidSegment {
+                name: "mac_or_device_id".to_owned(),
+                reason: SegmentError::DotSegment,
+            }
+        );
     }
 }

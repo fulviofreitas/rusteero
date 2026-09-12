@@ -4,7 +4,7 @@ Per-method checklist against `fulviofreitas/eero-api` at commit `e7bcfd9` (2026-
 
 Status values: `planned` → `ported` (with test) · `changed` · `renamed` · `identical` · `dropped`.
 
-**Summary:** 127 rows — changed: 9, dropped: 7, identical: 2, planned: 60, ported: 47, renamed: 2. Phases 1-3 complete: transport, errors, envelope, routes, auth, credential storage, and the read-only half of all 25 endpoint modules plus the EeroApi aggregator. Remaining `planned` rows are the phase 4 client/cache and the phase 5 mutations.
+**Summary:** 127 rows — changed: 9, dropped: 7, identical: 2, ported: 107, renamed: 2. **All five implementation phases are complete.** Every row is ported, changed with a reason, dropped with a reason, identical or renamed; no row remains planned. Remaining work is phase 6: docs, live validation against a real account, and release.
 
 | Module | Python | Rust | Verb | Path | Status | Test | Note |
 |---|---|---|---|---|---|---|---|
@@ -24,10 +24,10 @@ Status values: `planned` → `ported` (with test) · `changed` · `renamed` · `
 | EeroAPI | `is_authenticated / login / verify / logout` | `same on Client` | — | `—` | identical | — |  |
 | EeroClient (client-only logic) | `EeroClient(session, cookie_file, use_keyring, cache_timeout)` | `Client::builder()` | — | `—` | renamed | — | builder |
 | EeroClient (client-only logic) | `clear_cache` | `clear_cache` | — | `local` | changed | — | also clears timestamps |
-| EeroClient (client-only logic) | `_ensure_network_id` | `resolve_network_id (private)` | — | `local` | planned | — |  |
+| EeroClient (client-only logic) | `_ensure_network_id` | `resolve_network_id (private)` | — | `local` | ported | `tests/client.rs` |  |
 | EeroClient (client-only logic) | `set_preferred_network / preferred_network_id` | `same` | — | `local` | identical | — |  |
-| EeroClient (client-only logic) | `get_account` | `get_account` | GET | `2.2/account` | planned | — | cached |
-| EeroClient (client-only logic) | `get_networks (+ /account fallback, preferred side-effect)` | `get_networks` | GET | `2.2/networks` | planned | — | cached |
+| EeroClient (client-only logic) | `get_account` | `get_account` | GET | `2.2/account` | ported | `tests/client.rs` | cached |
+| EeroClient (client-only logic) | `get_networks (+ /account fallback, preferred side-effect)` | `get_networks` | GET | `2.2/networks` | ported | `tests/client.rs` | cached |
 | EeroClient (client-only logic) | `get_device_priority` | `(none)` | — | `—` | dropped | — | server no-op, eero-api #111 |
 | EeroClient (client-only logic) | `set_device_priority` | `(none)` | — | `—` | dropped | — | server no-op, eero-api #111 |
 | EeroClient (client-only logic) | `get_activity* (5)` | `(none)` | — | `—` | dropped | — | endpoints 404, eero-api #107 |
@@ -35,96 +35,96 @@ Status values: `planned` → `ported` (with test) · `changed` · `renamed` · `
 | ac_compat | `get_ac_compat` | `get_ac_compat` | GET | `2.2/networks/{nid}/ac_compat` | ported | `tests/endpoints_*` |  |
 | backup | `get_backup_network` | `get_backup_network` | GET | `2.2/networks/{nid}/backup` | ported | `tests/endpoints_*` |  |
 | backup | `get_backup_status` | `get_backup_status` | GET | `2.2/networks/{nid}/backup/status` | ported | `tests/endpoints_*` |  |
-| backup | `set_backup_network` | `set_backup_network` | PUT | `2.2/networks/{nid}/backup` | planned | — |  |
-| backup | `configure_backup_network` | `configure_backup_network` | PUT | `2.2/networks/{nid}/backup` | planned | — | empty → Validation |
+| backup | `set_backup_network` | `set_backup_network` | PUT | `2.2/networks/{nid}/backup` | ported | `tests/endpoints_*` |  |
+| backup | `configure_backup_network` | `configure_backup_network` | PUT | `2.2/networks/{nid}/backup` | ported | `tests/endpoints_*` | empty → Validation |
 | blacklist | `get_blacklist` | `get_blacklist` | GET | `2.2/networks/{nid}/blacklist` | ported | `tests/endpoints_*` |  |
-| blacklist | `add_to_blacklist` | `add_to_blacklist` | POST | `2.2/networks/{nid}/blacklist` | planned | — |  |
-| blacklist | `remove_from_blacklist` | `remove_from_blacklist` | DELETE | `2.2/networks/{nid}/blacklist/{mac_or_id}` | planned | — |  |
+| blacklist | `add_to_blacklist` | `add_to_blacklist` | POST | `2.2/networks/{nid}/blacklist` | ported | `tests/endpoints_*` |  |
+| blacklist | `remove_from_blacklist` | `remove_from_blacklist` | DELETE | `2.2/networks/{nid}/blacklist/{mac_or_id}` | ported | `tests/endpoints_*` |  |
 | burst_reporters | `get_burst_reporters` | `get_burst_reporters` | GET | `2.2/networks/{nid}/burst_reporters` | ported | `tests/endpoints_*` |  |
-| burst_reporters | `create_burst_reporter` | `create_burst_reporter` | POST | `2.2/networks/{nid}/burst_reporters` | planned | — |  |
+| burst_reporters | `create_burst_reporter` | `create_burst_reporter` | POST | `2.2/networks/{nid}/burst_reporters` | ported | `tests/endpoints_*` |  |
 | data_usage | `get_data_usage` | `get_data_usage` | GET+body | `2.2/networks/{nid}/data_usage[/{resource}]` | ported | `tests/endpoints_*` | JSON body on GET |
 | devices | `get_devices` | `get_devices` | GET | `2.2/networks/{nid}/devices` | ported | `tests/endpoints_*` |  |
 | devices | `get_device` | `get_device` | GET | `2.2/networks/{nid}/devices/{did}` | ported | `tests/endpoints_*` |  |
-| devices | `set_device_nickname` | `set_device_nickname` | PUT | `**2.3**/networks/{nid}/devices/{did}` | planned | — |  |
-| devices | `pause_device` | `pause_device` | PUT | `**2.3**/networks/{nid}/devices/{did}` | planned | — |  |
-| devices | `block_device` | `block_device` | GET+POST / DELETE | `2.2/networks/{nid}/blacklist[/{did}]` | planned | — | two round-trips on block |
+| devices | `set_device_nickname` | `set_device_nickname` | PUT | `**2.3**/networks/{nid}/devices/{did}` | ported | `tests/endpoints_*` |  |
+| devices | `pause_device` | `pause_device` | PUT | `**2.3**/networks/{nid}/devices/{did}` | ported | `tests/endpoints_*` |  |
+| devices | `block_device` | `block_device` | GET+POST / DELETE | `2.2/networks/{nid}/blacklist[/{did}]` | ported | `tests/endpoints_*` | two round-trips on block |
 | diagnostics | `get_diagnostics` | `get_diagnostics` | GET | `2.2/networks/{nid}/diagnostics` | ported | `tests/endpoints_*` |  |
-| diagnostics | `run_diagnostics` | `run_diagnostics` | POST | `2.2/networks/{nid}/diagnostics` | planned | — |  |
+| diagnostics | `run_diagnostics` | `run_diagnostics` | POST | `2.2/networks/{nid}/diagnostics` | ported | `tests/endpoints_*` |  |
 | dns | `get_dns_settings` | `get_dns_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| dns | `set_dns_caching` | `set_dns_caching` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
-| dns | `set_custom_dns` | `set_custom_dns` | PUT | `2.2/networks/{nid}/settings` | planned | — | ≤2 servers |
-| dns | `clear_custom_dns` | `clear_custom_dns` | PUT | `delegates` | planned | — |  |
-| dns | `set_dns_mode` | `set_dns_mode` | PUT | `2.2/networks/{nid}/settings` | planned | — | invalid → Validation |
-| dns | `set_ipv6_dns` | `set_ipv6_dns` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
+| dns | `set_dns_caching` | `set_dns_caching` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
+| dns | `set_custom_dns` | `set_custom_dns` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | ≤2 servers |
+| dns | `clear_custom_dns` | `clear_custom_dns` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
+| dns | `set_dns_mode` | `set_dns_mode` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | invalid → Validation |
+| dns | `set_ipv6_dns` | `set_ipv6_dns` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
 | eeros | `get_eeros` | `get_eeros` | GET | `2.2/networks/{nid}/eeros` | ported | `tests/endpoints_*` |  |
 | eeros | `get_eero` | `get_eero` | GET | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
-| eeros | `reboot_eero` | `reboot_eero` | POST | `2.2/eeros/{eid}/reboot` | planned | — |  |
+| eeros | `reboot_eero` | `reboot_eero` | POST | `2.2/eeros/{eid}/reboot` | ported | `tests/endpoints_*` |  |
 | eeros | `get_led_status` | `get_led_status` | GET | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
-| eeros | `set_led` | `set_led` | PUT | `2.2/eeros/{eid}` | planned | — |  |
-| eeros | `set_led_brightness` | `set_led_brightness` | PUT | `2.2/eeros/{eid}` | planned | — | clamp 0–100 |
+| eeros | `set_led` | `set_led` | PUT | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
+| eeros | `set_led_brightness` | `set_led_brightness` | PUT | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` | clamp 0–100 |
 | eeros | `get_nightlight` | `get_nightlight` | GET | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
-| eeros | `set_nightlight` | `set_nightlight` | PUT | `2.2/eeros/{eid}` | planned | — | empty → Validation |
-| eeros | `set_nightlight_brightness` | `set_nightlight_brightness` | PUT | `delegates` | planned | — |  |
-| eeros | `set_nightlight_schedule` | `set_nightlight_schedule` | PUT | `delegates` | planned | — |  |
+| eeros | `set_nightlight` | `set_nightlight` | PUT | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` | empty → Validation |
+| eeros | `set_nightlight_brightness` | `set_nightlight_brightness` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
+| eeros | `set_nightlight_schedule` | `set_nightlight_schedule` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
 | forwards | `get_forwards` | `get_forwards` | GET | `2.2/networks/{nid}/forwards` | ported | `tests/endpoints_*` |  |
-| forwards | `create_forward` | `create_forward` | POST | `2.2/networks/{nid}/forwards` | planned | — |  |
-| forwards | `delete_forward` | `delete_forward` | DELETE | `2.2/networks/{nid}/forwards/{fid}` | planned | — |  |
+| forwards | `create_forward` | `create_forward` | POST | `2.2/networks/{nid}/forwards` | ported | `tests/endpoints_*` |  |
+| forwards | `delete_forward` | `delete_forward` | DELETE | `2.2/networks/{nid}/forwards/{fid}` | ported | `tests/endpoints_*` |  |
 | insights | `get_insights` | `get_insights` | GET | `2.2/networks/{nid}/insights?start&end&cadence&insight_type` | ported | `tests/endpoints_*` |  |
-| insights | `run_insights` | `run_insights` | POST | `2.2/networks/{nid}/insights` | planned | — |  |
+| insights | `run_insights` | `run_insights` | POST | `2.2/networks/{nid}/insights` | ported | `tests/endpoints_*` |  |
 | networks | `get_networks` | `get_networks` | GET | `2.2/networks` | ported | `tests/endpoints_*` |  |
 | networks | `get_network` | `get_network` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| networks | `set_guest_network` | `set_guest_network` | PUT | `2.2/networks/{nid}/guestnetwork` | planned | — |  |
-| networks | `run_speed_test` | `run_speed_test` | POST | `2.2/networks/{nid}/speedtest` | planned | — |  |
-| networks | `reboot_network` | `reboot_network` | POST | `2.2/networks/{nid}/reboot` | planned | — |  |
+| networks | `set_guest_network` | `set_guest_network` | PUT | `2.2/networks/{nid}/guestnetwork` | ported | `tests/endpoints_*` |  |
+| networks | `run_speed_test` | `run_speed_test` | POST | `2.2/networks/{nid}/speedtest` | ported | `tests/endpoints_*` |  |
+| networks | `reboot_network` | `reboot_network` | POST | `2.2/networks/{nid}/reboot` | ported | `tests/endpoints_*` |  |
 | networks | `get_premium_status` | `get_premium_status` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| networks | `set_network_name` | `set_network_name` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
+| networks | `set_network_name` | `set_network_name` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
 | ouicheck | `get_ouicheck` | `get_ouicheck` | GET | `2.2/networks/{nid}/ouicheck` | ported | `tests/endpoints_*` |  |
-| ouicheck | `run_ouicheck` | `run_ouicheck` | POST | `2.2/networks/{nid}/ouicheck` | planned | — |  |
+| ouicheck | `run_ouicheck` | `run_ouicheck` | POST | `2.2/networks/{nid}/ouicheck` | ported | `tests/endpoints_*` |  |
 | password | `get_password` | `get_password` | GET | `2.2/networks/{nid}/password` | ported | `tests/endpoints_*` | never logged |
 | profiles | `get_profiles` | `get_profiles` | GET | `2.2/networks/{nid}/profiles` | ported | `tests/endpoints_*` |  |
 | profiles | `get_profile` | `get_profile` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `pause_profile` | `pause_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | planned | — |  |
+| profiles | `pause_profile` | `pause_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
 | profiles | `get_profile_devices` | `get_profile_devices` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `set_profile_devices` | `set_profile_devices` | PUT | `2.2/networks/{nid}/profiles/{pid}` | planned | — |  |
-| profiles | `update_profile_content_filter` | `update_profile_content_filter` | PUT | `2.2/networks/{nid}/profiles/{pid}` | planned | — | key whitelist |
-| profiles | `update_profile_block_list` | `update_profile_block_list` | PUT | `2.2/networks/{nid}/profiles/{pid}` | planned | — |  |
+| profiles | `set_profile_devices` | `set_profile_devices` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
+| profiles | `update_profile_content_filter` | `update_profile_content_filter` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` | key whitelist |
+| profiles | `update_profile_block_list` | `update_profile_block_list` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
 | profiles | `get_blocked_applications` | `get_blocked_applications` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `set_blocked_applications` | `set_blocked_applications` | PUT | `2.2/networks/{nid}/profiles/{pid}` | planned | — |  |
-| profiles | `create_profile` | `create_profile` | POST | `2.2/networks/{nid}/profiles` | planned | — |  |
-| profiles | `rename_profile` | `rename_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | planned | — |  |
-| profiles | `delete_profile` | `delete_profile` | DELETE | `2.2/networks/{nid}/profiles/{pid}` | planned | — |  |
+| profiles | `set_blocked_applications` | `set_blocked_applications` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
+| profiles | `create_profile` | `create_profile` | POST | `2.2/networks/{nid}/profiles` | ported | `tests/endpoints_*` |  |
+| profiles | `rename_profile` | `rename_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
+| profiles | `delete_profile` | `delete_profile` | DELETE | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
 | reservations | `get_reservations` | `get_reservations` | GET | `2.2/networks/{nid}/reservations` | ported | `tests/endpoints_*` |  |
-| reservations | `create_reservation` | `create_reservation` | POST | `2.2/networks/{nid}/reservations` | planned | — |  |
-| reservations | `update_reservation` | `update_reservation` | PUT | `2.2/networks/{nid}/reservations/{rid}` | planned | — |  |
-| reservations | `delete_reservation` | `delete_reservation` | DELETE | `2.2/networks/{nid}/reservations/{rid}` | planned | — |  |
+| reservations | `create_reservation` | `create_reservation` | POST | `2.2/networks/{nid}/reservations` | ported | `tests/endpoints_*` |  |
+| reservations | `update_reservation` | `update_reservation` | PUT | `2.2/networks/{nid}/reservations/{rid}` | ported | `tests/endpoints_*` |  |
+| reservations | `delete_reservation` | `delete_reservation` | DELETE | `2.2/networks/{nid}/reservations/{rid}` | ported | `tests/endpoints_*` |  |
 | routing | `get_routing` | `get_routing` | GET | `2.2/networks/{nid}/routing` | ported | `tests/endpoints_*` |  |
 | schedule | `get_profile_schedule` | `get_profile_schedule` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| schedule | `set_profile_schedule` | `set_profile_schedule` | PUT | `2.2/networks/{nid}/profiles/{pid}` | planned | — |  |
-| schedule | `clear_profile_schedule` | `clear_profile_schedule` | PUT | `delegates` | planned | — |  |
-| schedule | `enable_bedtime` | `enable_bedtime` | PUT | `delegates` | planned | — |  |
-| schedule | `set_weekday_bedtime` | `set_weekday_bedtime` | PUT | `delegates` | planned | — |  |
-| schedule | `set_weekend_bedtime` | `set_weekend_bedtime` | PUT | `delegates` | planned | — |  |
+| schedule | `set_profile_schedule` | `set_profile_schedule` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
+| schedule | `clear_profile_schedule` | `clear_profile_schedule` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
+| schedule | `enable_bedtime` | `enable_bedtime` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
+| schedule | `set_weekday_bedtime` | `set_weekday_bedtime` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
+| schedule | `set_weekend_bedtime` | `set_weekend_bedtime` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
 | security | `get_security_settings` | `get_security_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| security | `set_wpa3` | `set_wpa3` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
-| security | `set_band_steering` | `set_band_steering` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
-| security | `set_upnp` | `set_upnp` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
-| security | `set_ipv6` | `set_ipv6` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
-| security | `set_thread` | `set_thread` | PUT | `2.2/networks/{nid}/settings` | planned | — |  |
-| security | `configure_security` | `configure_security` | PUT | `2.2/networks/{nid}/settings` | planned | — | empty → Validation |
+| security | `set_wpa3` | `set_wpa3` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
+| security | `set_band_steering` | `set_band_steering` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
+| security | `set_upnp` | `set_upnp` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
+| security | `set_ipv6` | `set_ipv6` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
+| security | `set_thread` | `set_thread` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
+| security | `configure_security` | `configure_security` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | empty → Validation |
 | settings | `get_settings` | `get_settings` | GET | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
 | sqm | `get_sqm_settings` | `get_sqm_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| sqm | `set_sqm_enabled` | `set_sqm_enabled` | PUT | `2.2/networks/{nid}/settings` | planned | — | flat bool |
-| sqm | `set_sqm_bandwidth` | `set_sqm_bandwidth` | PUT | `2.2/networks/{nid}/settings` | planned | — | shape unverified upstream |
-| sqm | `configure_sqm` | `configure_sqm` | PUT | `2.2/networks/{nid}/settings` | planned | — | shape unverified upstream |
-| sqm | `set_sqm_auto` | `set_sqm_auto` | PUT | `2.2/networks/{nid}/settings` | planned | — | shape unverified upstream |
+| sqm | `set_sqm_enabled` | `set_sqm_enabled` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | flat bool |
+| sqm | `set_sqm_bandwidth` | `set_sqm_bandwidth` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | shape unverified upstream (sqm.py TODOs at :128,:173,:197) |
+| sqm | `configure_sqm` | `configure_sqm` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | shape unverified upstream (sqm.py TODOs at :128,:173,:197) |
+| sqm | `set_sqm_auto` | `set_sqm_auto` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | shape unverified upstream (sqm.py TODOs at :128,:173,:197) |
 | support | `get_support` | `get_support` | GET | `2.2/networks/{nid}/support` | ported | `tests/endpoints_*` |  |
-| support | `request_support` | `request_support` | POST | `2.2/networks/{nid}/support` | planned | — |  |
+| support | `request_support` | `request_support` | POST | `2.2/networks/{nid}/support` | ported | `tests/endpoints_*` |  |
 | thread | `get_thread` | `get_thread` | GET | `2.2/networks/{nid}/thread` | ported | `tests/endpoints_*` |  |
 | transfer | `get_transfer_stats` | `get_transfer_stats` | GET | `2.2/networks/{nid}/transfer | …/devices/{did}/transfer` | ported | `tests/endpoints_*` |  |
 | updates | `get_updates` | `get_updates` | GET | `2.2/networks/{nid}/updates` | ported | `tests/endpoints_*` |  |
 | activity (dropped module) | `get_activity, get_activity_clients, get_activity_for_device, get_activity_history, get_activity_categories` | `(none)` | GET | `2.2/networks/{nid}/activity*` | dropped | — | 404 on 2.2 and 2.3 upstream (eero-api #107) |
-| misc | `id_from_url` | `id_from_url` | — | `local` | planned | — |  |
-| misc | `redact_sensitive` | `redact::redact_sensitive` | — | `local` | planned | — | Value only |
+| misc | `id_from_url` | `id_from_url` | — | `local` | ported | `tests/endpoints_*` |  |
+| misc | `redact_sensitive` | `redact::redact_sensitive` | — | `local` | ported | `tests/endpoints_*` | Value only |
 | misc | `get_secure_logger / SecureLoggerAdapter` | `(none)` | — | `—` | dropped | — | Python-logging specific; tracing + SecretString |
 | misc | `const.py enums (EeroDeviceType, …)` | `(none)` | — | `—` | dropped | — | unused in Python |
 

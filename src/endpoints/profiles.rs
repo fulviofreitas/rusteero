@@ -7,7 +7,9 @@
 //! unmodified: `ProfilesApi` never extracts, filters or reshapes anything out of a response —
 //! the one deliberate exception is `update_profile_content_filter`'s *outgoing* key whitelist
 //! (`profiles.py:201-217`), which is a request-shaping step Python itself performs before the
-//! request is even sent, not a response transform; see that method's own docs.
+//! request is even sent, not a response transform. That method also fails closed with
+//! `Error::Validation` before sending anything if the whitelist leaves nothing behind — a
+//! deliberate divergence from Python (security review finding F4); see that method's own docs.
 //!
 //! `get_profile`, `get_profile_devices` and `get_blocked_applications` are the *same* wire call
 //! (`GET networks/{network_id}/profiles/{profile_id}`, `routes::GET_PROFILE` and its two
@@ -229,11 +231,26 @@ impl ProfilesApi {
     /// `filters` is filtered client-side against `VALID_CONTENT_FILTER_KEYS` *before* the
     /// request body is built: any `(key, _)` pair whose `key` is not in that list is silently
     /// dropped and never reaches the server, reproducing Python's `valid_filters` whitelist
-    /// (`profiles.py:201-217`) exactly, including the drop-not-reject behaviour — Python logs a
-    /// warning and continues rather than raising, and so does this port (minus the log line;
-    /// see `.claude/rules/security-review.md` on this crate's logging discipline). Keys are
-    /// otherwise passed through in the order given, and duplicate keys keep `filters`' own
-    /// last-write-wins order, matching Python's `dict` iteration.
+    /// (`profiles.py:201-217`) exactly, including the drop-not-reject behaviour for a *single*
+    /// unrecognized key mixed in with valid ones — Python logs a warning and continues rather
+    /// than raising, and so does this port (minus the log line; see
+    /// `.claude/rules/security-review.md` on this crate's logging discipline). Keys are otherwise
+    /// passed through in the order given, and duplicate keys keep `filters`' own last-write-wins
+    /// order, matching Python's `dict` iteration.
+    ///
+    /// **Deliberate divergence from Python (security review finding F4).** Unlike its four
+    /// sibling setters in this crate (`set_nightlight`, `configure_security`,
+    /// `configure_backup_network`, `set_dns_mode`), this method previously had no guard against
+    /// the whitelist leaving *every* key dropped: a caller who only passed misspelled keys (e.g.
+    /// `block_adult_content` instead of `block_adult`) got a `200 OK` for `PUT {"content_filter":
+    /// {}}}`, silently believing a filter was enabled — if the server replaces rather than merges
+    /// that nested object, this would clear every content filter already set on the profile, on
+    /// the one endpoint group whose entire purpose is restriction. Python has the same whitelist
+    /// but never guards this case either (`profiles.py:201-217` has no empty-payload check); this
+    /// port adds one anyway rather than reproducing a fail-open outcome on a parental-control
+    /// surface. An individual unrecognized key mixed in with at least one valid one is still
+    /// dropped silently, matching Python exactly (see above) — only the *all-dropped* case is
+    /// promoted to an error, since that is the one shape a caller cannot possibly have intended.
     ///
     /// Ported from `eero-api src/eero/api/profiles.py:179`
     /// (`ProfilesAPI.update_profile_content_filter`): sends `PUT`
@@ -242,8 +259,10 @@ impl ProfilesApi {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
-    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    /// Returns `Error::Validation { field: "filters", .. }` if `filters` is empty, or every key
+    /// in it falls outside `VALID_CONTENT_FILTER_KEYS` — checked *before* any request is sent.
+    /// Otherwise, returns [`Error::Authentication`] if no valid session is configured, or
+    /// whatever status-mapped [`Error`] the request produces (see [`Transport::send`]).
     pub async fn update_profile_content_filter(
         &self,
         network_id: &str,
@@ -255,6 +274,13 @@ impl ProfilesApi {
             if VALID_CONTENT_FILTER_KEYS.contains(key) {
                 content_filter.insert((*key).to_owned(), serde_json::Value::Bool(*value));
             }
+        }
+
+        if content_filter.is_empty() {
+            return Err(Error::Validation {
+                field: "filters".to_owned(),
+                message: "must contain at least one recognized content-filter key".to_owned(),
+            });
         }
 
         self.transport

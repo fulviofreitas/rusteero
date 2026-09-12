@@ -285,7 +285,8 @@ const RAW_TEXT_SENSITIVE_MARKERS: &[&str] = &[
 
 /// Returns `true` if `text`, matched case-insensitively as a substring, contains anything that
 /// looks like a credential — the fallback heuristic [`sanitize_body_for_error`] applies to a body
-/// it cannot structurally parse.
+/// it cannot structurally parse, and (security finding F5) to every string *value* left visible
+/// after [`crate::redact::redact_sensitive`] has run.
 fn looks_sensitive(text: &str) -> bool {
     let lower = text.to_lowercase();
     RAW_TEXT_SENSITIVE_MARKERS
@@ -293,17 +294,44 @@ fn looks_sensitive(text: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
+/// Returns `true` if any string *value* (never a key) reachable from `value` looks sensitive per
+/// [`looks_sensitive`].
+///
+/// Deliberately walks only values, not keys: [`crate::redact::redact_sensitive`] already replaced
+/// every value found under a sensitive *key* with a fixed, non-sensitive-looking marker (e.g.
+/// `"eyJs...[REDACTED:32chars]"`), but it leaves the key name itself — e.g. the literal text
+/// `"session_token"` — in the serialized JSON. [`RAW_TEXT_SENSITIVE_MARKERS`] contains several
+/// strings that are also completely ordinary JSON key names (`"token"`, `"password"`, `"cookie"`,
+/// ...), so scanning the *whole* redacted rendering as one string (keys included) would flag
+/// every body that ever carried a sensitive key, even after that key's value was safely redacted
+/// — defeating the entire point of doing structured, per-key redaction first. Scanning only
+/// values catches the case redaction cannot: a secret sitting under a key that is not on
+/// `redact_sensitive`'s own key-pattern list (e.g. a password echoed back under `"error"`).
+fn value_contains_sensitive_text(value: &Value) -> bool {
+    match value {
+        Value::String(text) => looks_sensitive(text),
+        Value::Array(items) => items.iter().any(value_contains_sensitive_text),
+        Value::Object(map) => map.values().any(value_contains_sensitive_text),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
 /// Prepares a response body for embedding in an [`Error::Api`] or [`Error::Authentication`]
 /// message (security finding F5): unlike [`truncate_for_error`], this never embeds a credential
 /// verbatim.
 ///
-/// - If `body` parses as JSON, it is run through [`crate::redact::redact_sensitive`] first and
-///   the *redacted* rendering is truncated and returned. A typical error body (e.g.
-///   `{"meta":{"code":404,"error":"..."}}`) contains none of `redact_sensitive`'s sensitive-key
-///   substrings, so it comes back unchanged in substance — only its exact byte layout changes
-///   (compact re-serialization, and `serde_json::Map`'s default key ordering), which is a
-///   deliberate, documented divergence from Python's verbatim-body messages (see this crate's
-///   `notes` for this change, recorded for `PARITY.md`).
+/// - If `body` parses as JSON, it is run through [`crate::redact::redact_sensitive`] first. If
+///   [`value_contains_sensitive_text`] still finds a sensitive-looking string *value* anywhere in
+///   the redacted tree — i.e. a secret that survived because it was submitted under a key
+///   `redact_sensitive` does not recognise as sensitive (the scenario this finding closes: a
+///   server echoing a submitted Wi-Fi password back under a plain `"error"` key) — the entire
+///   body is replaced with the same fixed marker the raw-text fallback below uses, rather than
+///   truncated. Otherwise the redacted rendering is truncated and returned; a typical error body
+///   (e.g. `{"meta":{"code":404,"error":"..."}}`) contains no such value, so it comes back
+///   unchanged in substance — only its exact byte layout changes (compact re-serialization, and
+///   `serde_json::Map`'s default key ordering), which is a deliberate, documented divergence from
+///   Python's verbatim-body messages (see this crate's `notes` for this change, recorded for
+///   `PARITY.md`).
 /// - If `body` does not parse as JSON at all (the only way `status_to_envelope`'s
 ///   invalid-JSON-on-2xx arm can be reached in the first place, since any syntactically valid
 ///   JSON on a 2xx succeeds as an `Envelope` instead of becoming an error), a body that is
@@ -313,10 +341,14 @@ fn looks_sensitive(text: &str) -> bool {
 ///   credential-carrying body can still itself carry the credential (see the `login`/`refresh`
 ///   scenario this guards against). Otherwise the raw text is truncated exactly as before.
 ///
-/// [`truncate_for_error`]'s truncation still applies in every branch.
+/// [`truncate_for_error`]'s truncation still applies in every branch that does not suppress the
+/// body outright.
 pub(crate) fn sanitize_body_for_error(body: &str) -> String {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         let redacted = redact::redact_sensitive(&value);
+        if value_contains_sensitive_text(&redacted) {
+            return "[response body omitted: contains data that looks sensitive]".to_owned();
+        }
         return truncate_for_error(&redacted.to_string());
     }
     if looks_sensitive(body) {

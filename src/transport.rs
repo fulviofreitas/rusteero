@@ -478,9 +478,21 @@ impl Transport {
     /// `routes::Route::render` rather than calling it directly: `Route::render` always builds
     /// against the *real* Eero host baked into `ApiVersion::base_url`, with no way to substitute
     /// a test double, which is exactly what `TransportBuilder::base_url` needs in order to point
-    /// a single wiremock server at both API versions. Percent-encoding and placeholder semantics
-    /// are identical to `Route::render` (see that function's docs for the `.`/`..`-segment
-    /// caveat); the only difference is which base `Url` the segments are pushed onto.
+    /// a single wiremock server at both API versions. The two loops share one thing rather than
+    /// reimplementing it twice, though: every substituted value is checked by
+    /// `routes::validate_segment` — the same function `Route::render` calls — before it is
+    /// pushed onto the URL, so both renderers reject exactly the same set of hostile values (see
+    /// `routes`'s module docs, "Path traversal" section, for what that guarantees and why).
+    /// Percent-encoding is otherwise identical to `Route::render`; the only remaining difference
+    /// is which base `Url` the segments are pushed onto.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation` if the configured base URL cannot be extended
+    /// (`field: "base_url"`), if `route`'s template references a placeholder absent from
+    /// `params` (`field` is the placeholder name, `message: "missing value for path
+    /// parameter"`), or if a substituted value fails `routes::validate_segment` (`field` is the
+    /// placeholder name, `message` describes which rule it broke).
     fn render_url(&self, route: &Route, params: &[(&str, &str)]) -> Result<Url, Error> {
         let mut url = self.base_for(route.version).clone();
         {
@@ -502,6 +514,10 @@ impl Transport {
                             field: name.to_owned(),
                             message: "missing value for path parameter".to_owned(),
                         })?;
+                    routes::validate_segment(value).map_err(|reason| Error::Validation {
+                        field: name.to_owned(),
+                        message: reason.to_string(),
+                    })?;
                     segments.push(value);
                 } else {
                     segments.push(part);
@@ -1232,17 +1248,41 @@ mod tests {
     /// that `refresh_session`'s `tracing::error!` call logs `status` only — never `message`.
     #[tokio::test]
     async fn refresh_failure_log_field_never_carries_the_response_body() {
-        let credential_carrying_body = r#"{"detail":"eyJsecret-refresh-value-must-never-log"}"#;
+        // Two layers are asserted here, because sanitisation alone would make a
+        // credential-shaped fixture prove nothing about the log site.
+        //
+        // Layer 1 — `sanitize_body_for_error` now neutralises a secret even under a key
+        // `redact_sensitive` does not recognise (security finding F5, hardened during the phase-5
+        // mutation review). Assert that directly, so the defence itself is pinned.
+        // A marker-bearing credential under the non-sensitive key `detail`. `redact_sensitive`
+        // keys off key names, so `detail` alone would not save it; F5's value scan is what
+        // neutralises it. Asserting the SUPPRESSION here is the point — a fixture with no marker
+        // word would pass this assertion vacuously.
+        let marked_credential_body = r#"{"detail":"eyJsecret-refresh-value-must-never-log"}"#;
+        assert!(
+            !crate::error::sanitize_body_for_error(marked_credential_body)
+                .contains("eyJsecret-refresh-value-must-never-log"),
+            "sanitisation must neutralise a credential-shaped value even under a non-sensitive key"
+        );
+
+        // Layer 2 — the actual subject of this test. Because layer 1 scrubs anything
+        // credential-shaped, a credential fixture can no longer reach the log even if
+        // `message = %message` were re-added, so it cannot guard that regression. Use a BENIGN
+        // marker that survives sanitisation instead: it reaches `Error::Api.message` intact, so
+        // the only thing keeping it out of the log is that `refresh_session`'s `tracing::error!`
+        // passes `status` alone. Re-add `message = %message` there and this test goes red.
+        let body_marker = "benign-body-marker-must-never-log";
+        let credential_carrying_body = format!(r#"{{"detail":"{body_marker}"}}"#);
+        let credential_carrying_body = credential_carrying_body.as_str();
         assert!(
             serde_json::from_str::<serde_json::Value>(credential_carrying_body).is_ok(),
             "sanity: the fixture must be well-formed JSON, so it reaches the generic non-2xx \
              arm (not the invalid-JSON arm, which has its own, stronger fallback redaction)"
         );
         assert!(
-            crate::error::sanitize_body_for_error(credential_carrying_body)
-                .contains("eyJsecret-refresh-value-must-never-log"),
-            "sanity: this fixture's credential must survive sanitisation under a non-sensitive \
-             key, or this test proves nothing about the tracing::error! call site itself"
+            crate::error::sanitize_body_for_error(credential_carrying_body).contains(body_marker),
+            "sanity: this fixture must SURVIVE sanitisation, or the log assertion below is \
+             vacuous and this test proves nothing about the tracing::error! call site itself"
         );
 
         let server = wiremock::MockServer::start().await;
@@ -1285,12 +1325,8 @@ mod tests {
             .expect("capture mutex is never held across a panic")
             .join(" | ");
         assert!(
-            !logged.contains("eyJsecret"),
-            "logged fields leaked the credential-carrying body: {logged}"
-        );
-        assert!(
-            !logged.contains("refresh-value-must-never-log"),
-            "logged: {logged}"
+            !logged.contains(body_marker),
+            "logged fields leaked the response body: {logged}"
         );
     }
 
@@ -1453,6 +1489,33 @@ mod tests {
             .build()
             .expect_err("malformed base URL must fail fast");
         assert!(matches!(err, Error::Validation { field, .. } if field == "base_url"));
+    }
+
+    // ===================== render_url / path-traversal rejection (security) =====================
+    //
+    // The concrete reproduction from the security finding: `render_url` must reject a
+    // trailing-newline placeholder value before it can collapse a per-item route onto its
+    // parent collection. See `tests/security_paths.rs` for the end-to-end (network-level)
+    // version of this same guarantee across a DELETE-by-id, a PUT-by-id on 2.3, and a GET-by-id.
+
+    #[test]
+    fn render_url_rejects_a_value_that_becomes_a_dot_segment_after_stripping() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let route = v2_3_route();
+        let err = transport
+            .render_url(&route, &[("network_id", "100"), ("device_id", "..\n")])
+            .expect_err("\"..\\n\" must not be allowed to collapse the rendered path");
+        assert!(matches!(err, Error::Validation { field, .. } if field == "device_id"));
+    }
+
+    #[test]
+    fn render_url_rejects_an_empty_placeholder_value() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let route = v2_3_route();
+        let err = transport
+            .render_url(&route, &[("network_id", "100"), ("device_id", "")])
+            .expect_err("an empty value must not collapse the route onto its collection");
+        assert!(matches!(err, Error::Validation { field, .. } if field == "device_id"));
     }
 
     // ===================== session snapshot / is_authenticated =====================

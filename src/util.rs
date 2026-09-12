@@ -23,6 +23,15 @@ use crate::error::Error;
 /// since `id_or_url: &str` is statically guaranteed to already be a string slice, so only the
 /// empty-string case from that Python test module is reachable and ported here.
 ///
+/// Also returns [`Error::Validation`] with `field: "id_or_url"` when the *extracted* trailing
+/// segment is empty (e.g. `id_from_url("/")`, or any input consisting entirely of slashes). This
+/// is a deliberate departure from parity, called out separately from the case above: Python's
+/// `id_from_url` has no such guard and returns `""` for the same input. A caller that feeds an
+/// empty id straight into a wire route (see `routes::validate_segment`) would otherwise
+/// collapse a per-item route onto its parent collection while keeping the same, possibly
+/// destructive, HTTP verb — closing the gap here, at the one place every such id is derived,
+/// is more robust than relying on every call site downstream to notice.
+///
 /// # Examples
 ///
 /// ```
@@ -31,6 +40,7 @@ use crate::error::Error;
 /// assert_eq!(id_from_url("12345").unwrap(), "12345");
 /// assert_eq!(id_from_url("/2.2/networks/12345/").unwrap(), "12345");
 /// assert!(id_from_url("").is_err());
+/// assert!(id_from_url("/").is_err());
 /// ```
 pub fn id_from_url(id_or_url: &str) -> Result<String, Error> {
     if id_or_url.is_empty() {
@@ -44,6 +54,17 @@ pub fn id_from_url(id_or_url: &str) -> Result<String, Error> {
     // Python: `stripped.rsplit("/", 1)[-1]` — the segment right of the last slash, or the whole
     // (already-stripped) string when there is no slash at all.
     let segment = stripped.rsplit('/').next().unwrap_or(stripped);
+    if segment.is_empty() {
+        // Reachable only when `id_or_url` is composed entirely of slashes (e.g. "/", "///"):
+        // `trim_end_matches` then leaves `stripped` empty, and splitting an empty string still
+        // yields one (empty) segment. Rejecting this outright, rather than returning `Ok("")`
+        // as Python does, is the fix for the empty-identifier finding — see this function's
+        // doc comment.
+        return Err(Error::Validation {
+            field: "id_or_url".to_string(),
+            message: "resolves to an empty path segment".to_string(),
+        });
+    }
     Ok(segment.to_string())
 }
 
@@ -103,6 +124,36 @@ mod tests {
             Error::Validation { field, message } => {
                 assert_eq!(field, "id_or_url");
                 assert_eq!(message, "must be a non-empty string");
+            }
+            other => panic!("expected Error::Validation, got {other:?}"),
+        }
+    }
+
+    // ===================== Empty-extracted-segment errors (security finding, no Python equivalent) =====================
+    //
+    // Python's `id_from_url` has no guard here at all and returns `""` for every input below;
+    // rejecting an empty *extracted* segment is a deliberate Rust-side hardening documented on
+    // `id_from_url` itself, not a parity regression.
+
+    #[test]
+    fn single_slash_raises_validation_error_for_empty_segment() {
+        let err = id_from_url("/").unwrap_err();
+        match err {
+            Error::Validation { field, message } => {
+                assert_eq!(field, "id_or_url");
+                assert_eq!(message, "resolves to an empty path segment");
+            }
+            other => panic!("expected Error::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_slashes_raises_validation_error_for_empty_segment() {
+        let err = id_from_url("///").unwrap_err();
+        match err {
+            Error::Validation { field, message } => {
+                assert_eq!(field, "id_or_url");
+                assert_eq!(message, "resolves to an empty path segment");
             }
             other => panic!("expected Error::Validation, got {other:?}"),
         }

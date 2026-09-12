@@ -18,9 +18,15 @@
 //! `pause_*`/`block_*` that has a corresponding endpoint method in [`crate::endpoints`]), plus
 //! the cache invalidation the behaviour brief's §2 table specifies for each — including the two
 //! deliberate improvements over Python `rust-port-plan.md` §3.8 records (`set_led_brightness`,
-//! and every DNS/SQM/security setter, invalidating cache entries Python's own setters forget to).
-//! `set_device_priority`/`get_device_priority` and the `get_activity*` family remain unported —
-//! see the phase-5 section's own banner comment for why.
+//! and every DNS/SQM/security setter, invalidating cache entries Python's own setters forget to),
+//! plus two more added by a later security review (findings F2, F3):
+//! [`Client::add_to_blacklist`]/[`Client::remove_from_blacklist`] now invalidate `devices`
+//! (matching [`Client::block_device`], which shares the same wire resource), and
+//! [`Client::enable_bedtime`]/[`Client::clear_profile_schedule`]/[`Client::set_weekday_bedtime`]/
+//! [`Client::set_weekend_bedtime`] now invalidate the profile keys (matching
+//! [`Client::set_profile_schedule`], which they all delegate to at the wire level). See each
+//! method's own doc comment for the citation. `set_device_priority`/`get_device_priority` and the
+//! `get_activity*` family remain unported — see the phase-5 section's own banner comment for why.
 //!
 //! # No `login`/`verify` on `Client` (architectural divergence from the port plan)
 //!
@@ -251,22 +257,28 @@ impl Client {
         Err(Error::MissingNetworkId)
     }
 
-    /// Logs the current session out and, on success, clears this client's cache.
+    /// Logs the current session out and unconditionally clears this client's cache.
     ///
-    /// Ported from `logout()` (`client.py:197-206`): `result = await self._api.logout(); if
-    /// result: self.clear_cache()`. This port's [`EeroApi::logout`] returns
-    /// `Result<Envelope, Error>` rather than a `bool`, so "success" is `Ok(_)` — the direct
-    /// analogue of Python's truthy `result`.
+    /// Ported from `logout()` (`client.py:197-206`, `result = await self._api.logout(); if
+    /// result: self.clear_cache()`), but **deliberately diverges** from that `if result:` gate
+    /// (security review finding F1): [`EeroApi::logout`] already clears the in-memory session
+    /// and the credential store unconditionally, on every outcome — see that method's own docs
+    /// — precisely because the session is gone either way, win or lose, on the wire. A `Client`
+    /// that only dropped its cache when the network call happened to succeed left every cached
+    /// getter (`get_account`, `get_network`, `get_devices`, `get_profiles`, ...) free to keep
+    /// serving the previous session's data for the rest of the TTL after a failed logout (a
+    /// `429`, a `5xx`, a timeout), with `is_authenticated()` already `false` and no auth check of
+    /// its own gating any of those reads. Clearing the cache unconditionally here — before either
+    /// return arm — closes that gap and matches [`EeroApi::logout`]'s own contract: the cache and
+    /// the session become stale at exactly the same moment, regardless of whether the request
+    /// itself succeeded.
     ///
     /// # Errors
     ///
-    /// Propagates whatever [`EeroApi::logout`] returns; the cache is left untouched on `Err`,
-    /// matching Python's `if result:` gate exactly.
+    /// Propagates whatever [`EeroApi::logout`] returns. The cache is cleared regardless.
     pub async fn logout(&self) -> Result<Envelope, Error> {
         let result = self.api.logout().await;
-        if result.is_ok() {
-            self.clear_cache();
-        }
+        self.clear_cache();
         result
     }
 
@@ -1086,9 +1098,15 @@ impl Client {
     // `BurstReportersApi::create_burst_reporter`, `OUICheckApi::run_ouicheck`). Each is called
     // out at its own doc comment below with the reasoning for the invalidation choice made in the
     // absence of a Python precedent to port — every one of them follows the policy already
-    // established for its nearest sibling (same underlying wire resource, the same delegated
-    // call, or — for the five domains with no cache bucket at all — the same "invalidate nothing"
-    // policy every other bucket-less domain already uses), never a freshly invented policy.
+    // established for its nearest sibling: same underlying wire resource
+    // (`BlacklistApi::add_to_blacklist`/`remove_from_blacklist` invalidate `devices`, matching
+    // `Client::block_device` — corrected by security review finding F2, which is also why this is
+    // no longer "no cache bucket at all" for blacklist specifically), same delegated call
+    // (`ScheduleApi::set_weekday_bedtime`/`set_weekend_bedtime` invalidate the profile keys,
+    // matching `Client::set_profile_schedule` — finding F3), or — for the four domains with
+    // genuinely no cache bucket at all (`burst_reporters`, `ouicheck`, `support`, `insights`) —
+    // the same "invalidate nothing" policy every other bucket-less domain already uses. Never a
+    // freshly invented policy.
     //
     // `set_device_priority`/`get_device_priority` and every `get_activity*` method are **not**
     // added here: `src/endpoints/devices.rs` deliberately never ported `set_device_priority` (a
@@ -1773,45 +1791,63 @@ impl Client {
     ///
     /// No `client.py` precedent — see this group's banner comment above. Distinct from
     /// [`Client::block_device`], which routes through this same `/blacklist` resource but also
-    /// resolves the device's MAC first and invalidates the device cache; this method is the bare
+    /// resolves the device's MAC first; this method is otherwise the bare
     /// [`crate::endpoints::BlacklistApi::add_to_blacklist`] pass-through, `mac` unchanged and
-    /// unresolved. Invalidates nothing — there is no `blacklist` cache bucket (behaviour brief
-    /// §2.1), and `get_blacklist` is not one of the eight cached getters either.
+    /// unresolved. There is still no `blacklist` cache bucket of its own (behaviour brief §2.1;
+    /// `get_blacklist` is not one of the eight cached getters), but security review finding F2
+    /// corrected the previous "invalidates nothing" banner claim: this issues the *identical*
+    /// `POST .../blacklist` request [`Client::block_device`] makes for `blocked: true`, which
+    /// mutates state the `devices` bucket caches — a blocked device's status would otherwise
+    /// keep reading as unblocked from a cached `get_devices()`/`get_device()` for the rest of the
+    /// TTL. On success, invalidates `devices[{nid}_devices]` — the list bucket only, since (unlike
+    /// `block_device`) this method never resolves a specific `device_id` to also drop from
+    /// `devices[{nid}_{did}]`.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`].
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn add_to_blacklist(
         &self,
         mac: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        self.api
+        let response = self
+            .api
             .blacklist()
             .add_to_blacklist(&network_id, mac)
-            .await
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::devices(network_id.as_str()));
+        Ok(response)
     }
 
     /// Removes a device from the blacklist — returns the raw Eero API response.
     ///
     /// No `client.py` precedent — see [`Client::add_to_blacklist`]'s docs, which apply
-    /// identically here. `mac_or_device_id` is forwarded unchanged, exactly like
-    /// [`crate::endpoints::BlacklistApi::remove_from_blacklist`] itself. Invalidates nothing.
+    /// identically here: `mac_or_device_id` is forwarded unchanged, exactly like
+    /// [`crate::endpoints::BlacklistApi::remove_from_blacklist`] itself, and this is the same
+    /// `DELETE .../blacklist/{id}` [`Client::block_device`] issues for `blocked: false`. On
+    /// success, invalidates `devices[{nid}_devices]` — see [`Client::add_to_blacklist`]'s docs
+    /// for why only the list key, not a single-device key, is dropped here.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`].
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn remove_from_blacklist(
         &self,
         mac_or_device_id: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        self.api
+        let response = self
+            .api
             .blacklist()
             .remove_from_blacklist(&network_id, mac_or_device_id)
-            .await
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::devices(network_id.as_str()));
+        Ok(response)
     }
 
     /// Creates a burst reporter on the network — returns the raw Eero API response.
@@ -1930,19 +1966,22 @@ impl Client {
     /// Ported from `enable_bedtime` (`eero-api src/eero/client.py:1150-1162`). `auto_discover =
     /// false`.
     ///
-    /// Faithful no-op: invalidates nothing, even though this delegates to
-    /// [`crate::endpoints::ScheduleApi::enable_bedtime`], which itself calls the same
-    /// `set_profile_schedule` wire endpoint [`Client::set_profile_schedule`] uses (and which
-    /// *does* invalidate the profile cache when called directly). This asymmetry is a real,
-    /// pre-existing Python inconsistency (behaviour brief §2: `enable_bedtime` invalidates
-    /// "nothing, despite `set_profile_schedule` ... invalidating the profile cache"), **not** one
-    /// of this port's two deliberate improvements — do not "fix" this later thinking it was
-    /// missed. A profile fetched via [`Client::get_profile`] right after this call can return
-    /// stale schedule data until the TTL naturally expires, exactly as in Python.
+    /// **Deliberate divergence from Python (security review finding F3).** This delegates to
+    /// [`crate::endpoints::ScheduleApi::enable_bedtime`], which itself calls the exact same
+    /// `PUT .../profiles/{pid}` [`Client::set_profile_schedule`] uses — the method that *does*
+    /// invalidate the profile cache. Python's own `client.py` leaves this asymmetric
+    /// (`enable_bedtime` invalidates nothing, despite delegating to the same wire call
+    /// `set_profile_schedule` invalidates for), which meant a profile fetched via
+    /// [`Client::get_profile`] right after this call could report a stale (or entirely absent)
+    /// bedtime schedule for the rest of the TTL — a parental-control setting a caller believes is
+    /// active/cleared may not be, as far as any cached read can tell. Unlike the schedule
+    /// pass-throughs' previous "faithful no-op" framing, this asymmetry is fixed here rather than
+    /// reproduced: on success, invalidates `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]`,
+    /// matching [`Client::set_profile_schedule`] exactly.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`].
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn enable_bedtime(
         &self,
         profile_id: &str,
@@ -1952,31 +1991,37 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        self.api
+        let response = self
+            .api
             .schedule()
             .enable_bedtime(&network_id, profile_id, start_time, end_time, days)
-            .await
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
     }
 
     /// Clears every schedule on a profile — returns the raw Eero API response.
     ///
     /// Ported from `clear_profile_schedule` (`eero-api src/eero/client.py:1164-1169`).
-    /// `auto_discover = false`. Faithful no-op: invalidates nothing, for the same reason
-    /// [`Client::enable_bedtime`] does not — see that method's docs.
+    /// `auto_discover = false`. Same divergence as [`Client::enable_bedtime`] (security review
+    /// finding F3): on success, invalidates `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]`.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`].
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn clear_profile_schedule(
         &self,
         profile_id: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        self.api
+        let response = self
+            .api
             .schedule()
             .clear_profile_schedule(&network_id, profile_id)
-            .await
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
     }
 
     /// Sets bedtime for weekdays only (Monday through Friday) — returns the raw Eero API
@@ -1986,12 +2031,12 @@ impl Client {
     /// (`api/schedule.py:169`) on `EeroClient`.
     /// [`crate::endpoints::ScheduleApi::set_weekday_bedtime`] is a pure delegator to
     /// `ScheduleApi::enable_bedtime`, so this method's cache behaviour matches
-    /// [`Client::enable_bedtime`] exactly: `auto_discover = false`, invalidates nothing — a
-    /// faithful no-op for the same bedtime-family reason.
+    /// [`Client::enable_bedtime`] exactly (security review finding F3): on success, invalidates
+    /// `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]`.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`].
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn set_weekday_bedtime(
         &self,
         profile_id: &str,
@@ -2000,20 +2045,24 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        self.api
+        let response = self
+            .api
             .schedule()
             .set_weekday_bedtime(&network_id, profile_id, start_time, end_time)
-            .await
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
     }
 
     /// Sets bedtime for weekends only (Saturday and Sunday) — returns the raw Eero API response.
     ///
     /// No `client.py` precedent — see [`Client::set_weekday_bedtime`]'s docs, which apply
-    /// identically here. `auto_discover = false`. Invalidates nothing.
+    /// identically here (security review finding F3): on success, invalidates
+    /// `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]`.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`].
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn set_weekend_bedtime(
         &self,
         profile_id: &str,
@@ -2022,10 +2071,13 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        self.api
+        let response = self
+            .api
             .schedule()
             .set_weekend_bedtime(&network_id, profile_id, start_time, end_time)
-            .await
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
     }
 
     // ==================== DNS (mutations) ====================
@@ -2593,11 +2645,23 @@ fn truthy_array(value: Option<&Value>) -> Option<&Vec<Value>> {
 /// call sites (`client.py:161-166`, `:324-329`; brief gotcha G11). Built on
 /// [`crate::util::id_from_url`] rather than re-deriving the trailing-segment logic a third time,
 /// unlike Python, which has no shared helper for it at all.
+///
+/// **Security review finding F3.** Both call sites above feed this function's return value
+/// straight into a request URL — `ensure_network_id`'s result becomes `{network_id}` in every
+/// subsequent mutation this `Client` issues, and `derive_preferred_network_id` latches it as the
+/// sticky [`Client::preferred_network_id`] for the rest of this client's lifetime — so a
+/// candidate that would trip [`crate::routes::validate_segment`] (empty, an ASCII control
+/// character, or a bare `"."`/`".."` once tab/CR/LF are stripped) is rejected here, at the one
+/// place a *server-derived* value (a hostile or buggy `/networks` response) can reach a request
+/// URL, rather than trusted through to `Route::render`/`Transport::render_url`'s own guard on
+/// every call after this one. Applies to both extraction paths, not just the `url` fallback:
+/// nothing stops a malicious `id` field from carrying the same value directly.
 fn extract_network_id(entry: &Value) -> Option<String> {
     if let Some(id) = entry
         .get("id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
+        .filter(|id| crate::routes::validate_segment(id).is_ok())
     {
         return Some(id.to_owned());
     }
@@ -2605,7 +2669,9 @@ fn extract_network_id(entry: &Value) -> Option<String> {
         .get("url")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())?;
-    crate::util::id_from_url(url).ok()
+    let candidate = crate::util::id_from_url(url).ok()?;
+    crate::routes::validate_segment(&candidate).ok()?;
+    Some(candidate)
 }
 
 /// Extracts the network list from a [`Client::get_account`] envelope's `data.networks` field.
@@ -2878,6 +2944,39 @@ mod tests {
     fn extract_network_id_is_none_when_neither_field_is_usable() {
         assert!(extract_network_id(&json!({})).is_none());
         assert!(extract_network_id(&json!({"id": "", "url": ""})).is_none());
+    }
+
+    // ===================== extract_network_id: security finding F3 =====================
+    //
+    // A hostile or buggy `/networks` response must not hand back a `".."`/`"."`/empty network
+    // id that later collapses a per-item route onto its collection — see this function's own
+    // doc comment. Both extraction paths (`id` field, `url`-tail fallback) are covered.
+
+    #[test]
+    fn extract_network_id_rejects_a_dot_segment_id_field_and_falls_back_to_url() {
+        let entry = json!({"id": "..", "url": "/2.2/networks/abc123"});
+        assert_eq!(extract_network_id(&entry).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_network_id_rejects_a_dot_segment_id_field_with_no_usable_url() {
+        assert!(extract_network_id(&json!({"id": ".."})).is_none());
+        assert!(extract_network_id(&json!({"id": "."})).is_none());
+    }
+
+    #[test]
+    fn extract_network_id_rejects_a_url_tail_that_resolves_to_a_dot_segment() {
+        // `id_from_url` extracts the trailing segment verbatim; a `/networks/..` url resolves
+        // to the literal id `".."`, which must be rejected rather than handed back as a usable
+        // network id.
+        assert!(extract_network_id(&json!({"url": "/2.2/networks/.."})).is_none());
+    }
+
+    #[test]
+    fn extract_network_id_rejects_a_url_that_resolves_to_an_empty_segment() {
+        // `id_from_url("/")` already fails (util's own empty-segment guard), so this exercises
+        // this function's `.ok()?` short-circuit on that error, not `validate_segment` itself.
+        assert!(extract_network_id(&json!({"url": "/"})).is_none());
     }
 
     // ===================== extract_account_networks =====================

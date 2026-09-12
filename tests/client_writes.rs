@@ -457,3 +457,316 @@ async fn a_failed_write_does_not_invalidate_the_cache() -> anyhow::Result<()> {
     assert_eq!(second.as_value(), &fixture_json("network.json"));
     Ok(())
 }
+
+// ===================== Security review findings (F1-F5) =====================
+//
+// One test per finding from the security merge review. Each was written first, run against the
+// unfixed code and observed RED, then GREEN again once the corresponding fix landed — see the
+// task's final report for the captured `cargo test` output of both runs (F1, F4, F5).
+
+/// **F1**: `AuthApi::logout` clears the in-memory session and credential store
+/// unconditionally, on every outcome (see `src/auth/mod.rs`'s own docs) — but the previous
+/// `Client::logout` only cleared *this client's cache* when the network call itself succeeded.
+/// That let a cached `get_network`/`get_account`/`get_devices`/`get_profiles` keep serving
+/// pre-logout data for the rest of the TTL even though `is_authenticated()` had already flipped
+/// to `false`. This primes the `network` bucket, forces `logout()` to fail on the wire (500),
+/// and asserts the cache can no longer serve the second `get_network` call: with both the cache
+/// and the session gone, it must fail with `Error::Authentication`, not silently return the
+/// stale envelope.
+#[tokio::test]
+async fn logout_failure_still_clears_the_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+
+    let err = client.logout().await.unwrap_err();
+    assert!(matches!(
+        err,
+        rusteero::error::Error::Api { status: 500, .. }
+    ));
+    assert!(!client.is_authenticated());
+
+    // Before the fix this served the pre-logout envelope straight from cache (`Ok`), with no
+    // auth check at all. After the fix the cache is empty and the session is gone, so this must
+    // fail closed rather than leak the earlier authenticated response.
+    let after = client.get_network(Some("network-0001"), false).await;
+    assert!(matches!(
+        after,
+        Err(rusteero::error::Error::Authentication(_))
+    ));
+    Ok(())
+}
+
+/// **F2**: `add_to_blacklist` issues the identical `POST .../blacklist` call
+/// `block_device(blocked: true)` makes, and `block_device` already invalidates the `devices`
+/// bucket on success. Before the fix, `add_to_blacklist` invalidated nothing, so a `get_devices`
+/// call right after would keep reporting the device as unblocked for the rest of the TTL.
+#[tokio::test]
+async fn add_to_blacklist_invalidates_the_devices_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/blacklist"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .add_to_blacklist("AA:BB:CC:00:00:01", Some("network-0001"))
+        .await?;
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+/// **F2**: `remove_from_blacklist` must invalidate the `devices` bucket too, for the same reason
+/// as `add_to_blacklist` above.
+#[tokio::test]
+async fn remove_from_blacklist_invalidates_the_devices_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/2.2/networks/network-0001/blacklist/AA:BB:CC:00:00:01",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .remove_from_blacklist("AA:BB:CC:00:00:01", Some("network-0001"))
+        .await?;
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+/// **F3**: `enable_bedtime` delegates to `ScheduleApi::set_profile_schedule` — the same `PUT
+/// .../profiles/{pid}` that `Client::set_profile_schedule` invalidates the profile cache for.
+/// Before the fix this was a faithful-to-Python no-op; the fix makes it match its own delegate.
+#[tokio::test]
+async fn enable_bedtime_invalidates_the_profile_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    client
+        .enable_bedtime("profile-0001", "21:00", "07:00", None, Some("network-0001"))
+        .await?;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    Ok(())
+}
+
+/// **F3**: `clear_profile_schedule` must invalidate the profile cache too — see
+/// `enable_bedtime_invalidates_the_profile_bucket` above.
+#[tokio::test]
+async fn clear_profile_schedule_invalidates_the_profile_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    client
+        .clear_profile_schedule("profile-0001", Some("network-0001"))
+        .await?;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    Ok(())
+}
+
+/// **F3**: `set_weekday_bedtime` must invalidate the profile cache too — see
+/// `enable_bedtime_invalidates_the_profile_bucket` above.
+#[tokio::test]
+async fn set_weekday_bedtime_invalidates_the_profile_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    client
+        .set_weekday_bedtime("profile-0001", "21:00", "07:00", Some("network-0001"))
+        .await?;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    Ok(())
+}
+
+/// **F3**: `set_weekend_bedtime` must invalidate the profile cache too — see
+/// `enable_bedtime_invalidates_the_profile_bucket` above.
+#[tokio::test]
+async fn set_weekend_bedtime_invalidates_the_profile_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    client
+        .set_weekend_bedtime("profile-0001", "21:00", "07:00", Some("network-0001"))
+        .await?;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    Ok(())
+}
+
+/// **F4**: every caller-supplied key outside `VALID_CONTENT_FILTER_KEYS` is dropped client-side
+/// before the request body is built (parity with Python). Before the fix, nothing guarded
+/// against the resulting map being empty: a caller who only passed a misspelled key (e.g.
+/// `block_adult_content` instead of `block_adult`) got a `200 OK` for `PUT {"content_filter":
+/// {}}}`, which — if the server replaces rather than merges that nested object — silently clears
+/// every content filter on the profile. This asserts the call now fails closed with
+/// `Error::Validation` *before* any request is sent (`.expect(0)` on the PUT mock).
+#[tokio::test]
+async fn update_profile_content_filter_with_only_unknown_keys_is_a_validation_error()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let err = client
+        .update_profile_content_filter(
+            "profile-0001",
+            &[("block_adult_content", true)],
+            Some("network-0001"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        rusteero::error::Error::Validation { ref field, .. } if field == "filters"
+    ));
+    Ok(())
+}
+
+/// **F5**: `sanitize_body_for_error` redacts a parseable JSON error body by *key* — a value that
+/// looks like a credential but sits under an unrelated key (e.g. a guest Wi-Fi password echoed
+/// back verbatim in a `400`'s `error` field) previously passed through untouched, because the
+/// raw-text `looks_sensitive` fallback was only reachable for bodies that failed to parse as
+/// JSON at all. This asserts the resulting `Error`'s `Display` never contains the submitted
+/// password.
+#[tokio::test]
+async fn a_password_echoed_under_a_non_sensitive_key_is_suppressed_from_the_error()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string(r#"{"meta":{"code":400,"error":"Invalid password: hunter2"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let err = client
+        .set_guest_network(true, None, Some("hunter2"), Some("network-0001"))
+        .await
+        .unwrap_err();
+    let rendered = err.to_string();
+    assert!(!rendered.contains("hunter2"));
+    Ok(())
+}
