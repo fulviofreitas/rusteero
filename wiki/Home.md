@@ -77,7 +77,11 @@ async fn main() -> Result<(), rusteero::Error> {
 original [eero-client](https://github.com/343max/eero-client) by
 [@343max](https://github.com/343max). The Rust login/verify handshake was cross-checked
 against [eero-rs](https://github.com/ssnover/eero-rs) by [@ssnover](https://github.com/ssnover),
-an earlier Rust adaptation of the same original client.
+an earlier Rust adaptation of the same original client. **No code was copied from any of
+them** — the designs, endpoint tables and behaviours are derived from `eero-api`, whose MIT
+notice is reproduced in the repository's
+[NOTICE](https://github.com/fulviofreitas/rusteero/blob/master/NOTICE) file. `eero-rs` carries
+no licence and was consulted as a reference only.
 
 **What's new** (relative to `eero-api`):
 
@@ -93,6 +97,10 @@ an earlier Rust adaptation of the same original client.
 *   Rate-limit errors carry `Retry-After` when the server sends it
 *   Every wire endpoint is a single `Route` constant, so upstream API drift is a one-line fix
 *   Removed-upstream endpoints (`activity/*`, device priority) are not carried over
+*   Response bodies embedded in errors are redacted before truncation, so a malformed reply
+    cannot leak a session token or a Wi-Fi password into a log line
+*   Path segments are validated before a URL is built, so an id carrying a stray newline
+    cannot escape its segment and send a write at the wrong resource
 
 ---
 

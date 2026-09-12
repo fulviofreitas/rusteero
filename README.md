@@ -107,13 +107,11 @@ All API methods return the exact JSON from Eero's API, wrapped in a lossless `En
 
 ## 🙏 Acknowledgments
 
-`rusteero` is a Rust port of [eero-api](https://github.com/fulviofreitas/eero-api) by
-[@fulviofreitas](https://github.com/fulviofreitas), which is itself a modern revamp of the
-original [eero-client](https://github.com/343max/eero-client) by
-[@343max](https://github.com/343max). The Rust login/verify handshake was cross-checked against
-[eero-rs](https://github.com/ssnover/eero-rs) by [@ssnover](https://github.com/ssnover), an
-earlier Rust adaptation of the same original client. No code was copied from any of them; see
-[NOTICE](NOTICE).
+`rusteero` is a Rust client library for the Eero (Amazon) mesh Wi-Fi cloud API, ported from
+[eero-api](https://github.com/fulviofreitas/eero-api). No code was copied from it or from any
+other project; full lineage and licence attribution is in [NOTICE](NOTICE), and the long-form
+version with what changed in the port is on the
+[wiki](https://github.com/fulviofreitas/rusteero/wiki).
 
 ## ⚠️ Important Notes
 
