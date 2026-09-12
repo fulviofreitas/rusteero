@@ -18,6 +18,8 @@
 
 use std::sync::Arc;
 
+use serde_json::{Map, Value, json};
+
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
@@ -91,11 +93,123 @@ impl NetworksApi {
         self.transport.send(&routes::ACCOUNT, &[], None).await
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Phase 5 (not this phase): NetworksAPI's mutation methods go here —
-    // `set_guest_network` (`networks.py:71-109`), `run_speed_test` (`networks.py:111-132`),
-    // `reboot_network` (`networks.py:134-157`) and `set_network_name` (`networks.py:182-208`).
-    // Each already has a `Route` constant in `src/routes.rs`
-    // (`SET_GUEST_NETWORK`/`RUN_SPEED_TEST`/`REBOOT_NETWORK`/`SET_NETWORK_NAME`).
-    // ---------------------------------------------------------------------------------------
+    /// `PUT /2.2/networks/{network_id}/guestnetwork` — enable/disable/configure the guest
+    /// network.
+    ///
+    /// Ported from `NetworksAPI.set_guest_network` (`networks.py:71-109`). Sends
+    /// `routes::SET_GUEST_NETWORK` with body `{"enabled": enabled}` (`networks.py:97`), plus
+    /// `{"name": ...}` and/or `{"password": ...}` only when `name`/`password` are `Some`
+    /// (`networks.py:99-103`) — neither key is ever sent as `null` for an omitted argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn set_guest_network(
+        &self,
+        network_id: &str,
+        enabled: bool,
+        name: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let mut payload = Map::new();
+        payload.insert("enabled".to_owned(), Value::Bool(enabled));
+        if let Some(name) = name {
+            payload.insert("name".to_owned(), Value::String(name.to_owned()));
+        }
+        if let Some(password) = password {
+            payload.insert("password".to_owned(), Value::String(password.to_owned()));
+        }
+        self.transport
+            .send(
+                &routes::SET_GUEST_NETWORK,
+                &[("network_id", network_id)],
+                Some(Value::Object(payload)),
+            )
+            .await
+    }
+
+    /// `POST /2.2/networks/{network_id}/speedtest` — run a speed test on the network.
+    ///
+    /// Ported from `NetworksAPI.run_speed_test` (`networks.py:111-132`). Sends
+    /// `routes::RUN_SPEED_TEST` with an empty body `{}` (`networks.py:131`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn run_speed_test(&self, network_id: &str) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::RUN_SPEED_TEST,
+                &[("network_id", network_id)],
+                Some(json!({})),
+            )
+            .await
+    }
+
+    /// `POST /2.2/networks/{network_id}/reboot` — reboot every Eero node on the network.
+    ///
+    /// Ported from `NetworksAPI.reboot_network` (`networks.py:134-157`). Sends
+    /// `routes::REBOOT_NETWORK` with an empty body `{}` (`networks.py:156`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn reboot_network(&self, network_id: &str) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::REBOOT_NETWORK,
+                &[("network_id", network_id)],
+                Some(json!({})),
+            )
+            .await
+    }
+
+    /// `PUT /2.2/networks/{network_id}/settings` — set the network name (SSID).
+    ///
+    /// Ported from `NetworksAPI.set_network_name` (`networks.py:182-208`). Sends
+    /// `{"name": name}` (`networks.py:207`) through `put_network_settings`, the shared call site
+    /// this crate factors out of `routes::PUT_NETWORK_SETTINGS`'s dozen-plus Python setters —
+    /// see that function's own doc comment for the full list of callers across `DnsApi`,
+    /// `SecurityApi` and `SqmApi`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn set_network_name(&self, network_id: &str, name: &str) -> Result<Envelope, Error> {
+        put_network_settings(&self.transport, network_id, json!({ "name": name })).await
+    }
+}
+
+/// Shared `PUT /2.2/networks/{network_id}/settings` call site behind every setter in
+/// `NetworksApi`, `DnsApi`, `SecurityApi` and `SqmApi` that targets `routes::PUT_NETWORK_SETTINGS`
+/// — see that route constant's own doc comment for the full list of Python setters it aliases.
+/// Centralising the call here, rather than repeating
+/// `transport.send(&routes::PUT_NETWORK_SETTINGS, &[("network_id", network_id)], Some(body))`
+/// across four files, means a future change to this one resource's request shape only needs to
+/// be made in one place.
+///
+/// `pub(crate)`, not `pub`: this is plumbing shared across `src/endpoints/`, not part of the
+/// domain-module API surface any of the four `*Api` structs expose to a caller. It has no direct
+/// Python original — Python repeats the equivalent `self.put(f"networks/{network_id}/settings",
+/// ...)` call inline in every one of the fifteen setters this function replaces.
+pub(crate) async fn put_network_settings(
+    transport: &Transport,
+    network_id: &str,
+    body: Value,
+) -> Result<Envelope, Error> {
+    transport
+        .send(
+            &routes::PUT_NETWORK_SETTINGS,
+            &[("network_id", network_id)],
+            Some(body),
+        )
+        .await
 }

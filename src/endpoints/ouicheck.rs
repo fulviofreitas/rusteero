@@ -1,8 +1,7 @@
-//! OUI Check API: the read-only (`GET`) half of `eero-api`'s `OUICheckAPI`.
+//! OUI Check API: `eero-api`'s `OUICheckAPI`.
 //!
-//! Ported from `eero-api src/eero/api/ouicheck.py`. This phase (3, GET-only) covers
-//! `OUICheckAPI.get_ouicheck`; `run_ouicheck` (`ouicheck.py:56-78`, `POST` with an empty `{}`
-//! body) is phase 5.
+//! Ported from `eero-api src/eero/api/ouicheck.py`: `OUICheckAPI.get_ouicheck` and
+//! `OUICheckAPI.run_ouicheck`.
 //!
 //! Every method here funnels through [`crate::transport::Transport::send`], which already
 //! implements the "not authenticated" precondition Python repeats at the top of each method
@@ -12,12 +11,14 @@
 
 use std::sync::Arc;
 
+use serde_json::json;
+
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
 use crate::transport::Transport;
 
-/// The read-only half of `eero-api`'s `OUICheckAPI` (`src/eero/api/ouicheck.py`).
+/// `eero-api`'s `OUICheckAPI` (`src/eero/api/ouicheck.py`).
 ///
 /// Build one with [`OUICheckApi::new`], wrapping a [`Transport`] already shared with the rest of
 /// the (not-yet-built) `EeroApi` aggregator — `OUICheckApi` never constructs or owns a
@@ -50,9 +51,24 @@ impl OUICheckApi {
             .await
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Phase 5 (not this phase): `OUICheckAPI.run_ouicheck` (`ouicheck.py:56-78`) — `POST`
-    // `routes::RUN_OUICHECK` (`networks/{network_id}/ouicheck`, same path as `GET_OUICHECK`)
-    // with an empty `{}` body.
-    // ---------------------------------------------------------------------------------------
+    /// Runs an OUI (vendor MAC prefix) check for a network — returns the raw Eero API response.
+    ///
+    /// Ported from `eero-api src/eero/api/ouicheck.py:56-78` (`OUICheckAPI.run_ouicheck`). Sends
+    /// `POST` [`crate::routes::RUN_OUICHECK`] (`networks/{network_id}/ouicheck`, the same path
+    /// as [`crate::routes::GET_OUICHECK`]) with an empty JSON object `{}` as the body
+    /// (`ouicheck.py:77`), not an absent body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn run_ouicheck(&self, network_id: &str) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::RUN_OUICHECK,
+                &[("network_id", network_id)],
+                Some(json!({})),
+            )
+            .await
+    }
 }

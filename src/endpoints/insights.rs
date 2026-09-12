@@ -1,23 +1,24 @@
-//! Insights API: the read-only (`GET`) half of `eero-api`'s `InsightsAPI`.
+//! Insights API: `eero-api`'s `InsightsAPI`.
 //!
-//! Ported from `eero-api src/eero/api/insights.py`. This phase (3, GET-only) covers
-//! `InsightsAPI.get_insights`; `run_insights` (`insights.py:115-137`, `POST` with an empty `{}`
-//! body) is phase 5.
+//! Ported from `eero-api src/eero/api/insights.py`: `InsightsAPI.get_insights` and
+//! `InsightsAPI.run_insights`.
 //!
-//! Every method here funnels through [`crate::transport::Transport::send_with_query`], which
-//! already implements the "not authenticated" precondition Python repeats at the top of each
-//! method (`get_auth_token()` / `EeroAuthenticationException("Not authenticated")`) and every
+//! Every method here funnels through [`crate::transport::Transport`], which already implements
+//! the "not authenticated" precondition Python repeats at the top of each method
+//! (`get_auth_token()` / `EeroAuthenticationException("Not authenticated")`) and every
 //! status-to-error mapping a response can produce — so, unlike the Python source, no method
 //! below duplicates that guard.
 
 use std::sync::Arc;
+
+use serde_json::json;
 
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
 use crate::transport::Transport;
 
-/// The read-only half of `eero-api`'s `InsightsAPI` (`src/eero/api/insights.py`).
+/// `eero-api`'s `InsightsAPI` (`src/eero/api/insights.py`).
 ///
 /// Build one with [`InsightsApi::new`], wrapping a [`Transport`] already shared with the rest of
 /// the (not-yet-built) `EeroApi` aggregator — `InsightsApi` never constructs or owns a
@@ -81,9 +82,24 @@ impl InsightsApi {
             .await
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Phase 5 (not this phase): `InsightsAPI.run_insights` (`insights.py:115-137`) — `POST`
-    // `routes::RUN_INSIGHTS` (`networks/{network_id}/insights`, same path as `GET_INSIGHTS`)
-    // with an empty `{}` body.
-    // ---------------------------------------------------------------------------------------
+    /// Runs insights analysis for a network — returns the raw Eero API response.
+    ///
+    /// Ported from `eero-api src/eero/api/insights.py:115-137` (`InsightsAPI.run_insights`).
+    /// Sends `POST` [`crate::routes::RUN_INSIGHTS`] (`networks/{network_id}/insights`, the same
+    /// path as [`crate::routes::GET_INSIGHTS`]) with an empty JSON object `{}` as the body
+    /// (`insights.py:136`), not an absent body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn run_insights(&self, network_id: &str) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::RUN_INSIGHTS,
+                &[("network_id", network_id)],
+                Some(json!({})),
+            )
+            .await
+    }
 }

@@ -1,9 +1,9 @@
-//! Backup Network API: the read-only (`GET`) half of `eero-api`'s `BackupAPI` (an Eero
-//! Plus/Eero Secure feature).
+//! Backup Network API: `eero-api`'s `BackupAPI` (an Eero Plus/Eero Secure feature).
 //!
-//! Ported from `eero-api src/eero/api/backup.py`. This phase (3, GET-only) covers
-//! `BackupAPI.get_backup_network` and `BackupAPI.get_backup_status` — **two distinct wire
-//! endpoints** (`.../backup` and `.../backup/status`), never aliases of one another.
+//! Ported from `eero-api src/eero/api/backup.py`: `BackupAPI.get_backup_network` and
+//! `BackupAPI.get_backup_status` — **two distinct wire endpoints** (`.../backup` and
+//! `.../backup/status`), never aliases of one another — plus the two mutation methods,
+//! `BackupAPI.set_backup_network` and `BackupAPI.configure_backup_network`.
 //!
 //! Every method here funnels through `Transport::send`, which already implements the "not
 //! authenticated" precondition Python repeats at the top of each method (`get_auth_token()` /
@@ -12,12 +12,14 @@
 
 use std::sync::Arc;
 
+use serde_json::{Map, Value, json};
+
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
 use crate::transport::Transport;
 
-/// The read-only half of `eero-api`'s `BackupAPI` (`src/eero/api/backup.py`).
+/// `eero-api`'s `BackupAPI` (`src/eero/api/backup.py`).
 ///
 /// Backup network features require an active Eero Plus/Eero Secure subscription — they let a
 /// mobile phone stand in as a backup internet connection when the primary connection fails.
@@ -84,21 +86,81 @@ impl BackupApi {
             .await
     }
 
-    // -----------------------------------------------------------------------------------------
-    // PHASE 5 (not implemented here — backup mutations, added by a later agent to this same
-    // file):
-    //
-    // - `set_backup_network` and `configure_backup_network` both PUT
-    //   `routes::SET_BACKUP_NETWORK` (alias `routes::CONFIGURE_BACKUP_NETWORK`) — the exact
-    //   `networks/{network_id}/backup` resource `get_backup_network` above reads. Ported from
-    //   `BackupAPI.set_backup_network` (`backup.py:80-112`) and
-    //   `BackupAPI.configure_backup_network` (`backup.py:114-156`).
-    // - Python's `configure_backup_network`, called with neither `enabled` nor `phone_number`
-    //   set, never sends a request at all: it logs a warning and fabricates a local
-    //   `{"meta": {"code": 400}, "data": {}}` envelope (`backup.py:146-148`) — a response that
-    //   never actually came from the server. The Rust port of this method must NOT reproduce
-    //   that: an empty call is a client-side precondition failure, so it should return
-    //   `Error::Validation { field, message }` before any request is sent, exactly like every
-    //   other client-side precondition in this crate.
-    // -----------------------------------------------------------------------------------------
+    /// `PUT /2.2/networks/{network_id}/backup` — enable or disable the backup network.
+    ///
+    /// Ported from `BackupAPI.set_backup_network` (`backup.py:80-112`). Sends
+    /// `routes::SET_BACKUP_NETWORK` with body `{"enabled": enabled}` (`backup.py:111`) — the
+    /// exact `networks/{network_id}/backup` resource `get_backup_network` reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn set_backup_network(
+        &self,
+        network_id: &str,
+        enabled: bool,
+    ) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::SET_BACKUP_NETWORK,
+                &[("network_id", network_id)],
+                Some(json!({ "enabled": enabled })),
+            )
+            .await
+    }
+
+    /// `PUT /2.2/networks/{network_id}/backup` — configure backup network settings.
+    ///
+    /// Ported from `BackupAPI.configure_backup_network` (`backup.py:114-156`). Sends
+    /// `routes::CONFIGURE_BACKUP_NETWORK` (alias of `routes::SET_BACKUP_NETWORK`, the same
+    /// `networks/{network_id}/backup` resource `set_backup_network` above PUTs) with a body
+    /// built from only the arguments actually supplied: `{"enabled": ...}` is included only when
+    /// `enabled` is `Some` (`backup.py:140-141`), `{"phone_number": ...}` only when
+    /// `phone_number` is `Some` (`backup.py:143-144`). Neither key is ever sent as `null` for an
+    /// omitted argument — the omitted argument's key is absent from the body entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation` if both `enabled` and `phone_number` are `None`, before any
+    /// request is sent. This is a deliberate divergence from Python, which never contacts the
+    /// server in that case either but instead fabricates a local
+    /// `{"meta": {"code": 400}, "data": {}}` response (`backup.py:146-148`) — a response that
+    /// never actually came from the wire. Inventing a fake envelope here would violate this
+    /// crate's raw-payload contract more than simply refusing before any request is built (port
+    /// plan §3.3). Returns `Error::Authentication("Not authenticated")` if no valid session is
+    /// configured, or whatever other status-mapped error the request produces otherwise — see
+    /// `Transport::send`.
+    pub async fn configure_backup_network(
+        &self,
+        network_id: &str,
+        enabled: Option<bool>,
+        phone_number: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let mut payload = Map::new();
+        if let Some(enabled) = enabled {
+            payload.insert("enabled".to_owned(), Value::Bool(enabled));
+        }
+        if let Some(phone_number) = phone_number {
+            payload.insert(
+                "phone_number".to_owned(),
+                Value::String(phone_number.to_owned()),
+            );
+        }
+        if payload.is_empty() {
+            return Err(Error::Validation {
+                field: "enabled, phone_number".to_owned(),
+                message: "at least one of `enabled` or `phone_number` must be provided".to_owned(),
+            });
+        }
+
+        self.transport
+            .send(
+                &routes::CONFIGURE_BACKUP_NETWORK,
+                &[("network_id", network_id)],
+                Some(Value::Object(payload)),
+            )
+            .await
+    }
 }

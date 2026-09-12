@@ -11,10 +11,14 @@
 
 use std::sync::Arc;
 
+use serde_json::{Map, Value, json};
+
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
 use crate::transport::Transport;
+
+use super::networks::put_network_settings;
 
 /// The read-only half of `eero-api`'s `SqmAPI` (`src/eero/api/sqm.py`).
 ///
@@ -53,31 +57,139 @@ impl SqmApi {
             .await
     }
 
-    // ---------------------------------------------------------------------------------------
-    // Phase 5 (not this phase): SqmAPI's mutation methods go here — `set_sqm_enabled`
-    // (`sqm.py:59-87`), `set_sqm_bandwidth` (`sqm.py:89-135`), `configure_sqm`
-    // (`sqm.py:137-180`) and `set_sqm_auto` (`sqm.py:182-204`). Notes for whoever implements
-    // them:
-    //
-    // - All four PUT `networks/{network_id}/settings` (`crate::routes::PUT_NETWORK_SETTINGS`),
-    //   the exact same wire resource `DnsAPI` and `SecurityAPI`'s setters also target — phase 5
-    //   should share one `put_network_settings(network_id, body)` helper on this resource rather
-    //   than repeating the call four times across three files.
-    // - `set_sqm_enabled` PUTs a **flat** `{"sqm": bool}` body (`sqm.py:86`) — unlike the other
-    //   three setters below, which nest an object under `"sqm"`.
-    // - `set_sqm_bandwidth`'s payload shape is UNVERIFIED upstream: Python leaves a `TODO:
-    //   Verify` comment at `sqm.py:128-130` questioning whether the bandwidth payload should be
-    //   flattened (e.g. `{"sqm": true, "upload_bandwidth": N}`) rather than nested (`{"sqm":
-    //   {"enabled": true, "upload_bandwidth"?, "download_bandwidth"?}}`, what the code actually
-    //   sends today). Phase 5 must implement it exactly as Python does — nested — and the
-    //   corresponding `PARITY.md` row must read "ported — shape unverified upstream", not
-    //   "ported".
-    // - `configure_sqm`'s payload shape carries the same caveat, at `sqm.py:173-175`: nested
-    //   `{"sqm": {"enabled": bool, "upload_bandwidth"?, "download_bandwidth"?}}` (bandwidth keys
-    //   included only when `enabled` is true). Same "ported — shape unverified upstream" marking.
-    // - `set_sqm_auto` carries the same caveat a third time, at `sqm.py:197-199`: nested
-    //   `{"sqm": {"enabled": true, "mode": "auto"}}`. Same "ported — shape unverified upstream"
-    //   marking. This method takes no bool argument in Python — it always enables SQM in auto
-    //   mode.
-    // ---------------------------------------------------------------------------------------
+    /// `PUT /2.2/networks/{network_id}/settings` — enable or disable SQM (Smart Queue
+    /// Management).
+    ///
+    /// Ported from `SqmAPI.set_sqm_enabled` (`sqm.py:59-87`). Sends a **flat** `{"sqm": enabled}`
+    /// body (`sqm.py:86`) through `put_network_settings` — unlike `set_sqm_bandwidth`,
+    /// `configure_sqm` and `set_sqm_auto` below, which all nest an object under `"sqm"` instead
+    /// of a bare bool.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn set_sqm_enabled(
+        &self,
+        network_id: &str,
+        enabled: bool,
+    ) -> Result<Envelope, Error> {
+        put_network_settings(&self.transport, network_id, json!({ "sqm": enabled })).await
+    }
+
+    /// `PUT /2.2/networks/{network_id}/settings` — set SQM upload/download bandwidth limits.
+    ///
+    /// Ported from `SqmAPI.set_sqm_bandwidth` (`sqm.py:89-135`). Sends a **nested**
+    /// `{"sqm": {"enabled": true, "upload_bandwidth"?, "download_bandwidth"?}}` body
+    /// (`sqm.py:113-119,131-135`) through `put_network_settings` — `upload_bandwidth`/
+    /// `download_bandwidth` are included only when `upload_mbps`/`download_mbps` are `Some`.
+    ///
+    /// Unverified upstream: Python leaves a `TODO: Verify` comment at `eero-api src/eero/api/
+    /// sqm.py:128-130` questioning whether this payload should be flattened (e.g. `{"sqm": true,
+    /// "upload_bandwidth": N}`) rather than nested, as it is here — nobody has confirmed either
+    /// shape against a real device. This port implements exactly what Python sends today, nested;
+    /// do not "fix" this without a live capture, and mark the corresponding `PARITY.md` row
+    /// "ported — shape unverified upstream", not "ported".
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn set_sqm_bandwidth(
+        &self,
+        network_id: &str,
+        upload_mbps: Option<u32>,
+        download_mbps: Option<u32>,
+    ) -> Result<Envelope, Error> {
+        let mut sqm = Map::new();
+        sqm.insert("enabled".to_owned(), Value::Bool(true));
+        if let Some(upload_mbps) = upload_mbps {
+            sqm.insert("upload_bandwidth".to_owned(), Value::from(upload_mbps));
+        }
+        if let Some(download_mbps) = download_mbps {
+            sqm.insert("download_bandwidth".to_owned(), Value::from(download_mbps));
+        }
+        put_network_settings(
+            &self.transport,
+            network_id,
+            json!({ "sqm": Value::Object(sqm) }),
+        )
+        .await
+    }
+
+    /// `PUT /2.2/networks/{network_id}/settings` — configure SQM (enable/disable plus optional
+    /// bandwidth limits) in one call.
+    ///
+    /// Ported from `SqmAPI.configure_sqm` (`sqm.py:137-180`). Sends a **nested**
+    /// `{"sqm": {"enabled": enabled, "upload_bandwidth"?, "download_bandwidth"?}}` body
+    /// (`sqm.py:163-179`) through `put_network_settings` — the bandwidth keys are included only
+    /// when `enabled` is `true` *and* the corresponding argument is `Some` (`sqm.py:165-169`); if
+    /// `enabled` is `false` neither bandwidth key is ever sent, regardless of the arguments.
+    ///
+    /// Unverified upstream: same caveat as `set_sqm_bandwidth` above, at `eero-api src/eero/api/
+    /// sqm.py:173-175` — Python's `TODO: Verify` questions whether this combined payload should
+    /// be flattened rather than nested. This port implements exactly what Python sends today,
+    /// nested; do not "fix" this without a live capture, and mark the corresponding `PARITY.md`
+    /// row "ported — shape unverified upstream", not "ported".
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn configure_sqm(
+        &self,
+        network_id: &str,
+        enabled: bool,
+        upload_mbps: Option<u32>,
+        download_mbps: Option<u32>,
+    ) -> Result<Envelope, Error> {
+        let mut sqm = Map::new();
+        sqm.insert("enabled".to_owned(), Value::Bool(enabled));
+        if enabled {
+            if let Some(upload_mbps) = upload_mbps {
+                sqm.insert("upload_bandwidth".to_owned(), Value::from(upload_mbps));
+            }
+            if let Some(download_mbps) = download_mbps {
+                sqm.insert("download_bandwidth".to_owned(), Value::from(download_mbps));
+            }
+        }
+        put_network_settings(
+            &self.transport,
+            network_id,
+            json!({ "sqm": Value::Object(sqm) }),
+        )
+        .await
+    }
+
+    /// `PUT /2.2/networks/{network_id}/settings` — set SQM to automatic mode (auto-detect
+    /// bandwidth).
+    ///
+    /// Ported from `SqmAPI.set_sqm_auto` (`sqm.py:182-204`). Takes no bool argument, unlike the
+    /// other three setters above — Python always enables SQM in auto mode. Sends the fixed,
+    /// **nested** body `{"sqm": {"enabled": true, "mode": "auto"}}` (`sqm.py:203`) through
+    /// `put_network_settings`.
+    ///
+    /// Unverified upstream: same caveat as `set_sqm_bandwidth`/`configure_sqm` above, a third
+    /// time, at `eero-api src/eero/api/sqm.py:197-199` — Python's `TODO: Verify` questions
+    /// whether this payload should be flattened (e.g. `{"sqm": true, "mode": "auto"}`) rather
+    /// than nested. This port implements exactly what Python sends today, nested; do not "fix"
+    /// this without a live capture, and mark the corresponding `PARITY.md` row "ported — shape
+    /// unverified upstream", not "ported".
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any request is sent, or whatever other status-mapped error the request produces —
+    /// see `Transport::send`.
+    pub async fn set_sqm_auto(&self, network_id: &str) -> Result<Envelope, Error> {
+        put_network_settings(
+            &self.transport,
+            network_id,
+            json!({ "sqm": { "enabled": true, "mode": "auto" } }),
+        )
+        .await
+    }
 }

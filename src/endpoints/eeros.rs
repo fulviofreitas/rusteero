@@ -1,37 +1,60 @@
 //! `EerosApi` — Eero (Amazon mesh node) endpoints, ported from `eero-api`'s `EerosAPI`
 //! (`src/eero/api/eeros.py:18-331`).
 //!
-//! This phase implements only the four read (`GET`) methods: [`EerosApi::get_eeros`],
-//! [`EerosApi::get_eero`], [`EerosApi::get_led_status`] and [`EerosApi::get_nightlight`]. The
-//! six mutation methods (`reboot_eero`, `set_led`, `set_led_brightness`, `set_nightlight`,
-//! `set_nightlight_brightness`, `set_nightlight_schedule`) are phase 5 — see the marker comment
-//! at the bottom of the `impl` block for what still needs to land there and the two behavioural
-//! gotchas already known before that work starts.
+//! Implements all ten `EerosAPI` methods: the four read (`GET`) methods —
+//! [`EerosApi::get_eeros`], [`EerosApi::get_eero`], [`EerosApi::get_led_status`] and
+//! [`EerosApi::get_nightlight`] — plus the six mutations — [`EerosApi::reboot_eero`],
+//! [`EerosApi::set_led`], [`EerosApi::set_led_brightness`], [`EerosApi::set_nightlight`],
+//! [`EerosApi::set_nightlight_brightness`] and [`EerosApi::set_nightlight_schedule`].
 //!
 //! ## The `network_id` parameter Python ignores
 //!
-//! Three of the four Python methods ported here — `get_eero`, `get_led_status` and
-//! `get_nightlight` — declare a `network_id: str` parameter that is never read; each method's
-//! own docstring says so explicitly (`"... (unused, kept for API compatibility)"`,
-//! `eeros.py:57,101,192`). All three make the exact same wire call, `GET eeros/{eero_id}` (not
-//! nested under `networks/`), regardless of what `network_id` holds or whether it names a
-//! network the Eero even belongs to.
+//! Every Python method ported here except [`EerosApi::get_eeros`] declares a `network_id: str`
+//! parameter that is never read; each method's own docstring says so explicitly (`"... (unused,
+//! kept for API compatibility)"`, `eeros.py:57,78,101,127,159,192,225`), or — for the two
+//! delegators, `set_nightlight_brightness` and `set_nightlight_schedule` — simply forwards a
+//! `network_id` into `set_nightlight`, which itself never reads it. Every one of those methods
+//! makes the exact same wire call, `eeros/{eero_id}` (not nested under `networks/`), regardless
+//! of what `network_id` holds or whether it names a network the Eero even belongs to.
 //!
-//! `rusteero` drops the parameter from all three signatures here rather than keeping a dead one:
+//! `rusteero` drops the parameter from all of those signatures here rather than keeping a dead
+//! one:
 //!
-//! - It carries no information the request ever uses, on either side of the wire — the wire path
-//!   is [`crate::routes::GET_EERO`] in every case, which has no `{network_id}` placeholder to
+//! - It carries no information any of these requests ever uses, on either side of the wire — the
+//!   wire path is [`crate::routes::GET_EERO`] (or one of its PUT/POST siblings on the same
+//!   `eeros/{eero_id}` resource) in every case, none of which has a `{network_id}` placeholder to
 //!   fill.
 //! - Keeping it would force every caller to supply a value that is silently discarded, with
 //!   nothing at the type level warning them that it does nothing.
-//! - `get_eeros`, the one method that *does* nest under `networks/{network_id}/eeros`, keeps its
-//!   `network_id` — the parameter is dropped only where Python itself never uses it, not across
-//!   the whole module.
+//! - [`EerosApi::get_eeros`] is the one method that *does* nest under
+//!   `networks/{network_id}/eeros`, and keeps its `network_id` — the parameter is dropped only
+//!   where Python itself never uses it, not across the whole module.
 //!
 //! This is a deliberate signature divergence from the Python source; see `PARITY.md` for where
 //! it is recorded.
+//!
+//! ## Brightness is clamped, not validated
+//!
+//! [`EerosApi::set_led_brightness`] and the `brightness` field of [`EerosApi::set_nightlight`]
+//! (and its [`EerosApi::set_nightlight_brightness`] delegator) reproduce Python's
+//! `max(0, min(100, brightness))` clamp (`eeros.py:175,252`) verbatim: an out-of-range value is
+//! silently pulled into `0..=100` before it is sent, never rejected with an error. See
+//! [`EerosApi::set_led_brightness`]'s own docs for why its `brightness` parameter is a signed
+//! `i32` rather than an unsigned or narrower type.
+//!
+//! ## The empty `set_nightlight` call diverges from Python
+//!
+//! Called with every optional field `None`, Python never sends a request at all: it logs a
+//! warning and fabricates a *local* `{"meta": {"code": 400}, "data": {}}` envelope
+//! (`eeros.py:269-272`) that never actually came from the server. That would violate this
+//! crate's "the raw envelope is the contract, never transform or invent it" rule, so this port
+//! diverges: an empty call returns `Error::Validation { field: "nightlight", .. }` before any
+//! request is built — a `Result` already expresses "you passed nothing" honestly, without lying
+//! about the wire. [`EerosApi::set_nightlight`]'s own docs cover this in detail.
 
 use std::sync::Arc;
+
+use serde_json::{Map, Value, json};
 
 use crate::envelope::Envelope;
 use crate::error::Error;
@@ -41,8 +64,7 @@ use crate::transport::Transport;
 /// Eero (mesh node) endpoints. Ported from `EerosAPI` (`eero-api src/eero/api/eeros.py:18-31`).
 ///
 /// Build one with [`EerosApi::new`], wrapping an already-configured [`Transport`] — typically
-/// the same `Transport` shared with every other endpoint module behind the not-yet-built
-/// `EeroApi` aggregator (phase 3/4).
+/// the same `Transport` shared with every other endpoint module behind the `EeroApi` aggregator.
 #[derive(Debug)]
 pub struct EerosApi {
     transport: Arc<Transport>,
@@ -138,28 +160,246 @@ impl EerosApi {
             .await
     }
 
-    // =================================================================================
-    // Phase 5 (not implemented here): the six `EerosAPI` mutation methods.
-    //
-    // - `reboot_eero`        (`eeros.py:74`)  — POST `crate::routes::REBOOT_EERO`.
-    // - `set_led`            (`eeros.py:118`) — PUT `crate::routes::SET_LED`,
-    //   `{"led_on": bool}`.
-    // - `set_led_brightness` (`eeros.py:150`) — PUT `crate::routes::SET_LED_BRIGHTNESS`
-    //   (alias of `SET_LED`), `{"led_brightness": 0..=100}`. Python clamps the caller's value
-    //   into range with `max(0, min(100, brightness))` rather than rejecting an out-of-range
-    //   input; the Rust port must reproduce that clamp, not add validation Python does not have.
-    // - `set_nightlight`     (`eeros.py:209`) — PUT `crate::routes::SET_NIGHTLIGHT` (alias of
-    //   `SET_LED`), `{"nightlight": {...}}` built from whichever optional fields are `Some`.
-    //   Python brightness fields are clamped the same way as `set_led_brightness`. When *no*
-    //   optional field is provided, Python never calls the network at all — it logs a warning
-    //   and fabricates a *local* `{"meta": {"code": 400}, "data": {}}` envelope (`eeros.py:269-272`).
-    //   That fabricated envelope would violate this crate's "the raw envelope is the contract,
-    //   never transform or invent it" rule (see this crate's `CLAUDE.md`), so the Rust port must
-    //   diverge here: an empty call becomes `Error::Validation` instead, before any request is
-    //   built. Document that divergence at the call site when it lands.
-    // - `set_nightlight_brightness` (`eeros.py:282`) — delegates to `set_nightlight`, no
-    //   separate route.
-    // - `set_nightlight_schedule`   (`eeros.py:302`) — delegates to `set_nightlight`, no
-    //   separate route.
-    // =================================================================================
+    /// Reboots a single Eero device — returns the raw Eero API response.
+    ///
+    /// Ported from `EerosAPI.reboot_eero` (`eero-api src/eero/api/eeros.py:74-93`); see the
+    /// module docs for why this port drops Python's unused `network_id` parameter. Sends `POST`
+    /// [`crate::routes::REBOOT_EERO`] with an empty JSON object body (`json={}`, matching
+    /// `eeros.py:93`), through [`Transport::send`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any network call is made. Returns whatever status-mapped error the request
+    /// produces otherwise (see [`Error`]'s own docs).
+    pub async fn reboot_eero(&self, eero_id: &str) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::REBOOT_EERO,
+                &[("eero_id", eero_id)],
+                Some(json!({})),
+            )
+            .await
+    }
+
+    /// Turns an Eero device's status LED on or off — returns the raw Eero API response.
+    ///
+    /// Ported from `EerosAPI.set_led` (`eero-api src/eero/api/eeros.py:118-148`); see the module
+    /// docs for why this port drops Python's unused `network_id` parameter. Sends `PUT`
+    /// [`crate::routes::SET_LED`] with body `{"led_on": enabled}` (`eeros.py:144-148`), through
+    /// [`Transport::send`]. This stays on API version 2.2 — unlike device nickname/pause writes,
+    /// `EerosAPI` never switches to the `/2.3` base.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any network call is made. Returns whatever status-mapped error the request
+    /// produces otherwise (see [`Error`]'s own docs).
+    pub async fn set_led(&self, eero_id: &str, enabled: bool) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::SET_LED,
+                &[("eero_id", eero_id)],
+                Some(json!({ "led_on": enabled })),
+            )
+            .await
+    }
+
+    /// Sets an Eero device's status LED brightness — returns the raw Eero API response.
+    ///
+    /// `brightness` is clamped to `0..=100` before it is sent, exactly like Python's
+    /// `max(0, min(100, brightness))` (`eeros.py:175`) — an out-of-range value is silently
+    /// clamped, never rejected with an error. `brightness` is a signed `i32` rather than an
+    /// unsigned or narrower type deliberately: Python's `int` accepts negative values and relies
+    /// on the clamp, not a type constraint, to correct them, so a caller must be able to *pass*
+    /// e.g. `-5` for the clamp to have anything to do. `u8` would make that a compile-time
+    /// impossibility instead of a runtime clamp, silently changing this method's behaviour
+    /// relative to Python's; `i32` is wide enough to express any realistic out-of-range input
+    /// (positive or negative) while staying a cheap `Copy` type.
+    ///
+    /// Ported from `EerosAPI.set_led_brightness` (`eero-api src/eero/api/eeros.py:150-183`); see
+    /// the module docs for why this port drops Python's unused `network_id` parameter. Sends
+    /// `PUT` [`crate::routes::SET_LED_BRIGHTNESS`] (an alias of [`crate::routes::SET_LED`]) with
+    /// body `{"led_brightness": <0..=100>}` (`eeros.py:179-183`), through [`Transport::send`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any network call is made. Returns whatever status-mapped error the request
+    /// produces otherwise (see [`Error`]'s own docs).
+    pub async fn set_led_brightness(
+        &self,
+        eero_id: &str,
+        brightness: i32,
+    ) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::SET_LED_BRIGHTNESS,
+                &[("eero_id", eero_id)],
+                Some(json!({ "led_brightness": brightness.clamp(0, 100) })),
+            )
+            .await
+    }
+
+    /// Sets nightlight settings for an Eero Beacon device — returns the raw Eero API response.
+    ///
+    /// Every setting is optional and independent, exactly like Python's keyword-only arguments
+    /// (`eeros.py:213-218`): only the fields actually supplied as `Some` are written into the
+    /// request body, so a caller who only wants to flip `enabled` never has to know or guess the
+    /// device's current brightness or schedule. `brightness` is clamped to `0..=100` the same
+    /// way as [`EerosApi::set_led_brightness`] (`eeros.py:251-252`) — see that method's docs for
+    /// why the parameter is a signed `i32`. The nested `schedule` object is built only when at
+    /// least one of `schedule_enabled`, `schedule_on` or `schedule_off` is supplied
+    /// (`eeros.py:258-267`), and, like the top-level object, only ever contains the keys that
+    /// were actually supplied — never a `null` for an omitted one.
+    ///
+    /// The resulting body shape is:
+    ///
+    /// ```json
+    /// {
+    ///   "nightlight": {
+    ///     "enabled": bool,               // present only if `enabled` was `Some`
+    ///     "brightness": 0..=100,         // present only if `brightness` was `Some`
+    ///     "ambient_light_enabled": bool, // present only if `ambient_light_enabled` was `Some`
+    ///     "schedule": {                  // present only if any schedule_* field was `Some`
+    ///       "enabled": bool,             // present only if `schedule_enabled` was `Some`
+    ///       "on": "HH:MM",               // present only if `schedule_on` was `Some`
+    ///       "off": "HH:MM"               // present only if `schedule_off` was `Some`
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// Ported from `EerosAPI.set_nightlight` (`eero-api src/eero/api/eeros.py:209-280`); see the
+    /// module docs for why this port drops Python's unused `network_id` parameter. Sends `PUT`
+    /// [`crate::routes::SET_NIGHTLIGHT`] (an alias of [`crate::routes::SET_LED`]) with the body
+    /// shown above, through [`Transport::send`].
+    ///
+    /// Takes seven parameters (including the receiver) to mirror `eeros.py:209-219`'s six
+    /// independent, optional keyword arguments one-to-one; splitting them into a params struct
+    /// would break that direct call-signature correspondence with the Python source without
+    /// making any call site clearer, since every field here is a plain, self-describing scalar.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_nightlight(
+        &self,
+        eero_id: &str,
+        enabled: Option<bool>,
+        brightness: Option<i32>,
+        schedule_enabled: Option<bool>,
+        schedule_on: Option<&str>,
+        schedule_off: Option<&str>,
+        ambient_light_enabled: Option<bool>,
+    ) -> Result<Envelope, Error> {
+        let mut nightlight = Map::new();
+
+        if let Some(enabled) = enabled {
+            nightlight.insert("enabled".to_string(), Value::Bool(enabled));
+        }
+        if let Some(brightness) = brightness {
+            nightlight.insert(
+                "brightness".to_string(),
+                Value::from(brightness.clamp(0, 100)),
+            );
+        }
+        if let Some(ambient_light_enabled) = ambient_light_enabled {
+            nightlight.insert(
+                "ambient_light_enabled".to_string(),
+                Value::Bool(ambient_light_enabled),
+            );
+        }
+
+        if schedule_enabled.is_some() || schedule_on.is_some() || schedule_off.is_some() {
+            let mut schedule = Map::new();
+            if let Some(schedule_enabled) = schedule_enabled {
+                schedule.insert("enabled".to_string(), Value::Bool(schedule_enabled));
+            }
+            if let Some(schedule_on) = schedule_on {
+                schedule.insert("on".to_string(), Value::String(schedule_on.to_string()));
+            }
+            if let Some(schedule_off) = schedule_off {
+                schedule.insert("off".to_string(), Value::String(schedule_off.to_string()));
+            }
+            if !schedule.is_empty() {
+                nightlight.insert("schedule".to_string(), Value::Object(schedule));
+            }
+        }
+
+        // Divergence from `eeros.py:269-272` (see the module docs' "empty `set_nightlight`"
+        // section): Python fabricates a local `{"meta": {"code": 400}, "data": {}}` envelope and
+        // never touches the network; this port refuses before any request is built instead,
+        // since a `Result` already says "you passed nothing" without inventing a fake response.
+        if nightlight.is_empty() {
+            return Err(Error::Validation {
+                field: "nightlight".to_string(),
+                message: "at least one nightlight setting must be provided".to_string(),
+            });
+        }
+
+        let mut body = Map::new();
+        body.insert("nightlight".to_string(), Value::Object(nightlight));
+
+        self.transport
+            .send(
+                &routes::SET_NIGHTLIGHT,
+                &[("eero_id", eero_id)],
+                Some(Value::Object(body)),
+            )
+            .await
+    }
+
+    /// Sets only the nightlight brightness for an Eero Beacon device — returns the raw Eero API
+    /// response.
+    ///
+    /// A convenience delegator: sends the exact same request as
+    /// `set_nightlight(eero_id, None, Some(brightness), None, None, None, None)`, so it shares
+    /// that method's clamp and body shape (see [`EerosApi::set_nightlight`]'s docs) rather than
+    /// building its own.
+    ///
+    /// Ported from `EerosAPI.set_nightlight_brightness` (`eero-api src/eero/api/eeros.py:282-300`);
+    /// see the module docs for why this port drops Python's unused `network_id` parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any network call is made. Returns whatever status-mapped error the request
+    /// produces otherwise (see [`Error`]'s own docs). Never returns `Error::Validation`: a
+    /// `brightness` value is always supplied here, so [`EerosApi::set_nightlight`]'s empty-body
+    /// guard can never trigger.
+    pub async fn set_nightlight_brightness(
+        &self,
+        eero_id: &str,
+        brightness: i32,
+    ) -> Result<Envelope, Error> {
+        self.set_nightlight(eero_id, None, Some(brightness), None, None, None, None)
+            .await
+    }
+
+    /// Sets only the nightlight schedule for an Eero Beacon device — returns the raw Eero API
+    /// response.
+    ///
+    /// A convenience delegator: sends the exact same request as
+    /// `set_nightlight(eero_id, None, None, Some(enabled), on_time, off_time, None)`, so it
+    /// shares that method's body shape (see [`EerosApi::set_nightlight`]'s docs) rather than
+    /// building its own.
+    ///
+    /// Ported from `EerosAPI.set_nightlight_schedule` (`eero-api src/eero/api/eeros.py:302-330`);
+    /// see the module docs for why this port drops Python's unused `network_id` parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any network call is made. Returns whatever status-mapped error the request
+    /// produces otherwise (see [`Error`]'s own docs). Never returns `Error::Validation`: `enabled`
+    /// is always supplied here, so [`EerosApi::set_nightlight`]'s empty-body guard can never
+    /// trigger.
+    pub async fn set_nightlight_schedule(
+        &self,
+        eero_id: &str,
+        enabled: bool,
+        on_time: Option<&str>,
+        off_time: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        self.set_nightlight(eero_id, None, None, Some(enabled), on_time, off_time, None)
+            .await
+    }
 }

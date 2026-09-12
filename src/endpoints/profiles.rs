@@ -1,28 +1,49 @@
 //! Profiles API for Eero: per-network device-grouping "profiles" (e.g. "Kids", "Guests").
 //!
-//! Ported from `eero-api`'s `src/eero/api/profiles.py`. This phase covers only the read-only
-//! methods (`get_profiles`, `get_profile`, `get_profile_devices`, `get_blocked_applications`);
-//! the mutation methods (`pause_profile`, `set_profile_devices`,
-//! `update_profile_content_filter`, `update_profile_block_list`, `set_blocked_applications`,
-//! `create_profile`, `rename_profile`, `delete_profile`) are phase 5 — see the marker comment
-//! at the bottom of this file for where they go.
+//! Ported from `eero-api`'s `src/eero/api/profiles.py`. Covers every `ProfilesAPI` method,
+//! read-only and mutating alike.
 //!
 //! As in Python, every method here returns the raw `{"meta": …, "data": …}` envelope
-//! unmodified: `ProfilesApi` never extracts, filters or reshapes anything out of a response.
-//! This matters most for `get_profile`, `get_profile_devices` and `get_blocked_applications`:
-//! all three are the *same* wire call (`GET networks/{network_id}/profiles/{profile_id}`,
-//! `routes::GET_PROFILE` and its two aliases `routes::GET_PROFILE_DEVICES` /
-//! `routes::GET_BLOCKED_APPLICATIONS`) returning the same full profile object. The distinct
-//! Python names exist purely to document caller intent — "I want this profile's `devices`
-//! field" vs. "I want this profile's `blocked_applications` field" — not to select a different
-//! request or to narrow the response. See each method's own docs for the citation.
+//! unmodified: `ProfilesApi` never extracts, filters or reshapes anything out of a response —
+//! the one deliberate exception is `update_profile_content_filter`'s *outgoing* key whitelist
+//! (`profiles.py:201-217`), which is a request-shaping step Python itself performs before the
+//! request is even sent, not a response transform; see that method's own docs.
+//!
+//! `get_profile`, `get_profile_devices` and `get_blocked_applications` are the *same* wire call
+//! (`GET networks/{network_id}/profiles/{profile_id}`, `routes::GET_PROFILE` and its two
+//! aliases `routes::GET_PROFILE_DEVICES` / `routes::GET_BLOCKED_APPLICATIONS`) returning the
+//! same full profile object. Likewise, `pause_profile`, `set_profile_devices`,
+//! `update_profile_content_filter`, `update_profile_block_list`, `set_blocked_applications` and
+//! `rename_profile` all `PUT` the same `networks/{network_id}/profiles/{profile_id}` resource
+//! (`routes::PUT_PROFILE` and its aliases) with a different JSON key each. The distinct Python
+//! names exist purely to document caller intent, not to select a different request or to narrow
+//! the response. See each method's own docs for the citation.
 
 use std::sync::Arc;
+
+use serde_json::json;
 
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
 use crate::transport::Transport;
+
+/// Content-filter keys the Eero cloud API accepts on a profile, verbatim from
+/// `eero-api src/eero/api/profiles.py:201-209`'s `valid_filters` set.
+///
+/// [`ProfilesApi::update_profile_content_filter`] drops any caller-supplied key outside this
+/// list *before* building the request body, reproducing Python's client-side whitelist exactly
+/// (the server is never given a chance to reject an invalid key, because it is never sent).
+const VALID_CONTENT_FILTER_KEYS: &[&str] = &[
+    "adblock",
+    "adblock_plus",
+    "safe_search",
+    "block_malware",
+    "block_illegal",
+    "block_violent",
+    "block_adult",
+    "youtube_restricted",
+];
 
 /// The profiles API for a single Eero account, built on a shared [`Transport`].
 ///
@@ -140,23 +161,247 @@ impl ProfilesApi {
             .await
     }
 
-    // Phase 5 (mutations, not yet ported) go here, in the same order as
-    // `eero-api src/eero/api/profiles.py`:
-    //   - pause_profile (profiles.py:77) — PUT routes::PAUSE_PROFILE, {"paused": bool}
-    //   - set_profile_devices (profiles.py:130) — PUT routes::SET_PROFILE_DEVICES,
-    //     {"devices": [{"url": ...}, ...]}
-    //   - update_profile_content_filter (profiles.py:179) — PUT
-    //     routes::UPDATE_PROFILE_CONTENT_FILTER, {"content_filter": {...}}. Python applies a
-    //     server-side key whitelist *client-side first* (profiles.py:201-217: only
-    //     `adblock`, `adblock_plus`, `safe_search`, `block_malware`, `block_illegal`,
-    //     `block_violent`, `block_adult`, `youtube_restricted` survive; anything else is
-    //     dropped with a warning) before building the request body — this filtering must be
-    //     reproduced here, not delegated to the server.
-    //   - update_profile_block_list (profiles.py:227) — PUT routes::UPDATE_PROFILE_BLOCK_LIST,
-    //     {"custom_block_list": [..]} or {"custom_allow_list": [..]}
-    //   - set_blocked_applications (profiles.py:294) — PUT routes::SET_BLOCKED_APPLICATIONS,
-    //     {"blocked_applications": [..]}
-    //   - create_profile (profiles.py:336) — POST routes::CREATE_PROFILE, {"name": str}
-    //   - rename_profile (profiles.py:364) — PUT routes::RENAME_PROFILE, {"name": str}
-    //   - delete_profile (profiles.py:391) — DELETE routes::DELETE_PROFILE
+    /// Pauses or unpauses internet access for a profile — returns the raw Eero API response.
+    ///
+    /// Ported from `eero-api src/eero/api/profiles.py:77` (`ProfilesAPI.pause_profile`): sends
+    /// `PUT` `routes::PAUSE_PROFILE` (alias of `routes::PUT_PROFILE`,
+    /// `networks/{network_id}/profiles/{profile_id}`) with body `{"paused": paused}`
+    /// (`profiles.py:101`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn pause_profile(
+        &self,
+        network_id: &str,
+        profile_id: &str,
+        paused: bool,
+    ) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::PAUSE_PROFILE,
+                &[("network_id", network_id), ("profile_id", profile_id)],
+                Some(json!({ "paused": paused })),
+            )
+            .await
+    }
+
+    /// Sets the devices assigned to a profile — returns the raw Eero API response.
+    ///
+    /// **Replaces the profile's entire device assignment list.** This is not additive: any
+    /// device previously assigned to `profile_id` but absent from `device_urls` is unassigned
+    /// by this call, exactly as `eero-api` documents (`profiles.py:138`, "This replaces all
+    /// existing device assignments with the provided list").
+    ///
+    /// Ported from `eero-api src/eero/api/profiles.py:130`
+    /// (`ProfilesAPI.set_profile_devices`): sends `PUT` `routes::SET_PROFILE_DEVICES` (alias of
+    /// `routes::PUT_PROFILE`) with body `{"devices": [{"url": ...}, ...]}` — each URL wrapped
+    /// in its own single-key object, matching Python's `devices_payload = [{"url": url} for
+    /// url in device_urls]` (`profiles.py:165`) exactly; `device_urls` is never sent as a bare
+    /// array of strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn set_profile_devices(
+        &self,
+        network_id: &str,
+        profile_id: &str,
+        device_urls: &[&str],
+    ) -> Result<Envelope, Error> {
+        let devices: Vec<_> = device_urls
+            .iter()
+            .map(|url| json!({ "url": url }))
+            .collect();
+        self.transport
+            .send(
+                &routes::SET_PROFILE_DEVICES,
+                &[("network_id", network_id), ("profile_id", profile_id)],
+                Some(json!({ "devices": devices })),
+            )
+            .await
+    }
+
+    /// Updates a profile's content-filtering settings — returns the raw Eero API response.
+    ///
+    /// `filters` is filtered client-side against `VALID_CONTENT_FILTER_KEYS` *before* the
+    /// request body is built: any `(key, _)` pair whose `key` is not in that list is silently
+    /// dropped and never reaches the server, reproducing Python's `valid_filters` whitelist
+    /// (`profiles.py:201-217`) exactly, including the drop-not-reject behaviour — Python logs a
+    /// warning and continues rather than raising, and so does this port (minus the log line;
+    /// see `.claude/rules/security-review.md` on this crate's logging discipline). Keys are
+    /// otherwise passed through in the order given, and duplicate keys keep `filters`' own
+    /// last-write-wins order, matching Python's `dict` iteration.
+    ///
+    /// Ported from `eero-api src/eero/api/profiles.py:179`
+    /// (`ProfilesAPI.update_profile_content_filter`): sends `PUT`
+    /// `routes::UPDATE_PROFILE_CONTENT_FILTER` (alias of `routes::PUT_PROFILE`) with body
+    /// `{"content_filter": {...}}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn update_profile_content_filter(
+        &self,
+        network_id: &str,
+        profile_id: &str,
+        filters: &[(&str, bool)],
+    ) -> Result<Envelope, Error> {
+        let mut content_filter = serde_json::Map::new();
+        for (key, value) in filters {
+            if VALID_CONTENT_FILTER_KEYS.contains(key) {
+                content_filter.insert((*key).to_owned(), serde_json::Value::Bool(*value));
+            }
+        }
+
+        self.transport
+            .send(
+                &routes::UPDATE_PROFILE_CONTENT_FILTER,
+                &[("network_id", network_id), ("profile_id", profile_id)],
+                Some(json!({ "content_filter": content_filter })),
+            )
+            .await
+    }
+
+    /// Updates a profile's custom domain block or allow list — returns the raw Eero API
+    /// response.
+    ///
+    /// The JSON key sent depends entirely on `block`: `{"custom_block_list": domains}` when
+    /// `block` is `true`, `{"custom_allow_list": domains}` when `block` is `false` — never
+    /// both, and never a `block`/`blocked` field of its own. Ported from
+    /// `eero-api src/eero/api/profiles.py:227` (`ProfilesAPI.update_profile_block_list`), whose
+    /// `list_type = "custom_block_list" if block else "custom_allow_list"` (`profiles.py:253`)
+    /// this reproduces verbatim: sends `PUT` `routes::UPDATE_PROFILE_BLOCK_LIST` (alias of
+    /// `routes::PUT_PROFILE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn update_profile_block_list(
+        &self,
+        network_id: &str,
+        profile_id: &str,
+        domains: &[&str],
+        block: bool,
+    ) -> Result<Envelope, Error> {
+        let list_key = if block {
+            "custom_block_list"
+        } else {
+            "custom_allow_list"
+        };
+        self.transport
+            .send(
+                &routes::UPDATE_PROFILE_BLOCK_LIST,
+                &[("network_id", network_id), ("profile_id", profile_id)],
+                Some(json!({ (list_key): domains })),
+            )
+            .await
+    }
+
+    /// Sets the blocked applications (Eero Plus feature) for a profile — returns the raw Eero
+    /// API response.
+    ///
+    /// Ported from `eero-api src/eero/api/profiles.py:294`
+    /// (`ProfilesAPI.set_blocked_applications`): sends `PUT`
+    /// `routes::SET_BLOCKED_APPLICATIONS` (alias of `routes::PUT_PROFILE`) with body
+    /// `{"blocked_applications": applications}` (`profiles.py:333`) — the full list replaces
+    /// whatever was previously blocked, same replace-not-merge semantics as
+    /// [`ProfilesApi::set_profile_devices`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn set_blocked_applications(
+        &self,
+        network_id: &str,
+        profile_id: &str,
+        applications: &[&str],
+    ) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::SET_BLOCKED_APPLICATIONS,
+                &[("network_id", network_id), ("profile_id", profile_id)],
+                Some(json!({ "blocked_applications": applications })),
+            )
+            .await
+    }
+
+    /// Creates a new profile on a network — returns the raw Eero API response.
+    ///
+    /// Ported from `eero-api src/eero/api/profiles.py:336` (`ProfilesAPI.create_profile`):
+    /// sends `POST` `routes::CREATE_PROFILE` (`networks/{network_id}/profiles`) with body
+    /// `{"name": name}`. Python's docstring notes the response's `data` field "contains the
+    /// full profile object including the assigned URL/ID" (`profiles.py:345-346`); this port
+    /// returns that envelope untouched, exactly as it does everywhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn create_profile(&self, network_id: &str, name: &str) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::CREATE_PROFILE,
+                &[("network_id", network_id)],
+                Some(json!({ "name": name })),
+            )
+            .await
+    }
+
+    /// Renames an existing profile — returns the raw Eero API response.
+    ///
+    /// Ported from `eero-api src/eero/api/profiles.py:364` (`ProfilesAPI.rename_profile`):
+    /// sends `PUT` `routes::RENAME_PROFILE` (alias of `routes::PUT_PROFILE`) with body
+    /// `{"name": name}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn rename_profile(
+        &self,
+        network_id: &str,
+        profile_id: &str,
+        name: &str,
+    ) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::RENAME_PROFILE,
+                &[("network_id", network_id), ("profile_id", profile_id)],
+                Some(json!({ "name": name })),
+            )
+            .await
+    }
+
+    /// Deletes a profile from a network — returns the raw Eero API response.
+    ///
+    /// Devices previously assigned to `profile_id` become unassigned (`profiles.py:394`);
+    /// the Eero cloud API performs that side effect server-side, nothing here initiates it.
+    ///
+    /// Ported from `eero-api src/eero/api/profiles.py:391` (`ProfilesAPI.delete_profile`):
+    /// sends `DELETE` `routes::DELETE_PROFILE` (`networks/{network_id}/profiles/{profile_id}`),
+    /// with no request body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    pub async fn delete_profile(
+        &self,
+        network_id: &str,
+        profile_id: &str,
+    ) -> Result<Envelope, Error> {
+        self.transport
+            .send(
+                &routes::DELETE_PROFILE,
+                &[("network_id", network_id), ("profile_id", profile_id)],
+                None,
+            )
+            .await
+    }
 }
