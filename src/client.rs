@@ -4,17 +4,23 @@
 //! `.claude/tasks/briefs/client.md` for the full behaviour brief this module implements — every
 //! non-obvious decision below cites it, plus the exact `client.py` line range it replaces.
 //!
-//! # Scope of this phase (phase 4)
+//! # Scope: phases 4 and 5
 //!
-//! This file implements every **read-only** `EeroClient` method: the eight cached getters
+//! Phase 4 implemented every **read-only** `EeroClient` method: the eight cached getters
 //! (`get_account`, `get_networks`, `get_network`, `get_eeros`, `get_devices`, `get_device`,
 //! `get_profiles`, `get_profile` — brief §1.4, §6), every other `GET`-shaped pass-through that
 //! has a corresponding method already implemented in [`crate::endpoints`], network-id
 //! resolution (`_ensure_network_id`, brief §3), the `/account` fallback inside `get_networks`
-//! (brief §4), and `clear_cache` plus the state it is wired into. Every *mutating* `EeroClient`
-//! method (every `set_*`/`run_*`/`reboot_*`/`create_*`/`delete_*`/`pause_*`/`block_*`) is phase
-//! 5 — see the marker comment near the bottom of this file for the full list, grouped exactly as
-//! the brief's §2 invalidation table groups them.
+//! (brief §4), and `clear_cache` plus the state it is wired into.
+//!
+//! Phase 5 (see the "Mutating pass-throughs" section near the bottom of this file) adds every
+//! *mutating* `EeroClient` method (every `set_*`/`run_*`/`reboot_*`/`create_*`/`delete_*`/
+//! `pause_*`/`block_*` that has a corresponding endpoint method in [`crate::endpoints`]), plus
+//! the cache invalidation the behaviour brief's §2 table specifies for each — including the two
+//! deliberate improvements over Python `rust-port-plan.md` §3.8 records (`set_led_brightness`,
+//! and every DNS/SQM/security setter, invalidating cache entries Python's own setters forget to).
+//! `set_device_priority`/`get_device_priority` and the `get_activity*` family remain unported —
+//! see the phase-5 section's own banner comment for why.
 //!
 //! # No `login`/`verify` on `Client` (architectural divergence from the port plan)
 //!
@@ -1060,52 +1066,1492 @@ impl Client {
         self.api.eeros().get_eero(eero_id).await
     }
 
-    // =================================================================================
-    // Phase 5 (not implemented here): every mutating `EeroClient` method. Grouped exactly as
-    // the behaviour brief's §2 invalidation table groups them; each needs the network-id
-    // resolution this phase already provides plus the cache invalidation `Cache::invalidate`/
-    // `Cache::invalidate_bucket` phase 4 built specifically for this work (see `cache.rs`'s own
-    // module docs, "what's new" (b)).
+    // ============================= Mutating pass-throughs (phase 5) =============================
     //
-    // Auth-adjacent (already covered, not phase 5): `logout`, `set_session_token`,
-    // `clear_session_token` — implemented above, wired to `clear_cache()`.
+    // Every method below resolves a network id (and, where relevant, an item id) exactly like the
+    // read-only pass-throughs above, delegates to the matching `EeroApi` domain accessor, and —
+    // on success only, never before the request completes and never on an `Err` — invalidates
+    // whatever cache entries the write can leave stale. Grouped in `client.py`'s own file order,
+    // so a diff against the Python source stays easy to follow.
     //
-    //   - Networks:   `set_guest_network`, `run_speed_test`, `reboot_network`,
-    //                 `set_network_name` — the last three invalidate `network[nid]`
-    //                 (`client.py:763-764,784-785,1020-1028`).
-    //   - Eeros:      `reboot_eero` (invalidates `eeros[{nid}_eeros]`, `client.py:410-432`),
-    //                 `set_led`, `set_nightlight` (same invalidation, `client.py:1039-1094`),
-    //                 `set_led_brightness` (Python invalidates nothing — brief gotcha G3; this
-    //                 port's cache.rs already decided to invalidate `eeros` here too, a
-    //                 documented improvement, not a byte-for-byte port).
-    //   - Devices:    `set_device_nickname`, `block_device`, `pause_device` — each invalidates
-    //                 both `devices[{nid}_{did}]` and `devices[{nid}_devices]` via the same
-    //                 two-key drop Python's `_invalidate_device_cache` performs
-    //                 (`client.py:494-576`).
-    //   - Profiles:   `create_profile` (list key only), `rename_profile`, `delete_profile`,
-    //                 `pause_profile`, `set_profile_schedule`, `set_blocked_applications`,
-    //                 `set_profile_devices` (**`auto_discover = true`** — brief gotcha G5, same
-    //                 exception as `get_profile_devices` above) — each drops
-    //                 `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]` via
-    //                 `client.py`'s `_invalidate_profile_cache`/`_invalidate_profiles_list_cache`.
-    //   - Diagnostics & Settings section setters that invalidate NOTHING in Python
-    //     (`client.py:809-1350`): `run_diagnostics`, DNS (`set_dns_caching`, `set_custom_dns`,
-    //     `set_dns_mode`), SQM (`set_sqm_enabled`, `configure_sqm`), security (`set_wpa3`,
-    //     `set_band_steering`, `set_upnp`, `set_ipv6`, `set_thread_enabled`,
-    //     `configure_security`), backup (`set_backup_network`, `configure_backup_network`),
-    //     reservations/forwards CRUD, bedtime (`enable_bedtime`, `clear_profile_schedule`).
-    //     Brief gotcha G3: DNS/SQM/security setters `PUT networks/{nid}/settings` while
-    //     `get_dns_settings`/`get_sqm_settings`/`get_security_settings` all `GET
-    //     networks/{nid}` — the exact same cache key `get_network` populates — so this port's
-    //     cache.rs decision stands: these MUST invalidate `network[nid]` even though Python
-    //     does not, and that decision must not be silently dropped when phase 5 lands.
-    //   - `set_device_priority` (deprecated, `client.py:1236-1272`) and its read-only
-    //     counterpart `get_device_priority` (`client.py:1229-1234`) are deferred together to
-    //     phase 5, alongside the double-`DeprecationWarning` decision (brief gotcha G7) —
-    //     neither exists on this `Client` yet.
-    //   - `get_activity*` / activity-family methods are not ported at all (not phase 5 either)
-    //     — every endpoint 404s upstream (eero-api #107); see `crate::endpoints`'s own docs.
-    // =================================================================================
+    // A handful of methods below have no `client.py` counterpart at all: `src/endpoints/` already
+    // ports every mutating method its equivalent Python `api/*.py` module exposes, but
+    // `client.py` itself never grew a wrapper for a few of them (`NetworksApi::reboot_network`,
+    // `DnsApi::set_ipv6_dns`/`clear_custom_dns`, `SqmApi::set_sqm_bandwidth`/`set_sqm_auto`,
+    // `EerosApi::set_nightlight_brightness`/`set_nightlight_schedule`,
+    // `ProfilesApi::update_profile_content_filter`/`update_profile_block_list`,
+    // `ScheduleApi::set_weekday_bedtime`/`set_weekend_bedtime`,
+    // `InsightsApi::run_insights`, `SupportApi::request_support`,
+    // `BlacklistApi::add_to_blacklist`/`remove_from_blacklist`,
+    // `BurstReportersApi::create_burst_reporter`, `OUICheckApi::run_ouicheck`). Each is called
+    // out at its own doc comment below with the reasoning for the invalidation choice made in the
+    // absence of a Python precedent to port — every one of them follows the policy already
+    // established for its nearest sibling (same underlying wire resource, the same delegated
+    // call, or — for the five domains with no cache bucket at all — the same "invalidate nothing"
+    // policy every other bucket-less domain already uses), never a freshly invented policy.
+    //
+    // `set_device_priority`/`get_device_priority` and every `get_activity*` method are **not**
+    // added here: `src/endpoints/devices.rs` deliberately never ported `set_device_priority` (a
+    // confirmed server no-op, eero-api #111) and explicitly says it should not be added later "for
+    // parity" — there is no endpoint method to delegate to. `get_activity*` is unported for the
+    // same reason `crate::endpoints` never grew an `ActivityApi`: every one of those routes 404s
+    // upstream on both API versions (eero-api #107).
+    //
+    // Auth-adjacent (already implemented above, not part of this section): `logout`,
+    // `set_session_token`, `clear_session_token` — wired to `clear_cache()`.
+
+    // ==================== Networks ====================
+
+    /// Enables, disables or reconfigures the guest network — returns the raw Eero API response.
+    ///
+    /// Ported from `set_guest_network` (`eero-api src/eero/client.py:740-766`). Resolves
+    /// `network_id` with `auto_discover = true` (Python's default; this call sits before the
+    /// `client.py:809` "Diagnostics & Settings" boundary — see `Client::get_diagnostics`'s docs
+    /// for that boundary and every method after it). On success, invalidates `network[nid]`
+    /// (`client.py:763-764`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingNetworkId`] if `network_id` is absent and no network can be resolved.
+    /// Otherwise, whatever status-mapped [`Error`] the request produces. The cache is left
+    /// untouched on any `Err`.
+    pub async fn set_guest_network(
+        &self,
+        enabled: bool,
+        name: Option<&str>,
+        password: Option<&str>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .networks()
+            .set_guest_network(&network_id, enabled, name, password)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Runs a speed test on the network — returns the raw Eero API response.
+    ///
+    /// Ported from `run_speed_test` (`eero-api src/eero/client.py:770-787`). `auto_discover =
+    /// true` — see [`Client::set_guest_network`]. On success, invalidates `network[nid]`
+    /// (`client.py:784-785`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::set_guest_network`].
+    pub async fn run_speed_test(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self.api.networks().run_speed_test(&network_id).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Reboots every Eero node on the network — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent: `eero-api` has never wrapped `NetworksAPI.reboot_network`
+    /// (`api/networks.py:134`) on `EeroClient` at all, so there is nothing to port faithfully
+    /// here — this method exists only because [`crate::endpoints::NetworksApi::reboot_network`]
+    /// does. `auto_discover = true`, matching its two closest siblings,
+    /// [`Client::set_guest_network`] and [`Client::run_speed_test`] — both plain, id-only network
+    /// actions resolved the same way. On success, invalidates `network[nid]`, for the same reason
+    /// `run_speed_test` does even though neither is a settings write in the DNS/SQM/security
+    /// sense: a reboot is a network-wide action indistinguishable in kind from its two siblings,
+    /// both of which drop this same key. This is a judgement call, not a brief citation — there is
+    /// no Python behaviour here to diverge from or match.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::set_guest_network`].
+    pub async fn reboot_network(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self.api.networks().reboot_network(&network_id).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets the network name (SSID) — returns the raw Eero API response.
+    ///
+    /// Ported from `set_network_name` (`eero-api src/eero/client.py:1020-1028`). Unlike its three
+    /// Networks-domain siblings above, this call is **after** the `client.py:809` boundary and so
+    /// resolves `network_id` with `auto_discover = false` — see [`Client::get_diagnostics`]. On
+    /// success, invalidates `network[nid]` (`client.py:1025-1026`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingNetworkId`] if `network_id` is absent and no preferred network is set —
+    /// auto-discovery is not attempted. Otherwise, whatever status-mapped [`Error`] the request
+    /// produces. The cache is left untouched on any `Err`.
+    pub async fn set_network_name(
+        &self,
+        name: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .networks()
+            .set_network_name(&network_id, name)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    // ==================== Eeros (mutations) ====================
+
+    /// Reboots a single Eero device — returns the raw Eero API response.
+    ///
+    /// Ported from `reboot_eero` (`eero-api src/eero/client.py:410-432`). `auto_discover = true`
+    /// (before the `client.py:809` boundary, matching [`Client::get_eero`] just above it in this
+    /// file). `network_id` is resolved only to build the `eeros[{nid}_eeros]` cache key below —
+    /// it is never forwarded to [`crate::endpoints::EerosApi::reboot_eero`], which drops it for
+    /// the same reason [`Client::get_led_status`] does (see that method's docs). On success,
+    /// invalidates `eeros[{nid}_eeros]` (`client.py:427-430`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    pub async fn reboot_eero(
+        &self,
+        eero_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self.api.eeros().reboot_eero(eero_id).await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Turns an Eero device's status LED on or off — returns the raw Eero API response.
+    ///
+    /// Ported from `set_led` (`eero-api src/eero/client.py:1039-1050`). `auto_discover = false`
+    /// — see [`Client::get_diagnostics`]. `network_id` is resolved but not forwarded; see
+    /// [`Client::reboot_eero`]. On success, invalidates `eeros[{nid}_eeros]`
+    /// (`client.py:1046-1048`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_led(
+        &self,
+        eero_id: &str,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.eeros().set_led(eero_id, enabled).await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets an Eero device's status LED brightness — returns the raw Eero API response.
+    ///
+    /// Ported from `set_led_brightness` (`eero-api src/eero/client.py:1052-1057`). `auto_discover
+    /// = false` — see [`Client::get_diagnostics`]. `network_id` is resolved but not forwarded;
+    /// see [`Client::reboot_eero`].
+    ///
+    /// Divergence from eero-api: Python invalidates nothing here, even though its sibling
+    /// [`Client::set_led`] invalidates `eeros[{nid}_eeros]` for the exact same underlying node
+    /// object — the behaviour brief calls this out as a likely oversight (gotcha G3), not a
+    /// deliberate design choice. This port does not reproduce the gap: on success, this method
+    /// also invalidates `eeros[{nid}_eeros]`, exactly like [`Client::set_led`] and
+    /// [`Client::set_nightlight`] do. `rust-port-plan.md` §3.8 and `cache.rs`'s own module docs
+    /// ("what's new" (b)) name this exact method as one of the two intentional improvements over
+    /// Python this crate makes — do not remove this call later thinking it restores parity; it
+    /// would reintroduce a bug, not fix one.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_led_brightness(
+        &self,
+        eero_id: &str,
+        brightness: i32,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .eeros()
+            .set_led_brightness(eero_id, brightness)
+            .await?;
+        // Divergence from eero-api (rust-port-plan.md §3.8, improvement (b)): Python never
+        // invalidates `eeros` after a brightness-only write; this port does, since the field it
+        // just wrote lives in the same cached node object `set_led` already invalidates for.
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets nightlight settings for an Eero Beacon device — returns the raw Eero API response.
+    ///
+    /// Ported from `set_nightlight` (`eero-api src/eero/client.py:1066-1094`). Every setting is
+    /// optional and independent, exactly like
+    /// [`crate::endpoints::EerosApi::set_nightlight`], which this delegates to unchanged — see
+    /// that method's own docs for the brightness clamp and the request body shape. `auto_discover
+    /// = false` — see [`Client::get_diagnostics`]. `network_id` is resolved but not forwarded;
+    /// see [`Client::reboot_eero`]. On success, invalidates `eeros[{nid}_eeros]`
+    /// (`client.py:1090-1092`).
+    ///
+    /// Takes eight parameters (including the receiver), one more than
+    /// [`crate::endpoints::EerosApi::set_nightlight`]'s seven, to additionally mirror
+    /// `client.py:1066-1075`'s own `network_id` parameter — the same reasoning that method's own
+    /// docs give for not splitting its six independent, self-describing scalar settings into a
+    /// params struct: doing so would break the direct correspondence with the Python source
+    /// without making any call site clearer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation { field: "nightlight", .. }` if every one of `enabled`,
+    /// `brightness`, `schedule_enabled`, `schedule_on`, `schedule_off` and
+    /// `ambient_light_enabled` is `None` — see
+    /// [`crate::endpoints::EerosApi::set_nightlight`]'s own docs for why this port refuses rather
+    /// than fabricating Python's local `400` envelope. Otherwise see [`Client::get_diagnostics`].
+    /// The cache is left untouched on any `Err`.
+    #[allow(clippy::too_many_arguments)] // mirrors client.py:1066-1075's own 8-parameter signature, like EerosApi::set_nightlight's identical allow
+    pub async fn set_nightlight(
+        &self,
+        eero_id: &str,
+        enabled: Option<bool>,
+        brightness: Option<i32>,
+        schedule_enabled: Option<bool>,
+        schedule_on: Option<&str>,
+        schedule_off: Option<&str>,
+        ambient_light_enabled: Option<bool>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .eeros()
+            .set_nightlight(
+                eero_id,
+                enabled,
+                brightness,
+                schedule_enabled,
+                schedule_on,
+                schedule_off,
+                ambient_light_enabled,
+            )
+            .await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets only the nightlight brightness for an Eero Beacon device — returns the raw Eero API
+    /// response.
+    ///
+    /// No `client.py` precedent: `eero-api` never wrapped `EerosAPI.set_nightlight_brightness`
+    /// (`api/eeros.py:282`) on `EeroClient`, even though it wraps its sibling
+    /// [`Client::set_nightlight`]. [`crate::endpoints::EerosApi::set_nightlight_brightness`]
+    /// itself is a pure delegator to `EerosApi::set_nightlight` — the exact same wire call — so
+    /// this method's cache behaviour simply follows suit: `auto_discover = false`, and on success
+    /// invalidates `eeros[{nid}_eeros]`, identically to [`Client::set_nightlight`]. This is not a
+    /// third invented improvement over Python; it is the same wire call `set_nightlight` already
+    /// makes, which already invalidates that bucket.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. Never returns `Error::Validation`: a `brightness` value
+    /// is always supplied here. The cache is left untouched on any `Err`.
+    pub async fn set_nightlight_brightness(
+        &self,
+        eero_id: &str,
+        brightness: i32,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .eeros()
+            .set_nightlight_brightness(eero_id, brightness)
+            .await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets only the nightlight schedule for an Eero Beacon device — returns the raw Eero API
+    /// response.
+    ///
+    /// No `client.py` precedent — see [`Client::set_nightlight_brightness`]'s docs, which apply
+    /// identically here: [`crate::endpoints::EerosApi::set_nightlight_schedule`] delegates to the
+    /// same `EerosApi::set_nightlight` call [`Client::set_nightlight`] itself uses, so this method
+    /// follows the same cache behaviour: `auto_discover = false`, invalidates `eeros[{nid}_eeros]`
+    /// on success.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. Never returns `Error::Validation`: `enabled` is always
+    /// supplied here. The cache is left untouched on any `Err`.
+    pub async fn set_nightlight_schedule(
+        &self,
+        eero_id: &str,
+        enabled: bool,
+        on_time: Option<&str>,
+        off_time: Option<&str>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .eeros()
+            .set_nightlight_schedule(eero_id, enabled, on_time, off_time)
+            .await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    // ==================== Devices (mutations) ====================
+
+    /// Sets a nickname for a device — returns the raw Eero API response.
+    ///
+    /// Ported from `set_device_nickname` (`eero-api src/eero/client.py:494-514`).
+    /// `auto_discover = true` (before the `client.py:809` boundary). On success, invalidates
+    /// both `devices[{nid}_{did}]` and `devices[{nid}_devices]` via `Client::invalidate_device_cache`
+    /// — the same two-key drop Python's `_invalidate_device_cache` performs
+    /// (`client.py:567-575`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    pub async fn set_device_nickname(
+        &self,
+        device_id: &str,
+        nickname: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .devices()
+            .set_device_nickname(&network_id, device_id, nickname)
+            .await?;
+        self.invalidate_device_cache(network_id.as_str(), device_id);
+        Ok(response)
+    }
+
+    /// Blocks or unblocks a device via the `/blacklist` resource — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `block_device` (`eero-api src/eero/client.py:516-543`). `auto_discover =
+    /// true`. [`crate::endpoints::DevicesApi::block_device`] itself performs up to two round
+    /// trips (a `GET` to resolve the MAC, then the blacklist `POST`, when `blocked == true`);
+    /// this method simply awaits that single call and invalidates once it succeeds overall. On
+    /// success, invalidates both `devices[{nid}_{did}]` and `devices[{nid}_devices]`
+    /// (`client.py:540-541`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. Also returns `Error::Api { status: 502, .. }` if `blocked ==
+    /// true` and the device's MAC cannot be resolved — see
+    /// [`crate::endpoints::DevicesApi::block_device`]'s own docs. The cache is left untouched on
+    /// any `Err`.
+    pub async fn block_device(
+        &self,
+        device_id: &str,
+        blocked: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .devices()
+            .block_device(&network_id, device_id, blocked)
+            .await?;
+        self.invalidate_device_cache(network_id.as_str(), device_id);
+        Ok(response)
+    }
+
+    /// Pauses or unpauses internet access for a device — returns the raw Eero API response.
+    ///
+    /// Ported from `pause_device` (`eero-api src/eero/client.py:545-565`). `auto_discover =
+    /// true`. On success, invalidates both `devices[{nid}_{did}]` and `devices[{nid}_devices]`
+    /// (`client.py:562-563`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    pub async fn pause_device(
+        &self,
+        device_id: &str,
+        paused: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .devices()
+            .pause_device(&network_id, device_id, paused)
+            .await?;
+        self.invalidate_device_cache(network_id.as_str(), device_id);
+        Ok(response)
+    }
+
+    // ==================== Profiles (mutations) ====================
+
+    /// Creates a new profile on the network — returns the raw Eero API response.
+    ///
+    /// Ported from `create_profile` (`eero-api src/eero/client.py:675-691`). `auto_discover =
+    /// true`. On success, invalidates `profiles[{nid}_profiles]` only — no single-profile key
+    /// exists yet for whatever id the server just assigned (`client.py:689`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    pub async fn create_profile(
+        &self,
+        name: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .profiles()
+            .create_profile(&network_id, name)
+            .await?;
+        self.invalidate_profiles_list_cache(network_id.as_str());
+        Ok(response)
+    }
+
+    /// Renames an existing profile — returns the raw Eero API response.
+    ///
+    /// Ported from `rename_profile` (`eero-api src/eero/client.py:693-713`). `auto_discover =
+    /// true`. On success, invalidates `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]` via
+    /// `Client::invalidate_profile_cache` — Python calls both `_invalidate_profile_cache` (which
+    /// already drops both keys itself) *and* `_invalidate_profiles_list_cache` at this call site
+    /// (`client.py:710-711`), a redundant double-drop of the list key the behaviour brief calls
+    /// out as harmless; this port calls the combined helper once, for the identical end state.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    pub async fn rename_profile(
+        &self,
+        profile_id: &str,
+        name: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .profiles()
+            .rename_profile(&network_id, profile_id, name)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    /// Deletes a profile from the network — returns the raw Eero API response.
+    ///
+    /// Ported from `delete_profile` (`eero-api src/eero/client.py:715-736`). `auto_discover =
+    /// true`. On success, invalidates `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]` —
+    /// see [`Client::rename_profile`]'s docs for the same redundant-double-drop note
+    /// (`client.py:733-734`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    pub async fn delete_profile(
+        &self,
+        profile_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .profiles()
+            .delete_profile(&network_id, profile_id)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    /// Pauses or unpauses internet access for a profile — returns the raw Eero API response.
+    ///
+    /// Ported from `pause_profile` (`eero-api src/eero/client.py:637-657`). `auto_discover =
+    /// true`. On success, invalidates `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]`
+    /// (`client.py:654-655`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    pub async fn pause_profile(
+        &self,
+        profile_id: &str,
+        paused: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .profiles()
+            .pause_profile(&network_id, profile_id, paused)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    // ==================== Diagnostics & Settings (mutations) ====================
+
+    /// Runs network diagnostics — returns the raw Eero API response.
+    ///
+    /// Ported from `run_diagnostics` (`eero-api src/eero/client.py:814-817`). `auto_discover =
+    /// false` — see [`Client::get_diagnostics`]. Invalidates nothing: `diagnostics` has no cache
+    /// bucket at all (behaviour brief §2.1), and Python's own method body has no
+    /// `del self._cache[...]` call to reproduce.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn run_diagnostics(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api.diagnostics().run_diagnostics(&network_id).await
+    }
+
+    // ==================== Reservations ====================
+
+    /// Creates a DHCP reservation on the network — returns the raw Eero API response.
+    ///
+    /// Ported from `create_reservation` (`eero-api src/eero/client.py:884-889`). `auto_discover =
+    /// false`. Invalidates nothing: there is no `reservations` cache bucket (behaviour brief
+    /// §2.1).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn create_reservation(
+        &self,
+        reservation_data: Value,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .reservations()
+            .create_reservation(&network_id, reservation_data)
+            .await
+    }
+
+    /// Updates a DHCP reservation on the network — returns the raw Eero API response.
+    ///
+    /// Ported from `update_reservation` (`eero-api src/eero/client.py:891-901`). `auto_discover =
+    /// false`. Invalidates nothing — see [`Client::create_reservation`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn update_reservation(
+        &self,
+        reservation_id: &str,
+        reservation_data: Value,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .reservations()
+            .update_reservation(&network_id, reservation_id, reservation_data)
+            .await
+    }
+
+    /// Deletes a DHCP reservation from the network — returns the raw Eero API response.
+    ///
+    /// Ported from `delete_reservation` (`eero-api src/eero/client.py:903-908`). `auto_discover =
+    /// false`. Invalidates nothing — see [`Client::create_reservation`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn delete_reservation(
+        &self,
+        reservation_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .reservations()
+            .delete_reservation(&network_id, reservation_id)
+            .await
+    }
+
+    // ==================== Forwards ====================
+
+    /// Creates a port forward on the network — returns the raw Eero API response.
+    ///
+    /// Ported from `create_forward` (`eero-api src/eero/client.py:915-920`). `auto_discover =
+    /// false`. Invalidates nothing: there is no `forwards` cache bucket (behaviour brief §2.1).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn create_forward(
+        &self,
+        forward_data: Value,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .forwards()
+            .create_forward(&network_id, forward_data)
+            .await
+    }
+
+    /// Deletes a port forward from the network — returns the raw Eero API response.
+    ///
+    /// Ported from `delete_forward` (`eero-api src/eero/client.py:922-927`). `auto_discover =
+    /// false`. Invalidates nothing — see [`Client::create_forward`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn delete_forward(
+        &self,
+        forward_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .forwards()
+            .delete_forward(&network_id, forward_id)
+            .await
+    }
+
+    // ==================== Insights, Support, Blacklist, Burst Reporters, OUICheck ====================
+    //
+    // None of these five has a `client.py` counterpart — `eero-api` never wrapped
+    // `InsightsAPI.run_insights` (`api/insights.py:96`), `SupportAPI.request_support`
+    // (`api/support.py:61`), `BlacklistAPI.add_to_blacklist`/`remove_from_blacklist`
+    // (`api/blacklist.py:56,81`), `BurstReportersAPI.create_burst_reporter`
+    // (`api/burst_reporters.py:56`) or `OUICheckAPI.run_ouicheck` (`api/ouicheck.py:56`) on
+    // `EeroClient`, confirmed absent by grepping the committed `client.py` for each name — see
+    // this file's own module docs for why they are added here anyway (item 1 of this phase's
+    // task: every mutating endpoint method under `src/endpoints/` gets a `Client` wrapper, with
+    // or without a `client.py` precedent). `auto_discover = false`, matching every sibling `GET`
+    // in this same region of `client.py` (`get_insights`, `get_support`, `get_blacklist`,
+    // `get_burst_reporters`, `get_ouicheck`, all between the `client.py:809` boundary and
+    // `get_premium_status`). None of these five domains has a cache bucket at all (behaviour
+    // brief §2.1), so every method below invalidates nothing — the same "no bucket to keep
+    // consistent" reasoning as [`Client::create_reservation`]/[`Client::create_forward`] above,
+    // not a judgement call specific to any one of them.
+
+    /// Runs an on-demand insights computation — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see this group's banner comment above. Invalidates nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn run_insights(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api.insights().run_insights(&network_id).await
+    }
+
+    /// Submits a support request for the network — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see this group's banner comment above. `request_data` is
+    /// forwarded verbatim as the request body, exactly like
+    /// [`crate::endpoints::SupportApi::request_support`] itself. Invalidates nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn request_support(
+        &self,
+        request_data: Value,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .support()
+            .request_support(&network_id, request_data)
+            .await
+    }
+
+    /// Adds a device (by MAC) to the blacklist — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see this group's banner comment above. Distinct from
+    /// [`Client::block_device`], which routes through this same `/blacklist` resource but also
+    /// resolves the device's MAC first and invalidates the device cache; this method is the bare
+    /// [`crate::endpoints::BlacklistApi::add_to_blacklist`] pass-through, `mac` unchanged and
+    /// unresolved. Invalidates nothing — there is no `blacklist` cache bucket (behaviour brief
+    /// §2.1), and `get_blacklist` is not one of the eight cached getters either.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn add_to_blacklist(
+        &self,
+        mac: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .blacklist()
+            .add_to_blacklist(&network_id, mac)
+            .await
+    }
+
+    /// Removes a device from the blacklist — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see [`Client::add_to_blacklist`]'s docs, which apply
+    /// identically here. `mac_or_device_id` is forwarded unchanged, exactly like
+    /// [`crate::endpoints::BlacklistApi::remove_from_blacklist`] itself. Invalidates nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn remove_from_blacklist(
+        &self,
+        mac_or_device_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .blacklist()
+            .remove_from_blacklist(&network_id, mac_or_device_id)
+            .await
+    }
+
+    /// Creates a burst reporter on the network — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see this group's banner comment above. `reporter_data` is
+    /// forwarded verbatim as the request body, exactly like
+    /// [`crate::endpoints::BurstReportersApi::create_burst_reporter`] itself. Invalidates
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn create_burst_reporter(
+        &self,
+        reporter_data: Value,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .burst_reporters()
+            .create_burst_reporter(&network_id, reporter_data)
+            .await
+    }
+
+    /// Runs an OUI (MAC vendor) check on the network — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see this group's banner comment above. Invalidates nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn run_ouicheck(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api.ouicheck().run_ouicheck(&network_id).await
+    }
+
+    // ==================== Backup Network (mutations) ====================
+
+    /// Enables or disables the backup network — returns the raw Eero API response.
+    ///
+    /// Ported from `set_backup_network` (`eero-api src/eero/client.py:1108-1113`).
+    /// `auto_discover = false`. Invalidates nothing: Python's method body has no
+    /// `del self._cache[...]` call (behaviour brief §2, "Verified to invalidate nothing at
+    /// all"), and there is no `backup` cache bucket to keep consistent with
+    /// `get_backup_network`/`get_backup_status` either way, since neither of those is one of the
+    /// eight cached getters.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn set_backup_network(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .backup()
+            .set_backup_network(&network_id, enabled)
+            .await
+    }
+
+    /// Configures the backup network (enable/disable and/or a phone number) — returns the raw
+    /// Eero API response.
+    ///
+    /// Ported from `configure_backup_network` (`eero-api src/eero/client.py:1115-1125`).
+    /// `auto_discover = false`. Invalidates nothing — see [`Client::set_backup_network`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation` if both `enabled` and `phone_number` are `None` — see
+    /// [`crate::endpoints::BackupApi::configure_backup_network`]'s own docs. Otherwise see
+    /// [`Client::get_diagnostics`].
+    pub async fn configure_backup_network(
+        &self,
+        enabled: Option<bool>,
+        phone_number: Option<&str>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .backup()
+            .configure_backup_network(&network_id, enabled, phone_number)
+            .await
+    }
+
+    // ==================== Schedule (mutations) ====================
+
+    /// Sets a profile's internet-access schedule — returns the raw Eero API response.
+    ///
+    /// Ported from `set_profile_schedule` (`eero-api src/eero/client.py:1136-1148`).
+    /// `auto_discover = false`. On success, invalidates `profiles[{nid}_{pid}]` and
+    /// `profiles[{nid}_profiles]` (`client.py:1147`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_profile_schedule(
+        &self,
+        profile_id: &str,
+        time_blocks: &[Value],
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .schedule()
+            .set_profile_schedule(&network_id, profile_id, time_blocks)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    /// Enables bedtime mode for a profile — returns the raw Eero API response.
+    ///
+    /// Ported from `enable_bedtime` (`eero-api src/eero/client.py:1150-1162`). `auto_discover =
+    /// false`.
+    ///
+    /// Faithful no-op: invalidates nothing, even though this delegates to
+    /// [`crate::endpoints::ScheduleApi::enable_bedtime`], which itself calls the same
+    /// `set_profile_schedule` wire endpoint [`Client::set_profile_schedule`] uses (and which
+    /// *does* invalidate the profile cache when called directly). This asymmetry is a real,
+    /// pre-existing Python inconsistency (behaviour brief §2: `enable_bedtime` invalidates
+    /// "nothing, despite `set_profile_schedule` ... invalidating the profile cache"), **not** one
+    /// of this port's two deliberate improvements — do not "fix" this later thinking it was
+    /// missed. A profile fetched via [`Client::get_profile`] right after this call can return
+    /// stale schedule data until the TTL naturally expires, exactly as in Python.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn enable_bedtime(
+        &self,
+        profile_id: &str,
+        start_time: &str,
+        end_time: &str,
+        days: Option<&[&str]>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .schedule()
+            .enable_bedtime(&network_id, profile_id, start_time, end_time, days)
+            .await
+    }
+
+    /// Clears every schedule on a profile — returns the raw Eero API response.
+    ///
+    /// Ported from `clear_profile_schedule` (`eero-api src/eero/client.py:1164-1169`).
+    /// `auto_discover = false`. Faithful no-op: invalidates nothing, for the same reason
+    /// [`Client::enable_bedtime`] does not — see that method's docs.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn clear_profile_schedule(
+        &self,
+        profile_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .schedule()
+            .clear_profile_schedule(&network_id, profile_id)
+            .await
+    }
+
+    /// Sets bedtime for weekdays only (Monday through Friday) — returns the raw Eero API
+    /// response.
+    ///
+    /// No `client.py` precedent: `eero-api` never wrapped `ScheduleAPI.set_weekday_bedtime`
+    /// (`api/schedule.py:169`) on `EeroClient`.
+    /// [`crate::endpoints::ScheduleApi::set_weekday_bedtime`] is a pure delegator to
+    /// `ScheduleApi::enable_bedtime`, so this method's cache behaviour matches
+    /// [`Client::enable_bedtime`] exactly: `auto_discover = false`, invalidates nothing — a
+    /// faithful no-op for the same bedtime-family reason.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn set_weekday_bedtime(
+        &self,
+        profile_id: &str,
+        start_time: &str,
+        end_time: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .schedule()
+            .set_weekday_bedtime(&network_id, profile_id, start_time, end_time)
+            .await
+    }
+
+    /// Sets bedtime for weekends only (Saturday and Sunday) — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see [`Client::set_weekday_bedtime`]'s docs, which apply
+    /// identically here. `auto_discover = false`. Invalidates nothing.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn set_weekend_bedtime(
+        &self,
+        profile_id: &str,
+        start_time: &str,
+        end_time: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .schedule()
+            .set_weekend_bedtime(&network_id, profile_id, start_time, end_time)
+            .await
+    }
+
+    // ==================== DNS (mutations) ====================
+    //
+    // Divergence from eero-api: every setter in this group invalidates `network[nid]`, even
+    // though not one of them does in Python (behaviour brief §2/§2.1, gotcha G3). `DnsApi`'s six
+    // setters all `PUT networks/{nid}/settings` through the shared `put_network_settings` call
+    // site (`src/endpoints/networks.rs`) — the exact same resource `Client::get_network` caches —
+    // so a `get_network()` call served from cache right after any of these would echo back
+    // pre-write data for as long as the TTL lasts. `rust-port-plan.md` §3.8 and `cache.rs`'s own
+    // module docs ("what's new" (b)) name this as one of this port's two deliberate improvements
+    // over Python; it applies to every DNS setter uniformly, including the two below with no
+    // `client.py` precedent at all — not just the three Python happens to wrap.
+
+    /// Enables or disables DNS caching — returns the raw Eero API response.
+    ///
+    /// Ported from `set_dns_caching` (`eero-api src/eero/client.py:1178-1183`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_dns_caching(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.dns().set_dns_caching(&network_id, enabled).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets custom DNS servers — returns the raw Eero API response.
+    ///
+    /// Ported from `set_custom_dns` (`eero-api src/eero/client.py:1185-1190`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_custom_dns(
+        &self,
+        dns_servers: &[&str],
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .dns()
+            .set_custom_dns(&network_id, dns_servers)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Clears custom DNS servers (reverts to automatic DNS) — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent: `eero-api` never wrapped `DnsAPI.clear_custom_dns`
+    /// (`api/dns.py:126`) on `EeroClient`. [`crate::endpoints::DnsApi::clear_custom_dns`] itself
+    /// delegates to `DnsApi::set_custom_dns([])` — the same resource [`Client::set_custom_dns`]
+    /// mutates — so this method follows the same cache behaviour: `auto_discover = false`,
+    /// invalidates `network[nid]` on success.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn clear_custom_dns(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.dns().clear_custom_dns(&network_id).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets DNS mode to a preset or a custom server list — returns the raw Eero API response.
+    ///
+    /// Ported from `set_dns_mode` (`eero-api src/eero/client.py:1192-1200`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation { field: "mode", .. }` for an unrecognised `mode` — see
+    /// [`crate::endpoints::DnsApi::set_dns_mode`]'s own docs. Otherwise see
+    /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_dns_mode(
+        &self,
+        mode: &str,
+        custom_servers: Option<&[&str]>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .dns()
+            .set_dns_mode(&network_id, mode, custom_servers)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Enables or disables IPv6 DNS (upstream only) — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see [`Client::clear_custom_dns`]'s docs; the same reasoning
+    /// applies here. `auto_discover = false`. On success, invalidates `network[nid]`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_ipv6_dns(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.dns().set_ipv6_dns(&network_id, enabled).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    // ==================== SQM (mutations) ====================
+    //
+    // Divergence from eero-api: every setter in this group invalidates `network[nid]`, for the
+    // exact same reason as the DNS group above — `SqmApi`'s four setters all `PUT
+    // networks/{nid}/settings` through the same shared call site `get_network` reads. See the DNS
+    // group's banner comment for the full rationale; it applies here unchanged.
+
+    /// Enables or disables SQM (Smart Queue Management) — returns the raw Eero API response.
+    ///
+    /// Ported from `set_sqm_enabled` (`eero-api src/eero/client.py:1209-1214`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_sqm_enabled(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.sqm().set_sqm_enabled(&network_id, enabled).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets SQM upload/download bandwidth limits — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see [`Client::clear_custom_dns`]'s docs for the reasoning
+    /// pattern this follows. `auto_discover = false`. On success, invalidates `network[nid]`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_sqm_bandwidth(
+        &self,
+        upload_mbps: Option<u32>,
+        download_mbps: Option<u32>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .sqm()
+            .set_sqm_bandwidth(&network_id, upload_mbps, download_mbps)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Configures SQM (enable/disable plus optional bandwidth limits) in one call — returns the
+    /// raw Eero API response.
+    ///
+    /// Ported from `configure_sqm` (`eero-api src/eero/client.py:1216-1225`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn configure_sqm(
+        &self,
+        enabled: bool,
+        upload_mbps: Option<u32>,
+        download_mbps: Option<u32>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .sqm()
+            .configure_sqm(&network_id, enabled, upload_mbps, download_mbps)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Sets SQM to automatic mode — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent — see [`Client::clear_custom_dns`]'s docs. `auto_discover =
+    /// false`. On success, invalidates `network[nid]`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_sqm_auto(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.sqm().set_sqm_auto(&network_id).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    // ==================== Security (mutations) ====================
+    //
+    // Divergence from eero-api: every setter in this group invalidates `network[nid]`, for the
+    // same reason as DNS/SQM above — `SecurityApi`'s six setters all `PUT
+    // networks/{nid}/settings` through the same shared call site `get_network` reads. See the DNS
+    // group's banner comment for the full rationale.
+
+    /// Enables or disables WPA3 encryption — returns the raw Eero API response.
+    ///
+    /// Ported from `set_wpa3` (`eero-api src/eero/client.py:1281-1284`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_wpa3(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.security().set_wpa3(&network_id, enabled).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Enables or disables band steering — returns the raw Eero API response.
+    ///
+    /// Ported from `set_band_steering` (`eero-api src/eero/client.py:1286-1291`).
+    /// `auto_discover = false`. On success, invalidates `network[nid]` — see this group's banner
+    /// comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_band_steering(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .security()
+            .set_band_steering(&network_id, enabled)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Enables or disables `UPnP` — returns the raw Eero API response.
+    ///
+    /// Ported from `set_upnp` (`eero-api src/eero/client.py:1293-1296`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_upnp(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.security().set_upnp(&network_id, enabled).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Enables or disables IPv6 (both upstream and downstream) — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `set_ipv6` (`eero-api src/eero/client.py:1298-1301`). `auto_discover =
+    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    /// Contrast with [`Client::set_ipv6_dns`], which sets only the upstream flag.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_ipv6(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.security().set_ipv6(&network_id, enabled).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Enables or disables Thread — returns the raw Eero API response.
+    ///
+    /// Ported from `set_thread_enabled` (`eero-api src/eero/client.py:1303-1308`), which
+    /// delegates to [`crate::endpoints::SecurityApi::set_thread`] — the client-level name keeps
+    /// Python's own `set_thread_enabled`, not `set_thread`, verbatim (`client.py:1303`).
+    /// `auto_discover = false`. On success, invalidates `network[nid]` — see this group's banner
+    /// comment above.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_thread_enabled(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self.api.security().set_thread(&network_id, enabled).await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Configures multiple security settings in one call — returns the raw Eero API response.
+    ///
+    /// Ported from `configure_security` (`eero-api src/eero/client.py:1310-1328`).
+    /// `auto_discover = false`. On success, invalidates `network[nid]` — see this group's banner
+    /// comment above.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Validation` if every argument is `None` — see
+    /// [`crate::endpoints::SecurityApi::configure_security`]'s own docs. Otherwise see
+    /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn configure_security(
+        &self,
+        wpa3: Option<bool>,
+        band_steering: Option<bool>,
+        upnp: Option<bool>,
+        ipv6: Option<bool>,
+        thread: Option<bool>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .security()
+            .configure_security(&network_id, wpa3, band_steering, upnp, ipv6, thread)
+            .await?;
+        self.cache
+            .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    // ==================== Blocked Applications & Profile Content (mutations) ====================
+
+    /// Sets the blocked applications (Eero Plus feature) for a profile — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `set_blocked_applications` (`eero-api src/eero/client.py:1339-1351`).
+    /// `auto_discover = false`. On success, invalidates `profiles[{nid}_{pid}]` and
+    /// `profiles[{nid}_profiles]` (`client.py:1350`).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_blocked_applications(
+        &self,
+        profile_id: &str,
+        applications: &[&str],
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .profiles()
+            .set_blocked_applications(&network_id, profile_id, applications)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    /// Updates a profile's content-filtering settings — returns the raw Eero API response.
+    ///
+    /// No `client.py` precedent: `eero-api` never wrapped
+    /// `ProfilesAPI.update_profile_content_filter` (`api/profiles.py:179`) on `EeroClient`.
+    /// [`crate::endpoints::ProfilesApi::update_profile_content_filter`] `PUT`s the exact same
+    /// `networks/{nid}/profiles/{pid}` resource [`Client::set_blocked_applications`],
+    /// [`Client::rename_profile`], [`Client::pause_profile`] and [`Client::set_profile_devices`]
+    /// all mutate — every one of which invalidates the profile cache in Python — so this method
+    /// follows the policy already established for that resource rather than inventing a new one:
+    /// `auto_discover = false` (grouped here with [`Client::set_blocked_applications`], not with
+    /// the `auto_discover = true` "Profile Devices" section at the very end of `client.py`), and
+    /// on success invalidates `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn update_profile_content_filter(
+        &self,
+        profile_id: &str,
+        filters: &[(&str, bool)],
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .profiles()
+            .update_profile_content_filter(&network_id, profile_id, filters)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    /// Updates a profile's custom domain block or allow list — returns the raw Eero API
+    /// response.
+    ///
+    /// No `client.py` precedent — see [`Client::update_profile_content_filter`]'s docs, which
+    /// apply identically here: [`crate::endpoints::ProfilesApi::update_profile_block_list`]
+    /// `PUT`s the same profile resource. `auto_discover = false`. On success, invalidates
+    /// `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn update_profile_block_list(
+        &self,
+        profile_id: &str,
+        domains: &[&str],
+        block: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .profiles()
+            .update_profile_block_list(&network_id, profile_id, domains, block)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    // ==================== Profile Devices ====================
+
+    /// Sets the devices assigned to a profile — returns the raw Eero API response.
+    ///
+    /// Ported from `set_profile_devices` (`eero-api src/eero/client.py:1362-1372`).
+    /// **`auto_discover = true`** — the same brief gotcha G5 exception
+    /// [`Client::get_profile_devices`]'s docs describe: this is one of the two methods at the
+    /// very end of `client.py` that call `_ensure_network_id(network_id)` with no
+    /// `auto_discover` argument at all, unlike every other method from `get_diagnostics` through
+    /// `set_blocked_applications`. On success, invalidates `profiles[{nid}_{pid}]` and
+    /// `profiles[{nid}_profiles]` (`client.py:1371`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingNetworkId`] if `network_id` is absent, no preferred network is set, *and*
+    /// auto-discovery finds nothing. Otherwise, whatever status-mapped [`Error`] the request
+    /// produces. The cache is left untouched on any `Err`.
+    pub async fn set_profile_devices(
+        &self,
+        profile_id: &str,
+        device_urls: &[&str],
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        // Brief gotcha G5 (see this method's doc comment): `true`, not `false`, deliberately —
+        // matching `Client::get_profile_devices` above.
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let response = self
+            .api
+            .profiles()
+            .set_profile_devices(&network_id, profile_id, device_urls)
+            .await?;
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    // ============================= Cache-invalidation helpers =============================
+    //
+    // Mirror Python's own private helpers (`client.py:567-575, 659-667, 669-673`) exactly: each
+    // drops precisely the keys Python drops, no more. Where a deliberate `network[nid]`/
+    // `eeros[{nid}_eeros]` drop is added on top of Python (the two documented improvements above),
+    // that extra call is made directly at the write site rather than folded into a helper here —
+    // there is no Python helper for it to mirror.
+
+    /// Drops both `devices[{nid}_{did}]` and `devices[{nid}_devices]` for one device.
+    ///
+    /// Mirrors `_invalidate_device_cache` (`eero-api src/eero/client.py:567-575`).
+    fn invalidate_device_cache(&self, network_id: &str, device_id: &str) {
+        self.cache
+            .invalidate(&CacheKey::device(network_id, device_id));
+        self.cache.invalidate(&CacheKey::devices(network_id));
+    }
+
+    /// Drops both `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]` for one profile.
+    ///
+    /// Mirrors `_invalidate_profile_cache` (`eero-api src/eero/client.py:659-667`), which already
+    /// drops both keys itself — see `Client::rename_profile`'s docs for why call sites that call
+    /// both `_invalidate_profile_cache` and `_invalidate_profiles_list_cache` in Python only need
+    /// this one helper here.
+    fn invalidate_profile_cache(&self, network_id: &str, profile_id: &str) {
+        self.cache
+            .invalidate(&CacheKey::profile(network_id, profile_id));
+        self.cache.invalidate(&CacheKey::profiles(network_id));
+    }
+
+    /// Drops only `profiles[{nid}_profiles]` — used by `Client::create_profile`, the one write
+    /// with no single-profile key to also drop yet.
+    ///
+    /// Mirrors `_invalidate_profiles_list_cache` (`eero-api src/eero/client.py:669-673`).
+    fn invalidate_profiles_list_cache(&self, network_id: &str) {
+        self.cache.invalidate(&CacheKey::profiles(network_id));
+    }
 }
 
 /// Extracts a JSON array of network entries from a `{meta, data}` envelope's `data` value.
