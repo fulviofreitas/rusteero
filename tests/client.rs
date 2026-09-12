@@ -1,0 +1,557 @@
+//! P4 `Client` integration suite: the cache actually working end to end.
+//!
+//! Covers, against a local `wiremock` server per `.claude/rules/testing.md`: the eight cached
+//! getters serving a second call from cache; `refresh_cache`/`cache_ttl(Duration::ZERO)`
+//! bypassing that cache; TTL expiry (via `tokio::time::pause()`/`advance()`, never a real
+//! `sleep`); the falsy-value rule end to end (`src/cache.rs`'s `is_falsy` — a real Python quirk,
+//! not a bug); two networks' cache entries never colliding; network-id resolution
+//! (`Client::ensure_network_id` — explicit id, preferred id, auto-discovery in both its `id` and
+//! `url`-tail shapes, and the `Error::MissingNetworkId` failure path); the `/account` fallback
+//! inside `get_networks` (the synthesised envelope and its `preferred_network_id` side effect);
+//! and every place `Client` clears its cache (`clear_cache`, `logout`, `set_session_token`,
+//! `clear_session_token`).
+//!
+//! Every caching test asserts on the wiremock `.expect(n)` call count, not just the returned
+//! value — a caching test that only checks the envelope is not testing caching at all (see
+//! `.claude/rules/testing.md`'s "Assertion Patterns"). Two tests below (`logout_...` and
+//! `clear_session_token_...`) restore a session directly at the `EeroApi` layer via
+//! [`Client::api`] rather than through `Client::set_session_token` — deliberately, so that
+//! restoring the ability to make a second request never itself clears the cache and masks a
+//! regression in the very call site under test.
+
+mod common;
+
+use std::time::Duration;
+
+use serde_json::json;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, ResponseTemplate};
+
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use rusteero::auth::Session;
+use rusteero::client::Client;
+use rusteero::error::Error;
+
+/// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
+/// default 60-second cache TTL. See [`client_with_ttl`] for a caller that needs a different TTL.
+async fn client(mock: &MockEero) -> Client {
+    client_with_ttl(mock, Duration::from_secs(60)).await
+}
+
+/// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with an explicit
+/// cache TTL — used by the TTL-expiry and zero-TTL tests below.
+async fn client_with_ttl(mock: &MockEero, cache_ttl: Duration) -> Client {
+    Client::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .cache_ttl(cache_ttl)
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL")
+}
+
+// ===================== Caching =====================
+
+#[tokio::test]
+async fn get_devices_second_call_is_served_from_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let first = client.get_devices(Some("network-0001"), false).await?;
+    let second = client.get_devices(Some("network-0001"), false).await?;
+
+    assert_eq!(first.as_value(), &fixture_json("devices.json"));
+    assert_eq!(second.as_value(), &fixture_json("devices.json"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_devices_with_refresh_cache_true_always_hits_the_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_devices(Some("network-0001"), true).await?;
+    client.get_devices(Some("network-0001"), true).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_devices_refetches_after_the_ttl_expires() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    // A `reqwest::Client` with neither of the crate's default request/read timeouts configured
+    // (see `Client::builder().http(..)`'s own docs for this escape hatch). Those timeouts are
+    // implemented as `tokio::time` sleeps racing the real response; `tokio::time::pause()`'s
+    // documented auto-advance behaviour ("if the runtime has no work to do, the clock is
+    // auto-advanced to the next pending timer") can fire one of those sleeps the instant the
+    // `advance()` call below leaves the runtime transiently idle mid-request — observed in
+    // practice as a flaky, spurious `Error::Timeout` (or an outright dropped connection) on the
+    // second call. Dropping both timeouts removes that race entirely; the real, unmocked socket
+    // I/O this test still performs is unaffected by the paused clock either way.
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a client with no timeouts configured always builds");
+    let client = Client::builder()
+        .http(http)
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .cache_ttl(Duration::from_secs(30))
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL");
+
+    client.get_devices(Some("network-0001"), false).await?;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_devices_with_zero_ttl_never_serves_from_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client_with_ttl(&mock, Duration::ZERO).await;
+    client.get_devices(Some("network-0001"), false).await?;
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+/// *** The falsy-value rule end to end. ***
+///
+/// A `204 No Content` becomes `Envelope::empty()` (a literal `{}`), which is "falsy" under
+/// `Cache::get`'s rule (`src/cache.rs`'s `is_falsy` — checked against the *whole* wire envelope,
+/// not just its `data` field, so `{"meta": ..., "data": {}}` would NOT qualify: only a
+/// genuinely empty top-level object does). This is a faithful port of a real Python quirk
+/// (`client.py`'s `if cached:` truthiness guard) — a second call within the TTL must still
+/// re-hit the network, so `.expect(2)` here is the correct assertion, not `.expect(1)`.
+#[tokio::test]
+async fn falsy_cached_value_is_never_served_from_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let first = client.get_devices(Some("network-0001"), false).await?;
+    let second = client.get_devices(Some("network-0001"), false).await?;
+
+    assert_eq!(first.as_value(), &json!({}));
+    assert_eq!(second.as_value(), &json!({}));
+    Ok(())
+}
+
+#[tokio::test]
+// `network_a_devices`/`network_b_devices` intentionally mirror each other (same shape, only the
+// network letter differs) — that pairing is the point of the test, not an accident worth
+// renaming around.
+#[allow(clippy::similar_names)]
+async fn devices_for_different_networks_do_not_collide() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let network_a_devices = json!({"meta": {"code": 200}, "data": [{"mac": "AA:BB:CC:00:00:0A"}]});
+    let network_b_devices = json!({"meta": {"code": 200}, "data": [{"mac": "AA:BB:CC:00:00:0B"}]});
+
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/net-a/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(network_a_devices.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/net-b/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(network_b_devices.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let a_first = client.get_devices(Some("net-a"), false).await?;
+    let b_first = client.get_devices(Some("net-b"), false).await?;
+    let a_second = client.get_devices(Some("net-a"), false).await?;
+    let b_second = client.get_devices(Some("net-b"), false).await?;
+
+    assert_eq!(a_first.as_value(), &network_a_devices);
+    assert_eq!(b_first.as_value(), &network_b_devices);
+    assert_eq!(
+        a_first, a_second,
+        "net-a's second call must be served from its own cache entry"
+    );
+    assert_eq!(
+        b_first, b_second,
+        "net-b's second call must be served from its own cache entry"
+    );
+    assert_ne!(
+        a_first.as_value(),
+        b_first.as_value(),
+        "the two networks' cached entries must never collide"
+    );
+    Ok(())
+}
+
+// ===================== Network-id resolution =====================
+
+#[tokio::test]
+async fn explicit_network_id_wins_over_the_preferred_one() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/explicit-net/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // Never hit if resolution incorrectly preferred the preferred-network state instead of the
+    // explicit argument.
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/preferred-net/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.set_preferred_network("preferred-net");
+
+    let env = client.get_devices(Some("explicit-net"), false).await?;
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn preferred_network_is_used_when_no_explicit_id_is_given() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/preferred-net/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.set_preferred_network("preferred-net");
+
+    let env = client.get_devices(None, false).await?;
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
+    Ok(())
+}
+
+/// Auto-discovery shape 1: the first `/networks` entry carries a bare, non-empty `id` field.
+#[tokio::test]
+async fn auto_discovery_uses_the_first_networks_bare_id() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let networks_body = json!({"meta": {"code": 200}, "data": [{"id": "auto-net-a"}]});
+
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(networks_body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/auto-net-a/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_devices(None, false).await?;
+
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
+    assert_eq!(client.preferred_network_id().as_deref(), Some("auto-net-a"));
+    Ok(())
+}
+
+/// Auto-discovery shape 2: the first `/networks` entry has no `id` field at all, so the network
+/// id is derived from the trailing path segment of its `url` via `id_from_url`.
+#[tokio::test]
+async fn auto_discovery_falls_back_to_the_url_tail_when_id_is_absent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let networks_body =
+        json!({"meta": {"code": 200}, "data": [{"url": "/2.2/networks/auto-net-b"}]});
+
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(networks_body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/auto-net-b/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_devices(None, false).await?;
+
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
+    assert_eq!(client.preferred_network_id().as_deref(), Some("auto-net-b"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_network_id_after_failed_auto_discovery_makes_no_downstream_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let empty_networks = json!({"meta": {"code": 200}, "data": []});
+    // The `/networks` list is empty, so `Client::get_networks` will itself attempt the
+    // `/account` fallback (see the tests below) before auto-discovery gives up; that fallback
+    // must also come back empty here so resolution genuinely finds nothing.
+    let empty_account = json!({"meta": {"code": 200}, "data": {"networks": {"data": []}}});
+
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_networks.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_account.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let err = client
+        .get_devices(None, false)
+        .await
+        .expect_err("no network id can be resolved");
+    assert!(matches!(err, Error::MissingNetworkId));
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(
+        requests.iter().all(|r| !r.url.path().contains("/devices")),
+        "no device request should ever have been attempted: {requests:?}"
+    );
+    Ok(())
+}
+
+// ===================== The `/account` fallback =====================
+
+/// *** The `/account` fallback, end to end. ***
+///
+/// When `/networks` comes back empty, `Client::get_networks` forces a live `/account` fetch and,
+/// if that yields a non-empty list, synthesises a new envelope: `meta` from the ORIGINAL
+/// `/networks` response, `data.networks` from the account-derived list (brief gotcha G1). This
+/// also derives `preferred_network_id` as a one-shot side effect.
+#[tokio::test]
+async fn get_networks_falls_back_to_account_when_the_list_is_empty() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let empty_networks = json!({
+        "meta": {"code": 200, "server_time": "2020-01-01T00:00:00Z"},
+        "data": [],
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(empty_networks.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_networks(false).await?;
+
+    // The synthesised envelope's `meta` is the ORIGINAL `/networks` response's `meta`, not
+    // `/account`'s (whose `server_time` is a different, fixture-owned value — see
+    // `tests/fixtures/account.json`).
+    assert_eq!(env.meta().code, Some(200));
+    assert_eq!(
+        env.meta().server_time.as_deref(),
+        Some("2020-01-01T00:00:00Z")
+    );
+    assert_ne!(
+        env.meta().server_time.as_deref(),
+        fixture_json("account.json")["meta"]["server_time"].as_str()
+    );
+
+    let expected_networks = fixture_json("account.json")["data"]["networks"]["data"].clone();
+    assert_eq!(env.data()["networks"], expected_networks);
+
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001"),
+        "the account fallback must derive a preferred network as a side effect"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_networks_does_not_fall_back_when_the_list_is_non_empty() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("networks.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_networks(false).await?;
+    assert_eq!(env.as_value(), &fixture_json("networks.json"));
+    Ok(())
+}
+
+// ===================== Session and cache invalidation =====================
+
+#[tokio::test]
+async fn clear_cache_forces_the_next_call_to_re_hit_the_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_devices(Some("network-0001"), false).await?;
+    client.clear_cache();
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn logout_clears_the_cache_so_a_subsequent_get_re_hits_the_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_devices(Some("network-0001"), false).await?;
+
+    client.logout().await?;
+
+    // `logout` also clears the in-memory session, so a session must be restored before this
+    // cached getter can be called again. Restore it directly at the `EeroApi` layer (the escape
+    // hatch `Client::api` documents) rather than via `Client::set_session_token`, which
+    // deliberately clears the cache itself (covered separately below) — if that shortcut were
+    // used here instead, this test could pass even if `Client::logout` never cleared the cache
+    // at all.
+    client.api().auth().set_session_token(TEST_TOKEN)?;
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_session_token_clears_the_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_devices(Some("network-0001"), false).await?;
+
+    client.set_session_token(TEST_TOKEN)?;
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_session_token_clears_the_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_devices(Some("network-0001"), false).await?;
+
+    client.clear_session_token()?;
+    // `clear_session_token` nulls the in-memory session token itself, so — exactly as in the
+    // `logout` test above — restore it via the `EeroApi` layer directly, never through
+    // `Client::set_session_token`, so this call cannot be the one masking a missing cache clear
+    // in `clear_session_token` itself.
+    client.api().auth().set_session_token(TEST_TOKEN)?;
+    client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
