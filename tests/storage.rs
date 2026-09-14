@@ -44,6 +44,35 @@ fn copy_fixture_into(dir: &Path, fixture_name: &str) -> PathBuf {
 
 // ===================== D-5 contract: FileStore reads a real eero-api cookies.json =====================
 
+/// Loads a fixture whose key order, key set and value *types* were taken byte-for-byte from a
+/// real `cookies.json` written by the Python `eeroctl`, with only the token and the date
+/// replaced by synthetic values of the same shape.
+///
+/// This differs from `cookies.json` in the one way that turned out to matter: a real file
+/// produced by an ordinary login has `"refresh_token": null`, because `eero-api` is never issued
+/// a refresh token at login (port plan §1.3). The hand-written fixture carries a refresh token,
+/// so the null case — the *common* one in practice — was only covered incidentally. Verified
+/// against a genuine file on 2026-09-14.
+#[test]
+fn filestore_loads_a_real_eeroctl_cookies_file_with_a_null_refresh_token() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = copy_fixture_into(dir.path(), "cookies_eeroctl.json");
+    let store = FileStore::new(&path);
+
+    let session = store.load()?;
+
+    assert_eq!(session.token().expose_secret().len(), 35);
+    assert!(
+        session.refresh_token().is_none(),
+        "a real post-login cookies.json has no refresh token; the port must not invent one"
+    );
+    assert!(
+        session.is_valid(),
+        "the fixture's expiry is in the future, so the session must load as valid"
+    );
+    Ok(())
+}
+
 #[test]
 fn filestore_loads_the_real_eero_api_cookies_json_fixture() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

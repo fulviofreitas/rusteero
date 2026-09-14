@@ -128,6 +128,44 @@ Status values: `planned` → `ported` (with test) · `changed` · `renamed` · `
 | misc | `get_secure_logger / SecureLoggerAdapter` | `(none)` | — | `—` | dropped | — | Python-logging specific; tracing + SecretString |
 | misc | `const.py enums (EeroDeviceType, …)` | `(none)` | — | `—` | dropped | — | unused in Python |
 
+## Live validation (2026-09-14)
+
+A read-only sweep against a real account (4 eeros, 135 devices, 10 profiles) with an
+`eeroctl`-issued session token. Every path below was additionally re-probed with raw `curl` to
+separate "this port builds the wrong URL" from "the endpoint is gone or gated" — the two agree in
+every case, so **no route constant is wrong**. Reproduce with
+`cargo test --test live -- --ignored --exact live_read_only_endpoint_sweep`.
+
+**18 of 25 read-only endpoints answered `200`**: account, networks, network, eeros, devices,
+profiles, dns_settings, security_settings, sqm_settings, blacklist, reservations, forwards,
+routing, thread, updates, ac_compat, support, diagnostics, premium_status.
+
+Confirmed by observation, not just by reading Python:
+
+- `get_dns_settings`, `get_security_settings`, `get_sqm_settings` and `get_premium_status` really
+  do return the whole network object, byte-identical to `get_network`. Modelling them as aliases
+  of one route is correct.
+- **`GET /networks` returned an empty list on this account**, so the `/account` fallback is what
+  actually resolved the network id. That fallback is load-bearing in the real world, not a
+  vestigial branch — worth knowing before anyone "simplifies" it away.
+- The account's stored `cookies.json` has `"refresh_token": null`, matching §1.3's finding that a
+  refresh token is never issued at login.
+
+Seven endpoints did not answer. These are observations from **one** account on one day, so a 404
+here may mean "feature not enabled for this account" rather than "removed upstream"; they are
+recorded, not acted on, and no row below was changed to `dropped` on this evidence alone.
+
+| Endpoint | Live result | Note |
+|---|---|---|
+| `GET networks/{nid}/settings` | 404 | `get_settings`. The PUT to the same path is how every settings writer works, so the resource is not simply absent — the GET appears unsupported. |
+| `GET networks/{nid}/password` | 404 | `get_password`. |
+| `GET networks/{nid}/transfer` | **403** | `get_transfer_stats`. Forbidden rather than missing — looks permission- or tier-gated. |
+| `GET networks/{nid}/backup` | 404 | `get_backup_network`; this account has no backup internet configured. |
+| `GET networks/{nid}/backup/status` | 404 | `get_backup_status`. |
+| `GET networks/{nid}/ouicheck` | 404 | `get_ouicheck`. |
+| `GET networks/{nid}/burst_reporters` | 404 | `get_burst_reporters`. |
+
+
 ## Credential storage (phase 2, `api/auth_storage.py`)
 
 | Python | Rust | Status | Test | Note |

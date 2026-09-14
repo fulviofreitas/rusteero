@@ -38,6 +38,7 @@ pub mod util;
 // still work) — nothing here is hidden behind the flat re-export surface.
 pub use api::EeroApi;
 pub use auth::Session;
+pub use client::{Client, ClientBuilder};
 pub use envelope::{Envelope, Meta};
 pub use error::{Error, StorageError};
 #[cfg(feature = "keyring")]
