@@ -68,6 +68,12 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
       - name: 🦀 Setup Rust (for `cargo update` in prepareCmd)
         uses: dtolnay/rust-toolchain@stable
+      # semantic-release's prepareCmd runs `cargo update -p rusteero --offline` to refresh the
+      # lockfile after it rewrites the version. `--offline` keeps that deterministic, but a fresh
+      # runner has no registry index, so resolution fails with "no matching package named
+      # `bytes`". Populate the cache first and the offline update resolves from it.
+      - name: 📦 Prime the cargo registry cache
+        run: cargo fetch --locked
       - name: 🚀 Run semantic-release
         id: release
         uses: fulviofreitas/workflow-arsenal/.github/actions/semantic-release@master
