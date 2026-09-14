@@ -38,15 +38,24 @@ cargo test --all-features
 ### Hello World
 
 ```rust
-use rusteero::{Client, auth::LoginFlow};
+use rusteero::auth::flow::LoginFlow;
+use rusteero::Client;
+use std::io::Write;
 
 #[tokio::main]
 async fn main() -> Result<(), rusteero::Error> {
-    let pending = LoginFlow::new(None).start("you@example.com").await?;
-    let code = rpassword::prompt_password("Code: ").unwrap();
+    let pending = LoginFlow::new(None)?.start("you@example.com").await?;
+
+    print!("Code: ");
+    std::io::stdout().flush().ok();
+    let mut code = String::new();
+    std::io::stdin().read_line(&mut code).ok();
     let session = pending.verify(code.trim()).await?;
 
-    let client = Client::builder().session(session).build()?;
+    // ClientBuilder::build is async: it may load a stored session from a configured
+    // CredentialStore.
+    let client = Client::builder().session(Some(session)).build().await?;
+
     let networks = client.get_networks(false).await?;   // raw {meta, data} envelope
     for n in networks.data()["networks"].as_array().into_iter().flatten() {
         println!("📶 {}: {}", n["name"], n["status"]);

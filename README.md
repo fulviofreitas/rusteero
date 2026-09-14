@@ -29,39 +29,44 @@ _It is a port of the Python [`eero-api`](https://github.com/fulviofreitas/eero-a
 
 ## 🚧 Status
 
-**Phase 0 (bootstrap).** The crate skeleton, CI, wiki and the per-method parity checklist
-([`PARITY.md`](PARITY.md)) exist; endpoint code does not yet. Nothing is published to crates.io
-until the library is fully tested and validated against a live account.
+**Feature-complete, not yet released.** Every method in the Python library is ported: transport,
+authentication, credential storage, all 25 endpoint modules, the client facade and its cache, and
+every mutating call. [`PARITY.md`](PARITY.md) tracks all 127 rows — none are outstanding — and
+records a read-only sweep against a real account.
+
+Nothing is published to crates.io until the library is validated against a live account and the
+author signs off.
 
 ## 📦 Install
 
-Not on crates.io yet. Once published:
+Not on crates.io yet — use the git dependency:
 
 ```toml
 [dependencies]
-rusteero = "0.1"
+rusteero = { git = "https://github.com/fulviofreitas/rusteero" }
 
 # Headless / embedded (no system keyring):
-rusteero = { version = "0.1", default-features = false }
+rusteero = { git = "https://github.com/fulviofreitas/rusteero", default-features = false }
 ```
 
 ## 🚀 Quick Start
 
 ```rust
-use rusteero::{Client, auth::LoginFlow};
+use rusteero::Client;
+use rusteero::auth::flow::LoginFlow;
 
 #[tokio::main]
 async fn main() -> Result<(), rusteero::Error> {
-    // Interactive step (once): email or phone → code → session
-    let pending = LoginFlow::new(None).start("you@example.com").await?;
+    // Interactive step (once): email or phone → one-time code → session
+    let pending = LoginFlow::new(None)?.start("you@example.com").await?;
     let code = rpassword::prompt_password("Code: ").unwrap();
     let session = pending.verify(code.trim()).await?;
 
     // Or, headless: let session = rusteero::Session::from_env("RUSTEERO_SESSION_TOKEN")?;
 
-    let client = Client::builder().session(session).build()?;
+    let client = Client::builder().session(Some(session)).build().await?;
 
-    // Every method returns the raw JSON envelope
+    // Every method returns the raw JSON envelope, exactly as Eero sent it
     let networks = client.get_networks(false).await?;
     for n in networks.data()["networks"].as_array().into_iter().flatten() {
         println!("📶 {}: {}", n["name"], n["status"]);
@@ -70,8 +75,10 @@ async fn main() -> Result<(), rusteero::Error> {
 }
 ```
 
-> 💡 With the default `keyring` feature, credentials are saved to your system keyring under the
-> same entry `eero-api` uses, so the Python tools and `rusteero` share one login.
+> 💡 A `Client` persists nothing unless you give it a credential store. Attach one — the system
+> keyring is available under the default `keyring` feature — and it uses the *same* entry the
+> Python library does, so `eeroctl` and `rusteero` share one login. See
+> [Configuration](https://github.com/fulviofreitas/rusteero/wiki/Configuration).
 
 ## 📄 Raw Response Format
 
