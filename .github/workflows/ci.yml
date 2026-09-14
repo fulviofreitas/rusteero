@@ -97,6 +97,16 @@ jobs:
         run: cargo test --all-features
       - name: 🧪 cargo test (no default features)
         run: cargo test --no-default-features
+      # P2.4's cross-OS smoke. The ordinary test run only proves the crate behaves
+      # correctly *without* a keyring, because the one test that actually stores and
+      # retrieves through a real backend is #[ignore]d. Run it explicitly where a backend
+      # exists: macOS has Keychain and Windows has Credential Manager on the hosted
+      # runners. Ubuntu runners have no Secret Service, so it stays skipped there and the
+      # no-backend path is what the normal run already covers.
+      - name: 🔑 Keyring round trip (real OS backend)
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo test --all-features -- --ignored --exact storage::keyring::tests::keyring_round_trip_save_load_clear
+
       - name: 📊 Coverage
         if: matrix.os == 'ubuntu-latest'
         run: |
