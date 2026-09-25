@@ -452,58 +452,103 @@ impl Route {
 // that share a wire resource) and is re-exported flat here so every existing
 // `crate::routes::CONSTANT` path keeps resolving unchanged.
 pub mod ac_compat;
+pub mod account;
 pub mod auth;
 pub mod backup;
+pub mod backup_access_points;
 pub mod blacklist;
 pub mod burst_reporters;
 pub mod data_usage;
+pub mod ddns;
 pub mod devices;
+pub mod dhcp;
 pub mod diagnostics;
 pub mod dns;
+pub mod dns_policies;
 pub mod eeros;
+pub mod entitlements;
+pub mod events;
 pub mod forwards;
 pub mod insights;
+pub mod members;
 pub mod networks;
+pub mod notifications;
 pub mod ouicheck;
-pub mod password;
+pub mod permissions;
+pub mod power_saving;
 pub mod profiles;
 pub mod reservations;
 pub mod routing;
 pub mod schedule;
 pub mod security;
-pub mod settings;
 pub mod sqm;
+pub mod subnets;
 pub mod support;
 pub mod thread;
 pub mod transfer;
 pub mod updates;
+pub mod wan;
+pub mod wpa3;
 
+// The 14 modules new in v8.0.0 (`account`, `backup_access_points`, `ddns`, `dhcp`,
+// `dns_policies`, `entitlements`, `events`, `members`, `notifications`, `permissions`,
+// `power_saving`, `subnets`, `wan`, `wpa3`) are currently empty — no `Resource`/`Nested`
+// constant is declared until the domain port (phase G) lands one. A glob `pub use` of an empty
+// module is legal (it re-exports nothing) but triggers `unused_imports` until the first constant
+// exists, so each is marked `#[allow(unused_imports)]` individually rather than widened to a
+// blanket module-level allow that would also hide a real future regression.
 pub use ac_compat::*;
+#[allow(unused_imports)]
+pub use account::*;
 pub use auth::*;
 pub use backup::*;
+#[allow(unused_imports)]
+pub use backup_access_points::*;
 pub use blacklist::*;
 pub use burst_reporters::*;
 pub use data_usage::*;
+#[allow(unused_imports)]
+pub use ddns::*;
 pub use devices::*;
+#[allow(unused_imports)]
+pub use dhcp::*;
 pub use diagnostics::*;
 pub use dns::*;
+#[allow(unused_imports)]
+pub use dns_policies::*;
 pub use eeros::*;
+#[allow(unused_imports)]
+pub use entitlements::*;
+#[allow(unused_imports)]
+pub use events::*;
 pub use forwards::*;
 pub use insights::*;
+#[allow(unused_imports)]
+pub use members::*;
 pub use networks::*;
+#[allow(unused_imports)]
+pub use notifications::*;
 pub use ouicheck::*;
-pub use password::*;
+#[allow(unused_imports)]
+pub use permissions::*;
+#[allow(unused_imports)]
+pub use power_saving::*;
 pub use profiles::*;
 pub use reservations::*;
 pub use routing::*;
 pub use schedule::*;
 pub use security::*;
-pub use settings::*;
 pub use sqm::*;
+#[allow(unused_imports)]
+pub use subnets::*;
 pub use support::*;
 pub use thread::*;
 pub use transfer::*;
 pub use updates::*;
+#[allow(unused_imports)]
+pub use wan::*;
+#[allow(unused_imports)]
+pub use wpa3::*;
 
 #[cfg(test)]
 mod tests {
@@ -675,19 +720,19 @@ mod tests {
         GET_BLACKLIST, GET_BLOCKED_APPLICATIONS, GET_BURST_REPORTERS, GET_DATA_USAGE,
         GET_DATA_USAGE_RESOURCE, GET_DEVICE, GET_DEVICE_TRANSFER_STATS, GET_DEVICES,
         GET_DIAGNOSTICS, GET_DNS_SETTINGS, GET_EERO, GET_EEROS, GET_FORWARDS, GET_INSIGHTS,
-        GET_LED_STATUS, GET_NETWORK, GET_NETWORKS, GET_NIGHTLIGHT, GET_OUICHECK, GET_PASSWORD,
+        GET_LED_STATUS, GET_NETWORK, GET_NETWORKS, GET_NIGHTLIGHT, GET_OUICHECK,
         GET_PREMIUM_STATUS, GET_PROFILE, GET_PROFILE_DEVICES, GET_PROFILE_SCHEDULE, GET_PROFILES,
-        GET_RESERVATIONS, GET_ROUTING, GET_SECURITY_SETTINGS, GET_SETTINGS, GET_SQM_SETTINGS,
-        GET_SUPPORT, GET_THREAD, GET_TRANSFER_STATS, GET_UPDATES, LOGIN, LOGIN_REFRESH,
-        LOGIN_RESEND, LOGIN_VERIFY, LOGOUT, PAUSE_DEVICE, PAUSE_PROFILE, PUT_NETWORK_SETTINGS,
-        PUT_PROFILE, REBOOT_EERO, REBOOT_NETWORK, REMOVE_FROM_BLACKLIST, RENAME_PROFILE,
-        REQUEST_SUPPORT, RUN_DIAGNOSTICS, RUN_INSIGHTS, RUN_OUICHECK, RUN_SPEED_TEST,
-        SET_BACKUP_NETWORK, SET_BAND_STEERING, SET_BLOCKED_APPLICATIONS, SET_CUSTOM_DNS,
-        SET_DEVICE_NICKNAME, SET_DNS_CACHING, SET_DNS_MODE, SET_GUEST_NETWORK, SET_IPV6,
-        SET_IPV6_DNS, SET_LED, SET_LED_BRIGHTNESS, SET_NETWORK_NAME, SET_NIGHTLIGHT,
-        SET_PROFILE_DEVICES, SET_PROFILE_SCHEDULE, SET_SQM_AUTO, SET_SQM_BANDWIDTH,
-        SET_SQM_ENABLED, SET_THREAD, SET_UPNP, SET_WPA3, UPDATE_PROFILE_BLOCK_LIST,
-        UPDATE_PROFILE_CONTENT_FILTER, UPDATE_RESERVATION,
+        GET_RESERVATIONS, GET_ROUTING, GET_SECURITY_SETTINGS, GET_SQM_SETTINGS, GET_SUPPORT,
+        GET_THREAD, GET_TRANSFER_STATS, GET_UPDATES, LOGIN, LOGIN_REFRESH, LOGIN_RESEND,
+        LOGIN_VERIFY, LOGOUT, PAUSE_DEVICE, PAUSE_PROFILE, PUT_NETWORK_SETTINGS, PUT_PROFILE,
+        REBOOT_EERO, REBOOT_NETWORK, REMOVE_FROM_BLACKLIST, RENAME_PROFILE, REQUEST_SUPPORT,
+        RUN_DIAGNOSTICS, RUN_INSIGHTS, RUN_OUICHECK, RUN_SPEED_TEST, SET_BACKUP_NETWORK,
+        SET_BAND_STEERING, SET_BLOCKED_APPLICATIONS, SET_CUSTOM_DNS, SET_DEVICE_NICKNAME,
+        SET_DNS_CACHING, SET_DNS_MODE, SET_GUEST_NETWORK, SET_IPV6, SET_IPV6_DNS, SET_LED,
+        SET_LED_BRIGHTNESS, SET_NETWORK_NAME, SET_NIGHTLIGHT, SET_PROFILE_DEVICES,
+        SET_PROFILE_SCHEDULE, SET_SQM_AUTO, SET_SQM_BANDWIDTH, SET_SQM_ENABLED, SET_THREAD,
+        SET_UPNP, SET_WPA3, UPDATE_PROFILE_BLOCK_LIST, UPDATE_PROFILE_CONTENT_FILTER,
+        UPDATE_RESERVATION,
     };
     /// One row per `Route` constant declared in this module. This is the drift tripwire for
     /// the whole crate: if Eero ever moves an endpoint, exactly one row here should fail and
@@ -1119,14 +1164,6 @@ mod tests {
             rendered: "https://api-user.e2ro.com/2.2/networks/100/ouicheck",
         },
         Case {
-            name: "GET_PASSWORD",
-            route: &GET_PASSWORD,
-            method: Method::GET,
-            version: ApiVersion::V2_2,
-            params: &[("network_id", "100")],
-            rendered: "https://api-user.e2ro.com/2.2/networks/100/password",
-        },
-        Case {
             name: "GET_PROFILES",
             route: &GET_PROFILES,
             method: Method::GET,
@@ -1338,14 +1375,6 @@ mod tests {
             name: "CONFIGURE_SECURITY",
             route: &CONFIGURE_SECURITY,
             method: Method::PUT,
-            version: ApiVersion::V2_2,
-            params: &[("network_id", "100")],
-            rendered: "https://api-user.e2ro.com/2.2/networks/100/settings",
-        },
-        Case {
-            name: "GET_SETTINGS",
-            route: &GET_SETTINGS,
-            method: Method::GET,
             version: ApiVersion::V2_2,
             params: &[("network_id", "100")],
             rendered: "https://api-user.e2ro.com/2.2/networks/100/settings",

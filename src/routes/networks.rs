@@ -83,8 +83,10 @@ pub const REBOOT_NETWORK: Route = Route {
 /// `SET_DNS_CACHING`/`SET_CUSTOM_DNS`/`SET_DNS_MODE`/`SET_IPV6_DNS`; `SecurityAPI`'s
 /// `SET_WPA3`/`SET_BAND_STEERING`/`SET_UPNP`/`SET_IPV6`/`SET_THREAD`/`CONFIGURE_SECURITY`;
 /// `SqmAPI`'s `SET_SQM_ENABLED`/`SET_SQM_BANDWIDTH`/`CONFIGURE_SQM`/`SET_SQM_AUTO`) — each
-/// PUTs a different JSON key onto the same settings object. Distinct from `GET_SETTINGS`,
-/// which reads this same resource via `SettingsAPI.get_settings`. Ported from
+/// PUTs a different JSON key onto the same settings object. Formerly distinct from
+/// `GET_SETTINGS` (read counterpart, `SettingsAPI.get_settings`); `SettingsAPI` was removed in
+/// `eero-api` v8.0.0 (client.md brief §1.2) along with `PasswordAPI`, so this route's only
+/// remaining sibling is whichever v8.0.4 GET the phase-G networks-domain port lands. Ported from
 /// `eero-api src/eero/api/networks.py:182` (`NetworksAPI.set_network_name`), the first
 /// setter of this resource in the port plan's endpoint catalogue.
 pub const PUT_NETWORK_SETTINGS: Route = Route {

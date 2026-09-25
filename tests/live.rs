@@ -206,11 +206,9 @@ async fn live_read_only_endpoint_sweep() {
     probe!("eeros", client.get_eeros(n, false));
     probe!("devices", client.get_devices(n, false));
     probe!("profiles", client.get_profiles(n, false));
-    probe!("settings", client.get_settings(n));
     probe!("dns_settings", client.get_dns_settings(n));
     probe!("security_settings", client.get_security_settings(n));
     probe!("sqm_settings", client.get_sqm_settings(n));
-    probe!("password", client.get_password(n));
     probe!("blacklist", client.get_blacklist(n));
     probe!("reservations", client.get_reservations(n));
     probe!("forwards", client.get_forwards(n));

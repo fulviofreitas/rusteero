@@ -30,14 +30,24 @@ mod common;
 
 use std::time::Duration;
 
+use reqwest::header::COOKIE;
 use serde_json::json;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 use rusteero::error::Error;
+
+/// Matches a request that carries no `Cookie` header at all — the same shape
+/// `tests/transport.rs`'s own `no_cookie_header` uses, duplicated here rather than shared: this
+/// file exercises `ClientBuilder::send_legacy_cookie`, `tests/transport.rs` exercises
+/// `TransportBuilder::send_legacy_cookie` directly, and neither integration-test binary can import
+/// from the other.
+fn no_cookie_header(request: &Request) -> bool {
+    !request.headers.contains_key(COOKIE)
+}
 
 /// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
 /// default 60-second cache TTL. See [`client_with_ttl`] for a caller that needs a different TTL.
@@ -521,5 +531,87 @@ async fn logout_failure_is_swallowed_but_still_clears_the_cache() -> anyhow::Res
     // fail closed rather than leak the earlier authenticated response.
     let after = client.get_network(Some("network-0001"), false).await;
     assert!(matches!(after, Err(Error::Authentication { .. })));
+    Ok(())
+}
+
+// ===================== ClientBuilder options (v8.0.4: send_legacy_cookie/accept_language/get_retries) =====================
+
+/// `ClientBuilder::send_legacy_cookie(false)` must reach the underlying `Transport`: the primary
+/// `X-User-Token` header is still sent, but the legacy `Cookie: s=<token>` header is omitted
+/// entirely. Both matchers are attached to the *same* `Mock`, so a request that still carried a
+/// `Cookie` header (the builder option silently not forwarded) would fail to match at all — the
+/// request would then get wiremock's default 404, `client.get_devices` would return an `Err`
+/// instead of the expected envelope, and the `.expect(1)` guard would additionally report the
+/// mock as never hit.
+#[tokio::test]
+async fn send_legacy_cookie_false_omits_the_cookie_header_but_keeps_the_user_token_header()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(user_token_header())
+        .and(no_cookie_header)
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = Client::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .send_legacy_cookie(false)
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL");
+
+    let env = client.get_devices(Some("network-0001"), false).await?;
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
+    Ok(())
+}
+
+/// The default (`ClientBuilder::send_legacy_cookie` never called) still sends both credentials —
+/// the sibling case to the test above, pinning that the new builder option is opt-out, not a
+/// behavioural change to `Client::builder()`'s existing default.
+#[tokio::test]
+async fn send_legacy_cookie_defaults_to_true_when_never_called() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_devices(Some("network-0001"), false).await?;
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
+    Ok(())
+}
+
+/// `ClientBuilder::accept_language` must reach the underlying `Transport`'s
+/// `X-Accept-Language` header.
+#[tokio::test]
+async fn accept_language_is_forwarded_to_the_transport() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(wiremock::matchers::header("x-accept-language", "fr-FR"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = Client::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .accept_language("fr-FR")
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL");
+
+    let env = client.get_devices(Some("network-0001"), false).await?;
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
     Ok(())
 }

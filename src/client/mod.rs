@@ -117,8 +117,11 @@
 // directory (`networks.rs`, `devices.rs`, `blacklist.rs`, `eeros.rs`, `profiles.rs`,
 // `schedule.rs`, `dns.rs`, `security.rs`, `sqm.rs`, `backup.rs`, `burst_reporters.rs`,
 // `data_usage.rs`, `diagnostics.rs`, `forwards.rs`, `insights.rs`, `ouicheck.rs`,
-// `password.rs`, `reservations.rs`, `routing.rs`, `settings.rs`, `support.rs`,
-// `thread.rs`, `transfer.rs`, `updates.rs`, `ac_compat.rs`) — Rust's privacy rules make
+// `reservations.rs`, `routing.rs`, `support.rs`,
+// `thread.rs`, `transfer.rs`, `updates.rs`, `ac_compat.rs`, plus the 14 new-in-v8.0.0 modules
+// this phase scaffolds empty — `account.rs`, `backup_access_points.rs`, `ddns.rs`, `dhcp.rs`,
+// `dns_policies.rs`, `entitlements.rs`, `events.rs`, `members.rs`, `notifications.rs`,
+// `permissions.rs`, `power_saving.rs`, `subnets.rs`, `wan.rs`, `wpa3.rs`) — Rust's privacy rules make
 // this transparent: a private item defined here (the `Client` fields, `ensure_network_id`,
 // the three cache-invalidation helpers below) is visible to every one of those submodules
 // without any `pub(crate)`/`pub(super)` change, because they are descendants of this module.
@@ -139,30 +142,42 @@ use crate::storage::CredentialStore;
 use crate::transport::{StorageFailures, Transport};
 
 mod ac_compat;
+mod account;
 mod backup;
+mod backup_access_points;
 mod blacklist;
 mod burst_reporters;
 mod data_usage;
+mod ddns;
 mod devices;
+mod dhcp;
 mod diagnostics;
 mod dns;
+mod dns_policies;
 mod eeros;
+mod entitlements;
+mod events;
 mod forwards;
 mod insights;
+mod members;
 mod networks;
+mod notifications;
 mod ouicheck;
-mod password;
+mod permissions;
+mod power_saving;
 mod profiles;
 mod reservations;
 mod routing;
 mod schedule;
 mod security;
-mod settings;
 mod sqm;
+mod subnets;
 mod support;
 mod thread;
 mod transfer;
 mod updates;
+mod wan;
+mod wpa3;
 
 /// `eero-api`'s `EeroClient` (`src/eero/client.py`): [`EeroApi`] plus the client-only cache and
 /// preferred-network state.
@@ -479,6 +494,96 @@ impl Client {
         }
     }
 
+    // ============================= Parent-resolution helpers =============================
+    //
+    // Ported from `eero-api`'s four read-only, side-effect-free `_..._parent(_kwargs)` helpers
+    // (`client.py:230-322`, `.claude/tasks/briefs/v8/client.md` §3.3): each looks up an already
+    // cached envelope and hands it back unchanged for use as a domain method's `parent=`
+    // argument, so a phase-G domain wrapper can prefer the server's own published `resources`
+    // link over a hand-built template without an extra round trip. None of these mutate the
+    // cache or trigger a network call; a miss (nothing cached, or a cached entry that is no
+    // longer fresh) is simply `None`, mirroring Python's own `{}`-kwargs-omitted shape (this
+    // port returns `Option<Value>` instead — the caller passes it straight through as
+    // `parent: Option<&Value>`, the shape `crate::routes::Resource::resolve`/`Nested::resolve`
+    // already expect).
+    //
+    // No call site yet within this crate as of this round: every phase-G domain wrapper that
+    // will call these is still unwritten (see `.claude/tasks/briefs/v8/g*.md`). Exercised
+    // directly by this module's own `#[cfg(test)] mod tests` in the meantime.
+
+    /// Returns the cached network envelope for `network_id`, if a fresh entry exists.
+    ///
+    /// Ported from `_network_parent` (`eero-api src/eero/client.py:230-241`): looks up
+    /// [`CacheKey::network`] and returns the whole cached envelope (`{"meta": .., "data": ..}`,
+    /// not just its `data`) exactly when [`Cache::get`] still considers it fresh — never mutates
+    /// the cache, never triggers a network call. Python additionally wraps this in
+    /// `_network_parent_kwargs`, which turns `Some`/`None` into a `{"parent": ..}`/`{}` kwargs
+    /// dict for `**kwargs`-unpacking into a domain call; this port has no keyword-unpacking
+    /// equivalent, so callers pass this method's `Option<Value>` straight through as
+    /// `parent: Option<&Value>` instead.
+    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    fn network_parent(&self, network_id: &str) -> Option<Value> {
+        self.cache
+            .get(&CacheKey::network(network_id))
+            .map(Envelope::into_value)
+    }
+
+    /// Finds the entry in `envelopes` whose `id` field, or whose `url` field's trailing path
+    /// segment, matches `resource_id` exactly.
+    ///
+    /// Ported from the `@staticmethod` `_find_by_id_or_url`
+    /// (`eero-api src/eero/client.py:259-282`). `resource_id` is compared verbatim against each
+    /// entry's `id` field first; on a miss, against the trailing path segment of that entry's own
+    /// `url` field, extracted via [`crate::util::id_from_url`] — a `url` for which `id_from_url`
+    /// itself errors (e.g. empty, or composed entirely of slashes) is simply never a match,
+    /// exactly like Python's own `isinstance(url, str)` guard skips a non-string `url`. Entries
+    /// that are not JSON objects are skipped, mirroring Python's `isinstance(entry, dict)` guard.
+    /// Never mutates `envelopes`; returns a clone of the matching entry, if any.
+    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    fn find_by_id_or_url(envelopes: &[Value], resource_id: &str) -> Option<Value> {
+        envelopes
+            .iter()
+            .find(|entry| {
+                let Some(obj) = entry.as_object() else {
+                    return false;
+                };
+                if obj.get("id").and_then(Value::as_str) == Some(resource_id) {
+                    return true;
+                }
+                obj.get("url")
+                    .and_then(Value::as_str)
+                    .and_then(|url| crate::util::id_from_url(url).ok())
+                    .is_some_and(|tail| tail == resource_id)
+            })
+            .cloned()
+    }
+
+    /// Returns the cached eero entry for `eero_id` within `network_id`'s eeros list, if fresh.
+    ///
+    /// Ported from `_eero_parent_kwargs` (`eero-api src/eero/client.py:284-305`): looks up
+    /// [`CacheKey::eeros`] for `network_id`, and — only when that entry is still fresh — reads
+    /// its envelope's `data` field as a JSON array (a non-array `data`, like Python's own
+    /// `isinstance(cached, dict)`/list check, yields `None` rather than a match) and searches it
+    /// via [`Client::find_by_id_or_url`].
+    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    fn eero_parent(&self, network_id: &str, eero_id: &str) -> Option<Value> {
+        let cached = self.cache.get(&CacheKey::eeros(network_id))?;
+        let data = cached.data().as_array()?;
+        Self::find_by_id_or_url(data, eero_id)
+    }
+
+    /// Returns the cached single-device envelope for `device_id` within `network_id`, if fresh.
+    ///
+    /// Ported from `_device_parent_kwargs` (`eero-api src/eero/client.py:307-322`): looks up
+    /// [`CacheKey::device`] and returns the whole cached envelope — not just its `data` — exactly
+    /// when it is still fresh.
+    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    fn device_parent(&self, network_id: &str, device_id: &str) -> Option<Value> {
+        self.cache
+            .get(&CacheKey::device(network_id, device_id))
+            .map(Envelope::into_value)
+    }
+
     // ============================= Cache-invalidation helpers =============================
     //
     // Mirror Python's own private helpers (`client.py:567-575, 659-667, 669-673`) exactly: each
@@ -486,6 +591,31 @@ impl Client {
     // `eeros[{nid}_eeros]` drop is added on top of Python (the two documented improvements above),
     // that extra call is made directly at the write site rather than folded into a helper here —
     // there is no Python helper for it to mirror.
+
+    /// Drops `network[{nid}]` for one network.
+    ///
+    /// No single Python helper mirrors this one — `client.py` deletes
+    /// `self._cache["network"][network_id]` inline at each setter call site — but it is added
+    /// here for the same reason [`Client::invalidate_device_cache`] exists: a single call site
+    /// for every phase-G network-scoped setter to invalidate through, instead of each one
+    /// repeating `self.cache.invalidate(&CacheKey::network(..))` by hand.
+    #[allow(dead_code)] // no call site yet; see the "Parent-resolution helpers" banner above
+    fn invalidate_network_cache(&self, network_id: &str) {
+        self.cache.invalidate(&CacheKey::network(network_id));
+    }
+
+    /// Drops `eeros[{nid}_eeros]` for one network.
+    ///
+    /// No single Python helper mirrors this one either — every `client.py` eeros setter deletes
+    /// `self._cache["eeros"][f"{network_id}_eeros"]` inline — added for the same reason as
+    /// [`Client::invalidate_network_cache`] just above. [`Client::reboot_eero`]/
+    /// [`Client::set_led`]/[`Client::set_led_brightness`]/[`Client::set_nightlight`] etc.
+    /// currently call `self.cache.invalidate(&CacheKey::eeros(..))` inline rather than through
+    /// this helper; a future cleanup pass may switch them over, but that is out of scope here.
+    #[allow(dead_code)] // no call site yet; see the "Parent-resolution helpers" banner above
+    fn invalidate_eeros_cache(&self, network_id: &str) {
+        self.cache.invalidate(&CacheKey::eeros(network_id));
+    }
 
     /// Drops both `devices[{nid}_{did}]` and `devices[{nid}_devices]` for one device.
     ///
@@ -625,6 +755,9 @@ pub struct ClientBuilder {
     http: Option<reqwest::Client>,
     base_url: Option<String>,
     user_agent: Option<String>,
+    accept_language: Option<String>,
+    send_legacy_cookie: Option<bool>,
+    get_retries: Option<u32>,
     session: Option<Session>,
     store: Option<Arc<dyn CredentialStore>>,
     storage_failures: StorageFailures,
@@ -643,6 +776,9 @@ impl Default for ClientBuilder {
             http: None,
             base_url: None,
             user_agent: None,
+            accept_language: None,
+            send_legacy_cookie: None,
+            get_retries: None,
             session: None,
             store: None,
             storage_failures: StorageFailures::default(),
@@ -674,6 +810,48 @@ impl ClientBuilder {
     #[must_use]
     pub fn user_agent(mut self, user_agent: Option<String>) -> Self {
         self.user_agent = user_agent;
+        self
+    }
+
+    /// Sets the `X-Accept-Language` header every request carries. Forwarded to
+    /// [`crate::transport::TransportBuilder::accept_language`] — see that method's docs for the
+    /// validation it applies (printable ASCII, no CR/LF) and its default
+    /// ([`crate::consts::DEFAULT_ACCEPT_LANGUAGE`]) when never called.
+    ///
+    /// Ported from `EeroClient.__init__`'s `accept_language` keyword-only parameter
+    /// (`client.py:49-59`, forwarded to `EeroAPI` at `client.py:80-87`;
+    /// `.claude/tasks/briefs/v8/client.md` §1.1/§1.3).
+    #[must_use]
+    pub fn accept_language(mut self, accept_language: impl Into<String>) -> Self {
+        self.accept_language = Some(accept_language.into());
+        self
+    }
+
+    /// Whether to also send the session as the legacy `Cookie: s=<token>` header alongside the
+    /// primary `X-User-Token` header, on every request. Forwarded to
+    /// [`crate::transport::TransportBuilder::send_legacy_cookie`] — defaults to `true` when never
+    /// called, matching Python's own default.
+    ///
+    /// Ported from `EeroClient.__init__`'s `send_legacy_cookie` keyword-only parameter
+    /// (`client.py:49-59`, forwarded to `EeroAPI` at `client.py:80-87`;
+    /// `.claude/tasks/briefs/v8/client.md` §1.1/§1.3).
+    #[must_use]
+    pub fn send_legacy_cookie(mut self, send_legacy_cookie: bool) -> Self {
+        self.send_legacy_cookie = Some(send_legacy_cookie);
+        self
+    }
+
+    /// Sets how many additional attempts a `GET` request gets on a transport error or a `5xx`
+    /// response. Forwarded to [`crate::transport::TransportBuilder::get_retries`] — defaults to
+    /// `0` (no retries) when never called, matching Python's own default. Never applies to
+    /// writes, and never affects the separate one-shot 401 refresh-and-replay.
+    ///
+    /// Ported from `EeroClient.__init__`'s `get_retries` keyword-only parameter
+    /// (`client.py:49-59`, forwarded to `EeroAPI` at `client.py:80-87`;
+    /// `.claude/tasks/briefs/v8/client.md` §1.1/§1.3).
+    #[must_use]
+    pub fn get_retries(mut self, get_retries: u32) -> Self {
+        self.get_retries = Some(get_retries);
         self
     }
 
@@ -765,6 +943,15 @@ impl ClientBuilder {
         if let Some(base_url) = self.base_url {
             transport_builder = transport_builder.base_url(base_url);
         }
+        if let Some(accept_language) = self.accept_language {
+            transport_builder = transport_builder.accept_language(accept_language);
+        }
+        if let Some(send_legacy_cookie) = self.send_legacy_cookie {
+            transport_builder = transport_builder.send_legacy_cookie(send_legacy_cookie);
+        }
+        if let Some(get_retries) = self.get_retries {
+            transport_builder = transport_builder.get_retries(get_retries);
+        }
 
         let transport = transport_builder.build()?;
         let api = EeroApi::new(transport);
@@ -781,12 +968,38 @@ impl ClientBuilder {
 mod tests {
     //! Unit tests for the pure, network-free helper functions this module builds on
     //! ([`extract_networks_list`], [`extract_network_id`], [`extract_account_networks`],
-    //! [`non_empty`]). HTTP-level behaviour (cache hits, the `/account` fallback end to end,
+    //! [`non_empty`]), plus the four private parent-resolution helpers
+    //! ([`Client::network_parent`], [`Client::find_by_id_or_url`], [`Client::eero_parent`],
+    //! [`Client::device_parent`]) — private, so (unlike every HTTP-level suite in this crate)
+    //! they are exercised here, directly, rather than through `tests/client_core.rs`; see
+    //! [`test_client`] for how a bare `Client` with a pre-populated [`Cache`] is built for that
+    //! purpose. HTTP-level behaviour (cache hits, the `/account` fallback end to end,
     //! network-id resolution against a live mock, `ClientBuilder::build`'s credential-store load)
-    //! is covered by `tests/client.rs`, per the crate's testing conventions.
+    //! is covered by `tests/client_core.rs`, per the crate's testing conventions.
 
-    use super::{extract_account_networks, extract_network_id, extract_networks_list, non_empty};
+    use super::{
+        Cache, CacheKey, Client, EeroApi, Envelope, extract_account_networks, extract_network_id,
+        extract_networks_list, non_empty,
+    };
+    use crate::transport::Transport;
     use serde_json::json;
+    use std::sync::RwLock;
+    use std::time::Duration;
+
+    /// Builds a bare [`Client`] with no session and no credential store — just enough to exercise
+    /// the parent-resolution helpers, which only ever read [`Client::cache`] and never touch the
+    /// network. A test populates the cache directly via `client.cache.put(..)` before calling the
+    /// helper under test.
+    fn test_client() -> Client {
+        let transport = Transport::builder()
+            .build()
+            .expect("default transport configuration (no overrides) always builds successfully");
+        Client {
+            api: EeroApi::new(transport),
+            cache: Cache::new(Duration::from_secs(60)),
+            preferred_network_id: RwLock::new(None),
+        }
+    }
 
     // ===================== extract_networks_list =====================
 
@@ -919,5 +1132,233 @@ mod tests {
         assert_eq!(non_empty(Some("")), None);
         assert_eq!(non_empty(None), None);
         assert_eq!(non_empty(Some("abc")), Some("abc"));
+    }
+
+    // ===================== network_parent =====================
+    //
+    // Ported from `test_client.py::TestClientParentResolutionHelpers` (v8.0.4, ~lines
+    // 1264-1345): empty cache -> None; cached + fresh -> Some; cached + expired -> None.
+
+    #[test]
+    fn network_parent_is_none_on_an_empty_cache() {
+        let client = test_client();
+        assert_eq!(client.network_parent("net1"), None);
+    }
+
+    #[test]
+    fn network_parent_returns_the_whole_cached_envelope_when_fresh() {
+        let client = test_client();
+        let envelope = json!({"meta": {"code": 200}, "data": {"name": "Home"}});
+        client.cache.put(
+            CacheKey::network("net1"),
+            Envelope::from_value(envelope.clone()),
+        );
+        assert_eq!(client.network_parent("net1"), Some(envelope));
+    }
+
+    #[test]
+    fn network_parent_is_none_once_the_entry_has_expired() {
+        let client = Client {
+            api: EeroApi::new(
+                Transport::builder()
+                    .build()
+                    .expect("default transport configuration always builds successfully"),
+            ),
+            cache: Cache::new(Duration::ZERO), // ZERO disables reads without disabling writes
+            preferred_network_id: RwLock::new(None),
+        };
+        client.cache.put(
+            CacheKey::network("net1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {"name": "Home"}})),
+        );
+        assert_eq!(client.network_parent("net1"), None);
+    }
+
+    #[test]
+    fn network_parent_is_scoped_to_its_own_network_id() {
+        let client = test_client();
+        client.cache.put(
+            CacheKey::network("net1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {"name": "net1"}})),
+        );
+        assert_eq!(client.network_parent("net2"), None);
+    }
+
+    // ===================== find_by_id_or_url =====================
+
+    #[test]
+    fn find_by_id_or_url_matches_the_bare_id_field() {
+        let envelopes = [json!({"id": "e1", "url": "/2.2/eeros/other"})];
+        assert_eq!(
+            Client::find_by_id_or_url(&envelopes, "e1"),
+            Some(envelopes[0].clone())
+        );
+    }
+
+    #[test]
+    fn find_by_id_or_url_falls_back_to_the_url_trailing_segment() {
+        let envelopes = [json!({"url": "/2.2/eeros/e1"})];
+        assert_eq!(
+            Client::find_by_id_or_url(&envelopes, "e1"),
+            Some(envelopes[0].clone())
+        );
+    }
+
+    #[test]
+    fn find_by_id_or_url_returns_none_when_nothing_matches() {
+        let envelopes = [
+            json!({"id": "e1", "url": "/2.2/eeros/e1"}),
+            json!({"id": "e2", "url": "/2.2/eeros/e2"}),
+        ];
+        assert_eq!(Client::find_by_id_or_url(&envelopes, "e3"), None);
+    }
+
+    #[test]
+    fn find_by_id_or_url_skips_non_object_entries() {
+        let envelopes = [json!("not an object"), json!({"id": "e1"})];
+        assert_eq!(
+            Client::find_by_id_or_url(&envelopes, "e1"),
+            Some(json!({"id": "e1"}))
+        );
+    }
+
+    #[test]
+    fn find_by_id_or_url_ignores_a_url_that_id_from_url_itself_rejects() {
+        // A `url` field that is empty, or composed entirely of slashes, makes `id_from_url` (and
+        // therefore this function's url-tail comparison) fail — such an entry must never match,
+        // not even when `resource_id` happens to also be an empty string.
+        let envelopes = [json!({"url": "/"})];
+        assert_eq!(Client::find_by_id_or_url(&envelopes, ""), None);
+    }
+
+    // ===================== eero_parent =====================
+
+    #[test]
+    fn eero_parent_is_none_on_an_empty_cache() {
+        let client = test_client();
+        assert_eq!(client.eero_parent("net1", "eero1"), None);
+    }
+
+    #[test]
+    fn eero_parent_finds_the_matching_entry_in_the_cached_eeros_list() {
+        let client = test_client();
+        let eero_entry = json!({"id": "eero1", "url": "/2.2/eeros/eero1"});
+        client.cache.put(
+            CacheKey::eeros("net1"),
+            Envelope::from_value(json!({
+                "meta": {"code": 200},
+                "data": [eero_entry.clone(), {"id": "eero2"}],
+            })),
+        );
+        assert_eq!(client.eero_parent("net1", "eero1"), Some(eero_entry));
+    }
+
+    #[test]
+    fn eero_parent_is_none_when_the_id_is_not_in_the_cached_list() {
+        let client = test_client();
+        client.cache.put(
+            CacheKey::eeros("net1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": [{"id": "eero2"}]})),
+        );
+        assert_eq!(client.eero_parent("net1", "eero1"), None);
+    }
+
+    #[test]
+    fn eero_parent_is_none_when_the_cached_datas_shape_is_not_an_array() {
+        let client = test_client();
+        client.cache.put(
+            CacheKey::eeros("net1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {}})),
+        );
+        assert_eq!(client.eero_parent("net1", "eero1"), None);
+    }
+
+    #[test]
+    fn eero_parent_is_none_once_the_entry_has_expired() {
+        let client = Client {
+            api: EeroApi::new(
+                Transport::builder()
+                    .build()
+                    .expect("default transport configuration always builds successfully"),
+            ),
+            cache: Cache::new(Duration::ZERO),
+            preferred_network_id: RwLock::new(None),
+        };
+        client.cache.put(
+            CacheKey::eeros("net1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": [{"id": "eero1"}]})),
+        );
+        assert_eq!(client.eero_parent("net1", "eero1"), None);
+    }
+
+    // ===================== device_parent =====================
+
+    #[test]
+    fn device_parent_is_none_on_an_empty_cache() {
+        let client = test_client();
+        assert_eq!(client.device_parent("net1", "dev1"), None);
+    }
+
+    #[test]
+    fn device_parent_returns_the_whole_cached_envelope_when_fresh() {
+        let client = test_client();
+        let envelope = json!({"meta": {"code": 200}, "data": {"mac": "dev1"}});
+        client.cache.put(
+            CacheKey::device("net1", "dev1"),
+            Envelope::from_value(envelope.clone()),
+        );
+        assert_eq!(client.device_parent("net1", "dev1"), Some(envelope));
+    }
+
+    #[test]
+    fn device_parent_is_scoped_to_its_own_device_id() {
+        let client = test_client();
+        client.cache.put(
+            CacheKey::device("net1", "dev1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {"mac": "dev1"}})),
+        );
+        assert_eq!(client.device_parent("net1", "dev2"), None);
+    }
+
+    #[test]
+    fn device_parent_is_none_once_the_entry_has_expired() {
+        let client = Client {
+            api: EeroApi::new(
+                Transport::builder()
+                    .build()
+                    .expect("default transport configuration always builds successfully"),
+            ),
+            cache: Cache::new(Duration::ZERO),
+            preferred_network_id: RwLock::new(None),
+        };
+        client.cache.put(
+            CacheKey::device("net1", "dev1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {"mac": "dev1"}})),
+        );
+        assert_eq!(client.device_parent("net1", "dev1"), None);
+    }
+
+    // ===================== invalidate_network_cache / invalidate_eeros_cache =====================
+
+    #[test]
+    fn invalidate_network_cache_drops_only_the_network_entry() {
+        let client = test_client();
+        client.cache.put(
+            CacheKey::network("net1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {}})),
+        );
+        client.invalidate_network_cache("net1");
+        assert_eq!(client.cache.get(&CacheKey::network("net1")), None);
+    }
+
+    #[test]
+    fn invalidate_eeros_cache_drops_only_the_eeros_list_entry() {
+        let client = test_client();
+        client.cache.put(
+            CacheKey::eeros("net1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": []})),
+        );
+        client.invalidate_eeros_cache("net1");
+        assert_eq!(client.cache.get(&CacheKey::eeros("net1")), None);
     }
 }

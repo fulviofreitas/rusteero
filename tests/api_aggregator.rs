@@ -3,12 +3,12 @@
 //!
 //! Two things matter here that no other suite in this crate exercises:
 //!
-//! - That each of the 26 accessors (`auth` + 25 domain modules) is wired to *its own* sub-API,
+//! - That each of the 38 accessors (`auth` + 37 domain modules) is wired to *its own* sub-API,
 //!   not a copy-pasted neighbour — [`each_domain_accessor_routes_only_to_its_own_wire_endpoint`]
 //!   drives one real call through several different accessors against a single mock server and
 //!   pins each one's path; [`every_accessor_is_reachable_and_returns_its_own_sub_api_type`]
-//!   mechanically touches all 26 and checks each returns a value of its own, distinct type.
-//! - That `EeroApi`'s `Debug` output — reachable transitively through 26 fields, each holding an
+//!   mechanically touches all 38 and checks each returns a value of its own, distinct type.
+//! - That `EeroApi`'s `Debug` output — reachable transitively through 38 fields, each holding an
 //!   `Arc<Transport>` (or, for `auth`, owning one directly) — never prints a session token, per
 //!   this crate's rule against logging anything that can carry one.
 
@@ -177,14 +177,14 @@ async fn auth_shares_the_same_transport_as_the_domain_modules() -> anyhow::Resul
     Ok(())
 }
 
-// ===================== reachability: all 26 accessors, all distinct =====================
+// ===================== reachability: all 38 accessors, all distinct =====================
 
-/// Mechanically touches all 26 accessors (`auth` plus the 25 domain modules) and checks each
+/// Mechanically touches all 38 accessors (`auth` plus the 37 domain modules) and checks each
 /// returns a value whose `Debug` output is prefixed by its own, distinct struct name.
 ///
 /// `#[derive(Debug)]` on a named struct always renders as `TypeName { .. }`, so this doubles as a
 /// type-identity check: if an accessor's body ever read the wrong field (a mistake that only
-/// fails to compile when the two fields' types differ, and every one of these 26 fields already
+/// fails to compile when the two fields' types differ, and every one of these 38 fields already
 /// *is* a distinct type — the one case that would NOT be caught at compile time is two same-named
 /// return types both reading whichever single field happens to have that type), the prefix would
 /// name the wrong struct and the assertion below would fail.
@@ -200,33 +200,48 @@ async fn auth_shares_the_same_transport_as_the_domain_modules() -> anyhow::Resul
 fn every_accessor_is_reachable_and_returns_its_own_sub_api_type() {
     let api = eero_api_offline();
 
-    let cases: [(&str, String); 26] = [
+    let cases: [(&str, String); 38] = [
         ("AuthApi", format!("{:?}", api.auth())),
         ("ACCompatApi", format!("{:?}", api.ac_compat())),
+        ("AccountApi", format!("{:?}", api.account())),
         ("BackupApi", format!("{:?}", api.backup())),
+        (
+            "BackupAccessPointsApi",
+            format!("{:?}", api.backup_access_points()),
+        ),
         ("BlacklistApi", format!("{:?}", api.blacklist())),
         ("BurstReportersApi", format!("{:?}", api.burst_reporters())),
         ("DataUsageApi", format!("{:?}", api.data_usage())),
+        ("DdnsApi", format!("{:?}", api.ddns())),
         ("DevicesApi", format!("{:?}", api.devices())),
+        ("DhcpApi", format!("{:?}", api.dhcp())),
         ("DiagnosticsApi", format!("{:?}", api.diagnostics())),
         ("DnsApi", format!("{:?}", api.dns())),
+        ("DnsPoliciesApi", format!("{:?}", api.dns_policies())),
         ("EerosApi", format!("{:?}", api.eeros())),
+        ("EntitlementsApi", format!("{:?}", api.entitlements())),
+        ("EventsApi", format!("{:?}", api.events())),
         ("ForwardsApi", format!("{:?}", api.forwards())),
         ("InsightsApi", format!("{:?}", api.insights())),
+        ("MembersApi", format!("{:?}", api.members())),
         ("NetworksApi", format!("{:?}", api.networks())),
+        ("NotificationsApi", format!("{:?}", api.notifications())),
         ("OUICheckApi", format!("{:?}", api.ouicheck())),
-        ("PasswordApi", format!("{:?}", api.password())),
+        ("PermissionsApi", format!("{:?}", api.permissions())),
+        ("PowerSavingApi", format!("{:?}", api.power_saving())),
         ("ProfilesApi", format!("{:?}", api.profiles())),
         ("ReservationsApi", format!("{:?}", api.reservations())),
         ("RoutingApi", format!("{:?}", api.routing())),
         ("ScheduleApi", format!("{:?}", api.schedule())),
         ("SecurityApi", format!("{:?}", api.security())),
-        ("SettingsApi", format!("{:?}", api.settings())),
         ("SqmApi", format!("{:?}", api.sqm())),
+        ("SubnetsApi", format!("{:?}", api.subnets())),
         ("SupportApi", format!("{:?}", api.support())),
         ("ThreadApi", format!("{:?}", api.thread())),
         ("TransferApi", format!("{:?}", api.transfer())),
         ("UpdatesApi", format!("{:?}", api.updates())),
+        ("WanApi", format!("{:?}", api.wan())),
+        ("Wpa3Api", format!("{:?}", api.wpa3())),
     ];
 
     for (expected_type, debug_output) in &cases {
