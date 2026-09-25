@@ -196,10 +196,10 @@ impl SecurityApi {
             payload.insert("thread".to_owned(), Value::Bool(thread));
         }
         if payload.is_empty() {
-            return Err(Error::Validation {
-                field: "wpa3, band_steering, upnp, ipv6, thread".to_owned(),
-                message: "at least one security setting must be provided".to_owned(),
-            });
+            return Err(Error::validation(
+                "wpa3, band_steering, upnp, ipv6, thread",
+                "at least one security setting must be provided",
+            ));
         }
 
         put_network_settings(&self.transport, network_id, Value::Object(payload)).await

@@ -149,10 +149,10 @@ impl BackupApi {
             );
         }
         if payload.is_empty() {
-            return Err(Error::Validation {
-                field: "enabled, phone_number".to_owned(),
-                message: "at least one of `enabled` or `phone_number` must be provided".to_owned(),
-            });
+            return Err(Error::validation(
+                "enabled, phone_number",
+                "at least one of `enabled` or `phone_number` must be provided",
+            ));
         }
 
         self.transport

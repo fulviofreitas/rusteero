@@ -40,7 +40,9 @@ use url::Url;
 use crate::auth::Session;
 use crate::consts;
 use crate::envelope::Envelope;
-use crate::error::{self, Error};
+use crate::error::Error;
+use crate::errors;
+use crate::redact;
 use crate::routes::{self, ApiVersion, Route};
 use crate::storage::CredentialStore;
 
@@ -345,9 +347,7 @@ impl Transport {
             .map(str::to_owned);
 
         let Some(refresh_token) = refresh_token else {
-            return Err(Error::Authentication(
-                "No refresh token available".to_owned(),
-            ));
+            return Err(Error::authentication("No refresh token available"));
         };
 
         let body = json!({ "refresh_token": refresh_token });
@@ -359,24 +359,36 @@ impl Transport {
             {
                 Ok(raw) => {
                     let data = raw.envelope.data();
+                    // "session_token"/"refresh_token": the literal wire keys a refresh response
+                    // body carried under this crate's pre-v8.0.4 shape. The two named constants
+                    // that used to hold these strings were removed at v8.0.4 per the port brief
+                    // §1 — v8.0.4's own refresh handshake never reads a new token from the
+                    // response body at all, see this method's own doc comment. Phase B reworks
+                    // this method's body shape entirely; these two literals are kept inline,
+                    // unchanged in behaviour, purely so the removed constants have no remaining
+                    // reference.
                     let Some(new_token) = data
-                        .get(consts::SESSION_TOKEN_KEY)
+                        .get("session_token")
                         .and_then(Value::as_str)
                         .filter(|token| !token.is_empty())
                     else {
-                        // `SESSION_TOKEN_KEY` missing or empty: Python returns `False` without
-                        // clearing or persisting anything (`api/auth.py:332`).
+                        // Missing or empty: Python returns `False` without clearing or
+                        // persisting anything (`api/auth.py:332`).
                         return Ok(false);
                     };
-                    let new_refresh_token =
-                        data.get(consts::REFRESH_TOKEN_KEY).and_then(Value::as_str);
+                    let new_refresh_token = data.get("refresh_token").and_then(Value::as_str);
                     let refreshed = build_refreshed_session(new_token, new_refresh_token);
                     self.replace_session(Some(refreshed.clone()));
                     self.persist_session(&refreshed).await?;
                     return Ok(true);
                 }
-                // A 404 from this route: try the next one in the tuple order.
-                Err(Error::Api { status: 404, .. }) => {}
+                // A 404 from this route: try the next one in the tuple order. At v8.0.4 a 404
+                // classifies to `Error::NotFound` rather than `Error::Api { status: 404, .. }`
+                // (see `crate::errors::error_for_response`'s precedence) — matched here only as
+                // far as needed to compile against the new variant shape; phase B reworks this
+                // method's routing/retry behaviour entirely (the port brief documents that
+                // v8.0.4 has exactly one refresh route, not two).
+                Err(Error::NotFound { .. }) => {}
                 // Any other `Error::Api` (400, 403, 5xx, ...) is the direct analogue of a
                 // generic `EeroAPIException` in Python — terminal, clears local state, and
                 // returns `Ok(false)` rather than propagating (`api/auth.py:312-316`). A `401`
@@ -386,6 +398,12 @@ impl Transport {
                 // the same sibling-exception-hierarchy gap the task brief documents for
                 // `login`/`verify`/`resend_verification_code` (brief gotcha #1), which applies
                 // here too since `refresh_session` never catches `Error::Authentication` either.
+                // `Error::AccessDenied`/`ClientBlocked`/`RateLimit`/`PremiumRequired`/
+                // `FeatureUnavailable`/`Validation` are new, separate variants at v8.0.4 (§3) that
+                // this pre-existing match never anticipated; they now fall to `Err(other)` below
+                // and propagate rather than being treated as terminal-and-clear — a deliberate,
+                // minimal-scope choice for this phase (phase B substantively reworks this
+                // method), noted in this phase's report.
                 Err(Error::Api { status, .. }) => {
                     // `message` is intentionally never logged here (finding 1): it is either the
                     // raw truncated response body or "Invalid JSON response: " + the truncated
@@ -496,9 +514,11 @@ impl Transport {
     fn render_url(&self, route: &Route, params: &[(&str, &str)]) -> Result<Url, Error> {
         let mut url = self.base_for(route.version).clone();
         {
-            let mut segments = url.path_segments_mut().map_err(|()| Error::Validation {
-                field: "base_url".to_owned(),
-                message: "configured base URL cannot be used as a path base".to_owned(),
+            let mut segments = url.path_segments_mut().map_err(|()| {
+                Error::validation(
+                    "base_url",
+                    "configured base URL cannot be used as a path base",
+                )
             })?;
             for part in route.path.split('/') {
                 if part.is_empty() {
@@ -510,14 +530,11 @@ impl Transport {
                         .iter()
                         .find(|(key, _)| *key == name)
                         .map(|(_, value)| *value)
-                        .ok_or_else(|| Error::Validation {
-                            field: name.to_owned(),
-                            message: "missing value for path parameter".to_owned(),
+                        .ok_or_else(|| {
+                            Error::validation(name, "missing value for path parameter")
                         })?;
-                    routes::validate_segment(value).map_err(|reason| Error::Validation {
-                        field: name.to_owned(),
-                        message: reason.to_string(),
-                    })?;
+                    routes::validate_segment(value)
+                        .map_err(|reason| Error::validation(name, reason.to_string()))?;
                     segments.push(value);
                 } else {
                     segments.push(part);
@@ -613,6 +630,8 @@ impl Transport {
                     "Redirect followed by a caller-supplied client: {url} -> {}",
                     response.url()
                 ),
+                envelope: None,
+                error_code: None,
                 url: Some(url.to_string()),
             });
         }
@@ -635,6 +654,8 @@ impl Transport {
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
+                envelope: None,
+                error_code: None,
                 url: Some(url.to_string()),
             });
         }
@@ -676,33 +697,28 @@ struct RawExchange {
 /// raises when no valid session is configured — factored out since it is constructed at two
 /// call sites (the initial precondition and the post-refresh retry).
 fn not_authenticated() -> Error {
-    Error::Authentication("Not authenticated".to_owned())
+    Error::authentication("Not authenticated")
 }
 
 /// Turns a response status and (already fully read) body into an `Envelope` or the matching
-/// `Error`, reproducing `api/base.py:207-269`'s status-code chain exactly (see
-/// the base behaviour notes §9-10 for the line-by-line citation this implements):
+/// `Error`, reproducing `api/base.py`'s status-code chain at `v8.0.4`:
 ///
 /// - `204`, or any `2xx` with an empty/whitespace-only body, becomes `Envelope::empty()` — the
 ///   `204` check short-circuits *before* the whitespace check, so a (spec-violating) `204` with
 ///   a non-empty body still yields `{}` without ever attempting to parse it.
 /// - Any other `2xx` is parsed as JSON; invalid JSON becomes `Error::Api` (not `Error::Json`,
-///   which is reserved for `Envelope::data_as`) with message `"Invalid JSON response: ..."`.
-/// - `401` becomes `Error::Authentication("Authentication failed: ...")`.
-/// - `404` becomes `Error::Api` with `"Resource not found: .... URL: ..."`.
-/// - `429` becomes `Error::RateLimit { retry_after }` (`retry_after` is an addition on top of
-///   the Python contract, which discards the response body and never reads this header at all).
-/// - Every other non-`2xx` becomes `Error::Api` with the truncated body as `message`.
+///   which is reserved for `Envelope::data_as`) with message `"Invalid JSON response ({n}
+///   bytes)"` — a byte count only, never body content, matching `base.py:593-597`.
+/// - Every other non-`2xx`, non-`3xx` status is classified by [`errors::error_for_response`]: the
+///   body is best-effort parsed into an `envelope` ([`errors::parse_envelope`]) and its
+///   `meta.error` extracted ([`errors::error_code_from_envelope`]) so both can be attached to the
+///   returned error and separately debug-logged, but the error's `message` is built entirely by
+///   [`errors::message_for_error_code`] — never from the raw body or this URL. See
+///   [`crate::errors`]'s module docs for the full precedence table.
 ///
-/// Every body embedded in an error message is passed through
-/// [`error::sanitize_body_for_error`] first: a body that parses as JSON is redacted
-/// (`crate::redact::redact_sensitive`) before truncation, matching `_truncate_for_error`'s
-/// truncation behaviour exactly for the common case (a typical error body carries none of the
-/// redacted key substrings, so it is unchanged in substance) while closing the credential leak a
-/// verbatim `_truncate_for_error` port would otherwise reproduce on `login`/`login/verify`/
-/// `login/refresh`/`account/refresh` error bodies (security finding F5) — see
-/// `sanitize_body_for_error`'s own docs for the unparseable-body fallback and the deliberate byte-
-/// layout divergence from Python this introduces.
+/// Every debug log line in this function logs `status` and, for a JSON body, the *redacted*
+/// envelope ([`redact::redact_sensitive`]) — mirroring `_log_error_body` (`base.py:78-105`) —
+/// never the raw body text.
 fn status_to_envelope(
     status: StatusCode,
     body: &str,
@@ -719,34 +735,30 @@ fn status_to_envelope(
             .map(Envelope::from_value)
             .map_err(|_| Error::Api {
                 status: code,
-                message: format!(
-                    "Invalid JSON response: {}",
-                    error::sanitize_body_for_error(body)
-                ),
+                message: format!("Invalid JSON response ({} bytes)", body.len()),
+                envelope: None,
+                error_code: None,
                 url: Some(url.to_string()),
             });
     }
 
-    match code {
-        401 => Err(Error::Authentication(format!(
-            "Authentication failed: {}",
-            error::sanitize_body_for_error(body)
-        ))),
-        404 => Err(Error::Api {
-            status: 404,
-            message: format!(
-                "Resource not found: {}. URL: {url}",
-                error::sanitize_body_for_error(body)
-            ),
-            url: Some(url.to_string()),
-        }),
-        429 => Err(Error::RateLimit { retry_after }),
-        _ => Err(Error::Api {
-            status: code,
-            message: error::sanitize_body_for_error(body),
-            url: Some(url.to_string()),
-        }),
+    let envelope = errors::parse_envelope(body);
+    let error_code = envelope.as_ref().and_then(errors::error_code_from_envelope);
+
+    let redacted_envelope = envelope
+        .as_ref()
+        .map(|value| redact::redact_sensitive(value).to_string());
+    tracing::debug!(
+        status = code,
+        envelope = ?redacted_envelope,
+        "eero transport error response"
+    );
+
+    let mut err = errors::error_for_response(code, envelope, error_code, retry_after);
+    if let Error::Api { url: err_url, .. } = &mut err {
+        *err_url = Some(url.to_string());
     }
+    Err(err)
 }
 
 /// Streams `response`'s body with a running size check, matching `eero-api`'s streamed,
@@ -774,6 +786,8 @@ async fn read_capped_body(mut response: reqwest::Response) -> Result<String, Err
                     "Response body exceeded max size of {} bytes",
                     consts::MAX_RESPONSE_BYTES
                 ),
+                envelope: None,
+                error_code: None,
                 url: Some(response.url().to_string()),
             });
         }
@@ -783,6 +797,8 @@ async fn read_capped_body(mut response: reqwest::Response) -> Result<String, Err
     String::from_utf8(buffer).map_err(|err| Error::Api {
         status: status.as_u16(),
         message: format!("Response body is not valid UTF-8: {err}"),
+        envelope: None,
+        error_code: None,
         url: Some(response.url().to_string()),
     })
 }
@@ -837,20 +853,17 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// Defensively checks whether a `401` response body carries the server-driven refresh signal
-/// (`meta.error == "error.session.refresh"`, ported from `api/base.py:284-293`). Any parse
-/// failure — invalid JSON, a `meta` that is not a JSON object, or a missing `error` key —
-/// degrades silently to `false` rather than propagating an error; this sniff must never itself
-/// raise, matching Python's own bare `try: ... except Exception: body = None`.
+/// (`classify_error_code(error_code) is ErrorGroup.SESSION_REFRESH`, ported from
+/// `api/base.py:602-680`). Any parse failure — invalid JSON, a `meta` that is not a JSON object,
+/// or a missing `error` key — degrades silently to `false` rather than propagating an error; this
+/// sniff must never itself raise, matching Python's own bare `try: ... except Exception: body =
+/// None`.
 fn refresh_signal_detected(body: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
+    let Some(envelope) = errors::parse_envelope(body) else {
         return false;
     };
-    value
-        .get("meta")
-        .and_then(Value::as_object)
-        .and_then(|meta| meta.get("error"))
-        .and_then(Value::as_str)
-        == Some(consts::REFRESH_ERROR_CODE)
+    let error_code = errors::error_code_from_envelope(&envelope);
+    errors::classify_error_code(error_code.as_deref()) == Some(errors::ErrorGroup::SessionRefresh)
 }
 
 /// Maps a transport-level `reqwest::Error` onto this crate's `Error`, matching `eero-api`'s
@@ -884,15 +897,13 @@ fn build_refreshed_session(new_token: &str, new_refresh_token: Option<&str>) -> 
 /// Parses a base URL string into a `Url` validated to be usable as a path base (i.e.
 /// `Url::path_segments_mut` will succeed on it), for use by `TransportBuilder::build`.
 fn parse_base(raw: &str) -> Result<Url, Error> {
-    let mut url = Url::parse(raw).map_err(|err| Error::Validation {
-        field: "base_url".to_owned(),
-        message: format!("not a valid URL: {err}"),
-    })?;
+    let mut url = Url::parse(raw)
+        .map_err(|err| Error::validation("base_url", format!("not a valid URL: {err}")))?;
     if url.path_segments_mut().is_err() {
-        return Err(Error::Validation {
-            field: "base_url".to_owned(),
-            message: "must be an absolute URL that can be used as a base".to_owned(),
-        });
+        return Err(Error::validation(
+            "base_url",
+            "must be an absolute URL that can be used as a base",
+        ));
     }
     Ok(url)
 }
@@ -1188,7 +1199,16 @@ mod tests {
     /// cannot be `mod`-included from `src/`, and vice versa), so the technique is reproduced
     /// here rather than imported. No new dependency: this is a hand-written
     /// `tracing_core::Subscriber` impl, not a `tracing-subscriber` `Layer`.
-    struct FieldCapturingSubscriber(Arc<Mutex<Vec<String>>>);
+    struct FieldCapturingSubscriber(Arc<Mutex<CapturedEvents>>);
+
+    /// Every event captured so far: one `(target, fields)` pair per event, where `target` is the
+    /// module path the `tracing` call site lives in and `fields` is every field, rendered
+    /// `"{name}={value:?}"`. Grouped per event (rather than one flat field list) so a test can
+    /// find *the specific event* it cares about among the many unrelated events a real HTTP
+    /// round trip also emits (connection-pool bookkeeping, this module's own generic
+    /// per-request debug line, ...) instead of asserting over the whole process's log output at
+    /// once.
+    type CapturedEvents = Vec<(&'static str, Vec<String>)>;
 
     struct FieldVisitor<'a>(&'a mut Vec<String>);
 
@@ -1212,12 +1232,13 @@ mod tests {
         fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
 
         fn event(&self, event: &tracing::Event<'_>) {
-            let mut fields = self
-                .0
-                .lock()
-                .expect("capture mutex is never held across a panic");
+            let mut fields = Vec::new();
             let mut visitor = FieldVisitor(&mut fields);
             event.record(&mut visitor);
+            self.0
+                .lock()
+                .expect("capture mutex is never held across a panic")
+                .push((event.metadata().target(), fields));
         }
 
         fn enter(&self, _span: &tracing::span::Id) {}
@@ -1225,64 +1246,25 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    /// Security finding T1 (this is the *second* time this test was found to be unable to
-    /// fail): the previous fixture drove a malformed **2xx** body containing the substring
-    /// `"token"` through `refresh_session`'s invalid-JSON-on-2xx arm. That arm builds its
-    /// `Error::Api.message` via `status_to_envelope` -> `error::sanitize_body_for_error`, whose
-    /// `looks_sensitive` fallback (triggered because the raw text cannot be parsed as JSON, and
-    /// contains `"token"`) replaces the *entire* body with a fixed, credential-free marker
-    /// string before `refresh_session`'s `tracing::error!(status, ...)` call site is even
-    /// reached — so the credential was already gone regardless of whether that call site logs
-    /// `message`. Re-adding `message = %message` there would still pass every assertion the old
-    /// test made.
-    ///
-    /// This version drives a **non-2xx** response whose credential-shaped value sits under a
-    /// **non-sensitive** JSON key (`"detail"`, which contains none of
-    /// [`crate::redact::redact_sensitive`]'s substring markers), so the value survives
-    /// `sanitize_body_for_error` intact and lands verbatim in `Error::Api.message`. The sanity
-    /// assertion below proves that premise directly against `sanitize_body_for_error` itself,
-    /// *before* the network round trip even runs: if a future change to redaction ever makes
-    /// this fixture stop surviving sanitisation, this test fails loudly there instead of quietly
-    /// stopping to test anything, which is exactly how the previous version regressed unnoticed.
-    /// The only thing left standing between the credential and the log line, in this version, is
-    /// that `refresh_session`'s `tracing::error!` call logs `status` only — never `message`.
+    /// Security finding T1, re-verified against the `v8.0.4` error model: `Error::Api.message`
+    /// is now built *entirely* from [`crate::errors::message_for_error_code`] — a catalogue
+    /// string, or the fixed `"unrecognised error string"` fallback — and never from raw response
+    /// body text at all (see [`status_to_envelope`]'s doc comment), so a credential-shaped value
+    /// anywhere in the body can never reach `message` regardless of which JSON key it sits
+    /// under. This test now pins the (weaker, but still real) remaining guarantee directly:
+    /// `refresh_session`'s own `tracing::error!` call site logs `status` alone, never the parsed
+    /// `envelope` this crate's [`status_to_envelope`] attaches to the error, so a value that
+    /// *would* have survived into `envelope` (any body content at all — this crate's
+    /// classification never suppresses or redacts `Error::envelope()` itself) still never
+    /// reaches this particular log line.
     #[tokio::test]
     async fn refresh_failure_log_field_never_carries_the_response_body() {
-        // Two layers are asserted here, because sanitisation alone would make a
-        // credential-shaped fixture prove nothing about the log site.
-        //
-        // Layer 1 — `sanitize_body_for_error` now neutralises a secret even under a key
-        // `redact_sensitive` does not recognise (security finding F5, hardened during the phase-5
-        // mutation review). Assert that directly, so the defence itself is pinned.
-        // A marker-bearing credential under the non-sensitive key `detail`. `redact_sensitive`
-        // keys off key names, so `detail` alone would not save it; F5's value scan is what
-        // neutralises it. Asserting the SUPPRESSION here is the point — a fixture with no marker
-        // word would pass this assertion vacuously.
-        let marked_credential_body = r#"{"detail":"eyJsecret-refresh-value-must-never-log"}"#;
-        assert!(
-            !crate::error::sanitize_body_for_error(marked_credential_body)
-                .contains("eyJsecret-refresh-value-must-never-log"),
-            "sanitisation must neutralise a credential-shaped value even under a non-sensitive key"
-        );
-
-        // Layer 2 — the actual subject of this test. Because layer 1 scrubs anything
-        // credential-shaped, a credential fixture can no longer reach the log even if
-        // `message = %message` were re-added, so it cannot guard that regression. Use a BENIGN
-        // marker that survives sanitisation instead: it reaches `Error::Api.message` intact, so
-        // the only thing keeping it out of the log is that `refresh_session`'s `tracing::error!`
-        // passes `status` alone. Re-add `message = %message` there and this test goes red.
         let body_marker = "benign-body-marker-must-never-log";
         let credential_carrying_body = format!(r#"{{"detail":"{body_marker}"}}"#);
         let credential_carrying_body = credential_carrying_body.as_str();
         assert!(
             serde_json::from_str::<serde_json::Value>(credential_carrying_body).is_ok(),
-            "sanity: the fixture must be well-formed JSON, so it reaches the generic non-2xx \
-             arm (not the invalid-JSON arm, which has its own, stronger fallback redaction)"
-        );
-        assert!(
-            crate::error::sanitize_body_for_error(credential_carrying_body).contains(body_marker),
-            "sanity: this fixture must SURVIVE sanitisation, or the log assertion below is \
-             vacuous and this test proves nothing about the tracing::error! call site itself"
+            "sanity: the fixture must be well-formed JSON, so it reaches the generic non-2xx arm"
         );
 
         let server = wiremock::MockServer::start().await;
@@ -1305,7 +1287,7 @@ mod tests {
             .build()
             .expect("a MockServer's own URI is always a valid base URL");
 
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<CapturedEvents>> = Arc::new(Mutex::new(Vec::new()));
         let subscriber = FieldCapturingSubscriber(Arc::clone(&captured));
 
         let refreshed = {
@@ -1320,14 +1302,36 @@ mod tests {
             "a failed refresh response must not be reported as a successful refresh"
         );
 
-        let logged = captured
+        let events = captured
             .lock()
-            .expect("capture mutex is never held across a panic")
-            .join(" | ");
+            .expect("capture mutex is never held across a panic");
+        // Find `refresh_session`'s OWN log event specifically (`"session refresh failed"`) —
+        // not this crate's separate, generic per-request debug line (`status_to_envelope`'s
+        // `"eero transport error response"`, which intentionally logs the redacted envelope,
+        // mirroring `_log_error_body`; a non-credential-shaped key like `"detail"` is expected to
+        // stay visible there, matching Python's own behaviour). Only the narrower guarantee is
+        // asserted here: `refresh_session`'s own error-arm log call never carries the body.
+        let refresh_failed_events: Vec<&Vec<String>> = events
+            .iter()
+            .filter(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|f| f.starts_with("message=") && f.contains("session refresh failed"))
+            })
+            .map(|(_, fields)| fields)
+            .collect();
         assert!(
-            !logged.contains(body_marker),
-            "logged fields leaked the response body: {logged}"
+            !refresh_failed_events.is_empty(),
+            "expected to capture refresh_session's own \"session refresh failed\" log event; \
+             captured events: {events:?}"
         );
+        for fields in refresh_failed_events {
+            let joined = fields.join(" | ");
+            assert!(
+                !joined.contains(body_marker),
+                "refresh_session's own log event leaked the response body: {joined}"
+            );
+        }
     }
 
     // ===================== refresh_signal_detected =====================

@@ -274,7 +274,7 @@ struct ErrorKind<'a>(&'a rusteero::Error);
 impl std::fmt::Display for ErrorKind<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self.0 {
-            rusteero::Error::Authentication(_) => "Authentication",
+            rusteero::Error::Authentication { .. } => "Authentication",
             rusteero::Error::RateLimit { .. } => "RateLimit",
             rusteero::Error::Network(_) => "Network",
             rusteero::Error::Api { .. } => "Api",

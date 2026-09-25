@@ -79,9 +79,9 @@ async fn get_device_unknown_id_maps_to_api_error_404() -> anyhow::Result<()> {
     let err = api
         .get_device("network-0001", "device-9999")
         .await
-        .expect_err("an unknown device id must map to Error::Api { status: 404, .. }");
+        .expect_err("an unknown device id must map to Error::NotFound { status: 404, .. }");
 
-    assert!(matches!(err, Error::Api { status: 404, .. }));
+    assert!(matches!(err, Error::NotFound { status: 404, .. }));
     Ok(())
 }
 

@@ -217,6 +217,8 @@ impl DevicesApi {
                 message: format!(
                     "Device {device_id} response missing 'mac' field; cannot blacklist"
                 ),
+                envelope: None,
+                error_code: None,
                 url: None,
             });
         };

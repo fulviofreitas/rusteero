@@ -9,7 +9,7 @@
 //! Per the crate's testing conventions, every test pins the exact verb, path and session cookie
 //! against a local `wiremock` server, and asserts the returned `Envelope` is byte-identical to
 //! the body served via `into_value()` — the raw wire payload is the contract, never a reshaped
-//! view of it. A final error-path test proves a `404` maps to `Error::Api { status: 404, .. }`.
+//! view of it. A final error-path test proves a `404` maps to `Error::NotFound { status: 404, .. }`.
 
 mod common;
 
@@ -64,10 +64,10 @@ async fn get_routing_with_unknown_network_maps_404_to_api_error() -> anyhow::Res
     let err = api
         .get_routing("does-not-exist")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());

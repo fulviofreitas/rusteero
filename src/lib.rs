@@ -26,6 +26,9 @@ pub mod consts;
 pub mod endpoints;
 pub mod envelope;
 pub mod error;
+pub mod errors;
+pub mod links;
+pub mod params;
 pub mod redact;
 pub mod routes;
 pub mod storage;
@@ -41,6 +44,8 @@ pub use auth::Session;
 pub use client::{Client, ClientBuilder};
 pub use envelope::{Envelope, Meta};
 pub use error::{Error, StorageError};
+pub use errors::{ErrorGroup, classify_error_code};
+pub use links::{join_api_path, resolve_link, resource_url, self_url, sub_resource_url};
 #[cfg(feature = "keyring")]
 pub use storage::KeyringStore;
 pub use storage::{ChainedStore, CredentialStore, FileStore, MemoryStore};

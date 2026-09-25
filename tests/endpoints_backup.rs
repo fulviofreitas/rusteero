@@ -7,7 +7,7 @@
 //! no real MACs, serials, IPs or names. A dedicated
 //! `get_backup_network_and_get_backup_status_hit_different_paths` test proves `BackupAPI`'s two
 //! `GET`s are distinct wire endpoints, not aliases of one another. A final error-path test
-//! proves a `404` maps to `Error::Api { status: 404, .. }`.
+//! proves a `404` maps to `Error::NotFound { status: 404, .. }`.
 //!
 //! The mutating half (`set_backup_network`, `configure_backup_network`) pins the exact verb,
 //! path, JSON body and session cookie via `body_json`, with `.expect(n)` call counts verified at
@@ -135,10 +135,10 @@ async fn get_backup_network_with_unknown_network_id_maps_404_to_api_error() -> a
     let err = api
         .get_backup_network("does-not-exist")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());

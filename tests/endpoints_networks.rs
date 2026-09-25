@@ -5,7 +5,7 @@
 //! [`rusteero::envelope::Envelope`] is byte-identical to its fixture. A dedicated
 //! `get_premium_status_hits_the_same_path_as_get_network` test proves the two methods share one
 //! wire endpoint, exactly as `eero-api src/eero/api/networks.py:159-180` does. A final error-path
-//! test proves a `404` on an unknown network id maps to `Error::Api { status: 404, .. }`.
+//! test proves a `404` on an unknown network id maps to `Error::NotFound { status: 404, .. }`.
 
 mod common;
 
@@ -127,10 +127,10 @@ async fn get_network_with_unknown_id_maps_404_to_api_error() -> anyhow::Result<(
     let err = api
         .get_network("does-not-exist")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());

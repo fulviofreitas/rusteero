@@ -518,6 +518,6 @@ async fn logout_failure_still_clears_the_cache() -> anyhow::Result<()> {
     // auth check at all. After the fix the cache is empty and the session is gone, so this must
     // fail closed rather than leak the earlier authenticated response.
     let after = client.get_network(Some("network-0001"), false).await;
-    assert!(matches!(after, Err(Error::Authentication(_))));
+    assert!(matches!(after, Err(Error::Authentication { .. })));
     Ok(())
 }

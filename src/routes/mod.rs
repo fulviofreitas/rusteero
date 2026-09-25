@@ -66,7 +66,9 @@
 //! as before — none of those can reach the parser's dot-segment logic at all.
 
 use crate::consts;
+use crate::error::Error;
 use reqwest::Method;
+use serde_json::Value;
 use url::Url;
 
 /// Selects which Eero cloud API host/version a [`Route`] targets.
@@ -94,6 +96,123 @@ impl ApiVersion {
             Self::V2_2 => consts::API_BASE_22,
             Self::V2_3 => consts::API_BASE_23,
         }
+    }
+
+    /// Returns the bare version path segment for this API version (`"2.2"` or `"2.3"`), the
+    /// single source of truth [`Self::base_url`] and every `links`/`params` caller derive their
+    /// version string from, so a future version bump only ever needs one edit.
+    #[must_use]
+    pub const fn segment(self) -> &'static str {
+        match self {
+            Self::V2_2 => consts::API_VERSION_DEFAULT,
+            Self::V2_3 => consts::API_VERSION_DEVICE_WRITES,
+        }
+    }
+}
+
+/// A resource addressed by one id-or-url plus an optional published link name — the
+/// `resource_url`/`sub_resource_url` shape from [`crate::links`], attached to a `'static` route
+/// definition so a domain module never builds the URL by hand.
+///
+/// `template` must contain exactly one `{id}` placeholder (e.g. `"networks/{id}/settings"`), or
+/// none at all for a fixed path that ignores its `id_or_url` argument entirely (e.g.
+/// `"account"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resource {
+    /// HTTP verb this endpoint expects.
+    pub method: Method,
+    /// Which API version (and therefore base host) this endpoint is served from.
+    pub version: ApiVersion,
+    /// A [`crate::links::resource_url`]-shaped template: exactly one `{id}` placeholder, or none
+    /// for a fixed path.
+    pub template: &'static str,
+    /// The name of the link in the parent's `resources` object that, when the caller supplies a
+    /// parent envelope and the link is present, is preferred over `template` entirely. `None`
+    /// when this resource is never published as a named link.
+    pub link: Option<&'static str>,
+}
+
+impl Resource {
+    /// Resolves this resource's absolute URL against `host`.
+    ///
+    /// When [`Self::template`] contains no `{id}` placeholder, resolves to `{host}/{version}/
+    /// {template}` and `id_or_url` is ignored. Otherwise: link-preferring via
+    /// [`crate::links::sub_resource_url`] when [`Self::link`] is `Some`, or
+    /// [`crate::links::resource_url`] otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] as the underlying `links` helper.
+    pub fn resolve(
+        &self,
+        host: &Url,
+        id_or_url: &str,
+        parent: Option<&Value>,
+    ) -> Result<Url, Error> {
+        if !self.template.contains("{id}") {
+            let base = host.as_str().trim_end_matches('/');
+            let segment = self.version.segment();
+            let path = self.template.trim_matches('/');
+            let full = format!("{base}/{segment}/{path}");
+            return Url::parse(&full)
+                .map_err(|err| Error::validation("url", format!("not a valid URL: {err}")));
+        }
+        match self.link {
+            Some(link) => crate::links::sub_resource_url(
+                host,
+                id_or_url,
+                self.template,
+                link,
+                parent,
+                self.version,
+            ),
+            None => crate::links::resource_url(host, id_or_url, self.template, self.version),
+        }
+    }
+}
+
+/// A two-level nested resource — `networks/{network}/{prefix}/{child}{suffix}` — the
+/// `resolve_nested_url` shape from [`crate::params`], attached to a `'static` route definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nested {
+    /// HTTP verb this endpoint expects.
+    pub method: Method,
+    /// Which API version (and therefore base host) this endpoint is served from.
+    pub version: ApiVersion,
+    /// The literal path segment(s) between the network and the child id, e.g. `"profiles"` or
+    /// `"insights/devices"`. No leading or trailing slash.
+    pub prefix: &'static str,
+    /// A literal path segment appended after the child id, e.g. `"/schedules"`. Empty when the
+    /// child id is the final path segment.
+    pub suffix: &'static str,
+    /// The name of the link in the parent's `resources` object that, when present, is preferred
+    /// over the network/child template entirely.
+    pub link: Option<&'static str>,
+}
+
+impl Nested {
+    /// Resolves this nested resource's absolute URL against `host`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] as [`crate::params::resolve_nested_url`].
+    pub fn resolve(
+        &self,
+        host: &Url,
+        network: &str,
+        child: &str,
+        parent: Option<&Value>,
+    ) -> Result<Url, Error> {
+        crate::params::resolve_nested_url(
+            host,
+            network,
+            child,
+            self.prefix,
+            self.suffix,
+            self.link,
+            parent,
+            self.version,
+        )
     }
 }
 
@@ -1548,6 +1667,107 @@ mod tests {
                 name: "mac_or_device_id".to_owned(),
                 reason: SegmentError::DotSegment,
             }
+        );
+    }
+
+    // ============================== Resource / Nested (v8 route model) ==============================
+
+    use super::{Nested, Resource};
+    use url::Url;
+
+    fn fake_host() -> Url {
+        Url::parse("https://api-user.e2ro.com").unwrap()
+    }
+
+    #[test]
+    fn resource_with_placeholder_resolves_bare_id_against_its_version() {
+        let resource = Resource {
+            method: Method::GET,
+            version: ApiVersion::V2_2,
+            template: "networks/{id}",
+            link: None,
+        };
+        let url = resource.resolve(&fake_host(), "100", None).unwrap();
+        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/networks/100");
+    }
+
+    #[test]
+    fn resource_without_placeholder_resolves_a_fixed_path_and_ignores_id_or_url() {
+        let resource = Resource {
+            method: Method::GET,
+            version: ApiVersion::V2_2,
+            template: "account",
+            link: None,
+        };
+        let url = resource.resolve(&fake_host(), "ignored", None).unwrap();
+        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/account");
+    }
+
+    #[test]
+    fn resource_with_link_prefers_the_parents_published_link() {
+        let resource = Resource {
+            method: Method::PUT,
+            version: ApiVersion::V2_2,
+            template: "networks/{id}/settings",
+            link: Some("settings"),
+        };
+        let parent = serde_json::json!({"resources": {"settings": "/2.4/networks/100/settings"}});
+        let url = resource
+            .resolve(&fake_host(), "100", Some(&parent))
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api-user.e2ro.com/2.4/networks/100/settings"
+        );
+    }
+
+    #[test]
+    fn resource_with_link_falls_back_when_no_parent_supplied() {
+        let resource = Resource {
+            method: Method::PUT,
+            version: ApiVersion::V2_2,
+            template: "networks/{id}/settings",
+            link: Some("settings"),
+        };
+        let url = resource.resolve(&fake_host(), "100", None).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api-user.e2ro.com/2.2/networks/100/settings"
+        );
+    }
+
+    #[test]
+    fn nested_resolves_bare_child_id() {
+        let nested = Nested {
+            method: Method::GET,
+            version: ApiVersion::V2_2,
+            prefix: "profiles",
+            suffix: "",
+            link: None,
+        };
+        let url = nested.resolve(&fake_host(), "100", "p1", None).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api-user.e2ro.com/2.2/networks/100/profiles/p1"
+        );
+    }
+
+    #[test]
+    fn nested_with_link_prefers_the_parents_published_link() {
+        let nested = Nested {
+            method: Method::GET,
+            version: ApiVersion::V2_2,
+            prefix: "profiles",
+            suffix: "/schedules",
+            link: Some("schedules"),
+        };
+        let parent = serde_json::json!({"resources": {"schedules": "/2.5/networks/100/profiles/p1/schedules"}});
+        let url = nested
+            .resolve(&fake_host(), "100", "p1", Some(&parent))
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api-user.e2ro.com/2.5/networks/100/profiles/p1/schedules"
         );
     }
 }

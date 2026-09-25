@@ -1,7 +1,7 @@
 //! HTTP integration tests for `DiagnosticsApi` (`src/endpoints/diagnostics.rs`) against a local
 //! `wiremock` server per the crate's testing conventions.
 //!
-//! A final error-path test proves a `404` maps to `Error::Api { status: 404, .. }`.
+//! A final error-path test proves a `404` maps to `Error::NotFound { status: 404, .. }`.
 
 mod common;
 
@@ -61,10 +61,10 @@ async fn get_diagnostics_with_unknown_network_maps_404_to_api_error() -> anyhow:
     let err = api
         .get_diagnostics("does-not-exist")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());

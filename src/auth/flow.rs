@@ -265,7 +265,7 @@ fn extract_user_token(envelope: &Envelope) -> Result<SecretString, Error> {
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
         .map(|token| SecretString::from(token.to_owned()))
-        .ok_or_else(|| Error::Authentication(LOGIN_FAILED_NO_USER_TOKEN.to_owned()))
+        .ok_or_else(|| Error::authentication(LOGIN_FAILED_NO_USER_TOKEN))
 }
 
 /// Chooses the session token to use after a successful [`PendingLogin::verify`] call: the fresh
@@ -323,7 +323,7 @@ mod tests {
         let envelope = Envelope::from_value(json!({ "data": {} }));
         let err = extract_user_token(&envelope).unwrap_err();
         assert!(
-            matches!(err, Error::Authentication(ref msg) if msg == "Login failed: No user token received")
+            matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Login failed: No user token received")
         );
     }
 

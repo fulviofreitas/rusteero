@@ -256,12 +256,12 @@ async fn a_failed_write_does_not_invalidate_the_cache() -> anyhow::Result<()> {
 
 // ===================== Security review finding F5 =====================
 
-/// **F5**: `sanitize_body_for_error` redacts a parseable JSON error body by *key* — a value that
-/// looks like a credential but sits under an unrelated key (e.g. a guest Wi-Fi password echoed
-/// back verbatim in a `400`'s `error` field) previously passed through untouched, because the
-/// raw-text `looks_sensitive` fallback was only reachable for bodies that failed to parse as
-/// JSON at all. This asserts the resulting `Error`'s `Display` never contains the submitted
-/// password.
+/// **F5** (superseded by the v8.0.4 error model, still worth pinning): a value that looks like a
+/// credential but sits under an unrelated key (e.g. a guest Wi-Fi password echoed back verbatim
+/// in a `400`'s `error` field) can no longer reach `Error::Api.message` at all — `message` is
+/// built entirely from `errors::message_for_error_code` (a catalogue string, or the fixed
+/// `"unrecognised error string"` fallback), never from the raw response body. This asserts the
+/// resulting `Error`'s `Display` never contains the submitted password.
 #[tokio::test]
 async fn a_password_echoed_under_a_non_sensitive_key_is_suppressed_from_the_error()
 -> anyhow::Result<()> {

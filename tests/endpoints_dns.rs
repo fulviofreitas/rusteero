@@ -4,7 +4,7 @@
 //! One test per read method pins the exact verb, path and session cookie, and asserts the
 //! returned [`rusteero::envelope::Envelope`] is byte-identical to its fixture. A final
 //! error-path test proves a `404` on an unknown network id maps to
-//! `Error::Api { status: 404, .. }`.
+//! `Error::NotFound { status: 404, .. }`.
 //!
 //! Every mutating test pins the exact verb, path, session cookie and request body (`body_json`,
 //! an exact deep-equality match, not a subset match) with a wiremock `.expect(n)` call count
@@ -135,10 +135,10 @@ async fn get_dns_settings_with_unknown_id_maps_404_to_api_error() -> anyhow::Res
     let err = api
         .get_dns_settings("does-not-exist")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());
@@ -335,7 +335,7 @@ async fn set_dns_mode_invalid_mode_is_validation_error_with_no_requests() -> any
     let mock = MockEero::start().await;
     // No `Mock` registered: if `set_dns_mode` ever reached the network for an unrecognised
     // mode, the request would hit wiremock's default 404-for-unmatched-request response and
-    // surface as `Error::Api { status: 404, .. }`, not `Error::Validation` — failing the
+    // surface as `Error::NotFound { status: 404, .. }`, not `Error::Validation` — failing the
     // assertion below.
     let api = dns_api(&mock);
     let err = api

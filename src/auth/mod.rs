@@ -201,7 +201,7 @@ impl AuthApi {
         if self.is_authenticated() {
             Ok(())
         } else {
-            Err(Error::Authentication("Not authenticated".to_owned()))
+            Err(Error::authentication("Not authenticated"))
         }
     }
 
@@ -230,10 +230,7 @@ impl AuthApi {
     /// installed regardless (see [`Transport::set_session`]'s docs).
     pub fn set_session_token(&self, token: &str) -> Result<(), Error> {
         if token.is_empty() {
-            return Err(Error::Validation {
-                field: "token".to_owned(),
-                message: EMPTY_TOKEN_MESSAGE.to_owned(),
-            });
+            return Err(Error::validation("token", EMPTY_TOKEN_MESSAGE));
         }
         let current = self.transport.session();
         let session =
@@ -393,7 +390,7 @@ mod tests {
             .expect_err("empty token must be rejected");
         assert!(matches!(
             err,
-            Error::Validation { ref field, ref message }
+            Error::Validation { ref field, ref message, .. }
                 if field == "token" && message == "must be a non-empty string"
         ));
         assert_eq!(
@@ -561,7 +558,9 @@ mod tests {
             .logout()
             .await
             .expect_err("no valid session: the transport-level precondition fires locally");
-        assert!(matches!(err, Error::Authentication(ref msg) if msg == "Not authenticated"));
+        assert!(
+            matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Not authenticated")
+        );
 
         assert!(!auth.is_authenticated());
         let persisted = store.load().expect("load succeeds");

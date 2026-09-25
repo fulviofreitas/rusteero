@@ -148,10 +148,10 @@ async fn get_profile_404_maps_to_error_api_and_is_not_an_auth_error() -> anyhow:
     let err = api
         .get_profile("network-0001", "missing-profile")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());
@@ -469,10 +469,10 @@ async fn delete_profile_404_maps_to_error_api_and_is_not_an_auth_error() -> anyh
     let err = api
         .delete_profile("network-0001", "missing-profile")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());

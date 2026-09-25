@@ -90,7 +90,9 @@ async fn transport_anonymous_has_no_session_and_never_calls_the_network() {
         .send(&ACCOUNT, &[], None)
         .await
         .expect_err("no session configured means the precondition fires before any request");
-    assert!(matches!(err, Error::Authentication(ref msg) if msg == "Not authenticated"));
+    assert!(
+        matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Not authenticated")
+    );
 }
 
 // ===================== login_flow: hits the mock's /login route =====================

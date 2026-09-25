@@ -277,10 +277,10 @@ impl ProfilesApi {
         }
 
         if content_filter.is_empty() {
-            return Err(Error::Validation {
-                field: "filters".to_owned(),
-                message: "must contain at least one recognized content-filter key".to_owned(),
-            });
+            return Err(Error::validation(
+                "filters",
+                "must contain at least one recognized content-filter key",
+            ));
         }
 
         self.transport

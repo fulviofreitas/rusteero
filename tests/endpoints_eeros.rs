@@ -128,10 +128,10 @@ async fn get_eero_404_maps_to_error_api_with_status_404() -> anyhow::Result<()> 
     let err = api
         .get_eero("missing-eero")
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api { status, .. } = &err else {
-        panic!("expected Error::Api, got {err:?}");
+    let Error::NotFound { status, .. } = &err else {
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
     Ok(())

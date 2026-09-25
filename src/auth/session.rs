@@ -87,15 +87,10 @@ impl Session {
 
     /// The testable half of [`Session::from_env`]: validates an already-read environment value.
     fn from_env_value(var_name: &str, value: Option<String>) -> Result<Self, Error> {
-        let token = value.ok_or_else(|| Error::Validation {
-            field: var_name.to_owned(),
-            message: "environment variable not set".to_owned(),
-        })?;
+        let token =
+            value.ok_or_else(|| Error::validation(var_name, "environment variable not set"))?;
         if token.is_empty() {
-            return Err(Error::Validation {
-                field: var_name.to_owned(),
-                message: "must be a non-empty string".to_owned(),
-            });
+            return Err(Error::validation(var_name, "must be a non-empty string"));
         }
         Ok(Self::from_token(token))
     }

@@ -123,7 +123,7 @@ async fn login_flow_start_missing_user_token_is_authentication_error() -> anyhow
         .await
         .expect_err("a response with no data.user_token at all must fail");
     assert!(
-        matches!(err, Error::Authentication(ref msg) if msg == "Login failed: No user token received")
+        matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Login failed: No user token received")
     );
     Ok(())
 }
@@ -146,7 +146,7 @@ async fn login_flow_start_null_user_token_is_authentication_error() -> anyhow::R
         .await
         .expect_err("a null data.user_token must fail");
     assert!(
-        matches!(err, Error::Authentication(ref msg) if msg == "Login failed: No user token received")
+        matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Login failed: No user token received")
     );
     Ok(())
 }
@@ -169,7 +169,7 @@ async fn login_flow_start_empty_user_token_is_authentication_error() -> anyhow::
         .await
         .expect_err("an empty-string data.user_token must fail");
     assert!(
-        matches!(err, Error::Authentication(ref msg) if msg == "Login failed: No user token received")
+        matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Login failed: No user token received")
     );
     Ok(())
 }
@@ -399,7 +399,7 @@ async fn auth_api_set_session_token_empty_is_validation_error_with_no_requests()
         .expect_err("an empty token must be rejected before any request");
     assert!(matches!(
         err,
-        Error::Validation { ref field, ref message }
+        Error::Validation { ref field, ref message, .. }
             if field == "token" && message == "must be a non-empty string"
     ));
 }
@@ -545,7 +545,9 @@ async fn auth_api_ensure_authenticated_with_no_session_is_authentication_error_w
         .ensure_authenticated()
         .await
         .expect_err("no session configured means this must fail locally");
-    assert!(matches!(err, Error::Authentication(ref msg) if msg == "Not authenticated"));
+    assert!(
+        matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Not authenticated")
+    );
 }
 
 // ===================== Session loaded from a store with a past expiry =====================

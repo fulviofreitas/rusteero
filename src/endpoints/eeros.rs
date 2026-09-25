@@ -329,10 +329,10 @@ impl EerosApi {
         // never touches the network; this port refuses before any request is built instead,
         // since a `Result` already says "you passed nothing" without inventing a fake response.
         if nightlight.is_empty() {
-            return Err(Error::Validation {
-                field: "nightlight".to_string(),
-                message: "at least one nightlight setting must be provided".to_string(),
-            });
+            return Err(Error::validation(
+                "nightlight",
+                "at least one nightlight setting must be provided",
+            ));
         }
 
         let mut body = Map::new();

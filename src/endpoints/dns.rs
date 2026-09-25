@@ -204,8 +204,5 @@ impl DnsApi {
 /// Private: this is a one-line helper factored out only because `set_dns_mode` has two identical
 /// return sites for the same error (the catch-all arm and the `"custom"`-with-no-servers arm).
 fn invalid_dns_mode(mode: &str) -> Error {
-    Error::Validation {
-        field: "mode".to_owned(),
-        message: format!("unknown DNS mode: {mode}"),
-    }
+    Error::validation("mode", format!("unknown DNS mode: {mode}"))
 }

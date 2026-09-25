@@ -282,7 +282,7 @@ async fn status_401_is_authentication_error_and_is_auth_error_true() -> anyhow::
         .await
         .expect_err("a plain 401 must surface as Error::Authentication");
 
-    assert!(matches!(err, Error::Authentication(_)));
+    assert!(matches!(err, Error::Authentication { .. }));
     assert!(err.is_auth_error());
     Ok(())
 }
@@ -290,7 +290,7 @@ async fn status_401_is_authentication_error_and_is_auth_error_true() -> anyhow::
 // ===================== 404 =====================
 
 #[tokio::test]
-async fn status_404_is_api_error_with_the_python_message_shape_and_is_not_an_auth_error()
+async fn status_404_is_not_found_with_the_catalogue_message_shape_and_is_not_an_auth_error()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
@@ -305,16 +305,19 @@ async fn status_404_is_api_error_with_the_python_message_shape_and_is_not_an_aut
     let err = transport
         .send(&ACCOUNT, &[], None)
         .await
-        .expect_err("a 404 must surface as Error::Api");
+        .expect_err("a 404 must surface as Error::NotFound");
 
-    let Error::Api {
+    let Error::NotFound {
         status, message, ..
     } = &err
     else {
-        panic!("expected Error::Api, got {err:?}");
+        panic!("expected Error::NotFound, got {err:?}");
     };
     assert_eq!(*status, 404);
-    assert!(message.starts_with("Resource not found: no such account. URL: "));
+    // The body ("no such account") is plain text, not JSON, so it never parses into an
+    // `envelope`/`error_code` at all; the message is the fixed unrecognised-string fallback —
+    // never the raw body text (the v8.0.4 error model never embeds body text in `message`).
+    assert_eq!(message, "unrecognised error string");
     assert!(!err.is_auth_error());
     Ok(())
 }
@@ -342,7 +345,8 @@ async fn status_429_with_delta_seconds_retry_after_carries_the_parsed_duration()
     assert!(matches!(
         err,
         Error::RateLimit {
-            retry_after: Some(duration)
+            retry_after: Some(duration),
+            ..
         } if duration == Duration::from_secs(120)
     ));
     Ok(())
@@ -371,7 +375,8 @@ async fn status_429_with_http_date_retry_after_carries_some_duration() -> anyhow
     assert!(matches!(
         err,
         Error::RateLimit {
-            retry_after: Some(_)
+            retry_after: Some(_),
+            ..
         }
     ));
     Ok(())
@@ -394,7 +399,13 @@ async fn status_429_with_no_retry_after_header_carries_none() -> anyhow::Result<
         .await
         .expect_err("429 must surface as Error::RateLimit");
 
-    assert!(matches!(err, Error::RateLimit { retry_after: None }));
+    assert!(matches!(
+        err,
+        Error::RateLimit {
+            retry_after: None,
+            ..
+        }
+    ));
     Ok(())
 }
 
@@ -416,14 +427,21 @@ async fn status_429_with_a_garbage_retry_after_carries_none_not_a_header_parse_e
         .await
         .expect_err("429 must surface as Error::RateLimit even with an unparseable header");
 
-    assert!(matches!(err, Error::RateLimit { retry_after: None }));
+    assert!(matches!(
+        err,
+        Error::RateLimit {
+            retry_after: None,
+            ..
+        }
+    ));
     Ok(())
 }
 
 // ===================== 500 =====================
 
 #[tokio::test]
-async fn status_500_is_api_error_carrying_the_truncated_body() -> anyhow::Result<()> {
+async fn status_500_is_api_error_with_the_fixed_unrecognised_message_never_the_body()
+-> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let long_body = "x".repeat(600);
     Mock::given(method("GET"))
@@ -441,14 +459,21 @@ async fn status_500_is_api_error_carrying_the_truncated_body() -> anyhow::Result
         .expect_err("a 500 must surface as Error::Api");
 
     let Error::Api {
-        status, message, ..
+        status,
+        message,
+        envelope,
+        ..
     } = &err
     else {
         panic!("expected Error::Api, got {err:?}");
     };
     assert_eq!(*status, 500);
-    assert!(message.len() < long_body.len());
-    assert!(message.ends_with("chars total]"));
+    // The v8.0.4 error model never embeds body text in `message` at all: a plain-text (non-JSON)
+    // body never parses into an `envelope`, so `error_code` is `None` and `message` is the fixed
+    // unrecognised-string fallback, regardless of the body's length or content.
+    assert_eq!(message, "unrecognised error string");
+    assert!(envelope.is_none());
+    assert!(!err.to_string().contains('x'));
     Ok(())
 }
 
@@ -589,7 +614,9 @@ async fn no_session_is_authentication_error_and_the_server_receives_zero_request
         .send(&ACCOUNT, &[], None)
         .await
         .expect_err("no session configured means the precondition fires before any request");
-    assert!(matches!(err, Error::Authentication(ref msg) if msg == "Not authenticated"));
+    assert!(
+        matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Not authenticated")
+    );
 
     let received = mock
         .server
@@ -829,7 +856,7 @@ async fn refresh_success_but_retry_still_401s_raises_the_retry_error_with_no_loo
         .send(&ACCOUNT, &[], None)
         .await
         .expect_err("a 401 on the retry itself must surface, not loop");
-    assert!(matches!(err, Error::Authentication(_)));
+    assert!(matches!(err, Error::Authentication { .. }));
     Ok(())
 }
 
@@ -863,7 +890,7 @@ async fn refresh_401_with_a_different_meta_error_never_attempts_a_refresh() -> a
         .send(&ACCOUNT, &[], None)
         .await
         .expect_err("a 401 without the refresh signal must not trigger a refresh");
-    assert!(matches!(err, Error::Authentication(_)));
+    assert!(matches!(err, Error::Authentication { .. }));
     Ok(())
 }
 
@@ -895,7 +922,7 @@ async fn refresh_401_with_a_non_json_body_never_attempts_a_refresh() -> anyhow::
         .send(&ACCOUNT, &[], None)
         .await
         .expect_err("a non-JSON 401 body must not trigger a refresh");
-    assert!(matches!(err, Error::Authentication(_)));
+    assert!(matches!(err, Error::Authentication { .. }));
     Ok(())
 }
 
@@ -976,7 +1003,7 @@ async fn refresh_route_1_500_is_terminal_and_route_2_is_never_tried() -> anyhow:
         .send(&ACCOUNT, &[], None)
         .await
         .expect_err("a terminal non-404 refresh failure must surface the original 401");
-    assert!(matches!(err, Error::Authentication(_)));
+    assert!(matches!(err, Error::Authentication { .. }));
     Ok(())
 }
 
@@ -1052,7 +1079,7 @@ async fn refresh_session_direct_call_with_no_refresh_token_is_the_universal_real
         .expect_err("no refresh token means the precondition fires before any network call");
     assert!(matches!(
         err,
-        Error::Authentication(ref msg) if msg == "No refresh token available"
+        Error::Authentication { message: ref msg, .. } if msg == "No refresh token available"
     ));
 
     let received = mock
@@ -1137,10 +1164,10 @@ async fn refresh_session_direct_call_terminal_500_never_tries_route_2_and_clears
 #[tokio::test]
 async fn refresh_session_response_missing_session_token_returns_false_and_changes_nothing()
 -> anyhow::Result<()> {
-    // Pins `Transport::refresh_session`'s own documented contract for this arm exactly:
-    // "`SESSION_TOKEN_KEY` missing or empty: Python returns `False` without clearing or
-    // persisting anything" — unlike the terminal-error arm above, this must leave the existing
-    // session (token *and* refresh token) completely untouched.
+    // Pins `Transport::refresh_session`'s own documented contract for this arm exactly: a
+    // response missing (or with an empty) `session_token` field returns `false` without
+    // clearing or persisting anything — unlike the terminal-error arm above, this must leave the
+    // existing session (token *and* refresh token) completely untouched.
     let mock = MockEero::start().await;
     let transport = transport_with_refresh_token(&mock, "initial-token", "old-refresh-token");
 
@@ -1270,7 +1297,7 @@ async fn auth_api_refresh_session_with_no_refresh_token_delegates_and_makes_no_r
     );
     assert!(matches!(
         err,
-        Error::Authentication(ref msg) if msg == "No refresh token available"
+        Error::Authentication { message: ref msg, .. } if msg == "No refresh token available"
     ));
 
     let received = mock

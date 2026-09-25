@@ -1,9 +1,9 @@
 //! The crate error type.
 //!
-//! Ported 1:1 from `eero-api`'s `src/eero/exceptions.py`. See
-//! the exceptions behaviour notes for the full behaviour brief this
-//! module implements, and the crate's architecture notes §7 for the mapping
-//! table reproduced below.
+//! Ported from `eero-api`'s `src/eero/exceptions.py` at `v8.0.4`. Every variant carries the
+//! parsed response `envelope` and `error_code` (`meta.error`) it was classified from, mirroring
+//! every Python exception now doing the same (`exceptions.py:9-30`); classification itself
+//! happens in [`crate::errors`].
 //!
 //! | Python | Rust |
 //! |---|---|
@@ -12,31 +12,35 @@
 //! | `EeroNetworkException` | [`Error::Network`] |
 //! | `EeroAPIException(status, msg)` | [`Error::Api`] |
 //! | `EeroTimeoutException` | [`Error::Timeout`] |
-//! | `EeroNotFoundException` | [`Error::NotFound`] (kept, D-8; never constructed) |
-//! | `EeroPremiumRequiredException` | [`Error::PremiumRequired`] (kept, D-8; never constructed) |
-//! | `EeroFeatureUnavailableException` | [`Error::FeatureUnavailable`] (kept, D-8; never constructed) |
+//! | `EeroAccessDeniedException` | [`Error::AccessDenied`] |
+//! | `EeroClientBlockedException` | [`Error::ClientBlocked`] |
+//! | `EeroNotFoundException.from_response` | [`Error::NotFound`] |
+//! | `EeroPremiumRequiredException.from_response` | [`Error::PremiumRequired`] |
+//! | `EeroFeatureUnavailableException.from_response` | [`Error::FeatureUnavailable`] |
 //! | `EeroValidationException(field, msg)` | [`Error::Validation`] |
 //! | bare `EeroException` (missing network id, `client.py:168`) | [`Error::MissingNetworkId`] |
 //! | — (added) | [`Error::Storage`], [`Error::Json`] |
+//!
+//! `AccessDenied`/`ClientBlocked`/`NotFound` are separate variants rather than folded into
+//! [`Error::Api`] (decision D-8): their Python counterparts are `EeroAPIException` *subclasses*
+//! purely for `isinstance` ergonomics, but keeping the distinct shapes here means a caller can
+//! match on the specific failure without inspecting `error_code` strings.
 
 use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::consts::MAX_ERROR_BODY_CHARS;
-use crate::redact;
-
 /// The crate's error type.
 ///
-/// Mirrors the flat exception hierarchy of `eero-api`'s `exceptions.py` one-to-one: every
-/// variant here corresponds to exactly one `Eero*Exception` subclass (see the module-level
-/// mapping table), plus two variants added for the Rust port ([`Error::Storage`],
-/// [`Error::Json`]) and one added field ([`Error::RateLimit::retry_after`]).
+/// Mirrors the exception hierarchy of `eero-api`'s `exceptions.py` at `v8.0.4`: every variant
+/// here corresponds to exactly one `Eero*Exception` subclass (see the module-level mapping
+/// table), plus two variants added for the Rust port ([`Error::Storage`], [`Error::Json`]).
 ///
 /// `Display` strings mirror Python's `str(exc)` character-for-character wherever Python's
-/// `__init__` builds a fixed format string; fields that are additions on top of the Python
-/// contract (such as [`Error::Api::url`]) are deliberately excluded from `Display` so the
-/// rendered message never gains information (or leaks anything) Python's would not have shown.
+/// `__init__` builds a fixed format string. `message` is *never* built from a raw response body
+/// or the request URL (`errors.py:204-224`) — only from the catalogue string a recognised
+/// `error_code` classifies to, or the fixed fallback `"unrecognised error string"`; the full
+/// parsed response is still available, verbatim, via [`Error::envelope`].
 ///
 /// This type is `#[non_exhaustive]`: new variants may be added in a minor release.
 #[derive(Debug, thiserror::Error)]
@@ -44,43 +48,53 @@ use crate::redact;
 pub enum Error {
     /// Authentication failed, or no session token is available.
     ///
-    /// Ported from `EeroAuthenticationException` (`exceptions.py:16-21`). Covers both the
-    /// client-side "no token in memory" pre-flight guard (always the literal message
-    /// `"Not authenticated"`, dozens of call sites across `api/*.py`) and the server-driven
-    /// HTTP 401 case (`"Authentication failed: {truncated body}"`, `api/base.py:254-256`) —
-    /// Python uses the same exception type for both, distinguished only by message text; this
-    /// port does the same rather than fragmenting into more variants (see the brief's gotcha
-    /// #4: collapsing further, e.g. matching on message text, would be more fragile, not less).
-    #[error("{0}")]
-    Authentication(String),
+    /// Ported from `EeroAuthenticationException` (`exceptions.py`). Covers both the client-side
+    /// "no token in memory" pre-flight guard (the literal message `"Not authenticated"`, built
+    /// via [`Error::authentication`]) and the server-driven HTTP 401 case, where `message` is
+    /// always [`crate::errors::message_for_error_code`]'s output — never raw body text.
+    /// `envelope`/`error_code` are `None` for the client-side guard case.
+    #[error("{message}")]
+    Authentication {
+        /// Human-readable message. Either the fixed `"Not authenticated"` guard text, or a
+        /// catalogue string / the fixed unrecognised-string fallback.
+        message: String,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
+    },
 
-    /// The server rejected the request with HTTP 429 (Too Many Requests).
+    /// The server rejected the request with HTTP 429 (Too Many Requests), or reported
+    /// `error.rate.limit` on any other status (status-independent classification).
     ///
-    /// Ported from `EeroRateLimitException` (`exceptions.py:24-27`), raised at
-    /// `api/base.py:265` with the fixed message `"Rate limit exceeded"`. `retry_after` is an
-    /// addition on top of the Python contract: Python discards the response's `Retry-After`
-    /// header entirely (never even reads it); this port surfaces it when the server sends one.
-    #[error("Rate limit exceeded")]
+    /// Ported from `EeroRateLimitException`. `retry_after` is an addition on top of the Python
+    /// contract: Python discards the response's `Retry-After` header entirely; this port
+    /// surfaces it when the server sends one.
+    #[error("{message}")]
     RateLimit {
-        /// The parsed `Retry-After` header value, if the server sent one. `None` when the
-        /// header was absent, matching Python's behaviour of never having this information at
-        /// all.
+        /// Human-readable message: a catalogue string, or the fixed unrecognised-string
+        /// fallback.
+        message: String,
+        /// The parsed `Retry-After` header value, if the server sent one.
         retry_after: Option<Duration>,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
     },
 
     /// A transport-level failure (DNS, TCP, TLS, connect, etc.) below the HTTP status layer.
     ///
-    /// Ported from `EeroNetworkException` (`exceptions.py:30-33`), raised at five call sites in
-    /// `api/base.py` and `api/auth.py`, all wrapping `aiohttp.ClientError` with `from err`.
+    /// Ported from `EeroNetworkException`, wrapping every `reqwest::Error` that isn't itself a
+    /// timeout (see [`Error::Timeout`]).
     #[error("Network error: {0}")]
     Network(#[source] reqwest::Error),
 
     /// The server responded with a non-2xx status that this crate maps to a generic API error,
     /// or a client-side synthetic error modeled on the same shape.
     ///
-    /// Ported from `EeroAPIException` (`exceptions.py:36-46`). `Display` renders as
-    /// `"API error {status}: {message}"`, exactly reproducing Python's `__str__`
-    /// (`exceptions.py:42`).
+    /// Ported from `EeroAPIException`. `Display` renders as `"API error {status}: {message}"`,
+    /// exactly reproducing Python's `__str__`.
     #[error("API error {status}: {message}")]
     Api {
         /// The HTTP status code returned by the server. In a couple of call sites ported
@@ -88,10 +102,14 @@ pub enum Error {
         /// missing MAC address before a blacklist call, `devices.py:174-177`) rather than an
         /// actual response status.
         status: u16,
-        /// The error message or response body. Bodies longer than the crate's fixed character
-        /// limit are truncated before being stored here, with a trailing marker noting the
-        /// original (pre-truncation) length.
+        /// Human-readable message: a catalogue string, or the fixed unrecognised-string
+        /// fallback for every server-driven case; a fixed, hand-written message for every
+        /// client-side-synthesized case (redirect refusal, oversized body, invalid JSON, ...).
         message: String,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
         /// The request URL, when known. An addition on top of the Python contract; deliberately
         /// kept out of `Display` so the rendered message stays identical to Python's, and so a
         /// token embedded in a query string (which should never happen, but is not this type's
@@ -101,62 +119,113 @@ pub enum Error {
 
     /// The request timed out.
     ///
-    /// Ported from `EeroTimeoutException` (`exceptions.py:49-52`), raised at `api/base.py:272`
-    /// with the fixed message `"Request timed out"`.
+    /// Ported from `EeroTimeoutException`, raised with the fixed message `"Request timed out"`.
     #[error("Request timed out")]
     Timeout,
 
-    /// A requested resource does not exist.
+    /// The API denied access to a resource (HTTP 403 with `error.access.denied`).
     ///
-    /// Ported from `EeroNotFoundException` (`exceptions.py:55-61`) for 1:1 parity with the
-    /// Python exception hierarchy. Kept per decision D-8 even though Python never actually
-    /// raises it — every real "not found" surfaces as `Error::Api { status: 404, .. }` instead
-    /// (`api/base.py:260-263`) — so this variant is never constructed anywhere in this crate.
-    #[error("{resource_type} '{resource_id}' not found")]
+    /// Ported from `EeroAccessDeniedException`, an `EeroAPIException` subclass distinct from
+    /// [`Error::Authentication`]: the caller is authenticated, but not permitted to perform the
+    /// operation. Never an auth error — see [`Error::is_auth_error`].
+    #[error("API error {status}: {message}")]
+    AccessDenied {
+        /// Always `403` in practice.
+        status: u16,
+        /// A catalogue string, or the fixed unrecognised-string fallback.
+        message: String,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
+    },
+
+    /// The API rejected requests from this client version (`error.app.version.blocked`,
+    /// status-independent).
+    ///
+    /// Ported from `EeroClientBlockedException`.
+    #[error("API error {status}: {message}")]
+    ClientBlocked {
+        /// The HTTP status code the server used to carry this status-independent code.
+        status: u16,
+        /// A catalogue string, or the fixed unrecognised-string fallback.
+        message: String,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
+    },
+
+    /// A requested resource does not exist (HTTP 404, any `error_code`, recognised or not).
+    ///
+    /// Ported from `EeroNotFoundException.from_response` — the shape `error_for_response`
+    /// actually constructs; the transport never knows a per-resource type/id at classification
+    /// time, so both are absent here (unlike Python's original, backward-compatible
+    /// two-argument constructor, which this port does not need since nothing in this crate
+    /// constructs a `NotFound` client-side).
+    #[error("API error {status}: {message}")]
     NotFound {
-        /// The kind of resource that was not found (e.g. `"network"`).
-        resource_type: String,
-        /// The identifier that was looked up.
-        resource_id: String,
+        /// Always `404` in practice.
+        status: u16,
+        /// A catalogue string, or the fixed unrecognised-string fallback.
+        message: String,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
     },
 
-    /// A feature requires an Eero Plus subscription.
+    /// A feature requires an Eero Plus subscription (status-independent).
     ///
-    /// Ported from `EeroPremiumRequiredException` (`exceptions.py:64-69`) for 1:1 parity. Kept
-    /// per decision D-8; like [`Error::NotFound`], never constructed anywhere in this crate
-    /// because Python never raises the exception it mirrors.
-    #[error("{feature} requires an Eero Plus subscription")]
+    /// Ported from `EeroPremiumRequiredException.from_response`.
+    #[error("API error {}: {message}", status.map_or_else(|| "None".to_owned(), |s| s.to_string()))]
     PremiumRequired {
-        /// The name of the gated feature.
-        feature: String,
+        /// The HTTP status code the server used to carry this status-independent code, when
+        /// known.
+        status: Option<u16>,
+        /// A catalogue string, or the fixed unrecognised-string fallback.
+        message: String,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
     },
 
-    /// A feature is unavailable for the reason given.
+    /// A feature is unavailable for the reason given (status-independent).
     ///
-    /// Ported from `EeroFeatureUnavailableException` (`exceptions.py:72-78`) for 1:1 parity.
-    /// Kept per decision D-8; like [`Error::NotFound`], never constructed anywhere in this
-    /// crate because Python never raises the exception it mirrors.
-    #[error("{feature} is {reason}")]
+    /// Ported from `EeroFeatureUnavailableException.from_response`.
+    #[error("API error {}: {message}", status.map_or_else(|| "None".to_owned(), |s| s.to_string()))]
     FeatureUnavailable {
-        /// The name of the unavailable feature.
-        feature: String,
-        /// Why the feature is unavailable.
-        reason: String,
+        /// The HTTP status code the server used to carry this status-independent code, when
+        /// known.
+        status: Option<u16>,
+        /// A catalogue string, or the fixed unrecognised-string fallback.
+        message: String,
+        /// The raw, parsed response envelope, when the response body was valid JSON.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present.
+        error_code: Option<String>,
     },
 
-    /// A client-side precondition failed before any request was sent.
+    /// A client-side precondition failed before any request was sent, or the server reported a
+    /// recognised validation string on HTTP 400.
     ///
-    /// Ported from `EeroValidationException` (`exceptions.py:81-86`), raised for e.g.
-    /// `id_from_url` on a non-string/empty id (`api/base.py:54`,
-    /// `"Validation error for 'id_or_url': must be a non-empty string"`) or
-    /// `set_session_token` on an empty token (`api/auth.py:408`,
-    /// `"Validation error for 'token': must be a non-empty string"`).
+    /// Ported from `EeroValidationException`. `field` is `"request"` for the server-driven
+    /// (`from_response`) shape — the transport has no per-field context at classification time —
+    /// and the specific field name for every client-side validation raised throughout this
+    /// crate (built via [`Error::validation`]).
     #[error("Validation error for '{field}': {message}")]
     Validation {
-        /// The name of the field that failed validation.
+        /// The name of the field that failed validation, or `"request"` for a server-driven
+        /// validation error.
         field: String,
         /// The reason validation failed.
         message: String,
+        /// The raw, parsed response envelope. `None` for every client-side validation.
+        envelope: Option<Value>,
+        /// The value of `envelope["meta"]["error"]`, when present. `None` for every client-side
+        /// validation.
+        error_code: Option<String>,
     },
 
     /// No network ID was supplied and no preferred network is set.
@@ -179,24 +248,127 @@ pub enum Error {
     /// A response body could not be deserialized into the requested type.
     ///
     /// Added for the Rust port. Used only by `Envelope::data_as::<T>()` — invalid JSON on a 2xx
-    /// response is instead mapped to `Error::Api` at the transport layer, matching Python's
-    /// `api/base.py:216-219` (`"Invalid JSON response: {truncated body}"`).
+    /// response is instead mapped to `Error::Api` at the transport layer (`"Invalid JSON
+    /// response ({n} bytes)"`, byte count only), matching Python's own `base.py:593-597`.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
 
 impl Error {
+    /// Builds the client-side "no session token available" guard error.
+    ///
+    /// The literal message `"Not authenticated"` matches every `EeroAuthenticationException`
+    /// call site in `eero-api` that fires before any request was sent (dozens of call sites
+    /// across `api/*.py`). `envelope`/`error_code` are always `None` for this shape, since no
+    /// response was ever received.
+    #[must_use]
+    pub fn authentication(message: impl Into<String>) -> Self {
+        Error::Authentication {
+            message: message.into(),
+            envelope: None,
+            error_code: None,
+        }
+    }
+
+    /// Builds a client-side validation error: `envelope`/`error_code` are always `None`, since
+    /// this shape is raised before any request is sent (matching `EeroValidationException`'s
+    /// original, non-`from_response` constructor).
+    #[must_use]
+    pub fn validation(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Error::Validation {
+            field: field.into(),
+            message: message.into(),
+            envelope: None,
+            error_code: None,
+        }
+    }
+
+    /// Returns the raw, parsed response envelope this error was classified from, if any.
+    ///
+    /// `None` for every client-side-synthesized error (a precondition that failed before any
+    /// request was sent, [`Error::Network`], [`Error::Timeout`], [`Error::MissingNetworkId`],
+    /// [`Error::Storage`], [`Error::Json`]) and for any server-driven error whose response body
+    /// was not valid JSON.
+    #[must_use]
+    pub fn envelope(&self) -> Option<&Value> {
+        match self {
+            Error::Authentication { envelope, .. }
+            | Error::RateLimit { envelope, .. }
+            | Error::Api { envelope, .. }
+            | Error::AccessDenied { envelope, .. }
+            | Error::ClientBlocked { envelope, .. }
+            | Error::NotFound { envelope, .. }
+            | Error::PremiumRequired { envelope, .. }
+            | Error::FeatureUnavailable { envelope, .. }
+            | Error::Validation { envelope, .. } => envelope.as_ref(),
+            Error::Network(_)
+            | Error::Timeout
+            | Error::MissingNetworkId
+            | Error::Storage(_)
+            | Error::Json(_) => None,
+        }
+    }
+
+    /// Returns the value of `envelope["meta"]["error"]` this error was classified from, if any.
+    #[must_use]
+    pub fn error_code(&self) -> Option<&str> {
+        match self {
+            Error::Authentication { error_code, .. }
+            | Error::RateLimit { error_code, .. }
+            | Error::Api { error_code, .. }
+            | Error::AccessDenied { error_code, .. }
+            | Error::ClientBlocked { error_code, .. }
+            | Error::NotFound { error_code, .. }
+            | Error::PremiumRequired { error_code, .. }
+            | Error::FeatureUnavailable { error_code, .. }
+            | Error::Validation { error_code, .. } => error_code.as_deref(),
+            Error::Network(_)
+            | Error::Timeout
+            | Error::MissingNetworkId
+            | Error::Storage(_)
+            | Error::Json(_) => None,
+        }
+    }
+
+    /// Returns the HTTP status code this error carries, if any.
+    ///
+    /// `None` for [`Error::PremiumRequired`]/[`Error::FeatureUnavailable`] when constructed
+    /// without a response (the original, client-side-only Python shape — never produced by this
+    /// crate's own transport, kept for parity), and for every variant with no status at all.
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Error::Api { status, .. }
+            | Error::AccessDenied { status, .. }
+            | Error::ClientBlocked { status, .. }
+            | Error::NotFound { status, .. } => Some(*status),
+            Error::PremiumRequired { status, .. } | Error::FeatureUnavailable { status, .. } => {
+                *status
+            }
+            Error::Authentication { .. }
+            | Error::RateLimit { .. }
+            | Error::Network(_)
+            | Error::Timeout
+            | Error::Validation { .. }
+            | Error::MissingNetworkId
+            | Error::Storage(_)
+            | Error::Json(_) => None,
+        }
+    }
+
     /// Returns `true` if this error represents an authentication failure.
     ///
     /// Mirrors the Python `is_auth_error()` predicate exactly: `true` for
-    /// [`Error::Authentication`] unconditionally (`exceptions.py:19-21`), and for
-    /// [`Error::Api`] iff `status == 401` (`exceptions.py:44-46`). No other variant is ever an
-    /// auth error — in particular a `403` (likely "insufficient subscription", per
-    /// `api/insights.py:88-89`) is deliberately *not* treated as one, matching Python's
-    /// exact-equality-against-401 semantics.
+    /// [`Error::Authentication`] unconditionally (`exceptions.py`'s override on
+    /// `EeroAuthenticationException`), and for every status-carrying variant whose `status`
+    /// (when known) equals `401` (`EeroAPIException.is_auth_error`, inherited by every one of
+    /// its subclasses). In practice no variant other than `Authentication` is ever constructed
+    /// with `status == 401` by this crate's own classification (401 always routes to
+    /// `Authentication` first, per [`crate::errors::error_for_response`]'s precedence), but the
+    /// check is written generically so it stays correct for any hand-constructed error too.
     #[must_use]
     pub fn is_auth_error(&self) -> bool {
-        matches!(self, Error::Authentication(_)) || matches!(self, Error::Api { status: 401, .. })
+        matches!(self, Error::Authentication { .. }) || self.status() == Some(401)
     }
 }
 
@@ -205,8 +377,8 @@ impl Error {
 /// This lives in `error.rs`, not `storage/`, so that `error.rs` has no dependency on the
 /// storage module; `storage::mod` re-exports it as `pub use crate::error::StorageError;`.
 ///
-/// `#[non_exhaustive]` so Phase 2 storage work can add backend-specific variants without a
-/// breaking change.
+/// `#[non_exhaustive]` so storage work can add backend-specific variants without a breaking
+/// change.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StorageError {
@@ -236,150 +408,37 @@ pub enum StorageError {
     Empty,
 }
 
-/// Truncates `text` to at most [`MAX_ERROR_BODY_CHARS`] Unicode scalar values, appending a
-/// marker that reports the *original* length.
-///
-/// Mirrors `_truncate_for_error` (`api/base.py:29-33`) exactly: if `text` is at most
-/// `MAX_ERROR_BODY_CHARS` characters long it is returned unchanged; otherwise the first
-/// `MAX_ERROR_BODY_CHARS` characters are kept and
-/// `"... [truncated, {original_length} chars total]"` is appended, where `original_length` is
-/// the *pre-truncation* character count — not the truncated length and not the byte length.
-///
-/// Truncation happens on `char` (Unicode scalar value) boundaries, matching Python's `str`
-/// slicing by code point, so this never panics on a multi-byte UTF-8 boundary the way a naive
-/// byte-index slice (`&text[..MAX_ERROR_BODY_CHARS]`) could.
-/// Called from `transport.rs`'s `status_to_envelope` at every site that embeds a response body
-/// in an `Error::Api`/`Error::Authentication` message (four call sites as of this writing: the
-/// invalid-JSON-on-2xx, `401`, `404`, and generic non-`2xx` arms).
-pub(crate) fn truncate_for_error(text: &str) -> String {
-    let char_count = text.chars().count();
-    if char_count <= MAX_ERROR_BODY_CHARS {
-        return text.to_owned();
-    }
-    let truncated: String = text.chars().take(MAX_ERROR_BODY_CHARS).collect();
-    format!("{truncated}... [truncated, {char_count} chars total]")
-}
-
-/// Case-insensitive substring markers used by [`sanitize_body_for_error`]'s fallback path for a
-/// response body that does not parse as JSON at all.
-///
-/// A deliberately small, independently-maintained list rather than a re-export of
-/// [`crate::redact`]'s own (private) `SENSITIVE_PATTERNS`: `redact.rs` is owned by a different
-/// task in this port and out of scope here, and its list is tuned for *structured* (parsed)
-/// JSON keys, not for scanning raw, possibly-truncated text. Keeping this list conservative and
-/// separate means a body that merely fails to parse is still protected without reaching into
-/// another module's private surface.
-const RAW_TEXT_SENSITIVE_MARKERS: &[&str] = &[
-    "token",
-    "password",
-    "passwd",
-    "secret",
-    "session_id",
-    "session_token",
-    "credential",
-    "cookie",
-    "authorization",
-    "bearer",
-    "private",
-];
-
-/// Returns `true` if `text`, matched case-insensitively as a substring, contains anything that
-/// looks like a credential — the fallback heuristic [`sanitize_body_for_error`] applies to a body
-/// it cannot structurally parse, and (security finding F5) to every string *value* left visible
-/// after [`crate::redact::redact_sensitive`] has run.
-fn looks_sensitive(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    RAW_TEXT_SENSITIVE_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
-}
-
-/// Returns `true` if any string *value* (never a key) reachable from `value` looks sensitive per
-/// [`looks_sensitive`].
-///
-/// Deliberately walks only values, not keys: [`crate::redact::redact_sensitive`] already replaced
-/// every value found under a sensitive *key* with a fixed, non-sensitive-looking marker (e.g.
-/// `"eyJs...[REDACTED:32chars]"`), but it leaves the key name itself — e.g. the literal text
-/// `"session_token"` — in the serialized JSON. [`RAW_TEXT_SENSITIVE_MARKERS`] contains several
-/// strings that are also completely ordinary JSON key names (`"token"`, `"password"`, `"cookie"`,
-/// ...), so scanning the *whole* redacted rendering as one string (keys included) would flag
-/// every body that ever carried a sensitive key, even after that key's value was safely redacted
-/// — defeating the entire point of doing structured, per-key redaction first. Scanning only
-/// values catches the case redaction cannot: a secret sitting under a key that is not on
-/// `redact_sensitive`'s own key-pattern list (e.g. a password echoed back under `"error"`).
-fn value_contains_sensitive_text(value: &Value) -> bool {
-    match value {
-        Value::String(text) => looks_sensitive(text),
-        Value::Array(items) => items.iter().any(value_contains_sensitive_text),
-        Value::Object(map) => map.values().any(value_contains_sensitive_text),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
-    }
-}
-
-/// Prepares a response body for embedding in an [`Error::Api`] or [`Error::Authentication`]
-/// message (security finding F5): unlike [`truncate_for_error`], this never embeds a credential
-/// verbatim.
-///
-/// - If `body` parses as JSON, it is run through [`crate::redact::redact_sensitive`] first. If
-///   [`value_contains_sensitive_text`] still finds a sensitive-looking string *value* anywhere in
-///   the redacted tree — i.e. a secret that survived because it was submitted under a key
-///   `redact_sensitive` does not recognise as sensitive (the scenario this finding closes: a
-///   server echoing a submitted Wi-Fi password back under a plain `"error"` key) — the entire
-///   body is replaced with the same fixed marker the raw-text fallback below uses, rather than
-///   truncated. Otherwise the redacted rendering is truncated and returned; a typical error body
-///   (e.g. `{"meta":{"code":404,"error":"..."}}`) contains no such value, so it comes back
-///   unchanged in substance — only its exact byte layout changes (compact re-serialization, and
-///   `serde_json::Map`'s default key ordering), which is a deliberate, documented divergence from
-///   Python's verbatim-body messages (see this crate's `notes` for this change, recorded for
-///   `PARITY.md`).
-/// - If `body` does not parse as JSON at all (the only way `status_to_envelope`'s
-///   invalid-JSON-on-2xx arm can be reached in the first place, since any syntactically valid
-///   JSON on a 2xx succeeds as an `Envelope` instead of becoming an error), a body that is
-///   irrecoverably malformed cannot be redacted field-by-field. [`looks_sensitive`] is a
-///   conservative substring scan of the *raw* text as a fallback: if it fires, the entire body is
-///   replaced with a fixed marker rather than truncated verbatim, since a truncated prefix of a
-///   credential-carrying body can still itself carry the credential (see the `login`/`refresh`
-///   scenario this guards against). Otherwise the raw text is truncated exactly as before.
-///
-/// [`truncate_for_error`]'s truncation still applies in every branch that does not suppress the
-/// body outright.
-pub(crate) fn sanitize_body_for_error(body: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        let redacted = redact::redact_sensitive(&value);
-        if value_contains_sensitive_text(&redacted) {
-            return "[response body omitted: contains data that looks sensitive]".to_owned();
-        }
-        return truncate_for_error(&redacted.to_string());
-    }
-    if looks_sensitive(body) {
-        return "[response body omitted: contains data that looks sensitive]".to_owned();
-    }
-    truncate_for_error(body)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{Error, StorageError, truncate_for_error};
+    use super::{Error, StorageError};
 
     // ===================== Display strings =====================
 
     #[test]
     fn authentication_display_is_verbatim_message() {
-        let err = Error::Authentication("Not authenticated".to_owned());
+        let err = Error::authentication("Not authenticated");
         assert_eq!(err.to_string(), "Not authenticated");
     }
 
     #[test]
-    fn rate_limit_display_is_fixed_message() {
-        let err = Error::RateLimit { retry_after: None };
-        assert_eq!(err.to_string(), "Rate limit exceeded");
+    fn rate_limit_display_is_the_message() {
+        let err = Error::RateLimit {
+            message: "error.rate.limit".to_owned(),
+            retry_after: None,
+            envelope: None,
+            error_code: Some("error.rate.limit".to_owned()),
+        };
+        assert_eq!(err.to_string(), "error.rate.limit");
 
         let err = Error::RateLimit {
+            message: "error.rate.limit".to_owned(),
             retry_after: Some(Duration::from_secs(30)),
+            envelope: None,
+            error_code: None,
         };
-        assert_eq!(err.to_string(), "Rate limit exceeded");
+        assert_eq!(err.to_string(), "error.rate.limit");
     }
 
     #[test]
@@ -387,6 +446,8 @@ mod tests {
         let err = Error::Api {
             status: 500,
             message: "boom".to_owned(),
+            envelope: None,
+            error_code: None,
             url: None,
         };
         assert_eq!(err.to_string(), "API error 500: boom");
@@ -397,6 +458,8 @@ mod tests {
         let err = Error::Api {
             status: 404,
             message: "not found".to_owned(),
+            envelope: None,
+            error_code: None,
             url: Some("https://api-user.e2ro.com/2.2/foo?s=secret-token".to_owned()),
         };
         let rendered = err.to_string();
@@ -410,40 +473,77 @@ mod tests {
     }
 
     #[test]
-    fn not_found_display_matches_python_format() {
-        let err = Error::NotFound {
-            resource_type: "network".to_owned(),
-            resource_id: "abc".to_owned(),
+    fn access_denied_display_matches_python_format() {
+        let err = Error::AccessDenied {
+            status: 403,
+            message: "error.access.denied".to_owned(),
+            envelope: None,
+            error_code: Some("error.access.denied".to_owned()),
         };
-        assert_eq!(err.to_string(), "network 'abc' not found");
+        assert_eq!(err.to_string(), "API error 403: error.access.denied");
     }
 
     #[test]
-    fn premium_required_display_matches_python_format() {
+    fn client_blocked_display_matches_python_format() {
+        let err = Error::ClientBlocked {
+            status: 200,
+            message: "error.app.version.blocked".to_owned(),
+            envelope: None,
+            error_code: None,
+        };
+        assert_eq!(err.to_string(), "API error 200: error.app.version.blocked");
+    }
+
+    #[test]
+    fn not_found_display_matches_python_format() {
+        let err = Error::NotFound {
+            status: 404,
+            message: "unrecognised error string".to_owned(),
+            envelope: None,
+            error_code: None,
+        };
+        assert_eq!(err.to_string(), "API error 404: unrecognised error string");
+    }
+
+    #[test]
+    fn premium_required_display_matches_python_str_of_optional_status() {
         let err = Error::PremiumRequired {
-            feature: "This feature".to_owned(),
+            status: Some(200),
+            message: "error.premium.user_not_subscribed".to_owned(),
+            envelope: None,
+            error_code: None,
         };
         assert_eq!(
             err.to_string(),
-            "This feature requires an Eero Plus subscription"
+            "API error 200: error.premium.user_not_subscribed"
+        );
+
+        let err = Error::PremiumRequired {
+            status: None,
+            message: "This feature requires an Eero Plus subscription".to_owned(),
+            envelope: None,
+            error_code: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "API error None: This feature requires an Eero Plus subscription"
         );
     }
 
     #[test]
     fn feature_unavailable_display_matches_python_format() {
         let err = Error::FeatureUnavailable {
-            feature: "Thread".to_owned(),
-            reason: "not supported on this device".to_owned(),
+            status: Some(200),
+            message: "error.eero.offline".to_owned(),
+            envelope: None,
+            error_code: None,
         };
-        assert_eq!(err.to_string(), "Thread is not supported on this device");
+        assert_eq!(err.to_string(), "API error 200: error.eero.offline");
     }
 
     #[test]
     fn validation_display_matches_python_format() {
-        let err = Error::Validation {
-            field: "field".to_owned(),
-            message: "msg".to_owned(),
-        };
+        let err = Error::validation("field", "msg");
         assert_eq!(err.to_string(), "Validation error for 'field': msg");
     }
 
@@ -497,16 +597,54 @@ mod tests {
         );
     }
 
+    // ===================== accessors =====================
+
+    #[test]
+    fn envelope_and_error_code_accessors_round_trip() {
+        let envelope = serde_json::json!({"meta": {"code": 404}});
+        let err = Error::NotFound {
+            status: 404,
+            message: "unrecognised error string".to_owned(),
+            envelope: Some(envelope.clone()),
+            error_code: Some("weird".to_owned()),
+        };
+        assert_eq!(err.envelope(), Some(&envelope));
+        assert_eq!(err.error_code(), Some("weird"));
+        assert_eq!(err.status(), Some(404));
+    }
+
+    #[test]
+    fn envelope_and_error_code_are_none_for_client_side_errors() {
+        let err = Error::authentication("Not authenticated");
+        assert_eq!(err.envelope(), None);
+        assert_eq!(err.error_code(), None);
+        assert_eq!(err.status(), None);
+
+        assert_eq!(Error::Timeout.envelope(), None);
+        assert_eq!(Error::MissingNetworkId.error_code(), None);
+    }
+
     // ===================== is_auth_error() =====================
 
     #[test]
     fn is_auth_error_matrix() {
-        assert!(Error::Authentication("Not authenticated".to_owned()).is_auth_error());
+        assert!(Error::authentication("Not authenticated").is_auth_error());
         assert!(
             Error::Api {
                 status: 401,
                 message: String::new(),
+                envelope: None,
+                error_code: None,
                 url: None,
+            }
+            .is_auth_error()
+        );
+        assert!(
+            Error::AccessDenied {
+                status: 401,
+                message: String::new(),
+                envelope: None,
+                error_code: None,
             }
             .is_auth_error()
         );
@@ -515,133 +653,65 @@ mod tests {
             !Error::Api {
                 status: 403,
                 message: String::new(),
+                envelope: None,
+                error_code: None,
                 url: None,
             }
             .is_auth_error()
         );
         assert!(
-            !Error::Api {
-                status: 404,
+            !Error::AccessDenied {
+                status: 403,
                 message: String::new(),
-                url: None,
+                envelope: None,
+                error_code: None,
             }
             .is_auth_error()
         );
-        assert!(!Error::RateLimit { retry_after: None }.is_auth_error());
-        assert!(!Error::Timeout.is_auth_error());
         assert!(
             !Error::NotFound {
-                resource_type: "network".to_owned(),
-                resource_id: "x".to_owned(),
+                status: 404,
+                message: String::new(),
+                envelope: None,
+                error_code: None,
             }
             .is_auth_error()
         );
         assert!(
+            !Error::RateLimit {
+                message: String::new(),
+                retry_after: None,
+                envelope: None,
+                error_code: None,
+            }
+            .is_auth_error()
+        );
+        assert!(!Error::Timeout.is_auth_error());
+        assert!(
             !Error::PremiumRequired {
-                feature: "x".to_owned(),
+                status: None,
+                message: String::new(),
+                envelope: None,
+                error_code: None,
             }
             .is_auth_error()
         );
         assert!(
             !Error::FeatureUnavailable {
-                feature: "x".to_owned(),
-                reason: "y".to_owned(),
+                status: None,
+                message: String::new(),
+                envelope: None,
+                error_code: None,
             }
             .is_auth_error()
         );
-        assert!(
-            !Error::Validation {
-                field: "x".to_owned(),
-                message: "y".to_owned(),
-            }
-            .is_auth_error()
-        );
+        assert!(!Error::validation("x", "y").is_auth_error());
         assert!(!Error::MissingNetworkId.is_auth_error());
         assert!(!Error::Storage(StorageError::NotFound).is_auth_error());
         assert!(
             !Error::Json(serde_json::from_str::<serde_json::Value>("bad").unwrap_err())
                 .is_auth_error()
         );
-    }
-
-    // ===================== truncate_for_error =====================
-
-    #[test]
-    fn truncate_for_error_passes_short_body_through_unchanged() {
-        let body = r#"{"error":"s=secret-token"}"#;
-        assert_eq!(truncate_for_error(body), body);
-    }
-
-    #[test]
-    fn truncate_for_error_truncates_long_ascii_body_and_reports_original_length() {
-        let body = "a".repeat(600);
-        let truncated = truncate_for_error(&body);
-        let expected = format!("{}... [truncated, 600 chars total]", "a".repeat(512));
-        assert_eq!(truncated, expected);
-    }
-
-    #[test]
-    fn truncate_for_error_does_not_panic_on_multibyte_boundary() {
-        // 600 multi-byte characters (each "é" is 2 bytes in UTF-8): a naive byte-index slice
-        // at index 512 would either panic or split a character in half. Truncating by `char`
-        // must land exactly on the 512th character and report 600 as the original length,
-        // counted in characters, not bytes.
-        let body = "é".repeat(600);
-        let truncated = truncate_for_error(&body);
-        let expected = format!("{}... [truncated, 600 chars total]", "é".repeat(512));
-        assert_eq!(truncated, expected);
-        // Sanity: the byte length is double the char length, confirming this body would have
-        // panicked under a byte-index slice at an odd offset.
-        assert_eq!(body.len(), 1200);
-    }
-
-    #[test]
-    fn truncate_for_error_boundary_exactly_at_limit_is_unchanged() {
-        let body = "a".repeat(512);
-        assert_eq!(truncate_for_error(&body), body);
-    }
-
-    // ===================== sanitize_body_for_error (finding F5) =====================
-
-    #[test]
-    fn sanitize_body_for_error_redacts_a_parseable_json_body() {
-        let body = r#"{"meta":{"code":200},"data":{"session_token":"eyJsecret-value"}}"#;
-        let sanitized = super::sanitize_body_for_error(body);
-        // `redact::redact_sensitive` keeps a short, fixed-length visible prefix (matching
-        // Python's `_redact_value`); the point of this test is that the *full* credential is
-        // gone, not that every leading character is.
-        assert!(!sanitized.contains("eyJsecret-value"));
-        assert!(sanitized.contains("REDACTED"));
-    }
-
-    #[test]
-    fn sanitize_body_for_error_leaves_a_typical_error_body_unaffected_in_substance() {
-        let body = r#"{"meta":{"code":404,"error":"resource not found"}}"#;
-        let sanitized = super::sanitize_body_for_error(body);
-        let value: serde_json::Value = serde_json::from_str(&sanitized).expect("still valid json");
-        assert_eq!(value["meta"]["code"], 404);
-        assert_eq!(value["meta"]["error"], "resource not found");
-    }
-
-    #[test]
-    fn sanitize_body_for_error_omits_an_unparseable_body_that_looks_sensitive() {
-        // Deliberately truncated/malformed, exactly like a cut-off `login/refresh` response —
-        // the scenario security finding F5 exists to close.
-        let body = concat!(
-            r#"{"meta":{"code":200},"data":{"session_token":"eyJsecret-session-value","#,
-            r#""refresh_token":"eyJsecret-refresh-value"#,
-        );
-        assert!(serde_json::from_str::<serde_json::Value>(body).is_err());
-        let sanitized = super::sanitize_body_for_error(body);
-        assert!(!sanitized.contains("eyJsecret"));
-        assert!(!sanitized.contains("session-value"));
-        assert!(!sanitized.contains("refresh-value"));
-    }
-
-    #[test]
-    fn sanitize_body_for_error_truncates_an_unparseable_body_with_nothing_sensitive() {
-        let body = "no such account";
-        assert_eq!(super::sanitize_body_for_error(body), body);
     }
 
     // ===================== #[from] conversions =====================
