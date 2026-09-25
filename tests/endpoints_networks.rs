@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use rusteero::endpoints::networks::NetworksApi;
 use rusteero::error::Error;
-use wiremock::matchers::{method, path};
+use serde_json::json;
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
@@ -22,6 +23,11 @@ use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
 /// with [`TEST_TOKEN`] (see [`MockEero::transport_with_token`]).
 fn networks_api(mock: &MockEero) -> NetworksApi {
     NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
+}
+
+/// A small, obviously-synthetic success envelope every write test in this file can share.
+fn ok_envelope() -> serde_json::Value {
+    json!({ "meta": { "code": 200 }, "data": {} })
 }
 
 // ===================== get_networks =====================
@@ -128,5 +134,111 @@ async fn get_network_with_unknown_id_maps_404_to_api_error() -> anyhow::Result<(
     };
     assert_eq!(*status, 404);
     assert!(!err.is_auth_error());
+    Ok(())
+}
+
+// ============================= NetworksApi::set_guest_network =============================
+
+#[tokio::test]
+async fn set_guest_network_puts_guestnetwork_with_full_payload() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .and(body_json(
+            json!({ "enabled": true, "name": "Guest", "password": "hunter2" }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = networks_api(&mock);
+    let env = api
+        .set_guest_network("network-0001", true, Some("Guest"), Some("hunter2"))
+        .await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_guest_network_with_only_enabled_omits_name_and_password() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // An exact `body_json` match on a body with only "enabled": if `name`/`password` were ever
+    // sent as `null` keys instead of omitted entirely, this mock would never match.
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .and(body_json(json!({ "enabled": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = networks_api(&mock);
+    let env = api
+        .set_guest_network("network-0001", false, None, None)
+        .await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+// ================================ NetworksApi::run_speed_test ================================
+
+#[tokio::test]
+async fn run_speed_test_posts_empty_body_to_speedtest_path() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/speedtest"))
+        .and(session_cookie())
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = networks_api(&mock);
+    let env = api.run_speed_test("network-0001").await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+// ================================ NetworksApi::reboot_network ================================
+
+#[tokio::test]
+async fn reboot_network_posts_empty_body_to_reboot_path() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/reboot"))
+        .and(session_cookie())
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = networks_api(&mock);
+    let env = api.reboot_network("network-0001").await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+// =============================== NetworksApi::set_network_name ===============================
+
+#[tokio::test]
+async fn set_network_name_puts_settings_with_name() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(body_json(json!({ "name": "My Network" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = networks_api(&mock);
+    let env = api.set_network_name("network-0001", "My Network").await?;
+    assert_eq!(env.into_value(), ok_envelope());
     Ok(())
 }

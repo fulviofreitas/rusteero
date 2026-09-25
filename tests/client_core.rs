@@ -1,23 +1,30 @@
-//! P4 `Client` integration suite: the cache actually working end to end.
+//! `Client` integration suite: core mechanics that are not specific to any one domain — the
+//! cache actually working end to end, network-id resolution, and every place `Client` clears its
+//! cache.
 //!
-//! Covers, against a local `wiremock` server per the crate's testing conventions: the eight cached
+//! Covers, against a local `wiremock` server per the crate's testing conventions: the cached
 //! getters serving a second call from cache; `refresh_cache`/`cache_ttl(Duration::ZERO)`
 //! bypassing that cache; TTL expiry (via `tokio::time::pause()`/`advance()`, never a real
 //! `sleep`); the falsy-value rule end to end (`src/cache.rs`'s `is_falsy` — a real Python quirk,
 //! not a bug); two networks' cache entries never colliding; network-id resolution
 //! (`Client::ensure_network_id` — explicit id, preferred id, auto-discovery in both its `id` and
-//! `url`-tail shapes, and the `Error::MissingNetworkId` failure path); the `/account` fallback
-//! inside `get_networks` (the synthesised envelope and its `preferred_network_id` side effect);
-//! and every place `Client` clears its cache (`clear_cache`, `logout`, `set_session_token`,
-//! `clear_session_token`).
+//! `url`-tail shapes, and the `Error::MissingNetworkId` failure path); every place `Client`
+//! clears its cache (`clear_cache`, `logout`, `set_session_token`, `clear_session_token`); and
+//! that a failed `logout` still clears the cache (security review finding F1).
+//!
+//! `get_devices` is used throughout purely as a convenient, already-cached vehicle to exercise
+//! these generic `Client`/`Cache` mechanics — none of the assertions here are about `DevicesApi`
+//! business logic itself (that lives in `endpoints_devices.rs`/`client_devices.rs`). The
+//! `/account` fallback of `get_networks`, and `get_networks`/`get_account`-specific caching, are
+//! judged to be networks-domain tests and live in `client_networks.rs` instead — see that file's
+//! module docs for the reasoning.
 //!
 //! Every caching test asserts on the wiremock `.expect(n)` call count, not just the returned
 //! value — a caching test that only checks the envelope is not testing caching at all (see
-//! the crate's testing conventions' "Assertion Patterns"). Two tests below (`logout_...` and
-//! `clear_session_token_...`) restore a session directly at the `EeroApi` layer via
-//! [`Client::api`] rather than through `Client::set_session_token` — deliberately, so that
-//! restoring the ability to make a second request never itself clears the cache and masks a
-//! regression in the very call site under test.
+//! the crate's testing conventions' "Assertion Patterns"). `logout_...`/`clear_session_token_...`
+//! restore a session directly at the `EeroApi` layer via [`Client::api`] rather than through
+//! `Client::set_session_token` — deliberately, so that restoring the ability to make a second
+//! request never itself clears the cache and masks a regression in the very call site under test.
 
 mod common;
 
@@ -340,8 +347,8 @@ async fn missing_network_id_after_failed_auto_discovery_makes_no_downstream_requ
     let mock = MockEero::start().await;
     let empty_networks = json!({"meta": {"code": 200}, "data": []});
     // The `/networks` list is empty, so `Client::get_networks` will itself attempt the
-    // `/account` fallback (see the tests below) before auto-discovery gives up; that fallback
-    // must also come back empty here so resolution genuinely finds nothing.
+    // `/account` fallback (covered in `client_networks.rs`) before auto-discovery gives up; that
+    // fallback must also come back empty here so resolution genuinely finds nothing.
     let empty_account = json!({"meta": {"code": 200}, "data": {"networks": {"data": []}}});
 
     Mock::given(method("GET"))
@@ -375,88 +382,6 @@ async fn missing_network_id_after_failed_auto_discovery_makes_no_downstream_requ
         requests.iter().all(|r| !r.url.path().contains("/devices")),
         "no device request should ever have been attempted: {requests:?}"
     );
-    Ok(())
-}
-
-// ===================== The `/account` fallback =====================
-
-/// *** The `/account` fallback, end to end. ***
-///
-/// When `/networks` comes back empty, `Client::get_networks` forces a live `/account` fetch and,
-/// if that yields a non-empty list, synthesises a new envelope: `meta` from the ORIGINAL
-/// `/networks` response, `data.networks` from the account-derived list (brief gotcha G1). This
-/// also derives `preferred_network_id` as a one-shot side effect.
-#[tokio::test]
-async fn get_networks_falls_back_to_account_when_the_list_is_empty() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    let empty_networks = json!({
-        "meta": {"code": 200, "server_time": "2020-01-01T00:00:00Z"},
-        "data": [],
-    });
-
-    Mock::given(method("GET"))
-        .and(path("/2.2/networks"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(empty_networks.to_string()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/2.2/account"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let client = client(&mock).await;
-    let env = client.get_networks(false).await?;
-
-    // The synthesised envelope's `meta` is the ORIGINAL `/networks` response's `meta`, not
-    // `/account`'s (whose `server_time` is a different, fixture-owned value — see
-    // `tests/fixtures/account.json`).
-    assert_eq!(env.meta().code, Some(200));
-    assert_eq!(
-        env.meta().server_time.as_deref(),
-        Some("2020-01-01T00:00:00Z")
-    );
-    assert_ne!(
-        env.meta().server_time.as_deref(),
-        fixture_json("account.json")["meta"]["server_time"].as_str()
-    );
-
-    let expected_networks = fixture_json("account.json")["data"]["networks"]["data"].clone();
-    assert_eq!(env.data()["networks"], expected_networks);
-
-    assert_eq!(
-        client.preferred_network_id().as_deref(),
-        Some("network-0001"),
-        "the account fallback must derive a preferred network as a side effect"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn get_networks_does_not_fall_back_when_the_list_is_non_empty() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("GET"))
-        .and(path("/2.2/networks"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("networks.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/2.2/account"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
-        .expect(0)
-        .mount(&mock.server)
-        .await;
-
-    let client = client(&mock).await;
-    let env = client.get_networks(false).await?;
-    assert_eq!(env.as_value(), &fixture_json("networks.json"));
     Ok(())
 }
 
@@ -553,5 +478,46 @@ async fn clear_session_token_clears_the_cache() -> anyhow::Result<()> {
     // in `clear_session_token` itself.
     client.api().auth().set_session_token(TEST_TOKEN)?;
     client.get_devices(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+/// **F1** (security review): `AuthApi::logout` clears the in-memory session and credential store
+/// unconditionally, on every outcome (see `src/auth/mod.rs`'s own docs) — but the previous
+/// `Client::logout` only cleared *this client's cache* when the network call itself succeeded.
+/// That let a cached `get_network`/`get_account`/`get_devices`/`get_profiles` keep serving
+/// pre-logout data for the rest of the TTL even though `is_authenticated()` had already flipped
+/// to `false`. This primes the `network` bucket, forces `logout()` to fail on the wire (500),
+/// and asserts the cache can no longer serve the second `get_network` call: with both the cache
+/// and the session gone, it must fail with `Error::Authentication`, not silently return the
+/// stale envelope.
+#[tokio::test]
+async fn logout_failure_still_clears_the_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+
+    let err = client.logout().await.unwrap_err();
+    assert!(matches!(err, Error::Api { status: 500, .. }));
+    assert!(!client.is_authenticated());
+
+    // Before the fix this served the pre-logout envelope straight from cache (`Ok`), with no
+    // auth check at all. After the fix the cache is empty and the session is gone, so this must
+    // fail closed rather than leak the earlier authenticated response.
+    let after = client.get_network(Some("network-0001"), false).await;
+    assert!(matches!(after, Err(Error::Authentication(_))));
     Ok(())
 }
