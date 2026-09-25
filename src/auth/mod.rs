@@ -2,8 +2,7 @@
 //! representation, the interactive login handshake ([`flow`]), and the network-facing
 //! authentication API ([`AuthApi`]).
 //!
-//! Ported from `eero-api`'s `src/eero/api/auth.py`. See
-//! the auth behaviour notes for the full behaviour brief this module implements.
+//! Ported from `eero-api`'s `src/eero/api/auth.py` at `v8.0.4`.
 pub mod flow;
 pub mod session;
 
@@ -11,31 +10,25 @@ pub use session::Session;
 
 use std::sync::Arc;
 
-use serde_json::json;
+use reqwest::Method;
 
-use crate::envelope::Envelope;
+use crate::consts;
 use crate::error::{Error, StorageError};
 use crate::routes;
-use crate::transport::{StorageFailures, Transport};
-
-/// The exact validation message Python raises for an empty token
-/// (`exceptions.py:85`, called with `("token", "must be a non-empty string")` at
-/// `api/auth.py:407-408`).
-const EMPTY_TOKEN_MESSAGE: &str = "must be a non-empty string";
+use crate::transport::{RequestBody, StorageFailures, Transport};
 
 /// The network-facing half of `eero-api`'s `AuthAPI` (`src/eero/api/auth.py`): everything except
 /// the interactive login handshake itself, which lives in [`flow`] as a separable type-state pair
 /// ([`flow::LoginFlow`] / [`flow::PendingLogin`]).
 ///
-/// Build one with [`AuthApi::new`], wrapping any already-configured [`Transport`] — the same
+/// Build one with [`AuthApi::new`], wrapping an already-configured [`Transport`] — the same
 /// `Transport` a [`flow::LoginFlow`] can be pointed at, so a `Session` obtained from
 /// [`flow::PendingLogin::verify`] and handed to `Transport::set_session` is immediately usable
 /// here too. Use [`AuthApi::from_shared`] instead when the caller already holds an `Arc<Transport>`
-/// it needs to keep sharing with other consumers (e.g. the `EeroApi` aggregator's 25 domain
-/// modules) — both constructors produce an `AuthApi` backed by the exact same allocation the
-/// caller passed in, never a copy. `AuthApi` holds the `Transport` behind an `Arc` internally so
-/// that [`AuthApi::logout`] can move a handle onto a `tokio::task::spawn_blocking` task for its
-/// credential-store write without requiring `Transport` itself to be `Clone`.
+/// it needs to keep sharing with other consumers (e.g. the `EeroApi` aggregator's domain
+/// modules). `AuthApi` holds the `Transport` behind an `Arc` internally so that [`AuthApi::logout`]
+/// can move a handle onto a `tokio::task::spawn_blocking` task for its credential-store write
+/// without requiring `Transport` itself to be `Clone`.
 #[derive(Debug)]
 pub struct AuthApi {
     transport: Arc<Transport>,
@@ -43,22 +36,12 @@ pub struct AuthApi {
 
 impl AuthApi {
     /// Wraps `transport` as an `AuthApi`, allocating a new `Arc` around it.
-    ///
-    /// For a `Transport` that must also be shared with other consumers (so that, e.g., `logout`
-    /// actually affects the session everyone else observes), build the `Arc<Transport>` once and
-    /// use [`AuthApi::from_shared`] instead.
     #[must_use]
     pub fn new(transport: Transport) -> Self {
         Self::from_shared(Arc::new(transport))
     }
 
     /// Wraps an already-shared `transport` as an `AuthApi`, without allocating a new `Arc`.
-    ///
-    /// This is the constructor every other endpoint module's own `XxxApi::new(Arc<Transport>)`
-    /// already uses; `AuthApi` gains it so that a caller holding one `Arc<Transport>` — the
-    /// `EeroApi` aggregator, in particular — can hand the very same allocation to `AuthApi` and
-    /// to every domain module, rather than being forced to give `AuthApi` a detached, separately
-    /// configured `Transport` that nothing else can observe.
     #[must_use]
     pub fn from_shared(transport: Arc<Transport>) -> Self {
         Self { transport }
@@ -71,15 +54,13 @@ impl AuthApi {
         &self.transport
     }
 
-    /// Whether a session is configured, has a non-empty token, and has not passed its
-    /// client-fabricated expiry.
+    /// Whether a session is configured and has a non-empty token.
     ///
-    /// Ported from the `is_authenticated` property (`api/auth.py:51-62`; brief lines 286-296):
-    /// this is a purely local check, delegating entirely to [`Transport::is_authenticated`] (in
-    /// turn `Session::is_valid`) — it never makes a network call and never attempts a refresh,
-    /// matching Python's own property exactly (the only side effect Python's version has beyond
-    /// this crate's is a `DEBUG` log line on the expired-but-present case, which carries no
-    /// observable behaviour worth reproducing).
+    /// Ported from the `is_authenticated` property (`api/auth.py:108-118`): a pure token-presence
+    /// check — `v8.0.4` has no client-side session expiry anywhere ("There is no client-side
+    /// session expiry -- the server is the sole authority on session validity, signalled via 401
+    /// responses.") — delegating entirely to [`Transport::is_authenticated`]. Never makes a
+    /// network call and never attempts a refresh.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         self.transport.is_authenticated()
@@ -95,78 +76,69 @@ impl AuthApi {
 
     /// Logs the current session out.
     ///
-    /// Ported from `logout()` (`api/auth.py:239-277`; see the auth behaviour notes lines
-    /// 171-202 for the full behaviour brief). Sends `POST` [`crate::routes::LOGOUT`] with body
-    /// `{}` (`auth.py:256`, "Empty payload for logout"), through [`Transport::send`] — which
-    /// already implements the "not authenticated" precondition (`auth.py:248-250`) and every
-    /// status-to-error mapping a real logout response can produce, so no separate guard is
-    /// needed here.
+    /// Ported from `logout()` (`api/auth.py:293-330`). If no valid session is configured, logs a
+    /// `WARNING` (`"Attempted to logout when not authenticated"`) and returns `Ok(false)` **with
+    /// no network call at all** (`auth.py:307-309`) — unlike every other authenticated call in
+    /// this crate, `logout` never raises `Error::Authentication("Not authenticated")` for this
+    /// case, matching Python's own guard exactly. Otherwise, sends `POST` [`routes::LOGOUT`]
+    /// authenticated by the current token, with a **form** body whose single field is literally
+    /// named [`consts::LOGOUT_COOKIE_FIELD_NAME`] (`"Cookie"`) and whose value is
+    /// [`consts::SESSION_COOKIE_PREFIX`] (`"s="`) followed by the token — not the real HTTP
+    /// `Cookie` header, and not JSON (`auth.py:309-314`).
     ///
-    /// # Divergence from eero-api (`auth.py:239-277`)
-    ///
-    /// Python's cleanup (`clear_all()` plus persisting the cleared credentials) only runs when
-    /// the network call raised nothing, or raised the equivalent of [`Error::Authentication`] (a
-    /// 401, treated as "already logged out server-side") or a generic [`Error::Api`]
-    /// (`auth.py:259-266`): a 429 ([`Error::RateLimit`]) or a network/timeout failure
-    /// ([`Error::Network`] / [`Error::Timeout`]) is **not** caught by any of `logout()`'s three
-    /// `except` clauses and propagates straight out, **skipping** the cleanup block entirely
-    /// (the auth behaviour notes lines 189-193) — contradicting both Python's own "Always
-    /// clear local credentials regardless of API response" comment (`auth.py:269`) and this
-    /// port's plan. `rusteero` always clears the in-memory session and persists that clear to the
-    /// credential store, regardless of the outcome of the network call (including the local
-    /// "not authenticated" precondition failure, treated here as just another outcome), and only
-    /// then returns that outcome unmodified — leaving a live token behind after a failed logout
-    /// is the strictly less safe choice, and matches Python's own stated intent even though its
-    /// implementation does not honour it.
+    /// Every failure mode from that request — an authentication error, a generic API error, a
+    /// rate limit, a network failure, a timeout — is logged at `WARN` and otherwise ignored
+    /// (`auth.py:315-327`): `logout()` **never propagates a network/API error**. Credentials are
+    /// always destroyed afterward, in memory and in every configured backend
+    /// (`CredentialStore::clear`, not a `save` with an emptied session), regardless of the network
+    /// outcome, and this then returns `Ok(true)`.
     ///
     /// # Errors
     ///
-    /// Propagates whatever [`Transport::send`] produces, including
-    /// `Error::Authentication("Not authenticated")` if no valid session is configured, before any
-    /// network call is made. The in-memory session is always cleared regardless of the network
-    /// outcome or of whether persisting that clear succeeds (decision D-13) — but what this
-    /// method *returns* when persistence fails now depends on the configured
-    /// [`crate::transport::StorageFailures`] policy (security finding T2, fixed after a review
-    /// found the previous version silently discarded a `Fatal`-policy storage failure here,
-    /// leaving an operator who explicitly opted into "storage failures are fatal" with no
-    /// programmatic way to learn the at-rest copy still held the old session):
-    ///
-    /// - If the network call succeeded but the configured store failed to persist the clear
-    ///   under [`crate::transport::StorageFailures::Fatal`], this returns that `Error::Storage`
-    ///   instead of the network `Ok`.
-    /// - If the network call itself failed, that error is always what is returned — even if the
-    ///   storage cleanup also failed under `Fatal` — since it is the more actionable failure and
-    ///   the storage failure is already logged by this method's internal cleanup helper.
-    /// - Under the default [`crate::transport::StorageFailures::Warn`], a storage failure never
-    ///   changes what this method returns, matching the previous behaviour exactly.
-    pub async fn logout(&self) -> Result<Envelope, Error> {
-        let outcome = self
+    /// The only way this returns `Err` past the initial "not authenticated" case is a credential-
+    /// store failure while clearing, under [`crate::transport::StorageFailures::Fatal`] (decision
+    /// D-13, security finding T2): a caller who explicitly opted into "storage failures are
+    /// fatal" can still learn the at-rest copy was not cleared. Under the default
+    /// [`crate::transport::StorageFailures::Warn`], a storage failure here is logged at `WARN`
+    /// and this still returns `Ok(true)`. The in-memory session is always cleared regardless of
+    /// either outcome.
+    pub async fn logout(&self) -> Result<bool, Error> {
+        let Some(session) = self.transport.session().filter(Session::is_valid) else {
+            tracing::warn!("Attempted to logout when not authenticated");
+            return Ok(false);
+        };
+        let token = session.token().clone();
+
+        let url = self.transport.render_url(&routes::LOGOUT, &[])?;
+        let cookie_value = format!(
+            "{}{}",
+            consts::SESSION_COOKIE_PREFIX,
+            Session::expose_secret_token(&token)
+        );
+        let body = RequestBody::Form(vec![(
+            consts::LOGOUT_COOKIE_FIELD_NAME.to_owned(),
+            cookie_value,
+        )]);
+
+        if let Err(err) = self
             .transport
-            .send(&routes::LOGOUT, &[], Some(json!({})))
-            .await;
-
-        // Divergence from eero-api (auth.py:239-277): see this method's doc comment for the full
-        // citation. Clear the in-memory session and persist that clear unconditionally, on every
-        // outcome, rather than reproducing Python's exception-hierarchy gap that skips cleanup on
-        // a 429 or a network failure.
-        let cleanup = self.clear_local_and_store().await;
-
-        match (outcome, cleanup) {
-            (Ok(envelope), Ok(())) => Ok(envelope),
-            // Security finding T2: a successful logout call must not hide a `Fatal`-policy
-            // storage failure — see this method's doc comment.
-            (Ok(_), Err(storage_err)) => Err(storage_err),
-            // The network/auth outcome is the more actionable failure; return it even if the
-            // storage cleanup also failed (already logged by `clear_local_and_store`) rather than
-            // masking the reason the request itself failed with a storage error.
-            (Err(network_err), Ok(()) | Err(_)) => Err(network_err),
+            .request_with_token(Method::POST, url, &[], body, Some(&token))
+            .await
+        {
+            // Every failure mode is swallowed here, per `auth.py:315-327` — logout never
+            // propagates a network/API error. `error` is this crate's ordinary `Display`, which
+            // never embeds a token or raw body text (see `crate::error::Error`'s own docs).
+            tracing::warn!(error = %err, "logout request failed; credentials are still cleared locally");
         }
+
+        self.clear_local_and_store().await?;
+        Ok(true)
     }
 
     /// Attempts to refresh the current session.
     ///
     /// A thin wrapper over [`Transport::refresh_session`]; see that method's docs for the full
-    /// behaviour, ported from `refresh_session()` (`api/auth.py:279-340`; brief lines 204-260).
+    /// behaviour, ported from `refresh_session()`/`_do_refresh()` (`api/auth.py:331-477`).
     ///
     /// # Errors
     ///
@@ -177,25 +149,17 @@ impl AuthApi {
 
     /// Checks whether the current session is usable, without attempting a network refresh.
     ///
-    /// Ported from `ensure_authenticated()` (`api/auth.py:342-360`; brief lines 262-284):
-    /// delegates entirely to [`AuthApi::is_authenticated`], returning
-    /// `Error::Authentication("Not authenticated")` when it is `false`. Python's version also has
-    /// a branch that attempts `refresh_session()` when a session is present but has just passed
-    /// its expiry at the exact instant of the check (`auth.py:352-358`) — the behaviour brief
-    /// establishes that branch is logically unreachable in practice, since a normal login/verify
-    /// never yields a refresh token (`auth.py:295-296`'s own precondition) and `is_authenticated`
-    /// already re-checks expiry via a fresh clock read each time it is evaluated. This port keeps
-    /// the same observable behaviour (a session that has expired is simply "not authenticated")
-    /// rather than inventing a refresh call Python's own logic can never actually reach.
+    /// Ported from `ensure_authenticated()` (`api/auth.py:479-489`): a bare alias for
+    /// [`AuthApi::is_authenticated`] — `v8.0.4` has no expiry-driven refresh branch of any kind
+    /// (there is no client-side expiry concept left to trigger one, see
+    /// [`AuthApi::is_authenticated`]'s own docs).
     ///
     /// # Errors
     ///
     /// Returns `Error::Authentication("Not authenticated")` if [`AuthApi::is_authenticated`] is
     /// `false`.
     // `async` with no `.await` is deliberate: kept `async` for API parity with Python's
-    // `async def ensure_authenticated()` and because a genuine refresh branch, while
-    // unreachable today (see the doc comment above), would need to `.await` if it were ever
-    // reachable in a future finding. Both async-related pedantic lints fire on this shape.
+    // `async def ensure_authenticated()`.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn ensure_authenticated(&self) -> Result<(), Error> {
         if self.is_authenticated() {
@@ -207,66 +171,46 @@ impl AuthApi {
 
     /// Seeds a session from a pre-obtained `token`, without any network call.
     ///
-    /// Ported from `set_session_token()` (`api/auth.py:390-418`; brief lines 304-318): validates
-    /// that `token` is non-empty (`auth.py:407-408`), builds a session with a fresh expiry of
-    /// `now + `[`crate::consts::SESSION_LIFETIME_DAYS`]` days` (`auth.py:411-413`, the same rule
-    /// [`Session::from_token`] applies), installs it as the current session, and persists it
-    /// through the configured credential store — mirroring `_save_credentials()`
-    /// (`auth.py:416`).
-    ///
-    /// Preserves any refresh token already held by the current session: Python's
-    /// `set_session_token()` only ever assigns `session_id` and `session_expiry`
-    /// (`auth.py:411-413`) and never touches `refresh_token` at all (brief lines 315-317), so
-    /// whatever was already in memory survives untouched — the same preservation
-    /// [`AuthApi::clear_session_token`] has to reproduce for the same reason. A session with no
-    /// prior refresh token (the common case, since a normal login/verify never populates one)
-    /// still ends up with `refresh_token: None`, matching [`Session::from_token`] directly.
+    /// Ported from `set_session_token()` (`api/auth.py:511-537`): validates that `token` is
+    /// non-empty and printable ASCII with no CR/LF (`auth.py:530-532`, reusing
+    /// `_validate_header_value`'s rule since the token becomes the literal `X-User-Token` header
+    /// value), sets `session_id`, and persists through the configured credential store
+    /// (`_save_credentials()`). `v8.0.4` fabricates no expiry of any kind (`AuthCredentials` has
+    /// no such field) — a genuine simplification over the `v6.2.0` shape this method used to have.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation { field: "token", .. }` with Python's exact message
-    /// (`"must be a non-empty string"`) if `token` is empty. Returns `Error::Storage` if the
-    /// configured credential store failed to persist the new session — the in-memory session is
-    /// installed regardless (see [`Transport::set_session`]'s docs).
+    /// Returns `Error::Validation { field: "token", .. }` if `token` is empty or contains a byte
+    /// outside the printable-ASCII range (or a CR/LF). Returns `Error::Storage` if the configured
+    /// credential store failed to persist the new session — the in-memory session is installed
+    /// regardless (see [`Transport::set_session`]'s docs).
     pub fn set_session_token(&self, token: &str) -> Result<(), Error> {
-        if token.is_empty() {
-            return Err(Error::validation("token", EMPTY_TOKEN_MESSAGE));
-        }
-        let current = self.transport.session();
-        let session =
-            session_preserving_refresh_token(&Session::from_token(token), current.as_ref());
-        self.transport.set_session(Some(session))
+        session::validate_token_shape("token", token)?;
+        self.transport.set_session(Some(Session::from_token(token)))
     }
 
-    /// Clears only the session token and its expiry, leaving any refresh token in place.
+    /// Clears the current session token, in memory and in every configured credential-store
+    /// backend.
     ///
-    /// Ported from `clear_session_token()` (`api/auth.py:420-433`; brief lines 320-333): nulls
-    /// `session_id` and `session_expiry` (`auth.py:427-428`) but deliberately does **not** touch
-    /// `refresh_token` — a genuine difference from [`AuthApi::clear_auth_data`], which clears
-    /// everything. The result is persisted through the credential store via a save (mirroring
-    /// `_save_credentials()`, `auth.py:431`), not a store-entry removal.
+    /// Ported from `clear_session_token()` (`api/auth.py:501-510`): at `v8.0.4` this does the
+    /// **exact same thing** as [`AuthApi::clear_auth_data`] — `_destroy_stored_credentials()`,
+    /// full `clear_all()` plus `storage.clear()` on every backend — since `AuthCredentials` is a
+    /// one-field record (`session_id` only) with no `refresh_token`/`session_expiry` left to
+    /// distinguish the two methods by. Kept as a separate method for API parity with Python.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Storage` if the configured credential store failed to persist the change —
-    /// the in-memory session is updated regardless (see [`Transport::set_session`]'s docs).
+    /// Returns `Error::Storage` if the configured credential store failed to clear its entry —
+    /// the in-memory session is cleared regardless (see [`Transport::set_session`]'s docs).
     pub fn clear_session_token(&self) -> Result<(), Error> {
-        let current = self.transport.session();
-        let cleared = session_preserving_refresh_token(&Session::empty(), current.as_ref());
-        self.transport.set_session(Some(cleared))
+        self.transport.set_session(None)
     }
 
-    /// Clears the session token, refresh token, and expiry entirely, and removes the stored
-    /// credential-store entry.
+    /// Clears the current session entirely, in memory and in every configured credential-store
+    /// backend.
     ///
-    /// Ported from `clear_auth_data()` (`api/auth.py:372-388`; brief lines 335-350):
-    /// `clear_all()` nulls every field (`auth.py:379`), and this is the one auth-clearing method
-    /// that calls the credential store's `clear()` rather than `save()` (`auth.py:386`) — for a
-    /// file-backed or keyring-backed store this removes the entry entirely rather than
-    /// overwriting it with null fields, in contrast with [`AuthApi::logout`] and
-    /// [`AuthApi::clear_session_token`]. [`Transport::set_session`] with `None` implements exactly
-    /// this: clears the in-memory session and, if a store is configured, calls
-    /// `CredentialStore::clear`.
+    /// Ported from `clear_auth_data()` (`api/auth.py:539-547`); see
+    /// [`AuthApi::clear_session_token`]'s docs for why the two methods are identical at `v8.0.4`.
     ///
     /// # Errors
     ///
@@ -276,39 +220,28 @@ impl AuthApi {
         self.transport.set_session(None)
     }
 
-    /// Clears the in-memory session to [`Session::empty`] and persists that clear via
-    /// [`Transport::set_session`] on a blocking task — the underlying `CredentialStore` trait is
-    /// synchronous (see `crate::storage`'s docs) — used only by [`AuthApi::logout`]'s
-    /// unconditional cleanup.
+    /// Clears the in-memory session to `None` and persists that clear via [`Transport::set_session`]
+    /// on a blocking task — the underlying `CredentialStore` trait is synchronous — used only by
+    /// [`AuthApi::logout`]'s unconditional cleanup.
     ///
-    /// Honours this transport's configured [`StorageFailures`] policy (decision D-13, security
-    /// finding T2): under the default [`StorageFailures::Warn`], a persistence failure —
-    /// including the blocking task itself panicking or being cancelled — is logged at `WARN` and
-    /// this returns `Ok(())`, matching [`Transport::set_session`]'s own contract exactly; under
-    /// [`StorageFailures::Fatal`], the failure is returned as `Error::Storage` instead, so a
-    /// caller who explicitly opted into "storage failures are fatal" can actually learn the
-    /// at-rest copy was not overwritten. Either way, the in-memory session is cleared
-    /// unconditionally and immediately — [`Transport::set_session`]'s own in-memory-first
-    /// ordering guarantee (security finding T4) already covers that half; this method never
-    /// weakens it.
+    /// Honours this transport's configured [`StorageFailures`] policy: under the default
+    /// [`StorageFailures::Warn`], a persistence failure — including the blocking task itself
+    /// panicking or being cancelled — is logged at `WARN` and this returns `Ok(())`; under
+    /// [`StorageFailures::Fatal`], the failure is returned as `Error::Storage` instead. Either
+    /// way, the in-memory session is cleared unconditionally and immediately.
     ///
     /// # Errors
     ///
     /// See above: only returns `Err` under [`StorageFailures::Fatal`].
     async fn clear_local_and_store(&self) -> Result<(), Error> {
         let transport = Arc::clone(&self.transport);
-        match tokio::task::spawn_blocking(move || transport.set_session(Some(Session::empty())))
-            .await
-        {
+        match tokio::task::spawn_blocking(move || transport.set_session(None)).await {
             Ok(result) => result,
             Err(join_err) => {
-                // Security finding T3: `JoinError`'s `Display` *and* `Debug` can carry a
-                // panicking task's payload verbatim in the tokio version this crate pins
-                // (1.53.1's `runtime::task::error` renders `task {id} panicked with message
-                // {panic_str:?}` for both — this is not a "Display only" hazard).
-                // `CredentialStore` is a public, pluggable trait, so a third-party backend that
-                // panics (e.g. via `unwrap()`/`expect()`) on a value derived from the session it
-                // was asked to persist could leak that text through this join error. Only
+                // Security finding T3: `JoinError`'s `Display`/`Debug` can carry a panicking
+                // task's payload verbatim. `CredentialStore` is a public, pluggable trait, so a
+                // third-party backend that panics on a value derived from the session it was
+                // asked to persist could leak that text through this join error. Only
                 // `is_panic()`/`is_cancelled()`/`id()` are ever read below — never `join_err`
                 // itself, in any format.
                 let message = format!(
@@ -335,27 +268,6 @@ impl AuthApi {
     }
 }
 
-/// Splices `current`'s refresh token (if any) into `base`, producing a session that combines
-/// `base`'s token/expiry with `current`'s preserved refresh token.
-///
-/// Shared by [`AuthApi::set_session_token`] (`base` is a fresh [`Session::from_token`],
-/// `auth.py:411-413` never touches `refresh_token`) and [`AuthApi::clear_session_token`] (`base`
-/// is [`Session::empty`], matching `clear_session_token()`'s inline field assignments exactly,
-/// `auth.py:427-428`: only `session_id` and `session_expiry` are reset) — both Python methods
-/// leave `refresh_token` untouched, just with a different `base`.
-///
-/// Defers to [`Session::with_refresh_token`] (security finding T5), which builds the result
-/// directly from one [`session::StoredSession`] to another and is infallible — this function used
-/// to round-trip through [`Session::to_json`]/[`Session::from_json`] and a mutated
-/// `serde_json::Value` instead, the same pattern `crate::transport::build_refreshed_session` used
-/// to share, for the same underlying reason: [`session::StoredSession`]'s fields are private to
-/// the `session` module, so a session with a *specific* combination of `base`'s fields and a
-/// preserved refresh token cannot be assembled by touching private state from here.
-fn session_preserving_refresh_token(base: &Session, current: Option<&Session>) -> Session {
-    let refresh_token = current.and_then(Session::expose_refresh_token);
-    Session::with_refresh_token(base, refresh_token)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -369,19 +281,10 @@ mod tests {
 
     use super::Session;
 
-    /// A session with a token, a refresh token, and an expiry far enough in the future that
-    /// `is_valid()` is `true` for the lifetime of any test.
-    fn session_with_refresh_token() -> Session {
-        Session::from_json(
-            r#"{"session_id":"tok","refresh_token":"rt-1","session_expiry":"2099-01-01T00:00:00"}"#,
-        )
-        .expect("valid json")
-    }
-
-    // ===================== set_session_token: empty-token validation =====================
+    // ===================== set_session_token: validation =====================
 
     #[test]
-    fn set_session_token_rejects_empty_token_with_pythons_message() {
+    fn set_session_token_rejects_empty_token_with_the_expected_message() {
         let transport = Transport::builder().build().expect("builds with defaults");
         let auth = AuthApi::new(transport);
 
@@ -400,6 +303,17 @@ mod tests {
     }
 
     #[test]
+    fn set_session_token_rejects_a_control_character() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let auth = AuthApi::new(transport);
+
+        let err = auth
+            .set_session_token("tok\r\nX-Evil: 1")
+            .expect_err("a control character must be rejected");
+        assert!(matches!(err, Error::Validation { field, .. } if field == "token"));
+    }
+
+    #[test]
     fn set_session_token_installs_a_valid_session() {
         let transport = Transport::builder().build().expect("builds with defaults");
         let auth = AuthApi::new(transport);
@@ -409,38 +323,10 @@ mod tests {
 
         assert!(auth.is_authenticated());
         let session = auth.session().expect("session installed");
-        assert_eq!(session.expose_token(), "tok-123");
-        assert!(session.refresh_token().is_none());
+        assert_eq!(session.token().expose_secret(), "tok-123");
     }
 
-    #[test]
-    fn set_session_token_preserves_an_existing_refresh_token() {
-        // Finding 2 / Python parity (`auth.py:411-413`, brief lines 315-317):
-        // `set_session_token()` only ever assigns `session_id` and `session_expiry`, never
-        // `refresh_token` — so a refresh token already held by the current session must survive
-        // the call, exactly like `clear_session_token`.
-        let transport = Transport::builder()
-            .session(Some(session_with_refresh_token()))
-            .build()
-            .expect("builds with an initial session");
-        let auth = AuthApi::new(transport);
-
-        auth.set_session_token("new-token")
-            .expect("non-empty token is accepted");
-
-        let session = auth.session().expect("session installed");
-        assert_eq!(session.expose_token(), "new-token");
-        assert_eq!(
-            session
-                .refresh_token()
-                .expect("refresh token preserved")
-                .expose_secret(),
-            "rt-1"
-        );
-        assert!(session.is_valid());
-    }
-
-    // ===================== is_authenticated(): absent / valid / expired =====================
+    // ===================== is_authenticated(): absent / valid =====================
 
     #[test]
     fn is_authenticated_false_with_no_session_configured() {
@@ -460,27 +346,13 @@ mod tests {
         assert!(auth.is_authenticated());
     }
 
-    #[test]
-    fn is_authenticated_false_with_an_expired_session() {
-        let expired = Session::from_json(
-            r#"{"session_id":"tok","refresh_token":null,"session_expiry":"2000-01-01T00:00:00"}"#,
-        )
-        .expect("valid json");
-        let transport = Transport::builder()
-            .session(Some(expired))
-            .build()
-            .expect("builds with an initial session");
-        let auth = AuthApi::new(transport);
-        assert!(!auth.is_authenticated());
-    }
-
-    // ===================== the three clear_* scopes, against a MemoryStore =====================
+    // ===================== the two clear_* scopes are now identical =====================
 
     #[test]
-    fn clear_session_token_nulls_token_but_preserves_refresh_token() {
+    fn clear_session_token_clears_everything_and_removes_the_store_entry() {
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
         let transport = Transport::builder()
-            .session(Some(session_with_refresh_token()))
+            .session(Some(Session::from_token("tok")))
             .store(Some(Arc::clone(&store)))
             .build()
             .expect("builds with an initial session and a store");
@@ -489,35 +361,16 @@ mod tests {
         auth.clear_session_token().expect("clears without error");
 
         assert!(!auth.is_authenticated());
-        let session = auth
-            .session()
-            .expect("clear_session_token keeps a session value, just emptied");
-        assert_eq!(session.expose_token(), "");
-        assert_eq!(
-            session
-                .refresh_token()
-                .expect("refresh token preserved in memory")
-                .expose_secret(),
-            "rt-1"
-        );
-        assert!(session.expiry().is_none());
-
+        assert!(auth.session().is_none());
         let persisted = store.load().expect("load succeeds");
-        assert_eq!(persisted.expose_token(), "");
-        assert_eq!(
-            persisted
-                .refresh_token()
-                .expect("refresh token preserved in the store")
-                .expose_secret(),
-            "rt-1"
-        );
+        assert!(persisted.token().expose_secret().is_empty());
     }
 
     #[test]
     fn clear_auth_data_clears_everything_and_removes_the_store_entry() {
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
         let transport = Transport::builder()
-            .session(Some(session_with_refresh_token()))
+            .session(Some(Session::from_token("tok")))
             .store(Some(Arc::clone(&store)))
             .build()
             .expect("builds with an initial session and a store");
@@ -526,27 +379,18 @@ mod tests {
         auth.clear_auth_data().expect("clears without error");
 
         assert!(!auth.is_authenticated());
-        assert!(
-            auth.session().is_none(),
-            "clear_auth_data clears the in-memory session to None"
-        );
-
+        assert!(auth.session().is_none());
         let persisted = store.load().expect("load succeeds");
-        assert_eq!(persisted.expose_token(), "");
-        assert!(
-            persisted.refresh_token().is_none(),
-            "clear_auth_data clears the refresh token too, unlike clear_session_token"
-        );
+        assert!(persisted.token().expose_secret().is_empty());
     }
 
+    // ===================== logout: not authenticated, no network call =====================
+
     #[tokio::test]
-    async fn logout_clears_local_state_and_store_even_when_not_authenticated() {
-        // No valid session is configured, so `Transport::send`'s own precondition fires before
-        // any network call — this exercises `logout`'s unconditional cleanup without needing a
-        // mock server (HTTP-level logout tests are a later wave, per this crate's testing rules).
+    async fn logout_when_not_authenticated_returns_false_with_no_network_call() {
         let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
         store
-            .save(&session_with_refresh_token())
+            .save(&Session::from_token("stale-token"))
             .expect("seed the store with a stale entry");
         let transport = Transport::builder()
             .store(Some(Arc::clone(&store)))
@@ -554,28 +398,25 @@ mod tests {
             .expect("builds with a store but no session");
         let auth = AuthApi::new(transport);
 
-        let err = auth
+        // No mock server is configured at all — if `logout` ever attempted a network call, it
+        // would panic on connection refused rather than return `Ok(false)`.
+        let result = auth
             .logout()
             .await
-            .expect_err("no valid session: the transport-level precondition fires locally");
-        assert!(
-            matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Not authenticated")
-        );
+            .expect("no session configured: the local guard fires, no network call attempted");
+        assert!(!result);
 
-        assert!(!auth.is_authenticated());
+        // The not-authenticated guard does not touch the store at all — the stale entry from
+        // before this call is still exactly what it was.
         let persisted = store.load().expect("load succeeds");
-        assert_eq!(persisted.expose_token(), "");
-        assert!(
-            persisted.refresh_token().is_none(),
-            "logout's cleanup clears the refresh token too (clear_all(), auth.py:270)"
-        );
+        assert_eq!(persisted.token().expose_secret(), "stale-token");
     }
 
     // ===================== logout under StorageFailures::Fatal (security finding T2) =====================
 
     /// A [`CredentialStore`] whose `save`/`clear` always fail, for pinning security finding T2:
-    /// `logout()` must surface a `Fatal`-policy storage failure instead of silently returning the
-    /// network `Ok` while the at-rest copy still holds the old session.
+    /// `logout()` must surface a `Fatal`-policy storage failure instead of silently returning
+    /// `Ok(true)` while the at-rest copy still holds the old session.
     #[derive(Debug)]
     struct AlwaysFailingStore;
 
@@ -615,7 +456,7 @@ mod tests {
         let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
         let transport = Transport::builder()
             .base_url(server.uri())
-            .session(Some(session_with_refresh_token()))
+            .session(Some(Session::from_token("tok")))
             .store(Some(store))
             .storage_failures(StorageFailures::Fatal)
             .build()
@@ -626,9 +467,6 @@ mod tests {
             "Fatal policy must surface the store's failure even though the network call succeeded",
         );
         assert!(matches!(err, Error::Storage(_)));
-
-        // The other half of finding T2: the in-memory session must still be cleared
-        // unconditionally, exactly as under the default Warn policy.
         assert!(
             !auth.is_authenticated(),
             "in-memory session must be cleared even though persisting the clear failed"
@@ -636,11 +474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_under_default_warn_policy_still_returns_the_network_outcome_when_storage_fails()
-    {
-        // No `.storage_failures(..)` call: exercises the default, `StorageFailures::Warn` — the
-        // sibling of the `Fatal` test above, pinning that Warn's observable behaviour is
-        // unchanged by the T2 fix.
+    async fn logout_under_default_warn_policy_still_returns_true_when_storage_fails() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/2.2/logout"))
@@ -655,19 +489,52 @@ mod tests {
         let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
         let transport = Transport::builder()
             .base_url(server.uri())
-            .session(Some(session_with_refresh_token()))
+            .session(Some(Session::from_token("tok")))
             .store(Some(store))
             .build()
             .expect("builds with a session and a failing store");
         let auth = AuthApi::new(transport);
 
-        auth.logout().await.expect(
-            "the default Warn policy swallows the store failure and returns the network Ok",
-        );
+        let result = auth
+            .logout()
+            .await
+            .expect("the default Warn policy swallows the store failure and returns Ok(true)");
+        assert!(result);
+        assert!(!auth.is_authenticated());
+    }
 
+    #[tokio::test]
+    async fn logout_swallows_every_network_failure_and_still_clears_credentials() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/2.2/logout"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+        let transport = Transport::builder()
+            .base_url(server.uri())
+            .session(Some(Session::from_token("tok")))
+            .store(Some(Arc::clone(&store)))
+            .build()
+            .expect("builds with a session and a working store");
+        let auth = AuthApi::new(transport);
+
+        let result = auth
+            .logout()
+            .await
+            .expect("a 500 from the logout endpoint must never propagate");
+        assert!(result);
+        assert!(!auth.is_authenticated());
         assert!(
-            !auth.is_authenticated(),
-            "in-memory session must be cleared regardless of the store's outcome"
+            store
+                .load()
+                .expect("load succeeds")
+                .token()
+                .expose_secret()
+                .is_empty()
         );
     }
 
@@ -675,8 +542,7 @@ mod tests {
 
     /// A [`CredentialStore`] whose `save`/`clear` panic with a distinctive, credential-shaped
     /// payload, isolating the `JoinError` branch of `AuthApi::clear_local_and_store` (security
-    /// finding T3) from an ordinary `Err` returned by the store itself (`AlwaysFailingStore`,
-    /// above).
+    /// finding T3) from an ordinary `Err` returned by the store itself.
     #[derive(Debug)]
     struct PanickingStore;
 

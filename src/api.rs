@@ -60,7 +60,6 @@ use crate::endpoints::{
     PasswordApi, ProfilesApi, ReservationsApi, RoutingApi, ScheduleApi, SecurityApi, SettingsApi,
     SqmApi, SupportApi, ThreadApi, TransferApi, UpdatesApi,
 };
-use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::transport::Transport;
 
@@ -186,8 +185,10 @@ impl EeroApi {
     ///
     /// Delegates to [`EeroApi::auth`]'s own `logout`, which clears the session
     /// [`EeroApi::transport`] and every domain-module accessor also observe, since they all share
-    /// the same `Transport`.
-    pub async fn logout(&self) -> Result<Envelope, Error> {
+    /// the same `Transport`. Returns `false` (with no network call at all) when no valid session
+    /// was configured to begin with; see [`crate::auth::AuthApi::logout`]'s own docs for the full
+    /// `v8.0.4` contract this method inherits verbatim.
+    pub async fn logout(&self) -> Result<bool, Error> {
         self.auth.logout().await
     }
 

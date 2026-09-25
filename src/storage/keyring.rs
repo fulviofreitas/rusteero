@@ -113,7 +113,14 @@ impl CredentialStore for KeyringStore {
     fn load(&self) -> Result<Session, StorageError> {
         let entry = self.entry()?;
         match entry.get_password() {
-            Ok(json) => Session::from_json(&json),
+            Ok(json) => {
+                let (session, migrated) = Session::from_json_migrating(&json)?;
+                if migrated {
+                    // Best-effort: never fails this read, see `migrate_and_verify`'s own docs.
+                    super::migrate_and_verify(self, &session, "keyring");
+                }
+                Ok(session)
+            }
             Err(keyring::Error::NoEntry) => Ok(Session::empty()),
             Err(err) => Err(backend_error(&err)),
         }
@@ -122,8 +129,8 @@ impl CredentialStore for KeyringStore {
     /// Serializes `session` via `Session::to_json` and stores it as this entry's password.
     ///
     /// Mirrors `KeyringStorage.save()` (`auth_storage.py:147-155`): one JSON blob per entry, in
-    /// `Session::to_json`'s field order (`session_id`, `refresh_token`, `session_expiry`),
-    /// exactly reproducing `to_dict()`'s shape.
+    /// `Session::to_json`'s field order (`session_id`, `schema_version`), exactly reproducing
+    /// `to_dict()`'s shape at `v8.0.4`.
     ///
     /// # Divergence from eero-api
     ///

@@ -45,24 +45,15 @@ pub const LOGOUT: Route = Route {
     path: "logout",
 };
 
-/// `POST /2.2/login/refresh` — first of the two session-refresh routes the client tries, in
-/// order.
+/// `POST /2.2/login/refresh` — the single session-refresh route at `v8.0.4`.
 ///
-/// Ported from `const.py:22` (`LOGIN_REFRESH_ENDPOINT`); see `api/auth.py:299` (`REFRESH_ENDPOINTS`
-/// iteration) and the port plan §7.2 (neither refresh route is confirmed to return a token; a
-/// normal login never yields a refresh token, so this path is expected to be a practical no-op).
+/// Ported from `const.py:56` (`LOGIN_REFRESH_ENDPOINT`); see `api/auth.py:415-477`. `v6.2.0`'s
+/// `account/refresh` fallback route (`ACCOUNT_REFRESH_ENDPOINT`) is gone at `v8.0.4` — there is
+/// exactly one refresh route now, no try-next-route loop. Authenticated by the *current* session
+/// token itself (there is no separate refresh token at `v8.0.4`); the server-issued token in the
+/// response is discarded per SDK policy — see [`crate::transport::Transport::refresh_session`].
 pub const LOGIN_REFRESH: Route = Route {
     method: Method::POST,
     version: ApiVersion::V2_2,
     path: "login/refresh",
-};
-
-/// `POST /2.2/account/refresh` — second of the two session-refresh routes the client tries.
-///
-/// Ported from `const.py:23` (`ACCOUNT_REFRESH_ENDPOINT`); see [`LOGIN_REFRESH`] for the retry
-/// order and caveats.
-pub const ACCOUNT_REFRESH: Route = Route {
-    method: Method::POST,
-    version: ApiVersion::V2_2,
-    path: "account/refresh",
 };

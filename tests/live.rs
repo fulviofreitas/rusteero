@@ -12,10 +12,12 @@
 //! ```
 //!
 //! `RUSTEERO_SESSION_TOKEN` is a session token already obtained out of band (e.g. from a prior
-//! interactive login) — this file's tests only ever perform read-only calls with it, except for
-//! [`live_verify_sets_a_fresh_session_cookie_open_question_d16`], which is explicitly about
-//! performing a *fresh* login and is gated on its own additional environment variables (see that
-//! test's doc comment).
+//! interactive login) — this file's tests only ever perform read-only calls with it.
+//!
+//! The former D-16 diagnostic (`login/verify`'s `Set-Cookie` behaviour) is gone: `v8.0.4` has no
+//! `Set-Cookie` reader anywhere in `base.py`/`auth.py`, and the login token is unconditionally the
+//! session token (see `crate::auth::flow::PendingLogin::verify`'s docs), so there is no longer an
+//! open question for a live capture to settle.
 
 use rusteero::auth::AuthApi;
 use rusteero::auth::Session;
@@ -290,100 +292,4 @@ impl std::fmt::Display for ErrorKind<'_> {
         };
         f.write_str(name)
     }
-}
-
-// ===================== the verify-Set-Cookie open question (rust-port-plan.md §7.2, D-16) =====================
-
-/// Diagnostic-only test to settle the one open question this port still has: does a real
-/// `login/verify` response ever carry a fresh `Set-Cookie: s=...` header?
-///
-/// `eero-api` cannot answer this either way — it never reads `Set-Cookie` explicitly (it relies
-/// on aiohttp's implicit cookie jar) — and `rusteero` has no implicit jar to observe it
-/// silently, so [`PendingLogin::verify`](rusteero::auth::flow::PendingLogin::verify) falls back
-/// to the login token whenever no fresh cookie is present, which is indistinguishable from
-/// "there never was one" from outside the crate. This test therefore does **not** go through
-/// `rusteero`'s own `LoginFlow`/`PendingLogin` at all: it makes the login and verify calls with a
-/// bare `reqwest::Client` instead, purely so it can inspect the raw `Set-Cookie` response header
-/// this crate's own transport deliberately never logs (crate security rule: never log headers,
-/// cookies, or bodies).
-///
-/// # Running this test
-///
-/// Requires `RUSTEERO_LIVE=1`, `RUSTEERO_SESSION_TOKEN` (the blanket gate every test in this
-/// file shares), plus `RUSTEERO_LOGIN_IDENTIFIER` and a **freshly requested** `RUSTEERO_LOGIN_CODE`
-/// (one-time codes are single-use and short-lived, so this cannot be automated in CI — a human
-/// must request a code via [`live_login_start_returns_a_pending_login`] or the mobile/web app
-/// immediately before running this test with the code it received).
-///
-/// This test **mutates the live account's active session** (a real login/verify rotates it):
-/// update `RUSTEERO_SESSION_TOKEN` afterward if other live tests depend on the old one.
-///
-/// There is no hard assertion either way; the answer is printed for a human to copy into
-/// `rust-port-plan.md` §7.2 to close out decision D-16.
-#[tokio::test]
-#[ignore = "hits the real Eero cloud API and rotates the account's session; see this test's doc comment"]
-async fn live_verify_sets_a_fresh_session_cookie_open_question_d16() {
-    let Some(_gate) = live_credentials() else {
-        eprintln!(
-            "skipping live_verify_sets_a_fresh_session_cookie_open_question_d16: set \
-             RUSTEERO_LIVE=1 and RUSTEERO_SESSION_TOKEN to run live tests"
-        );
-        return;
-    };
-    let (Ok(identifier), Ok(code)) = (
-        std::env::var("RUSTEERO_LOGIN_IDENTIFIER"),
-        std::env::var("RUSTEERO_LOGIN_CODE"),
-    ) else {
-        eprintln!(
-            "skipping live_verify_sets_a_fresh_session_cookie_open_question_d16: set \
-             RUSTEERO_LOGIN_IDENTIFIER and RUSTEERO_LOGIN_CODE (a freshly requested one-time \
-             code) to run this test"
-        );
-        return;
-    };
-
-    // No `.cookie_store(true)` (the crate's `cookies` cargo feature is not enabled — this crate
-    // never wants an implicit jar, see `src/transport.rs`'s module docs), so `client` never
-    // stores or forwards the `Set-Cookie` this test needs to inspect directly.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("client builds");
-
-    let login_response = client
-        .post("https://api-user.e2ro.com/2.2/login")
-        .json(&serde_json::json!({ "login": identifier }))
-        .send()
-        .await
-        .expect("login request should succeed");
-    let login_body: serde_json::Value =
-        login_response.json().await.expect("login response is JSON");
-    let login_token = login_body["data"]["user_token"]
-        .as_str()
-        .expect("login response carries a non-empty data.user_token")
-        .to_owned();
-
-    let verify_response = client
-        .post("https://api-user.e2ro.com/2.2/login/verify")
-        .header("cookie", format!("s={login_token}"))
-        .json(&serde_json::json!({ "code": code }))
-        .send()
-        .await
-        .expect("verify request should succeed with a freshly requested code");
-
-    let fresh_cookie_present = verify_response
-        .headers()
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .any(|raw| raw.trim_start().starts_with("s="));
-
-    println!(
-        "D-16: login/verify {} send a fresh `s` Set-Cookie header",
-        if fresh_cookie_present {
-            "DID"
-        } else {
-            "did NOT"
-        }
-    );
 }

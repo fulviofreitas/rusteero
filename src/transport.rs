@@ -1,40 +1,50 @@
-//! Request core: status mapping, response size cap, redirect refusal, refresh retry.
+//! Request core: header/credential construction, status mapping, response size cap, redirect
+//! refusal, GET-only bounded retry, and the server-driven refresh-and-replay handshake.
 //!
-//! Ported from `eero-api`'s `src/eero/api/base.py` (see
-//! the base behaviour notes for the full behaviour brief) and, for the refresh handshake
-//! only, `src/eero/api/auth.py` (the auth behaviour notes). [`Transport`] is the single
-//! place that turns an HTTP status/body into either an `Envelope` or a typed `Error` — every
-//! endpoint module built on top of it (phase 3) is expected to be a thin wrapper that supplies a
-//! [`crate::routes::Route`] and path/query/body values and nothing else.
+//! Ported from `eero-api`'s `src/eero/api/base.py` at `v8.0.4` (request pipeline) and
+//! `src/eero/api/auth.py` (the refresh handshake). [`Transport`] is the single place that turns
+//! an HTTP status/body into either an `Envelope` or a typed `Error` — every endpoint module built
+//! on top of it is expected to be a thin wrapper that supplies a route and path/query/body values
+//! and nothing else.
+//!
+//! # The v8.0.4 request API
+//!
+//! [`Transport::request`]/[`Transport::resource`]/[`Transport::nested`] are the current,
+//! `RequestBody`-aware entry points; see `.claude/tasks/briefs/v8/transport-api.md` for a worked
+//! example of each. [`Transport::send`]/[`Transport::send_with_query`] are kept as thin,
+//! JSON-only wrappers over [`Transport::request`] purely so the endpoint modules not yet migrated
+//! onto the `Resource`/`Nested` route model keep compiling and their tests keep passing; new code
+//! should prefer `request`/`resource`/`nested`.
 //!
 //! # Locking
 //!
 //! The current [`crate::auth::Session`] lives behind a `std::sync::RwLock`, not a
-//! `tokio::sync::RwLock`. Every critical section that touches it (`session_snapshot`,
-//! `current_token`, `replace_session`, `set_session`) is a handful of clones/comparisons with no
-//! `.await` inside — an async lock would only add executor overhead for no benefit here. No lock
-//! guard is ever held across an `.await` point anywhere in this module; the async methods
-//! (`send`, `send_with_query`, `send_raw`, `refresh_session`) always take a session snapshot (or
-//! replace it) in its own statement, before or after any network call, never around one.
+//! `tokio::sync::RwLock`. Every critical section that touches it is a handful of clones/
+//! comparisons with no `.await` inside — an async lock would only add executor overhead for no
+//! benefit here. No lock guard is ever held across an `.await` point anywhere in this module.
 //!
 //! # The refresh-retry divergence (task brief gotcha G1)
 //!
 //! `eero-api`'s 401-triggered refresh retry re-sends the retried request with the *original,
-//! pre-refresh* token (`api/base.py:296-298`), which immediately clobbers the fresh cookie the
-//! refresh itself just set on the same shared cookie jar — so in the real Python library the
-//! retry can never actually benefit from a successful refresh. `rusteero` deliberately does not
-//! reproduce this: [`Transport::send_with_query`] re-reads the session from the shared state
-//! *after* calling [`Transport::refresh_session`] and retries with the refreshed token. See the
-//! comment at the retry call site for the exact citation.
+//! pre-refresh* token (`api/base.py:625-658`), which matters little at `v8.0.4` since a
+//! successful refresh never actually rotates the token (`refresh_session`'s own docs) — but
+//! `rusteero` still deliberately re-reads the session from shared state *after* the refresh
+//! completes rather than reusing the token captured before it, so the retry observes whatever the
+//! refresh handshake left behind (including a credential-clearing terminal failure, which turns
+//! the retry into another "Not authenticated" precondition failure rather than silently reusing a
+//! since-cleared token).
 
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
-use reqwest::header::{COOKIE, HeaderMap, LOCATION, RETRY_AFTER, SET_COOKIE};
+use reqwest::header::{
+    ACCEPT, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, LOCATION, RETRY_AFTER, USER_AGENT,
+};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Method, StatusCode};
 use secrecy::SecretString;
-use serde_json::{Value, json};
+use serde_json::Value;
+use tokio::sync::watch;
 use url::Url;
 
 use crate::auth::Session;
@@ -43,41 +53,70 @@ use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::errors;
 use crate::redact;
-use crate::routes::{self, ApiVersion, Route};
+use crate::routes::{self, ApiVersion, Nested, Resource, Route};
 use crate::storage::CredentialStore;
+
+/// The body a request carries, mirroring `eero-api`'s `RequestEncoding`
+/// (`api/base.py:54-75,324-361`).
+///
+/// Exactly one carrier is active per request: `Json` sets `Content-Type: application/json` and
+/// serializes `value` as the body (`reqwest::RequestBuilder::json`); `Form` sets
+/// `Content-Type: application/x-www-form-urlencoded` and url-encodes the pairs in order
+/// (`reqwest::RequestBuilder::form`); `EmptyJsonString` sends the literal two-byte body `""` with
+/// `Content-Type: application/json` set explicitly — the exact shape `login/refresh` requires
+/// (`api/base.py:483-484,501-502`); `None` sends no body and no `Content-Type` at all.
+#[derive(Debug, Clone)]
+pub enum RequestBody {
+    /// No body, no `Content-Type`.
+    None,
+    /// A JSON body.
+    Json(Value),
+    /// A `application/x-www-form-urlencoded` body, encoded from `field=value` pairs in order.
+    Form(Vec<(String, String)>),
+    /// The literal two-byte body `""`, with `Content-Type: application/json`.
+    EmptyJsonString,
+}
 
 /// The request core shared by every authenticated and unauthenticated Eero cloud API call.
 ///
-/// Build one with [`Transport::builder`]. See the module docs for the locking discipline and
-/// the deliberate refresh-retry divergence from `eero-api`.
+/// Build one with [`Transport::builder`]. See the module docs for the locking discipline and the
+/// deliberate refresh-retry divergence from `eero-api`.
 #[derive(Debug)]
 pub struct Transport {
     http: Client,
     base_22: Url,
     base_23: Url,
+    /// Scheme + authority (host, and port when non-default) of the configured API host, with no
+    /// path — what [`crate::links`]/[`crate::params`] and every [`Resource`]/[`Nested`] route
+    /// take as `host`. Derived from `base_22`'s origin at build time, so it already reflects a
+    /// `TransportBuilder::base_url` override (e.g. a wiremock server in tests).
+    api_host: Url,
     session: RwLock<Option<Session>>,
     store: Option<Arc<dyn CredentialStore>>,
     storage_failures: StorageFailures,
+    user_agent: String,
+    accept_language: String,
+    send_legacy_cookie: bool,
+    get_retries: u32,
+    /// Single-flight coalescing slot for [`Transport::refresh_session`]: a [`Weak`] reference to
+    /// the current leader's broadcast channel, if a refresh is in flight. See
+    /// [`Transport::refresh_session`]'s own docs for the self-healing rationale (a dropped/
+    /// cancelled leader's `Arc` drops too, so `Weak::upgrade` starts failing again immediately —
+    /// no explicit slot-clearing step is needed, and a cancelled leader can never permanently wedge
+    /// every future refresh attempt).
+    refresh_slot: tokio::sync::Mutex<Weak<watch::Sender<Option<bool>>>>,
 }
 
 /// How a [`Transport`] treats a failed write to its configured credential store (decision D-13).
 ///
 /// Set via [`TransportBuilder::storage_failures`]; honoured at every credential-store call site
-/// in this module ([`Transport::set_session`], and the persistence step of
+/// in this module ([`Transport::set_session`], and the credential-clearing branch of
 /// [`Transport::refresh_session`]). This is unrelated to whether the *in-memory* session is
 /// updated: that happens unconditionally and before persistence is even attempted, regardless of
-/// this setting — see [`Transport::set_session`]'s own docs for that separate guarantee.
-///
-/// The port plan places this switch on the not-yet-built `Client::builder()` (phase 4); it lives
-/// on [`TransportBuilder`] for now, and `Client::builder()` is expected to forward to it once
-/// built.
+/// this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageFailures {
-    /// Log the failure at `WARN` and proceed as though the operation had succeeded. This is the
-    /// default, matching every Python `eero-api` backend's own swallow-and-log ergonomics
-    /// (albeit at a louder level, since this crate surfaces the failure as a typed
-    /// [`crate::error::StorageError`] at all, unlike Python's silent `DEBUG`-only backends — see
-    /// [`crate::storage::CredentialStore`]'s own docs).
+    /// Log the failure at `WARN` and proceed as though the operation had succeeded. The default.
     #[default]
     Warn,
     /// Return [`Error::Storage`] immediately instead of swallowing the failure.
@@ -85,19 +124,24 @@ pub enum StorageFailures {
 }
 
 impl Transport {
-    /// Starts building a [`Transport`] with [`TransportBuilder`]'s defaults: the real Eero
-    /// cloud hosts, reqwest's own `User-Agent`, no session, no credential store, and the
+    /// Starts building a [`Transport`] with [`TransportBuilder`]'s defaults: the real Eero cloud
+    /// hosts, [`consts::DEFAULT_USER_AGENT`], [`consts::DEFAULT_ACCEPT_LANGUAGE`], the legacy
+    /// cookie sent by default, no `GET` retries, no session, no credential store, and the
     /// timeouts from `consts`.
     #[must_use]
     pub fn builder() -> TransportBuilder {
         TransportBuilder::default()
     }
 
+    /// Scheme + authority of the configured API host, with no path — the `host` argument every
+    /// [`crate::links`]/[`crate::params`] helper, and [`Resource::resolve`]/[`Nested::resolve`],
+    /// take explicitly.
+    #[must_use]
+    pub fn api_host(&self) -> &Url {
+        &self.api_host
+    }
+
     /// Returns a snapshot of the currently configured session, if any.
-    ///
-    /// This is a clone of the in-memory state at the moment of the call; it does not reach out
-    /// to the credential store and does not re-validate expiry beyond what `Session::is_valid`
-    /// already encodes.
     #[must_use]
     pub fn session(&self) -> Option<Session> {
         self.session_snapshot()
@@ -105,35 +149,27 @@ impl Transport {
 
     /// Replaces the in-memory session and, if a credential store is configured, persists the
     /// change: `Some(session)` calls `CredentialStore::save`, `None` calls
-    /// `CredentialStore::clear`. There is no direct Python equivalent — this is the single
-    /// primitive `auth::AuthApi` (and the not-yet-built `Client` layer) composes into
-    /// `login`/`verify`/`logout`/`set_session_token`-shaped operations.
+    /// `CredentialStore::clear`.
     ///
     /// # Errors
     ///
-    /// Honours this transport's [`StorageFailures`] policy (decision D-13,
-    /// [`TransportBuilder::storage_failures`]): under the default [`StorageFailures::Warn`], a
-    /// configured credential store failing to persist the change is logged at `WARN` and this
-    /// returns `Ok(())` regardless; under [`StorageFailures::Fatal`], it returns
-    /// `Error::Storage` instead. Either way, the in-memory session is updated regardless of
-    /// whether persistence succeeds — see the security note in this method's body.
+    /// Returns [`Error::Validation`] if `session` is `Some` and its token is empty or contains a
+    /// byte outside the printable-ASCII range (or a CR/LF) — the same shape check
+    /// `AuthApi::set_session_token` applies, reproduced here since this is the one place every
+    /// session change ultimately funnels through.
+    ///
+    /// Otherwise honours this transport's [`StorageFailures`] policy: under the default
+    /// [`StorageFailures::Warn`], a configured credential store failing to persist the change is
+    /// logged at `WARN` and this returns `Ok(())` regardless; under [`StorageFailures::Fatal`],
+    /// it returns `Error::Storage` instead. Either way, the in-memory session is updated
+    /// regardless of whether persistence succeeds, and *before* the (potentially slow or hung)
+    /// blocking store call even starts — a hung Secret Service/D-Bus call or a slow `fsync` must
+    /// not leave a stale token observable via `is_authenticated()`/`session()`, or attached to a
+    /// concurrent in-flight request, for the duration of that call.
     pub fn set_session(&self, session: Option<Session>) -> Result<(), Error> {
-        // Security finding F3: the in-memory session must update *before* this method returns,
-        // and unconditionally of the store's outcome — `AuthApi::logout`/`clear_auth_data`/
-        // `clear_session_token`'s own docs, and this method's own doc comment above, promise
-        // exactly that.
-        //
-        // Security finding T4: the in-memory update must also land *before* the (potentially
-        // slow or hung) blocking store call even starts, not merely before this method returns.
-        // A hung Secret Service / D-Bus call or a slow fsync must not leave a stale token
-        // observable via `is_authenticated()`/`session()` — or attached as `Cookie: s=<old
-        // token>` by a concurrent in-flight request — for the duration of that call. `session`
-        // is cloned once up front purely so the store call below still has an owned/borrowed
-        // value to work with after the original is moved into `replace_session`; the clone
-        // itself is not the fix, the *ordering* is: `replace_session` now runs strictly before
-        // `store.save`/`store.clear`, on every path, including the failure path, which is only
-        // inspected (and possibly turned into an `Err`) afterwards. This ordering is identical
-        // under either `StorageFailures` policy.
+        if let Some(ref s) = session {
+            crate::auth::session::validate_token_shape("token", s.expose_token())?;
+        }
         let Some(store) = &self.store else {
             self.replace_session(session);
             return Ok(());
@@ -156,10 +192,11 @@ impl Transport {
         }
     }
 
-    /// Whether a session is configured, has a non-empty token, and has not passed its
-    /// client-fabricated expiry — purely a local check, matching `Session::is_valid`. Never
-    /// makes a network call and never attempts a refresh (contrast with `eero-api`'s
-    /// `ensure_authenticated()`, which is a client-layer, not transport-layer, concern here).
+    /// Whether a session is configured and has a non-empty token.
+    ///
+    /// Purely a local check (`Session::is_valid`, itself a token-presence check — `v8.0.4` has no
+    /// client-side expiry, see [`Session`]'s own docs). Never makes a network call and never
+    /// attempts a refresh.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         self.session_snapshot()
@@ -167,19 +204,136 @@ impl Transport {
     }
 
     /// This transport's configured [`StorageFailures`] policy.
-    ///
-    /// `pub(crate)`: the only consumer outside this module is `auth::AuthApi`'s own
-    /// spawn-blocking cleanup helper (security finding T2), which needs to apply the *same*
-    /// policy to a `JoinError` from the blocking task itself (a failure `set_session`'s own
-    /// internal branching never sees, since it happens one layer up) as `set_session` already
-    /// applies to an ordinary store error.
     #[must_use]
     pub(crate) fn storage_failures(&self) -> StorageFailures {
         self.storage_failures
     }
 
-    /// Sends an authenticated request with no query-string parameters. Equivalent to
+    // ============================= v8.0.4 request API =============================
+
+    /// Sends an authenticated request built from an already-resolved `url`.
+    ///
+    /// Performs the one-shot server-driven refresh retry described in the module docs: on a
+    /// `401` whose body carries `meta.error == "error.session.refresh"`, calls
+    /// [`Transport::refresh_session`] and, if it reports success, retries the identical request
+    /// exactly once with a freshly re-read token before giving up. Runs through the same bounded
+    /// `GET`-only retry every request in this transport shares (`TransportBuilder::get_retries`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
+    /// before any network call is made. Returns whatever status-mapped error the request produces
+    /// otherwise, or propagates a refresh failure unmodified if the refresh hook itself errors.
+    pub async fn request(
+        &self,
+        method: Method,
+        url: Url,
+        query: &[(&str, String)],
+        body: RequestBody,
+    ) -> Result<Envelope, Error> {
+        let token = self.current_token().ok_or_else(not_authenticated)?;
+        let exchange = self
+            .execute_with_get_retry(method.clone(), &url, query, &body, Some(&token))
+            .await?;
+
+        if exchange.status.as_u16() == 401 && refresh_signal_detected(&exchange.body) {
+            let refreshed = self.refresh_session().await?;
+            if refreshed {
+                let retry_token = self.current_token().ok_or_else(not_authenticated)?;
+                let retry = self
+                    .execute_with_get_retry(method, &url, query, &body, Some(&retry_token))
+                    .await?;
+                return status_to_envelope(
+                    retry.status,
+                    &retry.body,
+                    &retry.url,
+                    retry.retry_after,
+                );
+            }
+        }
+
+        status_to_envelope(
+            exchange.status,
+            &exchange.body,
+            &exchange.url,
+            exchange.retry_after,
+        )
+    }
+
+    /// Sends an authenticated request to a [`Resource`]: `route.resolve(self.api_host(),
+    /// id_or_url, parent)` followed by [`Transport::request`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `route.resolve` fails, otherwise as [`Transport::request`].
+    pub async fn resource(
+        &self,
+        route: &Resource,
+        id_or_url: &str,
+        parent: Option<&Value>,
+        query: &[(&str, String)],
+        body: RequestBody,
+    ) -> Result<Envelope, Error> {
+        let url = route.resolve(self.api_host(), id_or_url, parent)?;
+        self.request(route.method.clone(), url, query, body).await
+    }
+
+    /// Sends an authenticated request to a [`Nested`] two-level resource: `route.resolve(
+    /// self.api_host(), network, child, parent)` followed by [`Transport::request`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `route.resolve` fails, otherwise as [`Transport::request`].
+    pub async fn nested(
+        &self,
+        route: &Nested,
+        network: &str,
+        child: &str,
+        parent: Option<&Value>,
+        query: &[(&str, String)],
+        body: RequestBody,
+    ) -> Result<Envelope, Error> {
+        let url = route.resolve(self.api_host(), network, child, parent)?;
+        self.request(route.method.clone(), url, query, body).await
+    }
+
+    /// Sends a request authenticated with an explicit (or absent) token: no "not authenticated"
+    /// precondition, no refresh-and-replay. Used by the login handshake
+    /// (`LoginFlow`/`PendingLogin`) and internally by [`Transport::refresh_session`] — none of
+    /// `login`/`login/verify`/`login/resend`/`logout`/`login/refresh` should trigger (or be
+    /// eligible for) the ordinary refresh replay, matching `AuthAPI` never wiring its own refresh
+    /// hook onto itself (`api/base.py:873-878`, preventing recursion on the refresh endpoint's
+    /// own 401).
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever status-mapped [`Error`] the request produces.
+    pub(crate) async fn request_with_token(
+        &self,
+        method: Method,
+        url: Url,
+        query: &[(&str, String)],
+        body: RequestBody,
+        token: Option<&SecretString>,
+    ) -> Result<Envelope, Error> {
+        let exchange = self
+            .execute_with_get_retry(method, &url, query, &body, token)
+            .await?;
+        status_to_envelope(
+            exchange.status,
+            &exchange.body,
+            &exchange.url,
+            exchange.retry_after,
+        )
+    }
+
+    /// Sends an authenticated request with no query-string parameters and a JSON-or-absent body,
+    /// through the legacy [`Route`] model. Equivalent to
     /// `send_with_query(route, path_params, &[], body)`.
+    ///
+    /// **Legacy.** Kept only so endpoint modules not yet migrated onto [`Resource`]/[`Nested`]
+    /// keep compiling; see `.claude/tasks/briefs/v8/transport-api.md` for the migration this
+    /// wrapper stands in for.
     ///
     /// # Errors
     ///
@@ -193,20 +347,18 @@ impl Transport {
         self.send_with_query(route, path_params, &[], body).await
     }
 
-    /// Sends an authenticated request, attaching `Cookie: s=<token>` from the current session.
+    /// Sends an authenticated request through the legacy [`Route`] model, JSON-only.
     ///
-    /// Performs the one-shot server-driven refresh retry described in the module docs: on a
-    /// `401` whose body carries `meta.error == "error.session.refresh"`
-    /// (`api/base.py:220-256`), calls [`Transport::refresh_session`] and, if it reports success,
-    /// retries the identical request exactly once with the refreshed token before giving up.
+    /// **Legacy.** A thin wrapper over [`Transport::request`]: renders `route`'s path template
+    /// against `path_params` using this transport's configured base for `route`'s API version
+    /// (via `Transport::render_url`, which — unlike [`Resource`]/[`Nested`] — always targets
+    /// the *configured* base, so a `TransportBuilder::base_url` override still applies), then maps
+    /// `body` to [`RequestBody::Json`] (`Some`) or [`RequestBody::None`] (`None`).
     ///
     /// # Errors
     ///
-    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
-    /// before any network call is made (`api/base.py`'s per-method `get_auth_token()` preamble,
-    /// reproduced here since every endpoint method funnels through this one call site). Returns
-    /// whatever status-mapped error the request produces otherwise (see the crate's `Error`
-    /// docs), or propagates a refresh failure unmodified if the refresh hook itself errors.
+    /// Returns [`Error::Validation`] if `route`'s template cannot be rendered against
+    /// `path_params`, otherwise as [`Transport::request`].
     pub async fn send_with_query(
         &self,
         route: &Route,
@@ -214,216 +366,139 @@ impl Transport {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Envelope, Error> {
-        let token = self.current_token().ok_or_else(not_authenticated)?;
         let url = self.render_url(route, path_params)?;
-
-        let exchange = self
-            .execute_raw(
-                route.method.clone(),
-                url.clone(),
-                query,
-                body.as_ref(),
-                Some(&token),
-            )
-            .await?;
-
-        if exchange.status.as_u16() == 401 && refresh_signal_detected(&exchange.body) {
-            let refreshed = self.refresh_session().await?;
-            if refreshed {
-                // Divergence from eero-api (api/base.py:296-298; task brief gotcha G1): Python
-                // re-passes the *original, pre-refresh* token into the retried request, which
-                // then clobbers the fresh cookie the refresh itself just set on the shared
-                // cookie jar — the retry never actually benefits from the refresh. rusteero
-                // re-reads the session from the shared state *after* the refresh completes and
-                // retries with the refreshed token instead of reproducing that bug.
-                let retry_token = self.current_token().ok_or_else(not_authenticated)?;
-                let retry = self
-                    .execute_raw(
-                        route.method.clone(),
-                        url.clone(),
-                        query,
-                        body.as_ref(),
-                        Some(&retry_token),
-                    )
-                    .await?;
-                return status_to_envelope(
-                    retry.status,
-                    &retry.body,
-                    &retry.url,
-                    retry.retry_after,
-                );
-            }
-            // `refreshed == false`: fall through and raise the original 401 below, exactly like
-            // Python's "Session refresh returned False; raising auth exception" path.
-        }
-
-        status_to_envelope(
-            exchange.status,
-            &exchange.body,
-            &exchange.url,
-            exchange.retry_after,
-        )
+        let body = body.map_or(RequestBody::None, RequestBody::Json);
+        self.request(route.method.clone(), url, query, body).await
     }
 
-    /// Sends an unauthenticated (or explicit-token) request: no "not authenticated" precondition,
-    /// no refresh retry. Used by the login handshake (`LoginFlow`/`PendingLogin`, a later phase)
-    /// and internally by [`Transport::refresh_session`].
+    /// Attempts to refresh the current session, ported from `AuthAPI._do_refresh`
+    /// (`api/auth.py:415-477`) with single-flight coalescing ported from
+    /// `AuthAPI.refresh_session` (`api/auth.py:331-413`).
     ///
-    /// The returned value's `set_cookie_session` surfaces any `Set-Cookie: s=...` header the
-    /// server sent on this response — `rusteero` has no implicit cookie jar to catch it the way
-    /// `eero-api`'s aiohttp session does (task brief gotcha #11), so this is the only place such
-    /// a cookie can ever become visible to a caller.
-    pub(crate) async fn send_raw(
-        &self,
-        route: &Route,
-        path_params: &[(&str, &str)],
-        query: &[(&str, String)],
-        body: Option<Value>,
-        token: Option<&SecretString>,
-    ) -> Result<RawResponse, Error> {
-        let url = self.render_url(route, path_params)?;
-        let exchange = self
-            .execute_raw(route.method.clone(), url, query, body.as_ref(), token)
-            .await?;
-        let envelope = status_to_envelope(
-            exchange.status,
-            &exchange.body,
-            &exchange.url,
-            exchange.retry_after,
-        )?;
-        Ok(RawResponse {
-            envelope,
-            set_cookie_session: exchange.set_cookie_session,
-        })
-    }
-
-    /// Attempts to refresh the current session, ported from `AuthAPI.refresh_session`
-    /// (`api/auth.py:279-340`; see the auth behaviour notes for the full behaviour brief
-    /// this reproduces, including the exception-hierarchy subtlety noted at the terminal-error
-    /// match arm below).
+    /// Sends `POST` [`routes::LOGIN_REFRESH`] (the only refresh route at `v8.0.4` — `v6.2.0`'s
+    /// `account/refresh` fallback is gone) with body [`RequestBody::EmptyJsonString`],
+    /// authenticated by the *current* session token — there is no separate refresh token at
+    /// `v8.0.4`, the session token authenticates its own refresh. On success, the response body is
+    /// **not** parsed for a new token at all: the server-issued token is discarded per SDK policy
+    /// and the current token stays current.
     ///
-    /// Tries `routes::LOGIN_REFRESH` then `routes::ACCOUNT_REFRESH`, in that order, with body
-    /// `{"refresh_token": <current refresh token>}` and no attached cookie (mirroring
-    /// `api/auth.py:301-304`, which omits `auth_token` for this call). On success, reads
-    /// `data.session_token` (a *different* wire key from the login/verify handshake's
-    /// `user_token`) and `data.refresh_token`, updates the in-memory session, and persists
-    /// through the configured credential store if any, honouring this transport's
-    /// [`StorageFailures`] policy (decision D-13, [`TransportBuilder::storage_failures`]): under
-    /// the default [`StorageFailures::Warn`], a store failure here is logged at WARN and never
-    /// masks a successful refresh; under [`StorageFailures::Fatal`], a persistence failure here
-    /// returns `Error::Storage` even though the in-memory session already reflects the refresh
-    /// (and the remote refresh itself succeeded) — see [`Transport::set_session`]'s docs for the
-    /// same in-memory-first ordering guarantee this shares.
+    /// # Single-flight coalescing
+    ///
+    /// Concurrent callers on this `Transport` share one in-flight refresh: the first caller
+    /// becomes the *leader* and performs the actual network call; every other concurrent caller
+    /// becomes a *waiter*, capped at [`consts::SESSION_REFRESH_GUARD_TIMEOUT`] (30s) — a waiter
+    /// whose wait exceeds that cap gives up and returns `Ok(false)` rather than raising, so its
+    /// own original error (e.g. the `401` that triggered the refresh in the first place) surfaces
+    /// instead of a fabricated one. A leader whose future is dropped or cancelled before it
+    /// finishes resolves every waiter to `Ok(false)` too (see `Transport::refresh_slot`'s own
+    /// docs for the self-healing mechanism this relies on — no explicit cleanup step is needed,
+    /// and a single cancellation can never permanently wedge every future refresh attempt).
     ///
     /// # Errors
     ///
-    /// Returns `Error::Authentication("No refresh token available")` if the current session has
-    /// no refresh token (the literal, unwrapped Python message, `api/auth.py:295-296`) — in
-    /// practice this is the common case, since a normal login/verify never yields one (task
-    /// brief finding (d)). Propagates a network/timeout error, or a `401`/`429`/other
-    /// non-`404` status from *either* refresh route unmodified once past that precondition. A
-    /// terminal `404`-from-both-routes or a terminal non-`404` `Error::Api` from either route is
-    /// **not** propagated as an error: both instead clear the local session (persisting the
-    /// clear, best-effort) and return `Ok(false)`, exactly matching `api/auth.py:305-338` — unless
-    /// that best-effort persistence itself fails under `StorageFailures::Fatal`, in which case
-    /// this returns `Error::Storage` instead of `Ok(false)`.
-    ///
-    /// **Divergence from eero-api (documentation finding F7, `api/auth.py:308-311`)**: a
-    /// network/timeout failure from either refresh route surfaces here as this crate's ordinary
-    /// [`Error::Network`]/[`Error::Timeout`], whose `Display` is the same fixed, call-site-
-    /// agnostic text used by every other network failure in the crate (`"Network error: {0}"`,
-    /// `"Request timed out"`). Python instead raises a call-site-specific
-    /// `EeroNetworkException(f"Network error during session refresh: {err}")` here. This port
-    /// deliberately does not thread refresh-specific wording through `Error::Network`/
-    /// `Error::Timeout` — doing so would mean either a new field those variants carry for no
-    /// other caller, or matching on which call site produced the error, both worse than the
-    /// small, intentional loss of this one message's specificity.
+    /// Returns `Error::Authentication("No session token available. Login first.")` if no valid
+    /// session is configured. On a terminal `Error::Authentication` from the refresh call itself:
+    /// if its `error_code` classifies into [`errors::ErrorGroup::Verification`] or
+    /// [`errors::ErrorGroup::SessionRefresh`] (the credential-retention groups), credentials are
+    /// **retained** and this returns `Ok(false)`; otherwise credentials are **destroyed**
+    /// (in-memory, plus `CredentialStore::clear` if configured — honouring this transport's
+    /// [`StorageFailures`] policy, so a `Fatal`-policy clear failure surfaces as `Error::Storage`
+    /// here) and this returns `Ok(false)`. `Error::Network`/`Error::Timeout` propagate unmodified,
+    /// credentials untouched. Every other `Error` is treated as non-terminal: credentials are left
+    /// untouched and this returns `Ok(false)`.
     pub async fn refresh_session(&self) -> Result<bool, Error> {
-        let current = self.session_snapshot();
-        let refresh_token = current
-            .as_ref()
-            .and_then(Session::expose_refresh_token)
-            .filter(|token| !token.is_empty())
-            .map(str::to_owned);
-
-        let Some(refresh_token) = refresh_token else {
-            return Err(Error::authentication("No refresh token available"));
-        };
-
-        let body = json!({ "refresh_token": refresh_token });
-
-        for route in [&routes::LOGIN_REFRESH, &routes::ACCOUNT_REFRESH] {
-            match self
-                .send_raw(route, &[], &[], Some(body.clone()), None)
-                .await
-            {
-                Ok(raw) => {
-                    let data = raw.envelope.data();
-                    // "session_token"/"refresh_token": the literal wire keys a refresh response
-                    // body carried under this crate's pre-v8.0.4 shape. The two named constants
-                    // that used to hold these strings were removed at v8.0.4 per the port brief
-                    // §1 — v8.0.4's own refresh handshake never reads a new token from the
-                    // response body at all, see this method's own doc comment. Phase B reworks
-                    // this method's body shape entirely; these two literals are kept inline,
-                    // unchanged in behaviour, purely so the removed constants have no remaining
-                    // reference.
-                    let Some(new_token) = data
-                        .get("session_token")
-                        .and_then(Value::as_str)
-                        .filter(|token| !token.is_empty())
-                    else {
-                        // Missing or empty: Python returns `False` without clearing or
-                        // persisting anything (`api/auth.py:332`).
-                        return Ok(false);
-                    };
-                    let new_refresh_token = data.get("refresh_token").and_then(Value::as_str);
-                    let refreshed = build_refreshed_session(new_token, new_refresh_token);
-                    self.replace_session(Some(refreshed.clone()));
-                    self.persist_session(&refreshed).await?;
-                    return Ok(true);
-                }
-                // A 404 from this route: try the next one in the tuple order. At v8.0.4 a 404
-                // classifies to `Error::NotFound` rather than `Error::Api { status: 404, .. }`
-                // (see `crate::errors::error_for_response`'s precedence) — matched here only as
-                // far as needed to compile against the new variant shape; phase B reworks this
-                // method's routing/retry behaviour entirely (the port brief documents that
-                // v8.0.4 has exactly one refresh route, not two).
-                Err(Error::NotFound { .. }) => {}
-                // Any other `Error::Api` (400, 403, 5xx, ...) is the direct analogue of a
-                // generic `EeroAPIException` in Python — terminal, clears local state, and
-                // returns `Ok(false)` rather than propagating (`api/auth.py:312-316`). A `401`
-                // is *not* `Error::Api` in this crate's type (it is `Error::Authentication`,
-                // mirroring `EeroAuthenticationException`'s separate class in Python), so it
-                // falls to the `Err(other)` arm below and propagates unmodified — reproducing
-                // the same sibling-exception-hierarchy gap the task brief documents for
-                // `login`/`verify`/`resend_verification_code` (brief gotcha #1), which applies
-                // here too since `refresh_session` never catches `Error::Authentication` either.
-                // `Error::AccessDenied`/`ClientBlocked`/`RateLimit`/`PremiumRequired`/
-                // `FeatureUnavailable`/`Validation` are new, separate variants at v8.0.4 (§3) that
-                // this pre-existing match never anticipated; they now fall to `Err(other)` below
-                // and propagate rather than being treated as terminal-and-clear — a deliberate,
-                // minimal-scope choice for this phase (phase B substantively reworks this
-                // method), noted in this phase's report.
-                Err(Error::Api { status, .. }) => {
-                    // `message` is intentionally never logged here (finding 1): it is either the
-                    // raw truncated response body or "Invalid JSON response: " + the truncated
-                    // body, and a successful refresh response legitimately carries
-                    // `data.session_token`/`data.refresh_token`. A malformed-JSON 200 from this
-                    // very refresh call would otherwise put live credentials into an ERROR log
-                    // line. `status` is a bare status code and carries nothing sensitive.
-                    tracing::error!(status, "session refresh failed");
-                    self.replace_session(Some(Session::empty()));
-                    self.persist_session(&Session::empty()).await?;
-                    return Ok(false);
-                }
-                Err(other) => return Err(other),
-            }
+        enum Role {
+            Leader(Arc<watch::Sender<Option<bool>>>),
+            Waiter(watch::Receiver<Option<bool>>),
         }
 
-        tracing::error!("session refresh failed: no refresh endpoint was accepted by the server");
-        self.replace_session(Some(Session::empty()));
-        self.persist_session(&Session::empty()).await?;
-        Ok(false)
+        let role = {
+            let mut guard = self.refresh_slot.lock().await;
+            if let Some(sender) = guard.upgrade() {
+                let rx = sender.subscribe();
+                Role::Waiter(rx)
+            } else {
+                let (tx, _rx) = watch::channel(None);
+                let tx = Arc::new(tx);
+                *guard = Arc::downgrade(&tx);
+                Role::Leader(tx)
+            }
+        };
+
+        match role {
+            Role::Leader(tx) => {
+                let result = self.do_refresh().await;
+                let broadcast = match &result {
+                    Ok(refreshed) => Some(*refreshed),
+                    // Waiters cannot cheaply observe the leader's own `Error` (not `Clone`); a
+                    // network/timeout/terminal failure here is reported to waiters as "did not
+                    // succeed" rather than propagated — the leader's own caller still sees the
+                    // real error via `result` below.
+                    Err(_) => Some(false),
+                };
+                let _ = tx.send(broadcast);
+                result
+            }
+            Role::Waiter(mut rx) => {
+                let wait = async {
+                    loop {
+                        if let Some(value) = *rx.borrow_and_update() {
+                            return value;
+                        }
+                        if rx.changed().await.is_err() {
+                            // The leader's `Arc<Sender>` was dropped without ever sending —
+                            // either it finished (and this race lost to the slot already being
+                            // re-claimed) or its future was cancelled. Either way: `false`.
+                            return false;
+                        }
+                    }
+                };
+                match tokio::time::timeout(consts::SESSION_REFRESH_GUARD_TIMEOUT, wait).await {
+                    Ok(value) => Ok(value),
+                    Err(_elapsed) => Ok(false),
+                }
+            }
+        }
+    }
+
+    /// The actual refresh network call, run only by [`Transport::refresh_session`]'s leader.
+    async fn do_refresh(&self) -> Result<bool, Error> {
+        let session = self.session_snapshot();
+        let Some(token) = session.filter(Session::is_valid).map(|s| s.token().clone()) else {
+            return Err(Error::authentication(
+                "No session token available. Login first.",
+            ));
+        };
+
+        let url = self.render_url(&routes::LOGIN_REFRESH, &[])?;
+        match self
+            .request_with_token(
+                Method::POST,
+                url,
+                &[],
+                RequestBody::EmptyJsonString,
+                Some(&token),
+            )
+            .await
+        {
+            Ok(_envelope) => {
+                tracing::debug!("Session refreshed; server-issued token ignored per SDK policy");
+                Ok(true)
+            }
+            Err(Error::Authentication { error_code, .. }) => {
+                let group = errors::classify_error_code(error_code.as_deref());
+                let retain = matches!(
+                    group,
+                    Some(errors::ErrorGroup::Verification | errors::ErrorGroup::SessionRefresh)
+                );
+                if !retain {
+                    self.set_session(None)?;
+                }
+                Ok(false)
+            }
+            Err(err @ (Error::Network(_) | Error::Timeout)) => Err(err),
+            Err(_other) => Ok(false),
+        }
     }
 
     /// Clones the in-memory session out from behind the lock. The guard never survives past this
@@ -436,7 +511,7 @@ impl Transport {
     }
 
     /// Returns the current session's token, but only if the session is present and
-    /// `Session::is_valid`. This is the exact gate `send`/`send_with_query` use for the
+    /// `Session::is_valid`. This is the exact gate `request`/`send`-family methods use for the
     /// "Not authenticated" precondition.
     fn current_token(&self) -> Option<SecretString> {
         self.session_snapshot()
@@ -444,44 +519,13 @@ impl Transport {
             .map(|session| session.token().clone())
     }
 
-    /// Overwrites the in-memory session without touching the credential store. Used internally
-    /// by `refresh_session` (which has its own, warn-only persistence policy) and by
-    /// `set_session` (which persists synchronously right after calling this).
+    /// Overwrites the in-memory session without touching the credential store.
     fn replace_session(&self, session: Option<Session>) {
         let mut guard = self.session.write().unwrap_or_else(PoisonError::into_inner);
         *guard = session;
     }
 
-    /// Persists `session` to the configured credential store, if any, via
-    /// `crate::storage`'s shared `save_async` adapter (`tokio::task::spawn_blocking` under the
-    /// hood — the store's trait is intentionally synchronous, see that module's docs), honouring
-    /// this transport's [`StorageFailures`] policy. Used only by [`Transport::refresh_session`]'s
-    /// three persistence points; see that method's own docs for the exact contract under each
-    /// policy.
-    ///
-    /// # Errors
-    ///
-    /// Under [`StorageFailures::Warn`] (the default), a store failure is logged at `WARN` and
-    /// this always returns `Ok(())`. Under [`StorageFailures::Fatal`], a store failure is
-    /// returned as `Error::Storage`.
-    async fn persist_session(&self, session: &Session) -> Result<(), Error> {
-        let Some(store) = self.store.clone() else {
-            return Ok(());
-        };
-        match crate::storage::save_async(store, session.clone()).await {
-            Ok(()) => Ok(()),
-            Err(err) => match self.storage_failures {
-                StorageFailures::Warn => {
-                    tracing::warn!(error = %err, "failed to persist session to credential store");
-                    Ok(())
-                }
-                StorageFailures::Fatal => Err(err.into()),
-            },
-        }
-    }
-
-    /// Returns the configured base `Url` for `version`: the real Eero host by default, or the
-    /// host derived from `TransportBuilder::base_url` when one was supplied.
+    /// Returns the configured base `Url` for `version`.
     fn base_for(&self, version: ApiVersion) -> &Url {
         match version {
             ApiVersion::V2_2 => &self.base_22,
@@ -495,23 +539,17 @@ impl Transport {
     /// This intentionally duplicates the (small) segment-substitution loop from
     /// `routes::Route::render` rather than calling it directly: `Route::render` always builds
     /// against the *real* Eero host baked into `ApiVersion::base_url`, with no way to substitute
-    /// a test double, which is exactly what `TransportBuilder::base_url` needs in order to point
-    /// a single wiremock server at both API versions. The two loops share one thing rather than
-    /// reimplementing it twice, though: every substituted value is checked by
-    /// `routes::validate_segment` — the same function `Route::render` calls — before it is
-    /// pushed onto the URL, so both renderers reject exactly the same set of hostile values (see
-    /// `routes`'s module docs, "Path traversal" section, for what that guarantees and why).
-    /// Percent-encoding is otherwise identical to `Route::render`; the only remaining difference
-    /// is which base `Url` the segments are pushed onto.
+    /// a test double, which is exactly what `TransportBuilder::base_url` needs. Every substituted
+    /// value is checked by `routes::validate_segment` — the same function `Route::render` calls —
+    /// before it is pushed onto the URL.
     ///
     /// # Errors
     ///
     /// Returns `Error::Validation` if the configured base URL cannot be extended
     /// (`field: "base_url"`), if `route`'s template references a placeholder absent from
-    /// `params` (`field` is the placeholder name, `message: "missing value for path
-    /// parameter"`), or if a substituted value fails `routes::validate_segment` (`field` is the
-    /// placeholder name, `message` describes which rule it broke).
-    fn render_url(&self, route: &Route, params: &[(&str, &str)]) -> Result<Url, Error> {
+    /// `params` (`field` is the placeholder name), or if a substituted value fails
+    /// `routes::validate_segment`.
+    pub(crate) fn render_url(&self, route: &Route, params: &[(&str, &str)]) -> Result<Url, Error> {
         let mut url = self.base_for(route.version).clone();
         {
             let mut segments = url.path_segments_mut().map_err(|()| {
@@ -522,7 +560,6 @@ impl Transport {
             })?;
             for part in route.path.split('/') {
                 if part.is_empty() {
-                    // Leading/trailing/doubled slashes in a template contribute no segment.
                     continue;
                 }
                 if let Some(name) = part.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
@@ -544,52 +581,176 @@ impl Transport {
         Ok(url)
     }
 
-    /// Sends one HTTP request and returns its status, body, and any incidental headers this
-    /// crate cares about (`Set-Cookie: s=...`, `Retry-After`) — everything *before*
-    /// status-code-specific interpretation, which is `status_to_envelope`'s job.
+    /// Whether `url`'s scheme, host, and port (default-normalised) all match this transport's
+    /// configured [`Transport::api_host`].
     ///
-    /// Handles, in order: attaching the `Cookie: s=<token>` header when `token` is `Some`
-    /// (`api/base.py:148-152`); sending the request; logging method + rendered path + status
-    /// only, never headers, cookies, or bodies (see the crate-level security rules); refusing
-    /// any `3xx` redirect immediately, before the body is streamed at all
-    /// (`api/base.py:158-186`); and streaming the body with the 10 MiB cap.
-    async fn execute_raw(
+    /// Ported from `_validate_absolute_url`'s host/scheme comparison (`base.py:394-406`), plus a
+    /// port comparison this crate adds: `eero-api`'s production host never carries a port, so
+    /// Python has no need to compare one, but `TransportBuilder::base_url` (used by every test in
+    /// this crate) legitimately does — two different local mock servers share the loopback
+    /// hostname but differ only by port, and a credential-placement gate that ignored port would
+    /// not actually withhold the credential from a "foreign" mock server in that common case.
+    fn matches_configured_host(&self, url: &Url) -> bool {
+        let scheme_matches = url.scheme().eq_ignore_ascii_case(self.api_host.scheme());
+        let host_matches = matches!(
+            (url.host_str(), self.api_host.host_str()),
+            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)
+        );
+        let port_matches = url.port_or_known_default() == self.api_host.port_or_known_default();
+        scheme_matches && host_matches && port_matches
+    }
+
+    /// Attaches the session credential to `request`, when `token` is `Some` — ported from
+    /// `_build_credentials` (`base.py:363-417`).
+    ///
+    /// Attached only when `url`'s scheme/host/port match this transport's configured API host
+    /// (see [`Transport::matches_configured_host`]): `X-User-Token: <token>` always, plus —
+    /// only if [`TransportBuilder::send_legacy_cookie`] is on (the default) — a
+    /// `Cookie: s=<token>` header. On a mismatch, no credential is attached and a `WARNING` is
+    /// logged with Python's wording, reproduced verbatim (`base.py:407-412`).
+    fn apply_credentials(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        url: &Url,
+        token: Option<&SecretString>,
+    ) -> reqwest::RequestBuilder {
+        let Some(token) = token else {
+            return request;
+        };
+        if !self.matches_configured_host(url) {
+            let scheme_matches = url.scheme().eq_ignore_ascii_case(self.api_host.scheme());
+            let host_matches = matches!(
+                (url.host_str(), self.api_host.host_str()),
+                (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)
+            );
+            let reason = if host_matches && !scheme_matches {
+                "non-matching scheme"
+            } else {
+                "foreign host"
+            };
+            tracing::warn!(
+                reason,
+                scheme = url.scheme(),
+                host = url.host_str().unwrap_or(""),
+                "Session header withheld from a request to a {reason}: {}://{}",
+                url.scheme(),
+                url.host_str().unwrap_or("")
+            );
+            return request;
+        }
+
+        let token_str = Session::expose_secret_token(token);
+        request = request.header(user_token_header(), token_str);
+        if self.send_legacy_cookie {
+            request = request.header(
+                COOKIE,
+                format!("{}={}", consts::SESSION_COOKIE_NAME, token_str),
+            );
+        }
+        request
+    }
+
+    /// Applies `body` to `request`, per [`RequestBody`]'s doc comment.
+    ///
+    /// `RequestBody::Form` is encoded by hand via `url::form_urlencoded` (already a transitive
+    /// dependency of this crate's direct `url` dependency, used elsewhere for query-string
+    /// encoding) rather than `reqwest::RequestBuilder::form`, which needs reqwest's `form` cargo
+    /// feature — not enabled for this crate (no new dependencies/feature flags without an
+    /// explicit decision).
+    fn apply_body(request: reqwest::RequestBuilder, body: &RequestBody) -> reqwest::RequestBuilder {
+        match body {
+            RequestBody::None => request,
+            RequestBody::Json(value) => request.json(value),
+            RequestBody::Form(pairs) => {
+                let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                for (key, value) in pairs {
+                    serializer.append_pair(key, value);
+                }
+                request
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(serializer.finish())
+            }
+            RequestBody::EmptyJsonString => request
+                .header(CONTENT_TYPE, "application/json")
+                .body("\"\""),
+        }
+    }
+
+    /// Runs [`Transport::execute_once`] with the bounded `GET`-only retry `_request_with_get_retry`
+    /// implements (`base.py:722-767`).
+    ///
+    /// Writes (`method != GET`) always attempt exactly once, regardless of
+    /// [`TransportBuilder::get_retries`]. A `GET` is retried, up to `get_retries` additional
+    /// times, on a transport error ([`Error::Network`]/[`Error::Timeout`]) or a `5xx` status —
+    /// never on a `4xx` (including `429`, which carries its own `Retry-After` semantics a caller
+    /// should honour explicitly rather than have this loop silently retry). A fixed delay
+    /// ([`consts::GET_RETRY_DELAY`]) separates attempts; each retry is logged at `WARN`.
+    async fn execute_with_get_retry(
+        &self,
+        method: Method,
+        url: &Url,
+        query: &[(&str, String)],
+        body: &RequestBody,
+        token: Option<&SecretString>,
+    ) -> Result<RawExchange, Error> {
+        let mut attempt: u32 = 0;
+        loop {
+            let outcome = self
+                .execute_once(method.clone(), url.clone(), query, body, token)
+                .await;
+            let is_get = method == Method::GET;
+            let retryable = is_get
+                && attempt < self.get_retries
+                && match &outcome {
+                    Ok(exchange) => exchange.status.as_u16() >= 500,
+                    Err(Error::Network(_) | Error::Timeout) => true,
+                    Err(_) => false,
+                };
+            if !retryable {
+                return outcome;
+            }
+            attempt += 1;
+            tracing::warn!(
+                attempt,
+                method = %method,
+                path = url.path(),
+                "retrying GET request"
+            );
+            tokio::time::sleep(consts::GET_RETRY_DELAY).await;
+        }
+    }
+
+    /// Sends one HTTP request and returns its status, body, and any incidental headers this
+    /// crate cares about (`Retry-After`) — everything *before* status-code-specific
+    /// interpretation, which is `status_to_envelope`'s job.
+    ///
+    /// Builds `Accept: application/json`, `User-Agent`, and `X-Accept-Language` on every request
+    /// (`build_request_headers`, `base.py:124-164`); attaches the session credential via
+    /// [`Transport::apply_credentials`]; applies `body` via [`Transport::apply_body`]; refuses any
+    /// `3xx` redirect immediately, before the body is streamed at all; and streams the body with
+    /// the response-size cap.
+    async fn execute_once(
         &self,
         method: Method,
         url: Url,
         query: &[(&str, String)],
-        body: Option<&Value>,
+        body: &RequestBody,
         token: Option<&SecretString>,
     ) -> Result<RawExchange, Error> {
         // Query parameters are appended directly onto the `Url` via `url`'s own percent-encoding
-        // (`Url::query_pairs_mut`) rather than `reqwest::RequestBuilder::query`, which requires
-        // reqwest's `query` cargo feature — not enabled for this crate (no new dependencies /
-        // feature flags without an explicit decision). `url::form_urlencoded` (which backs
-        // `query_pairs_mut`) is already pulled in transitively by the `url` crate, an existing
-        // direct dependency.
+        // rather than `reqwest::RequestBuilder::query`, which requires reqwest's `query` cargo
+        // feature — not enabled for this crate.
         let mut url = url;
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
 
         let mut request = self.http.request(method.clone(), url.clone());
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        if let Some(token) = token {
-            // The crate's controlled exposure point for a token that isn't (necessarily) part of
-            // a `Session` — this call site is shared with `auth::flow::PendingLogin`'s
-            // pre-`Session` login token, see `Session::expose_secret_token`'s docs; every other
-            // consumer of a token must go through `secrecy::ExposeSecret` explicitly.
-            request = request.header(
-                COOKIE,
-                format!(
-                    "{}={}",
-                    consts::SESSION_COOKIE_NAME,
-                    Session::expose_secret_token(token)
-                ),
-            );
-        }
+        request = request.header(ACCEPT, "application/json");
+        request = request.header(USER_AGENT, &self.user_agent);
+        request = request.header(x_accept_language_header(), &self.accept_language);
+        request = self.apply_credentials(request, &url, token);
+        request = Self::apply_body(request, body);
 
         let response = request.send().await.map_err(map_reqwest_error)?;
         let status = response.status();
@@ -603,26 +764,10 @@ impl Transport {
             "eero transport request"
         );
 
-        // Security finding F4: a caller-supplied `reqwest::Client` (`TransportBuilder::http`)
-        // can keep reqwest's default `Policy::limited(10)` instead of this crate's own
+        // Security finding F4: a caller-supplied `reqwest::Client` (`TransportBuilder::http`) can
+        // keep reqwest's default `Policy::limited(10)` instead of this crate's own
         // `Policy::none()`, in which case a `3xx` response is followed *inside* `request.send()`
-        // above and never reaches the `status.is_redirection()` check below at all — `status`
-        // and `response` at this point already reflect the final hop. `reqwest`'s
-        // `remove_sensitive_headers` compares host+port only, not scheme, so e.g. an
-        // `https://api-user.e2ro.com` -> `http://api-user.e2ro.com:443` redirect keeps
-        // `Cookie: s=<token>` attached and replays a live session token in cleartext over an
-        // unencrypted hop. This defends uniformly, regardless of which client was injected: if
-        // the URL the response actually came from differs from the URL we asked for, a redirect
-        // was followed, so refuse it here — before the body (which is the redirect target's, not
-        // the requested resource's) is ever read.
-        //
-        // This is *not* the same situation the `status.is_redirection()` arm below handles, and
-        // must not reuse its "Redirect not followed" wording: by the time this branch is
-        // reachable, the redirect *was* followed, by the injected client, not refused by this
-        // crate — `status` here is the final hop's status (e.g. `200`), not the original `3xx`,
-        // which this crate never even saw. Saying "not followed" would be a lie. `eero-api` has
-        // no equivalent of this path at all (`allow_redirects=False` unconditionally), so there
-        // is no Python wording to match here.
+        // above and never reaches the `status.is_redirection()` check below at all.
         if response.url() != &url {
             return Err(Error::Api {
                 status: status.as_u16(),
@@ -660,42 +805,41 @@ impl Transport {
             });
         }
 
-        let set_cookie_session = extract_set_cookie_session(&response);
         let retry_after = parse_retry_after(response.headers());
         let body_text = read_capped_body(response).await?;
 
         Ok(RawExchange {
             status,
             body: body_text,
-            set_cookie_session,
             retry_after,
             url,
         })
     }
 }
 
-/// Response of an unauthenticated call, including any fresh session cookie.
-pub(crate) struct RawResponse {
-    pub envelope: Envelope,
-    /// Read by `auth::flow::PendingLogin::verify` to prefer a fresh `Set-Cookie: s=...` session
-    /// token over the original login token, when the server sends one (see that method's docs).
-    pub set_cookie_session: Option<SecretString>,
+/// Header name for the primary session credential (`X-User-Token`), built lazily so a malformed
+/// `'static` literal would be caught by this crate's own test suite rather than trusted blindly.
+fn user_token_header() -> HeaderName {
+    HeaderName::from_static("x-user-token")
+}
+
+/// Header name for `X-Accept-Language`. See [`user_token_header`]'s doc comment.
+fn x_accept_language_header() -> HeaderName {
+    HeaderName::from_static("x-accept-language")
 }
 
 /// The ingredients of one HTTP exchange, before status-code interpretation.
 struct RawExchange {
     status: StatusCode,
     body: String,
-    set_cookie_session: Option<SecretString>,
     retry_after: Option<Duration>,
-    /// The exact URL requested, including any query string appended in `Transport::execute_raw`
+    /// The exact URL requested, including any query string appended in `Transport::execute_once`
     /// — used for error messages instead of the pre-query `Url` the caller originally rendered.
     url: Url,
 }
 
 /// The literal `Error::Authentication("Not authenticated")` guard every authenticated call
-/// raises when no valid session is configured — factored out since it is constructed at two
-/// call sites (the initial precondition and the post-refresh retry).
+/// raises when no valid session is configured.
 fn not_authenticated() -> Error {
     Error::authentication("Not authenticated")
 }
@@ -703,18 +847,10 @@ fn not_authenticated() -> Error {
 /// Turns a response status and (already fully read) body into an `Envelope` or the matching
 /// `Error`, reproducing `api/base.py`'s status-code chain at `v8.0.4`:
 ///
-/// - `204`, or any `2xx` with an empty/whitespace-only body, becomes `Envelope::empty()` — the
-///   `204` check short-circuits *before* the whitespace check, so a (spec-violating) `204` with
-///   a non-empty body still yields `{}` without ever attempting to parse it.
-/// - Any other `2xx` is parsed as JSON; invalid JSON becomes `Error::Api` (not `Error::Json`,
-///   which is reserved for `Envelope::data_as`) with message `"Invalid JSON response ({n}
-///   bytes)"` — a byte count only, never body content, matching `base.py:593-597`.
-/// - Every other non-`2xx`, non-`3xx` status is classified by [`errors::error_for_response`]: the
-///   body is best-effort parsed into an `envelope` ([`errors::parse_envelope`]) and its
-///   `meta.error` extracted ([`errors::error_code_from_envelope`]) so both can be attached to the
-///   returned error and separately debug-logged, but the error's `message` is built entirely by
-///   [`errors::message_for_error_code`] — never from the raw body or this URL. See
-///   [`crate::errors`]'s module docs for the full precedence table.
+/// - `204`, or any `2xx` with an empty/whitespace-only body, becomes `Envelope::empty()`.
+/// - Any other `2xx` is parsed as JSON; invalid JSON becomes `Error::Api` with message
+///   `"Invalid JSON response ({n} bytes)"` — a byte count only, never body content.
+/// - Every other non-`2xx`, non-`3xx` status is classified by [`errors::error_for_response`].
 ///
 /// Every debug log line in this function logs `status` and, for a JSON body, the *redacted*
 /// envelope ([`redact::redact_sensitive`]) — mirroring `_log_error_body` (`base.py:78-105`) —
@@ -761,19 +897,7 @@ fn status_to_envelope(
     Err(err)
 }
 
-/// Streams `response`'s body with a running size check, matching `eero-api`'s streamed,
-/// cap-checked read (`api/base.py:188-205`): as soon as the accumulated length would *exceed*
-/// `consts::MAX_RESPONSE_BYTES`, this aborts immediately without appending the chunk that pushed
-/// it over — a body of exactly the cap succeeds, one byte more does not. Unlike Python's fixed
-/// `65536`-byte chunker, this reads whatever chunk size `reqwest`'s `Response::chunk` yields
-/// from the underlying transport; the cap check runs after every chunk regardless of its size,
-/// so the strictly-greater-than semantics are identical either way.
-///
-/// Returns `Error::Api` (carrying the response's real status, not a synthetic one, matching
-/// `api/base.py:198-201`) on an oversized body, and on a body that is not valid UTF-8 — the
-/// latter has no Python equivalent (a raw `UnicodeDecodeError` would propagate uncaught there,
-/// per the task brief); this crate cannot leave a body undecoded, so it surfaces the same error
-/// shape instead of panicking or losing the failure.
+/// Streams `response`'s body with a running size check.
 async fn read_capped_body(mut response: reqwest::Response) -> Result<String, Error> {
     let status = response.status();
     let mut buffer: Vec<u8> = Vec::new();
@@ -803,38 +927,9 @@ async fn read_capped_body(mut response: reqwest::Response) -> Result<String, Err
     })
 }
 
-/// Extracts the value of a `Set-Cookie: s=...` header from `response`, if the server sent one.
-///
-/// No application code in `eero-api` ever reads this header explicitly (task brief gotcha #11);
-/// `rusteero` has no implicit cookie jar to catch it silently, so this is the one place a fresh
-/// session cookie can surface to a caller at all — used only by `Transport::send_raw`'s
-/// `RawResponse`, read by `auth::flow::PendingLogin::verify`'s login/verify handshake.
-fn extract_set_cookie_session(response: &reqwest::Response) -> Option<SecretString> {
-    response
-        .headers()
-        .get_all(SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .find_map(|raw| {
-            let (name, rest) = raw.split_once('=')?;
-            if name.trim() != consts::SESSION_COOKIE_NAME {
-                return None;
-            }
-            let value = rest.split(';').next().unwrap_or("").trim();
-            (!value.is_empty()).then(|| SecretString::from(value.to_owned()))
-        })
-}
-
 /// Parses a `Retry-After` header value into a `Duration`, accepting both the delta-seconds form
-/// (a bare integer number of seconds) and the HTTP-date form (RFC 1123, e.g. `"Wed, 21 Oct 2015
-/// 07:28:00 GMT"`). Returns `None` when the header is absent or its value matches neither form —
-/// this must never itself become an error: `eero-api` never reads this header at all, so there
-/// is no upstream behaviour to preserve, only a new addition to keep conservative
-/// (`Error::RateLimit::retry_after`'s docs).
-///
-/// A `Retry-After` date already in the past parses to `Some(Duration::ZERO)` rather than `None`,
-/// keeping the "absent or unparseable -> `None`" contract literal: a valid, if stale, date is
-/// neither of those two cases.
+/// and the HTTP-date form (RFC 1123). Returns `None` when the header is absent or its value
+/// matches neither form.
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim().to_owned();
 
@@ -854,10 +949,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 
 /// Defensively checks whether a `401` response body carries the server-driven refresh signal
 /// (`classify_error_code(error_code) is ErrorGroup.SESSION_REFRESH`, ported from
-/// `api/base.py:602-680`). Any parse failure — invalid JSON, a `meta` that is not a JSON object,
-/// or a missing `error` key — degrades silently to `false` rather than propagating an error; this
-/// sniff must never itself raise, matching Python's own bare `try: ... except Exception: body =
-/// None`.
+/// `api/base.py:602-680`). Any parse failure degrades silently to `false`.
 fn refresh_signal_detected(body: &str) -> bool {
     let Some(envelope) = errors::parse_envelope(body) else {
         return false;
@@ -866,9 +958,7 @@ fn refresh_signal_detected(body: &str) -> bool {
     errors::classify_error_code(error_code.as_deref()) == Some(errors::ErrorGroup::SessionRefresh)
 }
 
-/// Maps a transport-level `reqwest::Error` onto this crate's `Error`, matching `eero-api`'s
-/// split between `asyncio.TimeoutError` -> `Error::Timeout` and `aiohttp.ClientError` ->
-/// `Error::Network` (`api/base.py:270-275`).
+/// Maps a transport-level `reqwest::Error` onto this crate's `Error`.
 fn map_reqwest_error(err: reqwest::Error) -> Error {
     if err.is_timeout() {
         Error::Timeout
@@ -877,25 +967,8 @@ fn map_reqwest_error(err: reqwest::Error) -> Error {
     }
 }
 
-/// Builds a `Session` carrying `new_token` and `new_refresh_token`, with a fresh `+30`-day
-/// expiry fabricated the same way `Session::from_token` does.
-///
-/// `auth::session`'s on-disk representation type keeps its fields private to that module by
-/// design (decision D-5's wire-format guarantee), so a session with *both* a fresh token and a
-/// fresh refresh token cannot be assembled by touching private state from here. This defers to
-/// `Session::with_refresh_token` for the splice — see that method's docs (security finding T5)
-/// for why it no longer round-trips through `Session::to_json`/`Session::from_json` and a
-/// `serde_json::Value` the way this function used to: each hop in that chain was an un-zeroized
-/// plaintext copy of the token, and the direct `StoredSession`-to-`StoredSession` splice
-/// `with_refresh_token` performs instead is also infallible, which is why this function no
-/// longer returns a `Result`.
-fn build_refreshed_session(new_token: &str, new_refresh_token: Option<&str>) -> Session {
-    let base = Session::from_token(new_token);
-    Session::with_refresh_token(&base, new_refresh_token)
-}
-
-/// Parses a base URL string into a `Url` validated to be usable as a path base (i.e.
-/// `Url::path_segments_mut` will succeed on it), for use by `TransportBuilder::build`.
+/// Parses a base URL string into a `Url` validated to be usable as a path base, for use by
+/// `TransportBuilder::build`.
 fn parse_base(raw: &str) -> Result<Url, Error> {
     let mut url = Url::parse(raw)
         .map_err(|err| Error::validation("base_url", format!("not a valid URL: {err}")))?;
@@ -908,6 +981,28 @@ fn parse_base(raw: &str) -> Result<Url, Error> {
     Ok(url)
 }
 
+/// Validates that `value` is safe to use as an HTTP header value: printable ASCII with no CR/LF.
+///
+/// Ported from `_validate_header_value` (`base.py:108-121`,
+/// `_HEADER_VALUE_RE = re.compile(r"^[\x20-\x7E]*$")`) — note the `*`, not `+`: an *empty* header
+/// value is valid by this rule (unlike a session token, which [`crate::auth::session::validate_token_shape`]
+/// additionally requires to be non-empty).
+///
+/// # Errors
+///
+/// Returns [`Error::Validation`] with the fixed message `"header value must be printable ASCII
+/// with no CR/LF"` if `value` contains any byte outside `0x20..=0x7E`.
+fn validate_header_value(field: &str, value: &str) -> Result<(), Error> {
+    if value.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        Ok(())
+    } else {
+        Err(Error::validation(
+            field,
+            "header value must be printable ASCII with no CR/LF",
+        ))
+    }
+}
+
 /// Builds a [`Transport`].
 ///
 /// Every setter takes `self` by value and returns `Self`, so calls chain naturally; `build` is
@@ -917,6 +1012,9 @@ pub struct TransportBuilder {
     http: Option<Client>,
     base_root: Option<String>,
     user_agent: Option<String>,
+    accept_language: Option<String>,
+    send_legacy_cookie: bool,
+    get_retries: u32,
     session: Option<Session>,
     store: Option<Arc<dyn CredentialStore>>,
     storage_failures: StorageFailures,
@@ -930,6 +1028,9 @@ impl Default for TransportBuilder {
             http: None,
             base_root: None,
             user_agent: None,
+            accept_language: None,
+            send_legacy_cookie: true,
+            get_retries: 0,
             session: None,
             store: None,
             storage_failures: StorageFailures::default(),
@@ -942,24 +1043,17 @@ impl Default for TransportBuilder {
 impl TransportBuilder {
     /// Supplies a fully-configured `reqwest::Client` instead of letting `build` construct one.
     ///
-    /// When set, `user_agent`, `timeout`, and `read_timeout` are ignored entirely — the supplied
-    /// client is used exactly as given, which is the intended escape hatch for tests that need
-    /// full control over the HTTP layer.
+    /// When set, `timeout`/`read_timeout` are ignored — the supplied client is used exactly as
+    /// given (headers are still built explicitly per-request by `Transport::execute_once`
+    /// regardless of which client is used).
     ///
     /// # Warning
     ///
     /// A caller-supplied client silently discards two of this crate's safety guarantees: redirect
     /// refusal (`reqwest::redirect::Policy::none()`) and the request/read timeouts in
-    /// [`crate::consts`]. With such a client, a `3xx` response is followed *inside* the client
-    /// before this crate ever sees it, and the resulting body is refused with `Error::Api` and a
-    /// `"Redirect followed by a caller-supplied client: ..."` message rather than a
-    /// `"Redirect not followed: ..."` one (the latter is reserved for a `3xx` this crate's own
-    /// `Policy::none()` client received directly) — either way the hop's body never reaches the
-    /// caller as a successful envelope, but the follow itself already happened over the network.
-    /// There is also no 30-second ceiling on a hung request. Build your own client with
-    /// `.redirect(reqwest::redirect::Policy::none())` and explicit `.timeout(..)` /
-    /// `.read_timeout(..)` calls before passing it here if you need both custom configuration
-    /// *and* these guarantees.
+    /// [`crate::consts`]. `Transport::execute_once`'s own response-URL check (security finding
+    /// F4) still refuses a *followed* redirect before its body is ever read, regardless of which
+    /// client is injected here, but there is no 30-second ceiling on a hung request either way.
     #[must_use]
     pub fn http(mut self, client: Client) -> Self {
         self.http = Some(client);
@@ -967,40 +1061,61 @@ impl TransportBuilder {
     }
 
     /// Overrides the base host for *both* API versions, deriving each from `base_url` by
-    /// stripping any trailing `/` and appending `/2.2` or `/2.3` respectively — e.g.
-    /// `base_url("http://127.0.0.1:9999")` yields `http://127.0.0.1:9999/2.2` and
-    /// `http://127.0.0.1:9999/2.3`. This lets a single wiremock server stand in for both real
-    /// Eero cloud hosts in tests. When unset, `build` uses the real hosts
-    /// (`consts::API_BASE_22`/`consts::API_BASE_23`) unchanged.
+    /// stripping any trailing `/` and appending `/2.2` or `/2.3` respectively. [`Transport::api_host`]
+    /// is derived from this override too. When unset, `build` uses the real hosts.
     #[must_use]
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_root = Some(base_url.into());
         self
     }
 
-    /// Sets the `User-Agent` header reqwest sends. `None` (the default) means "send reqwest's
-    /// own default `User-Agent`" — this crate deliberately does not send `eero-api`'s unused
-    /// mobile-style `User-Agent` constant (decision D-7); pass `Some(..)` to opt into a custom
-    /// value instead.
+    /// Sets the `User-Agent` header sent on every request. `None` (the default) sends
+    /// [`consts::DEFAULT_USER_AGENT`] — decision D-7 is superseded at `v8.0.4`, where this header
+    /// is genuinely sent.
     #[must_use]
     pub fn user_agent(mut self, user_agent: Option<String>) -> Self {
         self.user_agent = user_agent;
         self
     }
 
-    /// Seeds the transport with an initial session. `None` (the default) starts with no
-    /// session, matching every `send`/`send_with_query` call failing with
-    /// `Error::Authentication("Not authenticated")` until one is set via
-    /// `Transport::set_session` or a successful refresh.
+    /// Sets the `X-Accept-Language` header sent on every request. `None` (the default) sends
+    /// [`consts::DEFAULT_ACCEPT_LANGUAGE`].
+    ///
+    /// Validated at [`TransportBuilder::build`] time (printable ASCII, no CR/LF); see
+    /// `validate_header_value`.
+    #[must_use]
+    pub fn accept_language(mut self, accept_language: impl Into<String>) -> Self {
+        self.accept_language = Some(accept_language.into());
+        self
+    }
+
+    /// Whether to also attach a legacy `Cookie: s=<token>` header alongside the primary
+    /// `X-User-Token` credential. Defaults to `true` (`send_legacy_cookie`'s Python default,
+    /// `base.py:241,254-257`).
+    #[must_use]
+    pub fn send_legacy_cookie(mut self, send_legacy_cookie: bool) -> Self {
+        self.send_legacy_cookie = send_legacy_cookie;
+        self
+    }
+
+    /// Sets how many additional attempts a `GET` request gets on a transport error or a `5xx`
+    /// status, beyond the first. Defaults to `0` (disabled) — see
+    /// `Transport::execute_with_get_retry`.
+    #[must_use]
+    pub fn get_retries(mut self, get_retries: u32) -> Self {
+        self.get_retries = get_retries;
+        self
+    }
+
+    /// Seeds the transport with an initial session. `None` (the default) starts with no session.
     #[must_use]
     pub fn session(mut self, session: Option<Session>) -> Self {
         self.session = session;
         self
     }
 
-    /// Sets the credential store used by `Transport::set_session` and the persistence side of
-    /// `Transport::refresh_session`. `None` (the default) means no persistence at all — the
-    /// session only ever lives in memory.
+    /// Sets the credential store used by `Transport::set_session` and the credential-clearing
+    /// branch of `Transport::refresh_session`. `None` (the default) means no persistence at all.
     #[must_use]
     pub fn store(mut self, store: Option<Arc<dyn CredentialStore>>) -> Self {
         self.store = store;
@@ -1008,30 +1123,20 @@ impl TransportBuilder {
     }
 
     /// Sets this transport's policy for a failed credential-store operation (decision D-13).
-    /// [`StorageFailures::Warn`] (the default) logs at `WARN` and proceeds;
-    /// [`StorageFailures::Fatal`] returns `Error::Storage` instead. Honoured at every
-    /// credential-store call site in this module ([`Transport::set_session`], and the
-    /// persistence step of [`Transport::refresh_session`]) — see [`StorageFailures`]'s own docs.
-    ///
-    /// The port plan places this switch on the not-yet-built `Client::builder()` (phase 4);
-    /// `Client::builder()` is expected to forward to this setter once built, so it lives here
-    /// for now.
     #[must_use]
     pub fn storage_failures(mut self, storage_failures: StorageFailures) -> Self {
         self.storage_failures = storage_failures;
         self
     }
 
-    /// Overrides the overall request timeout (`consts::REQUEST_TIMEOUT` by default). Ignored if
-    /// `http` was also called.
+    /// Overrides the overall request timeout. Ignored if `http` was also called.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Overrides the per-read timeout (`consts::READ_TIMEOUT` by default). Ignored if `http` was
-    /// also called.
+    /// Overrides the per-read timeout. Ignored if `http` was also called.
     #[must_use]
     pub fn read_timeout(mut self, read_timeout: Duration) -> Self {
         self.read_timeout = read_timeout;
@@ -1043,37 +1148,54 @@ impl TransportBuilder {
     /// # Errors
     ///
     /// Returns `Error::Validation` if `base_url` was set to a string that does not parse as an
-    /// absolute URL usable as a path base. Returns `Error::Network` if constructing the
-    /// underlying `reqwest::Client` fails (only reachable when `http` was not called; failure
-    /// here is exceedingly rare and generally indicates a broken TLS backend).
+    /// absolute URL usable as a path base, or if `accept_language`/`user_agent` contains a byte
+    /// outside the printable-ASCII range (or a CR/LF). Returns `Error::Network` if constructing
+    /// the underlying `reqwest::Client` fails.
     pub fn build(self) -> Result<Transport, Error> {
         let (base_22, base_23) = self.build_bases()?;
+        let api_host = {
+            let origin = base_22.origin().ascii_serialization();
+            Url::parse(&origin)
+                .map_err(|err| Error::validation("base_url", format!("not a valid URL: {err}")))?
+        };
+
+        let user_agent = self
+            .user_agent
+            .unwrap_or_else(|| consts::DEFAULT_USER_AGENT.to_owned());
+        validate_header_value("user_agent", &user_agent)?;
+        let accept_language = self
+            .accept_language
+            .unwrap_or_else(|| consts::DEFAULT_ACCEPT_LANGUAGE.to_owned());
+        validate_header_value("X-Accept-Language", &accept_language)?;
 
         let http = if let Some(client) = self.http {
             client
         } else {
-            let mut builder = Client::builder()
+            Client::builder()
                 .timeout(self.timeout)
                 .read_timeout(self.read_timeout)
-                .redirect(Policy::none());
-            if let Some(user_agent) = self.user_agent {
-                builder = builder.user_agent(user_agent);
-            }
-            builder.build().map_err(Error::Network)?
+                .redirect(Policy::none())
+                .build()
+                .map_err(Error::Network)?
         };
 
         Ok(Transport {
             http,
             base_22,
             base_23,
+            api_host,
             session: RwLock::new(self.session),
             store: self.store,
             storage_failures: self.storage_failures,
+            user_agent,
+            accept_language,
+            send_legacy_cookie: self.send_legacy_cookie,
+            get_retries: self.get_retries,
+            refresh_slot: tokio::sync::Mutex::new(Weak::new()),
         })
     }
 
-    /// Computes the effective 2.2/2.3 base `Url`s: the real Eero hosts by default, or both
-    /// derived from `base_root` per `TransportBuilder::base_url`'s doc comment when set.
+    /// Computes the effective 2.2/2.3 base `Url`s.
     fn build_bases(&self) -> Result<(Url, Url), Error> {
         let (raw_22, raw_23) = match &self.base_root {
             Some(root) => {
@@ -1092,20 +1214,13 @@ impl TransportBuilder {
     }
 }
 
-/// The version path segment (e.g. `"2.2"`) baked into `version`'s production base URL
-/// ([`ApiVersion::base_url`]) — `TransportBuilder::build_bases`'s single source of truth for
-/// deriving a caller-supplied override base, instead of re-stating `"2.2"`/`"2.3"` as a second
-/// literal that could silently drift from `consts::API_BASE_22`/`consts::API_BASE_23` (finding
-/// 3: routes.rs/consts.rs must be the only place wire paths exist). Slices the `'static` base
-/// URL string itself rather than parsing it into a `Url`, so no allocation is needed and the
-/// returned segment borrows straight from the `'static` constant.
+/// The version path segment (e.g. `"2.2"`) baked into `version`'s production base URL.
 ///
 /// # Panics
 ///
 /// Never in practice: [`ApiVersion::base_url`] always returns one of `consts::API_BASE_22` /
-/// `consts::API_BASE_23`, both of which are non-empty absolute URLs, so `rsplit('/').next()`
-/// always yields at least one item (pinned by
-/// `consts::tests::base_urls_are_versioned_variants_of_the_same_host`).
+/// `consts::API_BASE_23`, both non-empty absolute URLs, so `rsplit('/').next()` always yields at
+/// least one item.
 fn version_segment(version: ApiVersion) -> &'static str {
     version
         .base_url()
@@ -1116,17 +1231,16 @@ fn version_segment(version: ApiVersion) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use reqwest::Method;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use url::Url;
 
-    use super::{Route, StorageFailures, Transport, parse_retry_after, refresh_signal_detected};
+    use super::{
+        Route, Transport, parse_retry_after, refresh_signal_detected, validate_header_value,
+    };
     use crate::error::Error;
     use crate::routes::{ACCOUNT, ApiVersion};
-    use crate::storage::{CredentialStore, StorageError};
 
     // ===================== parse_retry_after =====================
 
@@ -1188,152 +1302,6 @@ mod tests {
         assert_eq!(parse_retry_after(&headers), None);
     }
 
-    // ===================== refresh_session error-arm log field (finding F1) =====================
-
-    /// A minimal `tracing::Subscriber` that records every event's fields (name and
-    /// debug-rendered value) into a shared buffer, ignoring spans entirely.
-    ///
-    /// The same hand-rolled-`Subscriber` technique `tests/transport.rs`'s
-    /// `PathCapturingSubscriber` uses for `query_string_is_never_logged_in_the_path` — that file
-    /// is a separate compilation unit from this crate's own unit tests (an integration test
-    /// cannot be `mod`-included from `src/`, and vice versa), so the technique is reproduced
-    /// here rather than imported. No new dependency: this is a hand-written
-    /// `tracing_core::Subscriber` impl, not a `tracing-subscriber` `Layer`.
-    struct FieldCapturingSubscriber(Arc<Mutex<CapturedEvents>>);
-
-    /// Every event captured so far: one `(target, fields)` pair per event, where `target` is the
-    /// module path the `tracing` call site lives in and `fields` is every field, rendered
-    /// `"{name}={value:?}"`. Grouped per event (rather than one flat field list) so a test can
-    /// find *the specific event* it cares about among the many unrelated events a real HTTP
-    /// round trip also emits (connection-pool bookkeeping, this module's own generic
-    /// per-request debug line, ...) instead of asserting over the whole process's log output at
-    /// once.
-    type CapturedEvents = Vec<(&'static str, Vec<String>)>;
-
-    struct FieldVisitor<'a>(&'a mut Vec<String>);
-
-    impl tracing::field::Visit for FieldVisitor<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0.push(format!("{}={value:?}", field.name()));
-        }
-    }
-
-    impl tracing::Subscriber for FieldCapturingSubscriber {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut fields = Vec::new();
-            let mut visitor = FieldVisitor(&mut fields);
-            event.record(&mut visitor);
-            self.0
-                .lock()
-                .expect("capture mutex is never held across a panic")
-                .push((event.metadata().target(), fields));
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// Security finding T1, re-verified against the `v8.0.4` error model: `Error::Api.message`
-    /// is now built *entirely* from [`crate::errors::message_for_error_code`] — a catalogue
-    /// string, or the fixed `"unrecognised error string"` fallback — and never from raw response
-    /// body text at all (see [`status_to_envelope`]'s doc comment), so a credential-shaped value
-    /// anywhere in the body can never reach `message` regardless of which JSON key it sits
-    /// under. This test now pins the (weaker, but still real) remaining guarantee directly:
-    /// `refresh_session`'s own `tracing::error!` call site logs `status` alone, never the parsed
-    /// `envelope` this crate's [`status_to_envelope`] attaches to the error, so a value that
-    /// *would* have survived into `envelope` (any body content at all — this crate's
-    /// classification never suppresses or redacts `Error::envelope()` itself) still never
-    /// reaches this particular log line.
-    #[tokio::test]
-    async fn refresh_failure_log_field_never_carries_the_response_body() {
-        let body_marker = "benign-body-marker-must-never-log";
-        let credential_carrying_body = format!(r#"{{"detail":"{body_marker}"}}"#);
-        let credential_carrying_body = credential_carrying_body.as_str();
-        assert!(
-            serde_json::from_str::<serde_json::Value>(credential_carrying_body).is_ok(),
-            "sanity: the fixture must be well-formed JSON, so it reaches the generic non-2xx arm"
-        );
-
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/2.2/login/refresh"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(500).set_body_string(credential_carrying_body),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let session = crate::auth::Session::from_json(
-            r#"{"session_id":"tok","refresh_token":"rt-1","session_expiry":"2099-01-01T00:00:00"}"#,
-        )
-        .expect("well-formed literal session json");
-        let transport = Transport::builder()
-            .base_url(server.uri())
-            .session(Some(session))
-            .build()
-            .expect("a MockServer's own URI is always a valid base URL");
-
-        let captured: Arc<Mutex<CapturedEvents>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = FieldCapturingSubscriber(Arc::clone(&captured));
-
-        let refreshed = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            transport
-                .refresh_session()
-                .await
-                .expect("a terminal Error::Api from a refresh call becomes Ok(false), not Err")
-        };
-        assert!(
-            !refreshed,
-            "a failed refresh response must not be reported as a successful refresh"
-        );
-
-        let events = captured
-            .lock()
-            .expect("capture mutex is never held across a panic");
-        // Find `refresh_session`'s OWN log event specifically (`"session refresh failed"`) —
-        // not this crate's separate, generic per-request debug line (`status_to_envelope`'s
-        // `"eero transport error response"`, which intentionally logs the redacted envelope,
-        // mirroring `_log_error_body`; a non-credential-shaped key like `"detail"` is expected to
-        // stay visible there, matching Python's own behaviour). Only the narrower guarantee is
-        // asserted here: `refresh_session`'s own error-arm log call never carries the body.
-        let refresh_failed_events: Vec<&Vec<String>> = events
-            .iter()
-            .filter(|(_, fields)| {
-                fields
-                    .iter()
-                    .any(|f| f.starts_with("message=") && f.contains("session refresh failed"))
-            })
-            .map(|(_, fields)| fields)
-            .collect();
-        assert!(
-            !refresh_failed_events.is_empty(),
-            "expected to capture refresh_session's own \"session refresh failed\" log event; \
-             captured events: {events:?}"
-        );
-        for fields in refresh_failed_events {
-            let joined = fields.join(" | ");
-            assert!(
-                !joined.contains(body_marker),
-                "refresh_session's own log event leaked the response body: {joined}"
-            );
-        }
-    }
-
     // ===================== refresh_signal_detected =====================
 
     #[test]
@@ -1356,28 +1324,33 @@ mod tests {
     }
 
     #[test]
-    fn refresh_signal_not_detected_when_meta_is_not_an_object() {
-        for bad_meta in ["\"oops\"", "42", "[1,2]", "null"] {
-            let body = format!(r#"{{"meta":{bad_meta}}}"#);
-            assert!(!refresh_signal_detected(&body), "meta = {bad_meta}");
-        }
-    }
-
-    #[test]
     fn refresh_signal_not_detected_on_invalid_json() {
         assert!(!refresh_signal_detected("not json at all"));
     }
 
+    // ===================== validate_header_value =====================
+
     #[test]
-    fn refresh_signal_not_detected_when_error_key_is_missing() {
-        assert!(!refresh_signal_detected(r#"{"meta":{"code":401}}"#));
+    fn validate_header_value_accepts_empty() {
+        validate_header_value("x", "").expect("empty header value matches the `*` rule");
+    }
+
+    #[test]
+    fn validate_header_value_rejects_crlf() {
+        let err = validate_header_value("x", "a\r\nb").unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "x"));
+    }
+
+    #[test]
+    fn validate_header_value_accepts_printable_ascii() {
+        validate_header_value("x", "eero/3.0 (iPhone; iOS 17.0)").expect("printable ascii ok");
     }
 
     // ===================== render_url / base selection =====================
 
     fn v2_3_route() -> Route {
         Route {
-            method: Method::PUT,
+            method: reqwest::Method::PUT,
             version: ApiVersion::V2_3,
             path: "networks/{network_id}/devices/{device_id}",
         }
@@ -1415,55 +1388,20 @@ mod tests {
     }
 
     #[test]
-    fn overridden_base_and_production_base_share_the_same_version_segments() {
-        // Finding 3: `build_bases` used to re-derive "2.2"/"2.3" by string formatting instead of
-        // from `ApiVersion`, so the override base and the production base could silently
-        // desync from `consts::API_BASE_22`/`consts::API_BASE_23` on a future version bump. This
-        // pins both bases to derive the *same* version segment at runtime, so a future bump that
-        // updates only one of the two call sites fails this test instead of passing silently.
-        let production = Transport::builder().build().expect("builds with defaults");
-        let overridden = Transport::builder()
+    fn api_host_has_no_path_and_reflects_the_override() {
+        let transport = Transport::builder()
             .base_url("http://127.0.0.1:9999")
             .build()
             .expect("builds with an overridden base");
+        assert_eq!(transport.api_host().as_str(), "http://127.0.0.1:9999/");
+        assert_eq!(transport.api_host().path(), "/");
+    }
 
-        let version_segment = |url: &Url| -> String {
-            url.path_segments()
-                .and_then(|mut segments| segments.next().map(str::to_owned))
-                .expect("rendered URL always has a version path segment")
-        };
-
-        let prod_22 = production
-            .render_url(&ACCOUNT, &[])
-            .expect("v2.2 route renders against the production base");
-        let over_22 = overridden
-            .render_url(&ACCOUNT, &[])
-            .expect("v2.2 route renders against the overridden base");
-        assert_eq!(
-            version_segment(&prod_22),
-            version_segment(&over_22),
-            "a consts::API_BASE_22 version bump must not desync the override base from production"
-        );
-
-        let route_23 = v2_3_route();
-        let path_params: &[(&str, &str)] = &[("network_id", "1"), ("device_id", "2")];
-        let prod_23 = production
-            .render_url(&route_23, path_params)
-            .expect("v2.3 route renders against the production base");
-        let over_23 = overridden
-            .render_url(&route_23, path_params)
-            .expect("v2.3 route renders against the overridden base");
-        assert_eq!(
-            version_segment(&prod_23),
-            version_segment(&over_23),
-            "a consts::API_BASE_23 version bump must not desync the override base from production"
-        );
-
-        assert_ne!(
-            version_segment(&prod_22),
-            version_segment(&prod_23),
-            "2.2 and 2.3 must remain distinct API versions"
-        );
+    #[test]
+    fn api_host_defaults_to_the_real_eero_host() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        assert_eq!(transport.api_host().host_str(), Some("api-user.e2ro.com"));
+        assert_eq!(transport.api_host().scheme(), "https");
     }
 
     #[test]
@@ -1494,13 +1432,6 @@ mod tests {
             .expect_err("malformed base URL must fail fast");
         assert!(matches!(err, Error::Validation { field, .. } if field == "base_url"));
     }
-
-    // ===================== render_url / path-traversal rejection (security) =====================
-    //
-    // The concrete reproduction from the security finding: `render_url` must reject a
-    // trailing-newline placeholder value before it can collapse a per-item route onto its
-    // parent collection. See `tests/security_paths.rs` for the end-to-end (network-level)
-    // version of this same guarantee across a DELETE-by-id, a PUT-by-id on 2.3, and a GET-by-id.
 
     #[test]
     fn render_url_rejects_a_value_that_becomes_a_dot_segment_after_stripping() {
@@ -1547,217 +1478,64 @@ mod tests {
         assert!(transport.session().is_none());
     }
 
-    /// A [`CredentialStore`] whose `save`/`clear` always fail, for pinning security finding F3:
-    /// `set_session` must clear the in-memory session *before* attempting to persist, and
-    /// unconditionally of the outcome, so a failing store never leaves a live token behind.
-    #[derive(Debug)]
-    struct AlwaysFailingStore;
-
-    impl CredentialStore for AlwaysFailingStore {
-        fn load(&self) -> Result<crate::auth::Session, StorageError> {
-            Ok(crate::auth::Session::empty())
-        }
-
-        fn save(&self, _session: &crate::auth::Session) -> Result<(), StorageError> {
-            Err(StorageError::Backend {
-                backend: "always-failing-test-store".to_owned(),
-                message: "deliberate failure".to_owned(),
-            })
-        }
-
-        fn clear(&self) -> Result<(), StorageError> {
-            Err(StorageError::Backend {
-                backend: "always-failing-test-store".to_owned(),
-                message: "deliberate failure".to_owned(),
-            })
-        }
-    }
-
     #[test]
-    fn set_session_clears_memory_even_when_the_store_fails_to_persist() {
-        // `StorageFailures::Fatal` is opted into explicitly: the default is now `Warn` (P2.5),
-        // so pinning finding F3's "in-memory session updates unconditionally, regardless of the
-        // store's outcome" guarantee under `Fatal` (where the store failure *does* propagate)
-        // needs an explicit opt-in. See `set_session_default_policy_warns_and_succeeds_when_the_
-        // store_fails_to_clear` below for the same guarantee under the default `Warn` policy.
-        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
-        let transport = Transport::builder()
-            .session(Some(crate::auth::Session::from_token("tok-123")))
-            .store(Some(store))
-            .storage_failures(StorageFailures::Fatal)
-            .build()
-            .expect("builds with an initial session and a store");
-        assert!(transport.is_authenticated());
-
+    fn set_session_rejects_an_empty_token() {
+        let transport = Transport::builder().build().expect("builds with defaults");
         let err = transport
-            .set_session(None)
-            .expect_err("the configured store always fails to clear");
-        assert!(matches!(err, Error::Storage(_)));
-
-        // The point of finding F3: the in-memory session must be cleared regardless of the
-        // store's outcome, exactly as `set_session`'s own doc comment promises.
-        assert!(
-            !transport.is_authenticated(),
-            "in-memory session must be cleared even though the store failed"
-        );
-        assert!(transport.session().is_none());
-    }
-
-    #[test]
-    fn set_session_installs_a_new_session_in_memory_even_when_the_store_fails_to_save() {
-        // See the sibling `..._fails_to_persist` test above for why `Fatal` is opted into
-        // explicitly here.
-        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
-        let transport = Transport::builder()
-            .store(Some(store))
-            .storage_failures(StorageFailures::Fatal)
-            .build()
-            .expect("builds with a store but no initial session");
+            .set_session(Some(crate::auth::Session::from_token("")))
+            .expect_err("an empty token must be rejected");
+        assert!(matches!(err, Error::Validation { field, .. } if field == "token"));
         assert!(!transport.is_authenticated());
-
-        let err = transport
-            .set_session(Some(crate::auth::Session::from_token("tok-456")))
-            .expect_err("the configured store always fails to save");
-        assert!(matches!(err, Error::Storage(_)));
-
-        assert!(
-            transport.is_authenticated(),
-            "in-memory session must be installed even though the store failed to persist it"
-        );
-    }
-
-    // ===================== StorageFailures (P2.5, decision D-13) =====================
-
-    #[test]
-    fn set_session_default_policy_warns_and_succeeds_when_the_store_fails_to_clear() {
-        // No `.storage_failures(..)` call: exercises the default, `StorageFailures::Warn`.
-        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
-        let transport = Transport::builder()
-            .session(Some(crate::auth::Session::from_token("tok-123")))
-            .store(Some(store))
-            .build()
-            .expect("builds with an initial session and a store");
-        assert!(transport.is_authenticated());
-
-        transport
-            .set_session(None)
-            .expect("the default Warn policy swallows the store's failure and returns Ok");
-
-        // Finding F3 still holds under the default policy: the in-memory session is cleared
-        // regardless of the store's outcome.
-        assert!(!transport.is_authenticated());
-        assert!(transport.session().is_none());
     }
 
     #[test]
-    fn set_session_default_policy_warns_and_succeeds_when_the_store_fails_to_save() {
-        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
-        let transport = Transport::builder()
-            .store(Some(store))
-            .build()
-            .expect("builds with a store but no initial session, default Warn policy");
-        assert!(!transport.is_authenticated());
-
-        transport
-            .set_session(Some(crate::auth::Session::from_token("tok-456")))
-            .expect("the default Warn policy swallows the store's failure and returns Ok");
-
-        assert!(
-            transport.is_authenticated(),
-            "in-memory session must be installed even though the store failed to persist it"
-        );
+    fn set_session_rejects_a_token_with_a_control_character() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let err = transport
+            .set_session(Some(crate::auth::Session::from_token("tok\r\nX-Evil: 1")))
+            .expect_err("a control character in the token must be rejected");
+        assert!(matches!(err, Error::Validation { field, .. } if field == "token"));
     }
 
-    #[tokio::test]
-    async fn refresh_session_fatal_policy_propagates_a_persistence_failure_but_keeps_the_refreshed_session_in_memory()
-    -> anyhow::Result<()> {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/2.2/login/refresh"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
-                r#"{"meta":{"code":200},"data":{"session_token":"new-tok","refresh_token":"new-rt"}}"#,
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
+    // ===================== matches_configured_host =====================
 
-        let session = crate::auth::Session::from_json(
-            r#"{"session_id":"tok","refresh_token":"rt-1","session_expiry":"2099-01-01T00:00:00"}"#,
-        )?;
-        let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailingStore);
+    #[test]
+    fn matches_configured_host_true_for_the_configured_scheme_host_and_port() {
         let transport = Transport::builder()
-            .base_url(server.uri())
-            .session(Some(session))
-            .store(Some(store))
-            .storage_failures(StorageFailures::Fatal)
+            .base_url("http://127.0.0.1:9999")
             .build()
-            .expect("a MockServer's own URI is always a valid base URL");
-
-        let err = transport
-            .refresh_session()
-            .await
-            .expect_err("Fatal policy must propagate the persistence failure");
-        assert!(matches!(err, Error::Storage(_)));
-
-        // The remote refresh itself succeeded and the in-memory session already reflects it —
-        // only persistence failed — matching `set_session`'s same in-memory-first guarantee.
-        let current = transport
-            .session()
-            .expect("the refreshed session is installed in memory regardless of persistence");
-        assert_eq!(current.expose_token(), "new-tok");
-        Ok(())
+            .expect("builds with an overridden base");
+        let url = Url::parse("http://127.0.0.1:9999/2.2/account").unwrap();
+        assert!(transport.matches_configured_host(&url));
     }
 
-    // ===================== injected client / redirect defence (finding F4) =====================
-
-    #[tokio::test]
-    async fn injected_client_that_follows_redirects_is_still_refused() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/2.2/account"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(302)
-                    .insert_header("Location", format!("{}/2.2/elsewhere", server.uri())),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/2.2/elsewhere"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(r#"{"data":{}}"#))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // A caller-supplied client that keeps reqwest's default redirect-following policy —
-        // exactly the hazard `TransportBuilder::http`'s `# Warning` section documents.
-        let following_client = reqwest::Client::builder()
-            .build()
-            .expect("a default reqwest client always builds");
-
+    #[test]
+    fn matches_configured_host_false_for_a_different_host() {
         let transport = Transport::builder()
-            .base_url(server.uri())
-            .http(following_client)
-            .session(Some(crate::auth::Session::from_token("tok")))
+            .base_url("http://127.0.0.1:9999")
             .build()
-            .expect("builds with an injected client");
+            .expect("builds with an overridden base");
+        let url = Url::parse("http://evil.example:9999/2.2/account").unwrap();
+        assert!(!transport.matches_configured_host(&url));
+    }
 
-        let err = transport
-            .send(&ACCOUNT, &[], None)
-            .await
-            .expect_err("a followed redirect must surface as an error, not the hop's body");
-        let Error::Api {
-            status, message, ..
-        } = &err
-        else {
-            panic!("expected Error::Api, got {err:?}");
-        };
-        // The final hop's status (200), not the original 302, and the honest "followed" wording
-        // — not the "Redirect not followed: ..." message the `Policy::none()` path produces.
-        assert_eq!(*status, 200);
-        assert!(
-            message.starts_with("Redirect followed by a caller-supplied client: "),
-            "unexpected message: {message}"
-        );
+    #[test]
+    fn matches_configured_host_false_for_a_different_port() {
+        let transport = Transport::builder()
+            .base_url("http://127.0.0.1:9999")
+            .build()
+            .expect("builds with an overridden base");
+        let url = Url::parse("http://127.0.0.1:8888/2.2/account").unwrap();
+        assert!(!transport.matches_configured_host(&url));
+    }
+
+    #[test]
+    fn matches_configured_host_false_for_a_different_scheme() {
+        let transport = Transport::builder()
+            .base_url("http://127.0.0.1:9999")
+            .build()
+            .expect("builds with an overridden base");
+        let url = Url::parse("https://127.0.0.1:9999/2.2/account").unwrap();
+        assert!(!transport.matches_configured_host(&url));
     }
 }

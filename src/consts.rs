@@ -98,23 +98,12 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Ported from `CACHE_TIMEOUT` (`const.py:74`).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Number of days a client-fabricated session is considered valid.
-///
-/// `// removed by phase B`: `v8.0.4` has no client-side session expiry anywhere —
-/// `is_authenticated` is a bare token-presence check (`auth.py`'s docstring: "There is no
-/// client-side session expiry -- the server is the sole authority on session validity, signalled
-/// via 401 responses."). `Session`/`StoredSession`/`auth/*` still read this constant as of this
-/// phase; phase B removes both the field and this constant together.
-pub const SESSION_LIFETIME_DAYS: i64 = 30;
-
 /// Name of the cookie that carries the session token on an authenticated request, when the
 /// legacy cookie is sent at all.
 ///
-/// `// removed by phase B`: at `v8.0.4` the *primary* credential becomes the `X-User-Token`
-/// header ([`USER_TOKEN_HEADER`]); a per-request `s=<token>` cookie is now only an optional
-/// secondary credential (`send_legacy_cookie`, default on, `api/base.py`). `transport.rs` still
-/// attaches only this cookie as of this phase; phase B adds the header and reworks credential
-/// placement.
+/// At `v8.0.4` the *primary* credential is the `X-User-Token` header ([`USER_TOKEN_HEADER`]); a
+/// per-request `s=<token>` cookie is an optional secondary credential, attached only when
+/// [`crate::transport::TransportBuilder::send_legacy_cookie`] is on (the default).
 pub const SESSION_COOKIE_NAME: &str = "s";
 
 /// Value of `meta.error` that signals the server wants the client to refresh its session and
@@ -137,15 +126,14 @@ pub const USER_TOKEN_KEY: &str = "user_token";
 ///
 /// Ported from the literal `"X-User-Token"` (`api/base.py`). Attached, together with an optional
 /// legacy `s=<token>` cookie, only when the resolved request URL's hostname and scheme both
-/// exactly match the configured API host. Not yet wired into `transport.rs`'s request path as of
-/// this phase (see [`SESSION_COOKIE_NAME`]'s doc comment) — added here so phase B has a single,
-/// already-reviewed source of truth for the header name.
+/// exactly match the configured API host (see [`crate::transport`]'s credential-placement gate).
 pub const USER_TOKEN_HEADER: &str = "X-User-Token";
 
 /// Default value of the `User-Agent` header sent on every request.
 ///
-/// Ported from `DEFAULT_USER_AGENT` (`const.py:68`). See the module docs' note on decision D-7
-/// being superseded at `v8.0.4`: this header is genuinely sent by the Python library at this tag.
+/// Ported from `DEFAULT_USER_AGENT` (`const.py:68`). Decision D-7 is superseded at `v8.0.4`: this
+/// header is genuinely sent by the Python library at this tag, and by [`crate::transport`] here
+/// unless overridden via `TransportBuilder::user_agent`.
 pub const DEFAULT_USER_AGENT: &str = "eero/3.0 (iPhone; iOS 17.0)";
 
 /// Default value of the `X-Accept-Language` header sent on every request.
@@ -170,24 +158,24 @@ pub const SESSION_COOKIE_PREFIX: &str = "s=";
 
 /// Fixed delay between bounded `GET` retries (transport errors / 5xx only).
 ///
-/// Ported from `GET_RETRY_DELAY_SECONDS` (`const.py:80`, `0.5`). Not yet wired into a retry loop
-/// as of this phase — see the port brief's transport section (phase B).
+/// Ported from `GET_RETRY_DELAY_SECONDS` (`const.py:80`, `0.5`). Applied by
+/// [`crate::transport::Transport`]'s bounded `GET`-only retry loop
+/// (`TransportBuilder::get_retries`).
 pub const GET_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Version marker written to every persisted credential record.
 ///
 /// Ported from `CREDENTIAL_SCHEMA_VERSION` (`const.py:86`). A record loaded without this key
 /// predates the marker — possibly carrying now-unsupported fields such as a legacy `user_token`,
-/// `refresh_token`, or `session_expiry` — and is migrated in place on load (phase B).
+/// `refresh_token`, or `session_expiry` — and is migrated in place on load
+/// (`crate::auth::session::Session::from_stored`).
 pub const CREDENTIAL_SCHEMA_VERSION: u32 = 2;
 
 /// Wall-clock cap a caller waits for an in-flight session refresh it did not initiate before
 /// giving up and surfacing its own original error instead of a fabricated one.
 ///
-/// Ported from `_SESSION_REFRESH_GUARD_TIMEOUT_SECONDS` (`auth.py`, `30.0`). Not yet wired into
-/// a coalescing refresh implementation as of this phase — see the port brief's auth section
-/// (phase B; open question #2 there flags that single-flight coalescing has no idiomatic 1:1
-/// Rust primitive).
+/// Ported from `_SESSION_REFRESH_GUARD_TIMEOUT_SECONDS` (`auth.py`, `30.0`). Applied by
+/// [`crate::transport::Transport::refresh_session`]'s single-flight coalescing.
 pub const SESSION_REFRESH_GUARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
@@ -197,8 +185,8 @@ mod tests {
         API_VERSION_MULTISTATICIP, API_VERSION_SECONDARY_WAN, CREDENTIAL_SCHEMA_VERSION,
         DEFAULT_ACCEPT_LANGUAGE, DEFAULT_CACHE_TTL, DEFAULT_USER_AGENT, GET_RETRY_DELAY,
         LOGOUT_COOKIE_FIELD_NAME, MAX_RESPONSE_BYTES, READ_TIMEOUT, REQUEST_TIMEOUT,
-        SESSION_COOKIE_NAME, SESSION_COOKIE_PREFIX, SESSION_LIFETIME_DAYS,
-        SESSION_REFRESH_GUARD_TIMEOUT, USER_TOKEN_HEADER, USER_TOKEN_KEY, api_endpoint,
+        SESSION_COOKIE_NAME, SESSION_COOKIE_PREFIX, SESSION_REFRESH_GUARD_TIMEOUT,
+        USER_TOKEN_HEADER, USER_TOKEN_KEY, api_endpoint,
     };
     use std::time::Duration;
 
@@ -239,9 +227,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_ttl_and_session_lifetime_match_python_defaults() {
+    fn cache_ttl_matches_python_default() {
         assert_eq!(DEFAULT_CACHE_TTL, Duration::from_secs(60));
-        assert_eq!(SESSION_LIFETIME_DAYS, 30);
     }
 
     #[test]

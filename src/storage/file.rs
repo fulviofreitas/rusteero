@@ -19,9 +19,9 @@ use super::CredentialStore;
 /// A [`CredentialStore`] backed by a single JSON file on disk.
 ///
 /// Mirrors `FileStorage` (`auth_storage.py:169-237`): the file holds exactly the JSON object
-/// `Session::to_json`/[`Session::from_json`] produce/consume (`session_id`, `refresh_token`,
-/// `session_expiry`, plus the legacy `user_token` read alias) — the same shape a Python
-/// `eero-api` install reads and writes, per decision D-5. There is deliberately no default
+/// `Session::to_json`/[`Session::from_json`] produce/consume (`session_id`, `schema_version`,
+/// plus the legacy `user_token` read alias) — the same shape a Python `eero-api` install reads
+/// and writes at `v8.0.4`, per decision D-5. There is deliberately no default
 /// path: like `FileStorage.__init__`, which always requires an explicit `file_path`, choosing
 /// *where* the file lives is left entirely to the caller (in `eero-api`'s ecosystem, that
 /// choice belongs to the CLI layer, not this library).
@@ -42,6 +42,19 @@ use super::CredentialStore;
 /// permissions/ACL the OS applies, and this crate does not attempt to further restrict them.
 /// Callers on Windows should not rely on the stored file being owner-only — treat the containing
 /// directory's own ACLs as the real access boundary there.
+///
+/// # Security: writing through a symlink at the final path (v8.0.4 parity note)
+///
+/// Python's `FileStorage.save()` refuses to write when the *final* path is a symlink
+/// (`os.path.islink` check before opening the temp file, `auth_storage.py:299-301`) — a defence
+/// against a symlink planted at the cookie-file path being used to redirect a credential write
+/// onto an attacker-chosen target. This port does not reproduce that check as a separate
+/// precondition, and does not need to: the final step of [`FileStore::save`] is [`fs::rename`],
+/// not an in-place open of `path`. POSIX `rename(2)` (and its Windows equivalent) *replaces*
+/// whatever is at the destination — including a symlink — rather than following it, so the write
+/// always lands at `path` itself, never at whatever a symlink there might point to. This is
+/// verified by `save_replaces_a_symlink_at_the_destination_rather_than_following_it` below rather
+/// than merely asserted in this comment.
 ///
 /// # Security: no orphaned plaintext credential (phase-2 storage review, finding S3)
 ///
@@ -85,7 +98,14 @@ impl CredentialStore for FileStore {
             // expected "never logged in" state, not an error.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Session::empty()),
             Err(err) => Err(StorageError::Io(err)),
-            Ok(contents) => Session::from_json(&contents),
+            Ok(contents) => {
+                let (session, migrated) = Session::from_json_migrating(&contents)?;
+                if migrated {
+                    // Best-effort: never fails this read, see `migrate_and_verify`'s own docs.
+                    super::migrate_and_verify(self, &session, "file");
+                }
+                Ok(session)
+            }
         }
     }
 
@@ -258,8 +278,6 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
 
-    use secrecy::ExposeSecret;
-
     use super::{CredentialStore, FileStore};
     use crate::auth::Session;
     use crate::error::StorageError;
@@ -280,35 +298,100 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_through_eero_api_cookies_json_shape() {
-        // The exact on-disk shape `FileStorage.save()` writes (`auth_storage.py:220-221`): key
-        // order `session_id`, `refresh_token`, `session_expiry`, with Python's default
-        // `json.dump` separators (a space after `:`/`,`). This differs byte-for-byte from this
-        // port's compact `serde_json` output, but both are valid JSON over the same D-5 wire
-        // contract, so a file a Python install wrote must still load cleanly here.
+    fn round_trip_through_v8_0_4_cookies_json_shape() {
+        // The exact on-disk shape `FileStorage.save()` writes at v8.0.4 (`auth_storage.py:50-56`):
+        // key order `session_id`, `schema_version`, with Python's default `json.dump` separators
+        // (a space after `:`/`,`). This differs byte-for-byte from this port's compact
+        // `serde_json` output, but both are valid JSON over the same D-5 wire contract, so a file
+        // a Python install wrote must still load cleanly here.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cookies.json");
-        let python_written = r#"{"session_id": "session_valid_id", "refresh_token": "rt_refresh_token", "session_expiry": "2026-10-10T14:32:07"}"#;
+        let python_written = r#"{"session_id": "session_valid_id", "schema_version": 2}"#;
         fs_write(&path, python_written);
 
         let store = FileStore::new(&path);
         let session = store.load().expect("load succeeds");
 
         assert_eq!(session.expose_token(), "session_valid_id");
-        assert_eq!(
-            session
-                .refresh_token()
-                .expect("refresh token present")
-                .expose_secret(),
-            "rt_refresh_token"
-        );
-        assert!(session.expiry().is_some());
 
         // Re-saving through this port must remain a valid credential file: reloading it here
-        // must still recover every field.
+        // must still recover the token.
         store.save(&session).expect("save succeeds");
         let reloaded = store.load().expect("load succeeds");
         assert_eq!(reloaded.expose_token(), "session_valid_id");
+    }
+
+    // ===================== legacy migration (no schema_version) =====================
+
+    #[test]
+    fn load_migrates_a_legacy_record_and_the_migration_read_back_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        // A pre-v8.0.4 record: no `schema_version`, carries now-dropped legacy fields.
+        fs_write(
+            &path,
+            r#"{"session_id":"legacy-token","refresh_token":"rt-1","session_expiry":"2099-01-01T00:00:00"}"#,
+        );
+        let store = FileStore::new(&path);
+
+        let session = store
+            .load()
+            .expect("load succeeds, legacy record tolerated");
+        assert_eq!(session.expose_token(), "legacy-token");
+
+        // The migration re-save must have overwritten the file with the current schema shape.
+        let on_disk = fs::read_to_string(&path).expect("file still exists");
+        assert!(on_disk.contains("\"schema_version\":2"));
+        assert!(!on_disk.contains("refresh_token"));
+        assert!(!on_disk.contains("session_expiry"));
+
+        // And a second load must not report a migration a second time.
+        let reloaded = store.load().expect("second load succeeds");
+        assert_eq!(reloaded.expose_token(), "legacy-token");
+    }
+
+    #[test]
+    fn load_of_a_current_schema_record_is_not_treated_as_a_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        fs_write(&path, r#"{"session_id":"tok","schema_version":2}"#);
+        let store = FileStore::new(&path);
+
+        let before = fs::read_to_string(&path).expect("file exists");
+        let session = store.load().expect("load succeeds");
+        assert_eq!(session.expose_token(), "tok");
+        let after = fs::read_to_string(&path).expect("file still exists");
+        assert_eq!(
+            before, after,
+            "a current-schema record must not be rewritten"
+        );
+    }
+
+    // ===================== symlink-at-destination (v8.0.4 parity note) =====================
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_a_symlink_at_the_destination_rather_than_following_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_target = dir.path().join("attacker-owned-target.json");
+        fs_write(&real_target, "should never be written to");
+        let cookie_path = dir.path().join("cookies.json");
+        std::os::unix::fs::symlink(&real_target, &cookie_path).expect("symlink created");
+
+        let store = FileStore::new(&cookie_path);
+        store
+            .save(&Session::from_token("tok"))
+            .expect("save succeeds even though the destination is a symlink");
+
+        // The symlink itself was replaced by a regular file; the target it used to point to was
+        // never touched.
+        assert!(
+            !cookie_path.is_symlink(),
+            "save must replace the symlink, not write through it"
+        );
+        let target_contents =
+            fs::read_to_string(&real_target).expect("the original target file still exists");
+        assert_eq!(target_contents, "should never be written to");
     }
 
     // ===================== 0600 permissions (Unix) =====================

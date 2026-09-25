@@ -317,7 +317,7 @@ impl Client {
     /// # Errors
     ///
     /// Propagates whatever [`EeroApi::logout`] returns. The cache is cleared regardless.
-    pub async fn logout(&self) -> Result<Envelope, Error> {
+    pub async fn logout(&self) -> Result<bool, Error> {
         let result = self.api.logout().await;
         self.clear_cache();
         result

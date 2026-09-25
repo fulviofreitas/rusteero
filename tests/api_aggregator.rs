@@ -166,11 +166,8 @@ async fn auth_shares_the_same_transport_as_the_domain_modules() -> anyhow::Resul
     // The network call itself only succeeds if `auth()`'s transport actually carries the session
     // configured on `api` — a detached, session-less transport fails this locally (see this
     // test's doc comment) before the mock is ever reached.
-    let envelope = api.auth().logout().await?;
-    assert_eq!(
-        envelope.into_value(),
-        serde_json::json!({"meta": {"code": 200}, "data": {}})
-    );
+    let logged_out = api.auth().logout().await?;
+    assert!(logged_out);
 
     // After logging out: the shared session is cleared, and both views agree again.
     assert!(!api.is_authenticated());

@@ -481,17 +481,16 @@ async fn clear_session_token_clears_the_cache() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **F1** (security review): `AuthApi::logout` clears the in-memory session and credential store
-/// unconditionally, on every outcome (see `src/auth/mod.rs`'s own docs) — but the previous
-/// `Client::logout` only cleared *this client's cache* when the network call itself succeeded.
-/// That let a cached `get_network`/`get_account`/`get_devices`/`get_profiles` keep serving
-/// pre-logout data for the rest of the TTL even though `is_authenticated()` had already flipped
-/// to `false`. This primes the `network` bucket, forces `logout()` to fail on the wire (500),
-/// and asserts the cache can no longer serve the second `get_network` call: with both the cache
-/// and the session gone, it must fail with `Error::Authentication`, not silently return the
-/// stale envelope.
+/// **F1** (security review) / v8.0.4 logout contract: `AuthApi::logout` clears the in-memory
+/// session and credential store unconditionally, on every outcome, and — at `v8.0.4` — never
+/// propagates a network/API error from the `logout` request itself (`api/auth.py:315-327`); see
+/// `src/auth/mod.rs`'s own docs. This primes the `network` bucket, forces the `logout` request to
+/// fail on the wire (500), and asserts (a) `Client::logout` still reports success (`Ok(true)`)
+/// rather than surfacing the 500, and (b) the cache can no longer serve the second `get_network`
+/// call: with both the cache and the session gone, it must fail with `Error::Authentication`, not
+/// silently return the stale envelope.
 #[tokio::test]
-async fn logout_failure_still_clears_the_cache() -> anyhow::Result<()> {
+async fn logout_failure_is_swallowed_but_still_clears_the_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
@@ -510,11 +509,14 @@ async fn logout_failure_still_clears_the_cache() -> anyhow::Result<()> {
     let client = client(&mock).await;
     client.get_network(Some("network-0001"), false).await?;
 
-    let err = client.logout().await.unwrap_err();
-    assert!(matches!(err, Error::Api { status: 500, .. }));
+    let logged_out = client
+        .logout()
+        .await
+        .expect("v8.0.4 logout never propagates a network/API error");
+    assert!(logged_out);
     assert!(!client.is_authenticated());
 
-    // Before the fix this served the pre-logout envelope straight from cache (`Ok`), with no
+    // Before the F1 fix this served the pre-logout envelope straight from cache (`Ok`), with no
     // auth check at all. After the fix the cache is empty and the session is gone, so this must
     // fail closed rather than leak the earlier authenticated response.
     let after = client.get_network(Some("network-0001"), false).await;
