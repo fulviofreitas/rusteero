@@ -235,15 +235,15 @@ fn wrap_as_authentication(prefix: &str, wrap_validation: bool, err: Error) -> Er
         | Error::ClientBlocked { .. }
         | Error::NotFound { .. }
         | Error::PremiumRequired { .. }
-        | Error::FeatureUnavailable { .. } => wrap(prefix, err),
-        Error::Validation { .. } if wrap_validation => wrap(prefix, err),
+        | Error::FeatureUnavailable { .. } => wrap(prefix, &err),
+        Error::Validation { .. } if wrap_validation => wrap(prefix, &err),
         other => other,
     }
 }
 
 /// The wrapping step of [`wrap_as_authentication`], split out so the match above stays a pure
 /// classification.
-fn wrap(prefix: &str, other: Error) -> Error {
+fn wrap(prefix: &str, other: &Error) -> Error {
     let envelope = other.envelope().cloned();
     let error_code = other.error_code().map(str::to_owned);
     let message = format!("{prefix} failed: {other}");
