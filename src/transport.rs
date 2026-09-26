@@ -660,17 +660,16 @@ impl Transport {
             "eero transport request"
         );
 
-        // Security finding F4: a caller-supplied `reqwest::Client` (`TransportBuilder::http`) can
-        // keep reqwest's default `Policy::limited(10)` instead of this crate's own
-        // `Policy::none()`, in which case a `3xx` response is followed *inside* `request.send()`
-        // above and never reaches the `status.is_redirection()` check below at all.
+        // Security finding F4 (superseded): `TransportBuilder::build` now forces
+        // `Policy::none()` onto every `reqwest::Client` it constructs — including one built from
+        // a caller-supplied `reqwest::ClientBuilder` via `TransportBuilder::http_builder` — so a
+        // `3xx` response can no longer be followed *inside* `request.send()` above in the first
+        // place. This check is kept anyway as a defence-in-depth belt-and-suspenders assertion:
+        // if it ever fired, that would mean the redirect policy was somehow not applied.
         if response.url() != &url {
             return Err(Error::Api {
                 status: status.as_u16(),
-                message: format!(
-                    "Redirect followed by a caller-supplied client: {url} -> {}",
-                    response.url()
-                ),
+                message: format!("Redirect followed unexpectedly: {status} at {}", url.path()),
                 envelope: None,
                 error_code: None,
                 url: Some(url.to_string()),
@@ -678,19 +677,33 @@ impl Transport {
         }
 
         if status.is_redirection() {
-            let location = response
+            // Security finding F5: the message must never carry the full request URL (which can
+            // embed a session token in its query string) or the full `Location` value (which can
+            // carry an attacker-chosen query string of its own) — only the status, the request
+            // *path*, and, when present, the `Location` header's *host* are safe to render here.
+            // The complete URL is still available, unredacted, via the non-`Display` `url` field.
+            let location_url = response
                 .headers()
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
-                .filter(|value| !value.is_empty());
-            let message = location.map_or_else(
+                .filter(|value| !value.is_empty())
+                .and_then(|value| Url::parse(value).ok().or_else(|| url.join(value).ok()));
+            let message = location_url.map_or_else(
                 || {
                     format!(
-                        "Redirect not followed: {} (no Location header)",
-                        status.as_u16()
+                        "Redirect not followed: {} at {} (no Location header)",
+                        status.as_u16(),
+                        url.path()
                     )
                 },
-                |loc| format!("Redirect not followed: {} -> {loc}", status.as_u16()),
+                |loc| {
+                    format!(
+                        "Redirect not followed: {} at {} -> {}",
+                        status.as_u16(),
+                        url.path(),
+                        loc.host_str().unwrap_or("unknown host")
+                    )
+                },
             );
             return Err(Error::Api {
                 status: status.as_u16(),
@@ -905,7 +918,7 @@ fn validate_header_value(field: &str, value: &str) -> Result<(), Error> {
 /// the only fallible step. See each setter's docs for its default when unset.
 #[derive(Debug)]
 pub struct TransportBuilder {
-    http: Option<Client>,
+    http_builder: Option<reqwest::ClientBuilder>,
     base_root: Option<String>,
     user_agent: Option<String>,
     accept_language: Option<String>,
@@ -921,7 +934,7 @@ pub struct TransportBuilder {
 impl Default for TransportBuilder {
     fn default() -> Self {
         Self {
-            http: None,
+            http_builder: None,
             base_root: None,
             user_agent: None,
             accept_language: None,
@@ -937,22 +950,30 @@ impl Default for TransportBuilder {
 }
 
 impl TransportBuilder {
-    /// Supplies a fully-configured `reqwest::Client` instead of letting `build` construct one.
+    /// Supplies a `reqwest::ClientBuilder` to customize the underlying HTTP client, instead of
+    /// letting `build` construct one from scratch with this crate's defaults.
     ///
-    /// When set, `timeout`/`read_timeout` are ignored — the supplied client is used exactly as
-    /// given (headers are still built explicitly per-request by `Transport::execute_once`
-    /// regardless of which client is used).
+    /// # Security (finding F4)
     ///
-    /// # Warning
+    /// Regardless of what redirect policy `builder` carries — or omits — `build` calls
+    /// `.redirect(reqwest::redirect::Policy::none())` on it **last**, immediately before
+    /// `.build()`, so the resulting client can never follow a redirect no matter what this
+    /// escape hatch is used to configure. This is not optional: reqwest's redirect machinery
+    /// strips only the `Authorization`/`Cookie` headers on a cross-host hop, never this crate's
+    /// primary `X-User-Token` credential, and re-sends a `307`/`308` request body verbatim — a
+    /// followed redirect could leak the session token to, or replay a write against, a host this
+    /// crate never intended to talk to. There is deliberately no way to opt back into redirect
+    /// following through this crate's public API.
     ///
-    /// A caller-supplied client silently discards two of this crate's safety guarantees: redirect
-    /// refusal (`reqwest::redirect::Policy::none()`) and the request/read timeouts in
-    /// [`crate::consts`]. `Transport::execute_once`'s own response-URL check (security finding
-    /// F4) still refuses a *followed* redirect before its body is ever read, regardless of which
-    /// client is injected here, but there is no 30-second ceiling on a hung request either way.
+    /// When set, this crate's own [`TransportBuilder::timeout`]/[`TransportBuilder::read_timeout`]
+    /// are **ignored** — `builder` is used exactly as given, aside from the forced redirect
+    /// policy above. Configure timeouts on `builder` itself, or leave both unset entirely (e.g.
+    /// `reqwest::ClientBuilder::new()` with nothing else called) for a test that pairs
+    /// `tokio::time::pause()` with a real HTTP round trip — see `.claude/rules/testing.md`'s
+    /// gotcha for why the crate's own timeouts and a paused clock do not mix.
     #[must_use]
-    pub fn http(mut self, client: Client) -> Self {
-        self.http = Some(client);
+    pub fn http_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.http_builder = Some(builder);
         self
     }
 
@@ -1025,14 +1046,16 @@ impl TransportBuilder {
         self
     }
 
-    /// Overrides the overall request timeout. Ignored if `http` was also called.
+    /// Overrides the overall request timeout. Ignored if [`TransportBuilder::http_builder`] was
+    /// also called.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Overrides the per-read timeout. Ignored if `http` was also called.
+    /// Overrides the per-read timeout. Ignored if [`TransportBuilder::http_builder`] was also
+    /// called.
     #[must_use]
     pub fn read_timeout(mut self, read_timeout: Duration) -> Self {
         self.read_timeout = read_timeout;
@@ -1047,6 +1070,12 @@ impl TransportBuilder {
     /// absolute URL usable as a path base, or if `accept_language`/`user_agent` contains a byte
     /// outside the printable-ASCII range (or a CR/LF). Returns `Error::Network` if constructing
     /// the underlying `reqwest::Client` fails.
+    ///
+    /// # Security (finding F4)
+    ///
+    /// `.redirect(reqwest::redirect::Policy::none())` is applied last, immediately before
+    /// `.build()`, regardless of whether the client comes from this crate's own defaults or from
+    /// a caller-supplied [`TransportBuilder::http_builder`] — see that method's own docs.
     pub fn build(self) -> Result<Transport, Error> {
         // Both bases are validated here, even though only the 2.2 base's origin is kept
         // (`api_host`, below): a bad `base_url` override must fail at build time regardless of
@@ -1067,8 +1096,14 @@ impl TransportBuilder {
             .unwrap_or_else(|| consts::DEFAULT_ACCEPT_LANGUAGE.to_owned());
         validate_header_value("X-Accept-Language", &accept_language)?;
 
-        let http = if let Some(client) = self.http {
-            client
+        let http = if let Some(builder) = self.http_builder {
+            // Timeouts are deliberately not forced onto a caller-supplied builder — see
+            // `TransportBuilder::http_builder`'s own docs. The redirect policy is not
+            // negotiable: it always wins, even over a policy `builder` explicitly set.
+            builder
+                .redirect(Policy::none())
+                .build()
+                .map_err(Error::Network)?
         } else {
             Client::builder()
                 .timeout(self.timeout)

@@ -99,6 +99,12 @@ impl CredentialStore for FileStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Session::empty()),
             Err(err) => Err(StorageError::Io(err)),
             Ok(contents) => {
+                // Security fix (phase-security-review, finding 8): a credential file with any
+                // group/other permission bit set (e.g. one this crate did not itself create —
+                // hand-placed, copied in from a backup, or written by an older/foreign tool) is
+                // readable by more than its owner. Never fails the read — this is a diagnostic,
+                // not an enforced precondition — but it must not go unnoticed either.
+                warn_if_permissions_are_loose(&self.path);
                 let (session, migrated) = Session::from_json_migrating(&contents)?;
                 if migrated {
                     // Best-effort: never fails this read, see `migrate_and_verify`'s own docs.
@@ -112,10 +118,17 @@ impl CredentialStore for FileStore {
     fn save(&self, session: &Session) -> Result<(), StorageError> {
         // Mirrors `os.makedirs(cookie_dir, exist_ok=True)` (`auth_storage.py:215-217`); an empty
         // parent (a bare file name with no directory component) has nothing to create.
+        //
+        // Security fix (phase-security-review, finding 8): every directory this call creates is
+        // created with owner-only (`0700`) permissions from the moment it is created, on Unix —
+        // matching the atomic 0600-on-create discipline `create_private_file` already applies to
+        // the file itself, rather than relying on the process umask (which a caller could have
+        // widened, e.g. `umask 022`, leaving a group/other-readable directory the credential file
+        // then inherits its own looser default permissions from on some platforms/filesystems).
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
-            fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
         let json = session.to_json()?;
         write_private_atomically(&self.path, json.as_bytes())
@@ -272,6 +285,63 @@ fn create_private_file(path: &Path) -> std::io::Result<File> {
 fn create_private_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
+
+/// Creates `parent` and every missing ancestor directory with owner-only (`0700`) permissions,
+/// set at creation time rather than via a separate `chmod` afterwards — the same atomic-mode
+/// discipline [`create_private_file`] applies to the credential file itself (security finding 8).
+///
+/// [`std::fs::DirBuilder::mode`] applies to every directory this call actually creates, not just
+/// the deepest one; an already-existing ancestor is left with whatever permissions it already
+/// has (matching `create_dir_all`'s own "existing directories are not modified" contract).
+#[cfg(unix)]
+fn create_private_dir_all(parent: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+}
+
+/// Non-Unix fallback: creates `parent` and every missing ancestor with the platform's default
+/// permissions. See [`FileStore`]'s own doc comment for what this means for callers on Windows.
+#[cfg(not(unix))]
+fn create_private_dir_all(parent: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(parent)
+}
+
+/// Returns `true` if `path`'s permission bits grant any access to group or other (i.e. anything
+/// beyond owner-only `0600`/`0700`), `false` if `path` cannot be inspected at all (never treated
+/// as loose — there is nothing this crate can usefully warn about for a file it cannot stat).
+///
+/// Unix-only: there is no portable notion of "group/other" permission bits to inspect elsewhere;
+/// see [`FileStore`]'s own doc comment for what that means for callers on Windows.
+#[cfg(unix)]
+fn has_loose_permissions(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o077 != 0)
+}
+
+/// Logs a fixed `WARN` (never fails, never blocks the read) if [`has_loose_permissions`] reports
+/// `path` is readable/writable by group or other — e.g. a credential file this crate did not
+/// itself create, copied in from elsewhere, or left over from an older non-atomic
+/// implementation. Security finding 8: this crate's own [`create_private_file`]/
+/// [`create_private_dir_all`] never produce such a file, but nothing prevents one from appearing
+/// at `path` by some other means, and a loosely-permissioned plaintext credential file should
+/// never go unnoticed merely because it still parses.
+#[cfg(unix)]
+fn warn_if_permissions_are_loose(path: &Path) {
+    if has_loose_permissions(path) {
+        tracing::warn!(
+            path = %path.display(),
+            "credential file has group/other-accessible permissions; expected owner-only (0600)"
+        );
+    }
+}
+
+/// Non-Unix no-op: there is no portable permission-bit check to perform. See
+/// [`has_loose_permissions`]'s own doc comment.
+#[cfg(not(unix))]
+fn warn_if_permissions_are_loose(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -459,6 +529,67 @@ mod tests {
             .expect("save succeeds");
 
         assert!(path.exists());
+    }
+
+    // ===================== Parent directory / loose-permission warning (finding 8) =====================
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_every_missing_parent_directory_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("dirs").join("cookies.json");
+        let store = FileStore::new(&path);
+
+        store
+            .save(&Session::from_token("tok"))
+            .expect("save succeeds");
+
+        for created in [dir.path().join("nested"), dir.path().join("nested/dirs")] {
+            let mode = fs::metadata(&created)
+                .expect("directory exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "expected {created:?} to be owner-only, got {mode:o}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_loose_permissions_is_false_for_a_freshly_saved_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        let store = FileStore::new(&path);
+        store
+            .save(&Session::from_token("tok"))
+            .expect("save succeeds");
+
+        assert!(!super::has_loose_permissions(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_loose_permissions_is_true_for_a_world_readable_file_and_load_still_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        fs_write(&path, r#"{"session_id":"tok","schema_version":2}"#);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod succeeds");
+
+        assert!(super::has_loose_permissions(&path));
+
+        let store = FileStore::new(&path);
+        let session = store.load().expect(
+            "a loosely-permissioned file must still load — this is a warning, not a failure",
+        );
+        assert_eq!(session.expose_token(), "tok");
     }
 
     // ===================== Missing file / empty session =====================

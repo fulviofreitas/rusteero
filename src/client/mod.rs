@@ -753,7 +753,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// [`ClientBuilder::store`].
 #[derive(Debug)]
 pub struct ClientBuilder {
-    http: Option<reqwest::Client>,
+    http: Option<reqwest::ClientBuilder>,
     base_url: Option<String>,
     user_agent: Option<String>,
     accept_language: Option<String>,
@@ -789,12 +789,14 @@ impl Default for ClientBuilder {
 }
 
 impl ClientBuilder {
-    /// Supplies a fully-configured `reqwest::Client` instead of letting [`ClientBuilder::build`]
-    /// construct one. Forwarded to [`crate::transport::TransportBuilder::http`] — see that
-    /// method's docs for the safety guarantees a caller-supplied client discards.
+    /// Supplies a `reqwest::ClientBuilder` instead of letting [`ClientBuilder::build`] construct
+    /// one from scratch. Forwarded to [`crate::transport::TransportBuilder::http_builder`] — see
+    /// that method's docs: the redirect policy is always forced to
+    /// `reqwest::redirect::Policy::none()` regardless of what `builder` carries, and this crate's
+    /// own timeouts are skipped unless `builder` sets its own.
     #[must_use]
-    pub fn http(mut self, client: reqwest::Client) -> Self {
-        self.http = Some(client);
+    pub fn http_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.http = Some(builder);
         self
     }
 
@@ -939,7 +941,7 @@ impl ClientBuilder {
             .store(self.store);
 
         if let Some(http) = self.http {
-            transport_builder = transport_builder.http(http);
+            transport_builder = transport_builder.http_builder(http);
         }
         if let Some(base_url) = self.base_url {
             transport_builder = transport_builder.base_url(base_url);

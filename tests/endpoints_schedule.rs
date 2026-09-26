@@ -282,6 +282,140 @@ async fn delete_schedule_deletes_its_own_url() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ===================== security finding 2: schedule-family validation =====================
+
+#[tokio::test]
+async fn delete_schedule_rejects_a_bare_identifier_that_is_not_a_schedule_path()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let err = api
+        .delete_schedule("networks", None)
+        .await
+        .expect_err("a bare identifier can never resolve to a schedule family path");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "schedule"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_schedule_rejects_an_unrelated_same_host_path() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let err = api
+        .delete_schedule("/2.2/networks/1", None)
+        .await
+        .expect_err("a same-host path outside the schedule family must be rejected");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "schedule"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_schedule_rejects_a_network_envelope_passed_as_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    // A network's own envelope: `url` resolves, but to the network, not a schedule.
+    let network_parent = json!({"url": "/2.2/networks/1"});
+    let err = api
+        .delete_schedule("ignored", Some(&network_parent))
+        .await
+        .expect_err("a network envelope's url must never be accepted as a schedule url");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "schedule"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_schedule_rejects_a_bare_identifier_that_is_not_a_schedule_path()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let err = api
+        .update_schedule(
+            "networks",
+            &UpdateScheduleOptions {
+                enabled: Some(false),
+                ..UpdateScheduleOptions::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("a bare identifier can never resolve to a schedule family path");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "schedule"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_schedule_still_accepts_a_genuine_schedule_path() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    api.update_schedule(
+        "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        &UpdateScheduleOptions {
+            enabled: Some(false),
+            ..UpdateScheduleOptions::default()
+        },
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_schedule_still_accepts_a_genuine_schedule_envelope() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let parent = json!({
+        "url": "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001"
+    });
+    api.delete_schedule("ignored", Some(&parent)).await?;
+    Ok(())
+}
+
 // ===================== clear_profile_schedule =====================
 
 #[tokio::test]

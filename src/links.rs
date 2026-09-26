@@ -50,12 +50,23 @@ pub fn validate_identifier(value: &str) -> Result<&str, Error> {
 /// # Errors
 ///
 /// Returns [`Error::validation`] with `field: "link"` if `link` is empty, contains `"://"`, or
-/// starts with `"//"` — none of which an API-published path ever does.
+/// starts with `"//"` — none of which an API-published path ever does. Also rejects a query
+/// string or fragment (security finding 3): every caller of this helper joins `link` verbatim
+/// onto the API host via [`join_api_path`], and a query/fragment slipped through here would ride
+/// along into the resolved request URL unexamined, whether `link` came from an envelope's
+/// `resources`/`url` field ([`resolve_link`]/[`self_url`]) or from a caller-supplied
+/// `/`-prefixed `id_or_url` ([`resource_url`]'s path branch).
 fn validate_link_path(link: &str) -> Result<&str, Error> {
     if link.is_empty() || link.contains("://") || link.starts_with("//") {
         return Err(Error::validation(
             "link",
             "must be a host-relative API path",
+        ));
+    }
+    if link.contains(['?', '#']) {
+        return Err(Error::validation(
+            "link",
+            "must not carry a query or fragment",
         ));
     }
     Ok(link)
@@ -104,8 +115,11 @@ pub fn join_api_path(host: &Url, path: &str) -> Result<Url, Error> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::validation`] with `field: "url"` if `url` does not parse, or its scheme or
-/// hostname does not exactly match `host`'s.
+/// Returns [`Error::validation`] with `field: "url"` if `url` does not parse, its scheme or
+/// hostname does not exactly match `host`'s, or it carries a query string or fragment (security
+/// finding 3: every caller of this helper appends a template-derived suffix onto the validated
+/// URL and sends the result as a request URL, so a query/fragment slipped through here would
+/// ride along unexamined).
 fn validate_absolute_url(url: &str, host: &Url) -> Result<Url, Error> {
     let parsed = Url::parse(url)
         .map_err(|err| Error::validation("url", format!("not a valid URL: {err}")))?;
@@ -122,6 +136,12 @@ fn validate_absolute_url(url: &str, host: &Url) -> Result<Url, Error> {
                 host.scheme(),
                 host.host_str().unwrap_or_default()
             ),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Error::validation(
+            "url",
+            "must not carry a query or fragment",
         ));
     }
     Ok(parsed)
@@ -432,6 +452,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Validation { .. }));
+    }
+
+    // ===================== security finding 3: query/fragment rejection =====================
+
+    #[test]
+    fn resource_url_absolute_url_with_query_is_rejected() {
+        let err = resource_url(
+            &host(),
+            "http://mock.test:1234/2.2/networks/100?evil=1",
+            "networks/{id}",
+            ApiVersion::V2_2,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "url"));
+    }
+
+    #[test]
+    fn resource_url_absolute_url_with_fragment_is_rejected() {
+        let err = resource_url(
+            &host(),
+            "http://mock.test:1234/2.2/networks/100#frag",
+            "networks/{id}",
+            ApiVersion::V2_2,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "url"));
+    }
+
+    #[test]
+    fn resource_url_path_prefixed_id_with_query_is_rejected() {
+        let err = resource_url(
+            &host(),
+            "/2.2/networks/100?evil=1",
+            "networks/{id}",
+            ApiVersion::V2_2,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "link"));
+    }
+
+    #[test]
+    fn resource_url_path_prefixed_id_with_fragment_is_rejected() {
+        let err = resource_url(
+            &host(),
+            "/2.2/networks/100#frag",
+            "networks/{id}",
+            ApiVersion::V2_2,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "link"));
+    }
+
+    #[test]
+    fn validate_link_path_via_resolve_link_rejects_a_query_string() {
+        let parent = json!({"resources": {"eeros": "/2.2/networks/100/eeros?evil=1"}});
+        let err = resolve_link(&host(), &parent, "eeros").unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "link"));
     }
 
     #[test]

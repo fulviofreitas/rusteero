@@ -46,23 +46,25 @@ pub struct LoginFlow {
 impl LoginFlow {
     /// Builds a `LoginFlow` against the real Eero cloud API.
     ///
-    /// Pass `Some(client)` to supply your own pre-configured `reqwest::Client`; `None` lets
-    /// [`crate::transport::TransportBuilder::build`] construct one with this crate's defaults
-    /// instead (redirects refused, the timeouts in [`crate::consts`], [`consts::DEFAULT_USER_AGENT`]).
+    /// Pass `Some(builder)` to supply your own pre-configured `reqwest::ClientBuilder`; `None`
+    /// lets [`crate::transport::TransportBuilder::build`] construct one with this crate's
+    /// defaults instead (redirects refused, the timeouts in [`crate::consts`],
+    /// [`consts::DEFAULT_USER_AGENT`]).
     ///
-    /// # Warning
+    /// # Security
     ///
-    /// A caller-supplied client silently discards two of this crate's safety guarantees: redirect
-    /// refusal and the request/read timeouts — see
-    /// [`crate::transport::TransportBuilder::http`]'s own `# Warning`.
+    /// A caller-supplied `builder` can never re-enable redirect following: `build` forces
+    /// `reqwest::redirect::Policy::none()` onto it regardless — see
+    /// [`crate::transport::TransportBuilder::http_builder`]'s own docs for why. It *does* still
+    /// skip this crate's default request/read timeouts unless `builder` sets its own.
     ///
     /// # Errors
     ///
     /// Propagates [`crate::transport::TransportBuilder::build`]'s error unmodified.
-    pub fn new(http: Option<reqwest::Client>) -> Result<Self, Error> {
+    pub fn new(http_builder: Option<reqwest::ClientBuilder>) -> Result<Self, Error> {
         let mut builder = Transport::builder();
-        if let Some(http) = http {
-            builder = builder.http(http);
+        if let Some(http_builder) = http_builder {
+            builder = builder.http_builder(http_builder);
         }
         Ok(Self {
             transport: Arc::new(builder.build()?),

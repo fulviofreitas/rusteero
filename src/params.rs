@@ -207,14 +207,49 @@ fn require_nested_family(
     Ok(url.clone())
 }
 
-/// Hand-written matcher for the fixed path shape
-/// `/<digits>.<digits>/networks/<network>/<prefix>/<child><suffix>`, standing in for
-/// `_params.py`'s single compiled regex (`_require_nested_family`, `_params.py:196-203`).
+/// Checks that a resolved scheduled-pause URL names the expected three-level resource family:
+/// `/<version>/networks/<network>/profiles/<profile>/schedules/<schedule>`, with single-segment
+/// ids and nothing after the final id.
+///
+/// Security finding 2 (phase-security-review): `ScheduleApi::update_schedule`/
+/// `ScheduleApi::delete_schedule` used to accept *any* same-host path or absolute URL as a
+/// schedule's own URL, as long as it resolved via [`crate::links::resource_url`]'s generic
+/// `{id}`-template substitution — a bare identifier such as `"networks"`, an unrelated path such
+/// as `"/2.2/networks/1"`, or a network's own envelope (whose `url` points at the network, not a
+/// schedule) would all resolve to *some* URL and then be sent a `PUT`/`DELETE` without ever being
+/// checked to actually be a schedule. This closes that gap the same way
+/// [`require_nested_family`] already closes it for every two-level nested resource: after
+/// resolution, the URL's path is required to match the schedule family shape below, or the call
+/// is rejected before any request is sent.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] with `field: "schedule"` if `url` carries a query or fragment,
+/// or its path does not match `networks/{id}/profiles/{id}/schedules/{id}`.
+pub(crate) fn require_schedule_family(url: &Url) -> Result<Url, Error> {
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(Error::validation(
+            "schedule",
+            "must not carry a query or fragment",
+        ));
+    }
+    if regex_free_matchers::path_matches_schedule_family(url.path()).is_none() {
+        return Err(Error::validation(
+            "schedule",
+            "must be a schedule path, URL or envelope",
+        ));
+    }
+    Ok(url.clone())
+}
+
+/// Hand-written matcher for the fixed path shapes this module validates, standing in for
+/// `_params.py`'s compiled regexes (`_require_nested_family`, `_params.py:196-203`, and
+/// `schedule.py`'s own URL-shape expectations).
 ///
 /// A regex crate is not among this crate's dependencies (no new dependencies without a stated
-/// reason, per this port's conventions); the shape is fixed and small enough to check by hand.
-/// `network` and `child` are each validated afterwards to be `[A-Za-z0-9._:-]+` — the same
-/// character class the Python regex enforces inline.
+/// reason, per this port's conventions); both shapes are fixed and small enough to check by hand.
+/// Every id is validated to be `[A-Za-z0-9._:-]+` — the same character class the Python regex
+/// enforces inline.
 mod regex_free_matchers {
     /// Returns `(network, child)` if `path` matches
     /// `/<digits>.<digits>/networks/<network>/<prefix>/<child><suffix>` with both `network` and
@@ -241,6 +276,30 @@ mod regex_free_matchers {
         Some((network, child))
     }
 
+    /// Returns `(network, profile, schedule)` if `path` matches
+    /// `/<digits>.<digits>/networks/<network>/profiles/<profile>/schedules/<schedule>`, with
+    /// every id a single-segment identifier (`[A-Za-z0-9._:-]+`), else `None`.
+    pub(super) fn path_matches_schedule_family(path: &str) -> Option<(&str, &str, &str)> {
+        let rest = path.strip_prefix('/')?;
+        let (version, rest) = rest.split_once('/')?;
+        if !is_version_segment(version) {
+            return None;
+        }
+        let rest = rest.strip_prefix("networks/")?;
+        let (network, rest) = rest.split_once('/')?;
+        let rest = rest.strip_prefix("profiles/")?;
+        let (profile, rest) = rest.split_once('/')?;
+        let rest = rest.strip_prefix("schedules/")?;
+        let schedule = rest;
+        if !is_identifier_segment(network)
+            || !is_identifier_segment(profile)
+            || !is_identifier_segment(schedule)
+        {
+            return None;
+        }
+        Some((network, profile, schedule))
+    }
+
     fn is_version_segment(segment: &str) -> bool {
         let Some((major, minor)) = segment.split_once('.') else {
             return false;
@@ -261,7 +320,10 @@ mod regex_free_matchers {
 
 #[cfg(test)]
 mod tests {
-    use super::{CADENCE_VALUES, resolve_nested_url, resolve_network_url, validate_cadence};
+    use super::{
+        CADENCE_VALUES, require_schedule_family, resolve_nested_url, resolve_network_url,
+        validate_cadence,
+    };
     use crate::error::Error;
     use crate::routes::ApiVersion;
     use serde_json::json;
@@ -423,6 +485,11 @@ mod tests {
 
     #[test]
     fn resolve_nested_url_child_with_query_is_rejected() {
+        // Security finding 3 moved this rejection earlier: `resource_url`'s own path branch (via
+        // `links::validate_link_path`) now rejects the query string before `require_nested_family`
+        // ever runs, so the error surfaces as `field: "link"` rather than `field: "child"` — still
+        // `Error::Validation`, just caught one layer sooner. See `links.rs`'s own
+        // `resource_url_path_prefixed_id_with_query_is_rejected` for the same fix in isolation.
         let err = resolve_nested_url(
             &host(),
             "100",
@@ -434,7 +501,7 @@ mod tests {
             ApiVersion::V2_2,
         )
         .unwrap_err();
-        assert!(matches!(err, Error::Validation { field, .. } if field == "child"));
+        assert!(matches!(err, Error::Validation { field, .. } if field == "link"));
     }
 
     #[test]
@@ -454,5 +521,51 @@ mod tests {
             url.as_str(),
             "http://mock.test:1234/2.2/networks/100/insights/devices/aa:bb:cc/history"
         );
+    }
+
+    // ===================== require_schedule_family (security finding 2) =====================
+
+    #[test]
+    fn require_schedule_family_accepts_a_genuine_schedule_path() {
+        let url =
+            Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1").unwrap();
+        assert_eq!(require_schedule_family(&url).unwrap(), url);
+    }
+
+    #[test]
+    fn require_schedule_family_rejects_a_bare_networks_collection_path() {
+        let url = Url::parse("http://mock.test:1234/2.2/networks").unwrap();
+        let err = require_schedule_family(&url).unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
+    }
+
+    #[test]
+    fn require_schedule_family_rejects_an_unrelated_network_path() {
+        let url = Url::parse("http://mock.test:1234/2.2/networks/1").unwrap();
+        let err = require_schedule_family(&url).unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
+    }
+
+    #[test]
+    fn require_schedule_family_rejects_a_query_or_fragment() {
+        let url = Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1?x=1")
+            .unwrap();
+        let err = require_schedule_family(&url).unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
+
+        let url =
+            Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1#frag")
+                .unwrap();
+        let err = require_schedule_family(&url).unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
+    }
+
+    #[test]
+    fn require_schedule_family_rejects_trailing_extra_segments() {
+        let url =
+            Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1/extra")
+                .unwrap();
+        let err = require_schedule_family(&url).unwrap_err();
+        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
     }
 }

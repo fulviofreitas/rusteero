@@ -125,21 +125,20 @@ async fn get_devices_refetches_after_the_ttl_expires() -> anyhow::Result<()> {
         .mount(&mock.server)
         .await;
 
-    // A `reqwest::Client` with neither of the crate's default request/read timeouts configured
-    // (see `Client::builder().http(..)`'s own docs for this escape hatch). Those timeouts are
-    // implemented as `tokio::time` sleeps racing the real response; `tokio::time::pause()`'s
-    // documented auto-advance behaviour ("if the runtime has no work to do, the clock is
-    // auto-advanced to the next pending timer") can fire one of those sleeps the instant the
-    // `advance()` call below leaves the runtime transiently idle mid-request — observed in
-    // practice as a flaky, spurious `Error::Timeout` (or an outright dropped connection) on the
-    // second call. Dropping both timeouts removes that race entirely; the real, unmocked socket
-    // I/O this test still performs is unaffected by the paused clock either way.
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("a client with no timeouts configured always builds");
+    // A `reqwest::ClientBuilder` with neither of the crate's default request/read timeouts
+    // configured (see `Client::builder().http_builder(..)`'s own docs for this escape hatch).
+    // Those timeouts are implemented as `tokio::time` sleeps racing the real response;
+    // `tokio::time::pause()`'s documented auto-advance behaviour ("if the runtime has no work to
+    // do, the clock is auto-advanced to the next pending timer") can fire one of those sleeps the
+    // instant the `advance()` call below leaves the runtime transiently idle mid-request —
+    // observed in practice as a flaky, spurious `Error::Timeout` (or an outright dropped
+    // connection) on the second call. Dropping both timeouts removes that race entirely; the
+    // real, unmocked socket I/O this test still performs is unaffected by the paused clock
+    // either way. The redirect policy is forced to `Policy::none()` by `build()` regardless, so
+    // there is no need to set one here.
+    let http = reqwest::Client::builder();
     let client = Client::builder()
-        .http(http)
+        .http_builder(http)
         .base_url(mock.uri())
         .session(Some(Session::from_token(TEST_TOKEN)))
         .cache_ttl(Duration::from_secs(30))

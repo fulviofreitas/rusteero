@@ -85,6 +85,16 @@ impl ScheduleApi {
     /// `parent` envelope with no `url` field is a validation error, not a silent fallback to
     /// `id_or_url`); when `parent` is `None`, `id_or_url` is resolved via `route`'s `"{id}"`
     /// template, exactly like Python's `str` branch.
+    ///
+    /// # Security (finding 2)
+    ///
+    /// Whichever branch resolves a URL, the result is required to actually name a scheduled
+    /// pause — `networks/{id}/profiles/{id}/schedules/{id}` — via
+    /// [`crate::params::require_schedule_family`], before it is returned to a caller that is
+    /// about to `PUT`/`DELETE` it. Without this, a bare identifier (`"networks"`), an unrelated
+    /// same-host path (`"/2.2/networks/1"`), or a *network's* own envelope passed as `parent`
+    /// would all resolve to *some* URL via the generic `{id}`-template/`self_url` machinery and
+    /// be sent a mutating request without ever being confirmed to be a schedule.
     fn resolve_schedule_url(
         &self,
         route: &Resource,
@@ -92,12 +102,14 @@ impl ScheduleApi {
         parent: Option<&Value>,
     ) -> Result<Url, Error> {
         let host = self.transport.api_host();
-        if let Some(parent) = parent {
-            return links::self_url(host, parent)?.ok_or_else(|| {
+        let url = if let Some(parent) = parent {
+            links::self_url(host, parent)?.ok_or_else(|| {
                 Error::validation("schedule", "envelope has no resolvable 'url' field")
-            });
-        }
-        route.resolve(host, id_or_url, None)
+            })?
+        } else {
+            route.resolve(host, id_or_url, None)?
+        };
+        crate::params::require_schedule_family(&url)
     }
 
     /// Gets the scheduled pauses for a profile — returns the raw Eero API response.

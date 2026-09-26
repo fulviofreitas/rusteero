@@ -30,6 +30,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::redact;
+
 /// The crate's error type.
 ///
 /// Mirrors the exception hierarchy of `eero-api`'s `exceptions.py` at `v8.0.4`: every variant
@@ -43,7 +45,13 @@ use serde_json::Value;
 /// parsed response is still available, verbatim, via [`Error::envelope`].
 ///
 /// This type is `#[non_exhaustive]`: new variants may be added in a minor release.
-#[derive(Debug, thiserror::Error)]
+///
+/// `Debug` is hand-written (see the `impl std::fmt::Debug for Error` below), not derived: a
+/// derived `Debug` would print `envelope`/`url` verbatim, and either can carry a credential — a
+/// server-echoed `password`/`token` field inside `envelope`, or a `?s=<session-token>` query
+/// string appended to `url` for logging/diagnostics before this error was constructed. Every
+/// other field is printed exactly as a derived `Debug` would.
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// Authentication failed, or no session token is available.
@@ -252,6 +260,156 @@ pub enum Error {
     /// response ({n} bytes)"`, byte count only), matching Python's own `base.py:593-597`.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Redacts `envelope` for `Debug`, via [`redact::redact_sensitive`]. `None` stays `None`.
+fn debug_envelope(envelope: Option<&Value>) -> Option<Value> {
+    envelope.map(redact::redact_sensitive)
+}
+
+/// Reduces `url` to its path component for `Debug`, dropping the query string and fragment (and
+/// therefore any session token or other sensitive value either could carry). `None` stays `None`.
+///
+/// Every `url` this crate ever constructs came from [`url::Url`] in the first place, so parsing
+/// it back always succeeds in practice; the fallback (splitting on the first `?`/`#` byte by
+/// hand) exists only so this can never panic on a hand-constructed `Error` a test or a future
+/// caller builds with an arbitrary string.
+fn debug_url_path_only(url: Option<&String>) -> Option<String> {
+    url.map(|full| {
+        url::Url::parse(full).map_or_else(
+            |_| full.split(['?', '#']).next().unwrap_or(full).to_owned(),
+            |parsed| parsed.path().to_owned(),
+        )
+    })
+}
+
+impl std::fmt::Debug for Error {
+    /// See the [`Error`] type's own doc comment for why this is hand-written rather than
+    /// derived. Every variant is rendered with the same field names and shape a derived `Debug`
+    /// would use, except `envelope` (redacted via `debug_envelope`) and `url` (reduced to its
+    /// path via `debug_url_path_only`).
+    // This is a single mechanical match over every variant, each arm four lines long and none of
+    // them sharing logic worth factoring out further without losing the direct one-arm-per-
+    // variant correspondence to a derived `Debug` that makes this easy to audit; splitting it
+    // into two functions purely to satisfy a line count would not improve readability.
+    #[allow(clippy::too_many_lines)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Authentication {
+                message,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("Authentication")
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::RateLimit {
+                message,
+                retry_after,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("RateLimit")
+                .field("message", message)
+                .field("retry_after", retry_after)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::Network(err) => f.debug_tuple("Network").field(err).finish(),
+            Error::Api {
+                status,
+                message,
+                envelope,
+                error_code,
+                url,
+            } => f
+                .debug_struct("Api")
+                .field("status", status)
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .field("url", &debug_url_path_only(url.as_ref()))
+                .finish(),
+            Error::Timeout => write!(f, "Timeout"),
+            Error::AccessDenied {
+                status,
+                message,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("AccessDenied")
+                .field("status", status)
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::ClientBlocked {
+                status,
+                message,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("ClientBlocked")
+                .field("status", status)
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::NotFound {
+                status,
+                message,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("NotFound")
+                .field("status", status)
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::PremiumRequired {
+                status,
+                message,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("PremiumRequired")
+                .field("status", status)
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::FeatureUnavailable {
+                status,
+                message,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("FeatureUnavailable")
+                .field("status", status)
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::Validation {
+                field,
+                message,
+                envelope,
+                error_code,
+            } => f
+                .debug_struct("Validation")
+                .field("field", field)
+                .field("message", message)
+                .field("envelope", &debug_envelope(envelope.as_ref()))
+                .field("error_code", error_code)
+                .finish(),
+            Error::MissingNetworkId => write!(f, "MissingNetworkId"),
+            Error::Storage(err) => f.debug_tuple("Storage").field(err).finish(),
+            Error::Json(err) => f.debug_tuple("Json").field(err).finish(),
+        }
+    }
 }
 
 impl Error {
@@ -741,5 +899,56 @@ mod tests {
         let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let err: Error = serde_err.into();
         assert!(matches!(err, Error::Json(_)));
+    }
+
+    // ===================== Debug redaction (security finding 4) =====================
+
+    #[test]
+    fn api_debug_never_prints_the_envelope_password_or_the_url_query() {
+        let err = Error::Api {
+            status: 200,
+            message: "boom".to_owned(),
+            envelope: Some(serde_json::json!({"password": "hunter2"})),
+            error_code: None,
+            url: Some("https://api-user.e2ro.com/2.2/account?serial=SECRET".to_owned()),
+        };
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("hunter2"),
+            "envelope value must be redacted, got {debug:?}"
+        );
+        assert!(
+            !debug.contains("SECRET"),
+            "url query string must be stripped, got {debug:?}"
+        );
+        assert!(
+            debug.contains("[REDACTED"),
+            "the redacted envelope's marker must still be visible, got {debug:?}"
+        );
+        assert!(
+            debug.contains("/2.2/account"),
+            "the url path itself is not sensitive and should still be visible, got {debug:?}"
+        );
+    }
+
+    #[test]
+    fn authentication_debug_never_prints_the_envelope_password() {
+        let err = Error::Authentication {
+            message: "failed".to_owned(),
+            envelope: Some(serde_json::json!({"token": "abc123456"})),
+            error_code: None,
+        };
+        let debug = format!("{err:?}");
+        assert!(!debug.contains("abc123456"));
+        assert!(debug.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn debug_with_no_envelope_or_url_still_renders() {
+        let err = Error::Timeout;
+        assert_eq!(format!("{err:?}"), "Timeout");
+
+        let err = Error::MissingNetworkId;
+        assert_eq!(format!("{err:?}"), "MissingNetworkId");
     }
 }

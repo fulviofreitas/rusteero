@@ -149,9 +149,10 @@ fn redact_value(value: &Value, visible_chars: usize) -> Value {
 /// Ported from `_redact_dict`: a sensitive key's value is replaced by [`redact_value`]'s output
 /// (with `visible_chars` set to `0` for a zero-visibility key, [`VISIBLE_CHARS`] otherwise)
 /// regardless of its type; a non-sensitive key whose value is itself an object recurses; a
-/// non-sensitive key whose value is an array is walked element-wise, and only object elements of
-/// that array recurse (non-object items, e.g. plain strings, pass through unchanged, matching
-/// Python's `isinstance(item, dict)` guard); every other value is copied through untouched.
+/// non-sensitive key whose value is an array is walked element-wise via [`redact_nested`], which
+/// recurses through arbitrarily deep object/array nesting (not just one array level — security
+/// finding 7: a value such as `[[{"token": "x"}]]` under a non-sensitive key must still have its
+/// doubly-nested `token` redacted); every other value is copied through untouched.
 fn redact_object(map: &Map<String, Value>) -> Value {
     let mut result = Map::with_capacity(map.len());
     for (key, value) in map {
@@ -163,23 +164,27 @@ fn redact_object(map: &Map<String, Value>) -> Value {
             };
             redact_value(value, visible_chars)
         } else {
-            match value {
-                Value::Object(nested) => redact_object(nested),
-                Value::Array(items) => Value::Array(
-                    items
-                        .iter()
-                        .map(|item| match item {
-                            Value::Object(nested) => redact_object(nested),
-                            other => other.clone(),
-                        })
-                        .collect(),
-                ),
-                other => other.clone(),
-            }
+            redact_nested(value)
         };
         result.insert(key.clone(), redacted);
     }
     Value::Object(result)
+}
+
+/// Recurses through arbitrarily deep [`Value::Object`]/[`Value::Array`] nesting under a
+/// non-sensitive key, redacting any sensitive key it finds at any depth. Every other JSON type is
+/// copied through unchanged.
+///
+/// This is what makes [`redact_object`] recurse past a single array level (security finding 7):
+/// an array of arrays of objects — or any deeper mix of the two — is walked all the way down,
+/// not just one level of `Value::Array` as the original single-level `.map(...)` implementation
+/// did.
+fn redact_nested(value: &Value) -> Value {
+    match value {
+        Value::Object(nested) => redact_object(nested),
+        Value::Array(items) => Value::Array(items.iter().map(redact_nested).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Redacts sensitive data from a JSON value for safe logging.
@@ -440,6 +445,19 @@ mod tests {
                 .contains("[REDACTED")
         );
         assert!(result["session_id"].as_str().unwrap().contains("[REDACTED"));
+    }
+
+    #[test]
+    fn handles_nested_list_of_lists_of_dicts() {
+        // Security finding 7: recursion through an array must not stop after one level.
+        let result = redact_sensitive(&json!({
+            "outer": [[{"token": "abc123"}]]
+        }));
+        let redacted = result["outer"][0][0]["token"].as_str().unwrap();
+        assert!(
+            redacted.contains("[REDACTED"),
+            "a token nested two array levels deep must still be redacted, got {redacted:?}"
+        );
     }
 
     #[test]

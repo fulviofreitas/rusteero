@@ -323,8 +323,13 @@ async fn redirect_is_refused_and_never_reaches_the_location_host() -> anyhow::Re
         panic!("expected Error::Api, got {err:?}");
     };
     assert_eq!(*status, 302);
-    assert!(message.starts_with("Redirect not followed: 302 -> "));
+    assert!(message.starts_with("Redirect not followed: 302 at /2.2/account -> "));
     assert!(!message.contains("leaked-token"));
+    // The message must carry the `Location` header's *host* only, never a full URL (which could
+    // embed a query string of its own) — the redirect target's bare loopback host:port, with no
+    // scheme and no `/2.2/account` path repeated a second time.
+    assert!(!message.contains("://"));
+    assert!(!message.ends_with("/2.2/account"));
 
     let received = redirect_target
         .received_requests()
@@ -334,51 +339,87 @@ async fn redirect_is_refused_and_never_reaches_the_location_host() -> anyhow::Re
     Ok(())
 }
 
-/// Security finding F4: a caller-supplied `reqwest::Client` that kept reqwest's default
-/// redirect-following policy still must not let a followed redirect's body reach the caller as a
-/// successful envelope.
 #[tokio::test]
-async fn injected_client_that_follows_redirects_is_still_refused() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
+async fn redirect_with_no_location_header_is_refused_with_the_fixed_message() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(302))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let transport = mock.transport_with_token(TEST_TOKEN);
+    let err = transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await
+        .expect_err("a 3xx with no Location header must still be refused");
+
+    let Error::Api { message, .. } = &err else {
+        panic!("expected Error::Api, got {err:?}");
+    };
+    assert_eq!(
+        message,
+        "Redirect not followed: 302 at /2.2/account (no Location header)"
+    );
+    Ok(())
+}
+
+/// Security finding 1: `TransportBuilder::http_builder` (the escape hatch that replaces the
+/// removed `TransportBuilder::http`) must force `Policy::none()` onto the resulting
+/// `reqwest::Client` even when the caller-supplied `reqwest::ClientBuilder` explicitly set a
+/// *permissive* redirect policy of its own (`Policy::limited(10)`, not merely the default) —
+/// `build()`'s own forced `.redirect(Policy::none())` must be applied last and win regardless.
+#[tokio::test]
+async fn http_builder_with_an_explicit_permissive_policy_still_refuses_a_cross_host_redirect()
+-> anyhow::Result<()> {
+    let server_a = MockServer::start().await;
+    let server_b = MockServer::start().await;
+
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
         .respond_with(
             ResponseTemplate::new(302)
-                .insert_header("Location", format!("{}/2.2/elsewhere", server.uri())),
+                .insert_header("Location", format!("{}/2.2/account", server_b.uri())),
         )
         .expect(1)
-        .mount(&server)
+        .mount(&server_a)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/2.2/elsewhere"))
+    Mock::given(wiremock::matchers::any())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{}}"#))
-        .expect(1)
-        .mount(&server)
+        .expect(0)
+        .mount(&server_b)
         .await;
 
-    let following_client = reqwest::Client::builder()
-        .build()
-        .expect("a default reqwest client always builds");
+    let permissive_builder =
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
 
     let transport = Transport::builder()
-        .base_url(server.uri())
-        .http(following_client)
-        .session(Some(Session::from_token("tok")))
+        .base_url(server_a.uri())
+        .http_builder(permissive_builder)
+        .session(Some(Session::from_token(TEST_TOKEN)))
         .build()
-        .expect("builds with an injected client");
+        .expect("builds with an injected client builder");
 
     let err = transport
         .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
-        .expect_err("a followed redirect must surface as an error, not the hop's body");
-    let Error::Api {
-        status, message, ..
-    } = &err
-    else {
+        .expect_err("the transport's own Policy::none() must win over the builder's own policy");
+    let Error::Api { status, .. } = &err else {
         panic!("expected Error::Api, got {err:?}");
     };
-    assert_eq!(*status, 200);
-    assert!(message.starts_with("Redirect followed by a caller-supplied client: "));
+    assert_eq!(*status, 302);
+
+    let received_b = server_b
+        .received_requests()
+        .await
+        .expect("request recording is on by default");
+    assert!(
+        received_b.is_empty(),
+        "server B must never receive a request: the redirect must be refused before the hop"
+    );
     Ok(())
 }
 
