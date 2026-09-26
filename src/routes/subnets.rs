@@ -30,25 +30,27 @@ pub const SUBNETS_SET_CONFIG: Resource = Resource {
     link: None,
 };
 
-/// `DELETE /2.2/networks/{network}/subnets_config/{subnet_type}` — delete a subnet's
-/// configuration.
+/// `networks/{id}/subnets_config` — the collection
+/// [`SubnetsApi::delete_subnet`](crate::endpoints::subnets::SubnetsApi::delete_subnet) resolves via
+/// [`Resource::resolve`], then appends a validated `subnet_type` onto with
+/// [`crate::links::child_url`] directly, rather than going through a [`Nested`] route.
 ///
 /// Ported from `eero-api src/eero/api/subnets.py:113-141` (`SubnetsAPI.delete_subnet`):
-/// `child_url(resource_url(network_id, "networks/{id}/subnets_config"), subnet_type)`. Resolved
-/// via [`crate::routes::Nested::resolve`], which reduces to the identical two-step
-/// `resource_url` + `child_url` call for the bare-identifier `subnet_type` values this method is
-/// ever called with in practice (there is no fixed vocabulary the API publishes, but every
-/// documented `subnet_type` — e.g. `"main"`, `"guest"` — is a single path segment). Deliberate,
-/// low-impact deviation: unlike Python's `child_url`, which rejects a `subnet_type` value that
-/// happens to start with `/` or `http(s)://` outright, `Nested::resolve` would instead try to
-/// resolve it as an already-encoded nested path/URL (and still fail, just via a different
-/// validation branch, for anything that is not actually a `subnets_config` path on this
-/// network) — see `crate::params::resolve_nested_url`'s own docs.
-pub const SUBNETS_DELETE_SUBNET: Nested = Nested {
+/// `child_url(resource_url(network_id, "networks/{id}/subnets_config"), subnet_type)`.
+/// **Deliberately not a [`Nested`]** (orchestrator decision, phase-G fix list item 12): a
+/// `Nested`'s `child` accepts a path/URL as well as a bare id (`crate::params::resolve_nested_url`
+/// treats anything starting with `/`/`http(s)://` as an already-resolved nested path to verify),
+/// but Python's `child_url` is stricter — `subnet_type` must always be a bare single-segment
+/// identifier, and a path or absolute URL is rejected outright, not interpreted. Using a
+/// `Resource` for the collection plus a direct `child_url` call reproduces that stricter rule
+/// exactly, instead of silently accepting a wider set of inputs than the Python SDK does.
+/// [`Resource::method`] is `DELETE` even though this constant only ever resolves the *collection*
+/// URL (the member id is appended afterwards) — matching every other route constant's convention
+/// of carrying its call site's HTTP verb.
+pub const SUBNETS_CONFIG_COLLECTION: Resource = Resource {
     method: Method::DELETE,
     version: ApiVersion::V2_2,
-    prefix: "subnets_config",
-    suffix: "",
+    template: "networks/{id}/subnets_config",
     link: None,
 };
 

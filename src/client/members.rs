@@ -1,11 +1,10 @@
 //! `Client` methods for the `MembersAPI` domain (new in v8.0.0).
 //!
 //! Ported from `eero-api src/eero/api/members.py` (v8.0.4) by way of `EeroClient`'s own
-//! `members`-scoped wrappers in `client.py`. None of the ten wrappers below passes a `parent` to
-//! its domain call (`.claude/tasks/briefs/v8/client.md` §4's `members` table carries no `+net`
-//! note on any row) — `EeroClient` has no `_member_parent_kwargs` helper, matching every single-
-//! resource read/write elsewhere in `client.py` that is called with no `parent=` at all (brief
-//! §3.3).
+//! `members`-scoped wrappers in `client.py`. Only [`Client::get_members`] passes a `parent`
+//! (`+net`, `client.py:2577-2579`) — every other wrapper below is called with no `parent=` at
+//! all, matching every single-resource read/write elsewhere in `client.py` that has no
+//! `_*_parent_kwargs` helper of its own (brief §3.3).
 
 use super::Client;
 use crate::envelope::Envelope;
@@ -15,14 +14,19 @@ impl Client {
     /// Lists network members — returns the raw Eero API response.
     ///
     /// Ported from `get_members()` (`client.py:2574-2580`). `auto_discover = false` — see
-    /// [`Client::get_diagnostics`].
+    /// [`Client::get_diagnostics`]. Passes the cached network envelope as `parent=` when fresh
+    /// (`+net`, `client.py:2577-2579`).
     ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
     pub async fn get_members(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        self.api.members().get_members(&network_id, None).await
+        let parent = self.network_parent(network_id.as_str());
+        self.api
+            .members()
+            .get_members(&network_id, parent.as_ref())
+            .await
     }
 
     /// Lists pending invites — returns the raw Eero API response.

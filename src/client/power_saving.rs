@@ -9,6 +9,7 @@
 
 use super::Client;
 use crate::cache::CacheKey;
+use crate::endpoints::power_saving::UpdatePowerSavingScheduleOptions;
 use crate::envelope::Envelope;
 use crate::error::Error;
 use serde_json::Value;
@@ -110,29 +111,16 @@ impl Client {
     ///
     /// Returns `Error::Validation { field: "schedule", .. }` if every one of `name`, `days`,
     /// `start_time`, `end_time`, `enabled` is `None`. Otherwise see [`Client::get_diagnostics`].
-    #[allow(clippy::too_many_arguments)] // mirrors client.py:2860-2870's own six keyword-only fields
     pub async fn update_power_saving_schedule(
         &self,
         schedule_id: &str,
         network_id: Option<&str>,
-        name: Option<&str>,
-        days: Option<Value>,
-        start_time: Option<&str>,
-        end_time: Option<&str>,
-        enabled: Option<bool>,
+        options: &UpdatePowerSavingScheduleOptions<'_>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .power_saving()
-            .update_schedule(
-                &network_id,
-                schedule_id,
-                name,
-                days,
-                start_time,
-                end_time,
-                enabled,
-            )
+            .update_schedule(&network_id, schedule_id, options)
             .await
     }
 

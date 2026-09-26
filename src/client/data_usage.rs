@@ -25,11 +25,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_data_usage(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -48,11 +48,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_data_usage_breakdown(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -73,12 +73,12 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub async fn get_devices_data_usage(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
         profile_id: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -98,11 +98,11 @@ impl Client {
     pub async fn get_device_data_usage(
         &self,
         device_mac: &str,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -122,11 +122,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_eeros_data_usage_summary(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -146,11 +146,11 @@ impl Client {
     pub async fn get_eero_data_usage(
         &self,
         eero_id: &str,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -170,11 +170,11 @@ impl Client {
     pub async fn get_profile_data_usage(
         &self,
         profile_id: &str,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -194,11 +194,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_unprofiled_devices_data_usage(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -218,11 +218,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_unprofiled_data_usage_summary(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api

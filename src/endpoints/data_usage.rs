@@ -175,14 +175,13 @@ impl DataUsageApi {
         timezone: Option<&str>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let cadence = validated_cadence(cadence)?;
         self.get_child_usage(
             &routes::data_usage::GET_DEVICES_DATA_USAGE,
             network_id,
             device_mac,
             start,
             end,
-            Some(cadence),
+            cadence,
             timezone,
             parent,
         )
@@ -240,14 +239,13 @@ impl DataUsageApi {
         timezone: Option<&str>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let cadence = validated_cadence(cadence)?;
         self.get_child_usage(
             &routes::data_usage::GET_EEROS_DATA_USAGE,
             network_id,
             eero_id,
             start,
             end,
-            Some(cadence),
+            cadence,
             timezone,
             parent,
         )
@@ -274,14 +272,13 @@ impl DataUsageApi {
         timezone: Option<&str>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let cadence = validated_cadence(cadence)?;
         self.get_child_usage(
             &routes::data_usage::GET_PROFILES_DATA_USAGE,
             network_id,
             profile_id,
             start,
             end,
-            Some(cadence),
+            cadence,
             timezone,
             parent,
         )
@@ -443,6 +440,12 @@ impl DataUsageApi {
     /// resource in this module: resolves `route`'s collection URL, then literal-appends `child`
     /// after validating it as a single path-segment identifier.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Validates `child` (a bare id) **before** `cadence` — mirroring Python's own evaluation
+    /// order at every one of this method's three call sites (`data_usage.py:317,405,450`), where
+    /// `_validate_child_id(...)` is embedded directly in the f-string argument expression handed
+    /// to `_get_usage`, so it raises before `_get_usage`'s own `cadence` check ever runs
+    /// (phase-G fix list item 15).
     async fn get_child_usage(
         &self,
         route: &Resource,
@@ -450,15 +453,16 @@ impl DataUsageApi {
         child: &str,
         start: &str,
         end: &str,
-        cadence: Option<&str>,
+        cadence: &str,
         timezone: Option<&str>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let validated_child = crate::links::validate_identifier(child)?;
+        let cadence = validated_cadence(cadence)?;
         let id_or_url = self.network_id_or_self_url(network_id, parent)?;
         let collection = route.resolve(self.transport.api_host(), &id_or_url, None)?;
         let url = append_path(&collection, validated_child)?;
-        let query = usage_query(start, end, cadence, timezone);
+        let query = usage_query(start, end, Some(cadence), timezone);
         self.transport
             .request(Method::GET, url, &query, RequestBody::None)
             .await

@@ -11,7 +11,7 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 fn diagnostics_api(mock: &MockEero) -> DiagnosticsApi {
     DiagnosticsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
@@ -30,6 +30,7 @@ async fn get_diagnostics_uses_the_default_template() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/diagnostics"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -47,6 +48,7 @@ async fn get_diagnostics_prefers_a_parent_supplied_link() -> anyhow::Result<()> 
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/diagnostics"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"meta": {}, "data": {}})))
         .expect(1)
         .mount(&mock.server)
@@ -64,6 +66,7 @@ async fn get_diagnostics_with_unknown_network_maps_404_to_not_found() -> anyhow:
     Mock::given(method("GET"))
         .and(path("/2.2/networks/does-not-exist/diagnostics"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(404).set_body_string("no such network"))
         .expect(1)
         .mount(&mock.server)
@@ -93,6 +96,7 @@ async fn run_diagnostics_sends_an_empty_object_with_no_args() -> anyhow::Result<
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/diagnostics"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({})))
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
@@ -114,6 +118,7 @@ async fn run_diagnostics_sends_only_the_supplied_keys() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/diagnostics"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "device": "dev-0001" })))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -132,6 +137,7 @@ async fn run_diagnostics_sends_both_supplied_keys() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/diagnostics"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(
             json!({ "device": "dev-0001", "symptom": "slow" }),
         ))

@@ -37,7 +37,8 @@ impl OUICheckApi {
     /// URL is `{resolve_network_url(network_id, parent)}/ouicheck` — the same self-url-preferred
     /// resolution [`crate::params::resolve_network_url`] gives every other network-scoped
     /// method, plus a literal `"/ouicheck"` suffix; not a shape [`crate::routes::Resource`] can
-    /// express (see `src/routes/ouicheck.rs`'s own docs), so the URL is built by hand here.
+    /// express (see [`crate::routes::ouicheck::OUICHECK_GET_OUICHECK`]'s own docs), so the URL is
+    /// built by hand here.
     /// `serial` and `version` are sent as required query parameters (`?serial=..&version=..`);
     /// the API 404s without both.
     ///

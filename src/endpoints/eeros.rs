@@ -109,12 +109,13 @@ fn resolve_self_preferred(
 /// Reads a `data.nightlight.url` field out of `value` (a full envelope or a bare `data` object)
 /// and joins it onto `host`, if present and non-empty.
 ///
-/// Ported from `_nightlight_url_from_envelope` (`eero-api src/eero/api/eeros.py:70-102`).
+/// Ported from `_nightlight_url_from_envelope` (`eero-api src/eero/api/eeros.py:70-102`), which
+/// unwraps `data` only when `value` looks like a *full* envelope (has both a `meta` key and an
+/// object `data` key) — exactly [`crate::links::as_data`]'s rule, used here instead of a
+/// bespoke unwrap so a bare `data` object that happens to carry its own `data` field is never
+/// double-unwrapped (phase-G fix list item 16).
 fn nightlight_url_from_value(host: &Url, value: &Value) -> Result<Option<Url>, Error> {
-    let data = value
-        .get("data")
-        .filter(|data| data.is_object())
-        .unwrap_or(value);
+    let data = crate::links::as_data(value);
     let Some(url) = data
         .get("nightlight")
         .and_then(|nightlight| nightlight.get("url"))
@@ -243,7 +244,7 @@ impl EerosApi {
         let url = resolve_self_preferred(
             self.transport.api_host(),
             eero_id,
-            &routes::SET_LOCATION,
+            &routes::EEROS_SET_LOCATION,
             parent,
         )?;
         crate::links::warn_uncharacterised_write("set location for eero");
@@ -537,16 +538,20 @@ impl EerosApi {
         if !NODE_ACTIONS.contains(&action) {
             return Err(Error::validation(
                 "action",
-                format!("must be one of {NODE_ACTIONS:?}, got {action:?}"),
+                format!(
+                    "must be one of {}, got {}",
+                    crate::params::py_list(NODE_ACTIONS),
+                    crate::params::py_quote(action)
+                ),
             ));
         }
-        crate::links::warn_uncharacterised_write(
-            "perform node action on eero -- power-cycles ports and, for \
-             POWER_CYCLE_ALL_PORTS_AND_REBOOT, reboots the eero",
-        );
+        crate::links::warn_uncharacterised_write(&format!(
+            "perform node action '{action}' on eero -- power-cycles ports and, for \
+             POWER_CYCLE_ALL_PORTS_AND_REBOOT, reboots the eero"
+        ));
         self.transport
             .resource(
-                &routes::NODE_ACTION,
+                &routes::EEROS_NODE_ACTION,
                 eero_id,
                 parent,
                 &[],
@@ -564,6 +569,13 @@ impl EerosApi {
     /// suffix, since two distinct ids (`eero_id`, `interface_number`) cannot be expressed by a
     /// single [`Resource`]. **Unverified against a live network.**
     ///
+    /// `interface_number: u32` is narrower than Python's `interface_number: str`
+    /// (`eeros.py:698`) — a deliberate divergence (phase-G fix list item 24), not an oversight:
+    /// every observed interface number is a small non-negative integer, and `u32` still ends up
+    /// as the identical decimal string once it reaches [`crate::links::child_url`]
+    /// (`interface_number.to_string()`), so this only narrows the accepted *input* shape, never
+    /// the wire value.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Validation { field: "action", .. }` if `action` is not one of the nine
@@ -577,17 +589,23 @@ impl EerosApi {
         if !PORT_ACTIONS.contains(&action) {
             return Err(Error::validation(
                 "action",
-                format!("must be one of {PORT_ACTIONS:?}, got {action:?}"),
+                format!(
+                    "must be one of {}, got {}",
+                    crate::params::py_list(PORT_ACTIONS),
+                    crate::params::py_quote(action)
+                ),
             ));
         }
-        crate::links::warn_uncharacterised_write("perform port action on eero port");
-
         let host = self.transport.api_host();
         let ports_base =
             crate::links::resource_url(host, eero_id, "eeros/{id}/ports", ApiVersion::V2_2)?;
         let member = crate::links::child_url(&ports_base, &interface_number.to_string())?;
         let url = Url::parse(&format!("{}/action", member.as_str().trim_end_matches('/')))
             .map_err(|err| Error::validation("url", format!("not a valid URL: {err}")))?;
+
+        crate::links::warn_uncharacterised_write(&format!(
+            "perform port action '{action}' on eero port"
+        ));
 
         self.transport
             .request(
@@ -608,6 +626,12 @@ impl EerosApi {
     /// aiohttp's own list-form encoding (`data={"colors[]": colors, ...}`,
     /// `eeros.py:787-791`) rather than a single JSON-array-shaped value. **Unverified against a
     /// live network.**
+    ///
+    /// `duration: u32`/`time_per_color: u32` are narrower than Python's `duration: str`/
+    /// `time_per_color: str` (`eeros.py:749-750`) — a deliberate divergence (phase-G fix list
+    /// item 24), not an oversight: both are forwarded to the API as decimal strings either way
+    /// (`duration.to_string()`/`time_per_color.to_string()`), so this only narrows the accepted
+    /// *input* shape, never the wire value.
     pub async fn led_cycle(
         &self,
         eero_serial: &str,
@@ -625,7 +649,7 @@ impl EerosApi {
 
         self.transport
             .resource(
-                &routes::LED_CYCLE,
+                &routes::EEROS_LED_CYCLE,
                 eero_serial,
                 None,
                 &[],

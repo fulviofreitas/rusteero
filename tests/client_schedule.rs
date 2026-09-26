@@ -10,6 +10,7 @@ use wiremock::{Mock, ResponseTemplate};
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use rusteero::endpoints::schedule::UpdateScheduleOptions;
 use serde_json::json;
 
 /// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
@@ -98,11 +99,45 @@ async fn update_schedule_takes_no_network_id_and_resolves_from_its_own_path() ->
     client
         .update_schedule(
             "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+            &UpdateScheduleOptions {
+                enabled: Some(false),
+                ..UpdateScheduleOptions::default()
+            },
             None,
-            None,
-            None,
-            None,
-            Some(false),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Ported from `client.py:2015-2044`'s `schedule: Any` — `Client::update_schedule` accepts the
+/// pause's own cached envelope via `parent`, not just a path/URL string (phase-G fix list item
+/// 19).
+#[tokio::test]
+async fn update_schedule_accepts_a_cached_pause_envelope_as_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        ))
+        .and(session_cookie())
+        .and(body_json(json!({ "enabled": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let parent = json!({
+        "url": "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001"
+    });
+    client
+        .update_schedule(
+            "ignored",
+            &UpdateScheduleOptions {
+                enabled: Some(false),
+                ..UpdateScheduleOptions::default()
+            },
+            Some(&parent),
         )
         .await?;
     Ok(())
@@ -123,7 +158,10 @@ async fn delete_schedule_takes_no_network_id() -> anyhow::Result<()> {
 
     let client = client(&mock).await;
     client
-        .delete_schedule("/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001")
+        .delete_schedule(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+            None,
+        )
         .await?;
     Ok(())
 }

@@ -25,11 +25,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_insights(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         insight_type: &str,
         cadence: &str,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -48,11 +48,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_devices_insights(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         insight_type: &str,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         let parent = self.network_parent(network_id.as_str());
@@ -80,11 +80,11 @@ impl Client {
     pub async fn get_device_insights(
         &self,
         device_id: &str,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         insight_type: &str,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -103,11 +103,11 @@ impl Client {
     /// See [`Client::get_diagnostics`].
     pub async fn get_profiles_insights(
         &self,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         insight_type: &str,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         let parent = self.network_parent(network_id.as_str());
@@ -135,11 +135,11 @@ impl Client {
     pub async fn get_profile_insights(
         &self,
         profile_id: &str,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         insight_type: &str,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
@@ -160,11 +160,11 @@ impl Client {
     pub async fn get_profile_devices_insights(
         &self,
         profile_id: &str,
-        network_id: Option<&str>,
         start: &str,
         end: &str,
         cadence: &str,
         insight_type: &str,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api

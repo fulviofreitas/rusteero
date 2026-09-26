@@ -16,7 +16,7 @@ use reqwest::Method;
 /// is a conventional sub-path, not a link. See
 /// [`PermissionsApi::get_permissions`](crate::endpoints::permissions::PermissionsApi::get_permissions)'s
 /// own doc comment for the resolution this constant documents.
-pub const GET_PERMISSIONS: Resource = Resource {
+pub const PERMISSIONS_GET_PERMISSIONS: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
     template: "networks/{id}/permissions",

@@ -14,7 +14,7 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 fn data_usage_api(mock: &MockEero) -> DataUsageApi {
     DataUsageApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
@@ -29,6 +29,7 @@ async fn get_data_usage_sends_query_params_and_no_body() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(query_param("start", "s"))
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
@@ -277,6 +278,46 @@ async fn get_device_usage_id_with_brace_does_not_break_template() -> anyhow::Res
     Ok(())
 }
 
+/// Ported from `data_usage.py:317`: `_validate_child_id(device_mac)` is embedded in the
+/// f-string argument passed to `_get_usage`, so it is evaluated -- and can raise -- before
+/// `_get_usage`'s own `cadence` check ever runs (phase-G fix list item 15). An invalid child id
+/// alongside an invalid cadence must surface the `id` error, not the `cadence` one.
+#[tokio::test]
+async fn get_device_usage_validates_child_id_before_cadence() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = data_usage_api(&mock);
+    let err = api
+        .get_device_usage("network-0001", "", "s", "e", "weekly", None, None)
+        .await
+        .expect_err("both id and cadence are invalid; id must be checked first");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eero_usage_validates_child_id_before_cadence() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = data_usage_api(&mock);
+    let err = api
+        .get_eero_usage("network-0001", "", "s", "e", "weekly", None, None)
+        .await
+        .expect_err("both id and cadence are invalid; id must be checked first");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_profile_usage_validates_child_id_before_cadence() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = data_usage_api(&mock);
+    let err = api
+        .get_profile_usage("network-0001", "", "s", "e", "weekly", None, None)
+        .await
+        .expect_err("both id and cadence are invalid; id must be checked first");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_eeros_summary_url_and_params() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
@@ -388,6 +429,7 @@ async fn set_report_settings_sends_a_json_body() -> anyhow::Result<()> {
             "/2.2/networks/network-0001/data_usage/report_settings",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(
             json!({ "cadence": "daily", "notification_day": "monday" }),
         ))

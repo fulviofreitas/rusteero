@@ -83,22 +83,25 @@ impl Client {
     /// Gets a single device's full object **without ever touching the cache** — returns the raw
     /// Eero API response.
     ///
-    /// Ported from `get_device_priority()` (`client.py:2196-...`): calls the exact same domain
+    /// Ported from `get_device_priority()` (`client.py:2194-2200`): calls the exact same domain
     /// method as [`Client::get_device`] (`DevicesApi::get_device`), but deliberately never reads
-    /// or writes `devices[{nid}_{did}]`. **Do not** wire this into the `devices` cache bucket to
-    /// "fix" the apparent duplication with `get_device` — the uncached-ness is the documented
-    /// v8.0.4 behaviour, not an oversight (`.claude/tasks/briefs/v8/client.md`, devices table,
-    /// `get_device_priority` row).
+    /// or writes `devices[{nid}_{did}]`, and resolves `network_id` with `auto_discover = false`
+    /// (`client.py:2199`) — unlike `get_device`, this method returns [`Error::MissingNetworkId`]
+    /// rather than probing `/networks` when no id/preferred network is set. **Do not** wire this
+    /// into the `devices` cache bucket to "fix" the apparent duplication with `get_device` — the
+    /// uncached-ness is the documented v8.0.4 behaviour, not an oversight
+    /// (`.claude/tasks/briefs/v8/client.md`, devices table, `get_device_priority` row).
     ///
     /// # Errors
     ///
-    /// See [`Client::get_network`].
+    /// [`Error::MissingNetworkId`] if `network_id` is absent and no preferred network is set.
+    /// Otherwise, whatever status-mapped [`Error`] the request produces.
     pub async fn get_device_priority(
         &self,
         device_id: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
-        let network_id = self.ensure_network_id(network_id, true).await?;
+        let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .devices()
             .get_device(&network_id, device_id, None)

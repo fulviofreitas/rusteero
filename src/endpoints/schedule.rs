@@ -42,6 +42,25 @@ const WEEKDAYS: &[&str] = &["monday", "tuesday", "wednesday", "thursday", "frida
 /// (`ScheduleAPI.set_weekend_bedtime`'s `WEEKEND` tuple).
 const WEEKEND: &[&str] = &["saturday", "sunday"];
 
+/// Every optional keyword argument [`ScheduleApi::update_schedule`] accepts.
+///
+/// More than four optional keyword arguments, per this port's conventions
+/// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2). Ported from `ScheduleAPI.update_schedule`'s
+/// own five independent keyword-only fields (`schedule.py:194-202`).
+#[derive(Debug, Default, Clone)]
+pub struct UpdateScheduleOptions<'a> {
+    /// The schedule's name. Omitted from the request when `None`.
+    pub name: Option<&'a str>,
+    /// The days the schedule applies to. Omitted from the request when `None`.
+    pub days: Option<&'a [&'a str]>,
+    /// The schedule's start time. Omitted from the request when `None`.
+    pub start: Option<&'a str>,
+    /// The schedule's end time. Omitted from the request when `None`.
+    pub end: Option<&'a str>,
+    /// Whether the schedule is enabled. Omitted from the request when `None`.
+    pub enabled: Option<bool>,
+}
+
 /// `eero-api`'s `ScheduleAPI` (`src/eero/api/schedule.py`) at v8.0.4.
 #[derive(Debug)]
 pub struct ScheduleApi {
@@ -136,13 +155,17 @@ impl ScheduleApi {
         enabled: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::schedule::SCHEDULE_CREATE_SCHEDULE.resolve(
+            self.transport.api_host(),
+            network_id,
+            profile_id,
+            parent,
+        )?;
         links::warn_uncharacterised_write("create_schedule");
         self.transport
-            .nested(
-                &routes::schedule::SCHEDULE_CREATE_SCHEDULE,
-                network_id,
-                profile_id,
-                parent,
+            .request(
+                routes::schedule::SCHEDULE_CREATE_SCHEDULE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({
                     "name": name,
@@ -174,22 +197,17 @@ impl ScheduleApi {
     /// `Error::Validation { field: "schedule", .. }` if `schedule`/`parent` cannot be resolved to
     /// a URL. Otherwise, [`Error::Authentication`] if no valid session is configured, or whatever
     /// status-mapped [`Error`] the request produces.
-    #[allow(clippy::too_many_arguments)] // mirrors schedule.py:194-202's own five-optional-keyword signature
     pub async fn update_schedule(
         &self,
         schedule: &str,
-        name: Option<&str>,
-        days: Option<&[&str]>,
-        start: Option<&str>,
-        end: Option<&str>,
-        enabled: Option<bool>,
+        options: &UpdateScheduleOptions<'_>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let mut payload = serde_json::Map::new();
-        if let Some(name) = name {
+        if let Some(name) = options.name {
             payload.insert("name".to_owned(), Value::String(name.to_owned()));
         }
-        if let Some(days) = days {
+        if let Some(days) = options.days {
             payload.insert(
                 "days".to_owned(),
                 Value::Array(
@@ -199,13 +217,13 @@ impl ScheduleApi {
                 ),
             );
         }
-        if let Some(start) = start {
+        if let Some(start) = options.start {
             payload.insert("start".to_owned(), Value::String(start.to_owned()));
         }
-        if let Some(end) = end {
+        if let Some(end) = options.end {
             payload.insert("end".to_owned(), Value::String(end.to_owned()));
         }
-        if let Some(enabled) = enabled {
+        if let Some(enabled) = options.enabled {
             payload.insert("enabled".to_owned(), Value::Bool(enabled));
         }
 
@@ -289,10 +307,16 @@ impl ScheduleApi {
 
         let mut results = Vec::with_capacity(pauses.len());
         for pause in pauses {
-            let self_url = pause.get("url").and_then(Value::as_str).ok_or_else(|| {
-                Error::validation("schedule", "pause envelope has no resolvable 'url' field")
-            })?;
-            results.push(self.delete_schedule(self_url, None).await?);
+            // Ported from `delete_schedule(pause)` (`schedule.py:313`): Python passes the pause's
+            // own *envelope* (mapping), not a bare URL string, so this goes through the same
+            // `parent`-is-`Some` branch of `resolve_schedule_url`/`_resolve_schedule_url` every
+            // other caller uses — the placeholder `""` `id_or_url` is never consulted, matching
+            // `_resolve_schedule_url`'s `Mapping` branch, which ignores nothing else. This is also
+            // what gives an unresolvable pause the *identical* message
+            // (`"envelope has no resolvable 'url' field"`, field `"schedule"`) every other
+            // resolution failure in this module produces, and the identical treat-empty-as-missing
+            // rule ([`links::self_url`]).
+            results.push(self.delete_schedule("", Some(pause)).await?);
         }
         Ok(results)
     }

@@ -24,12 +24,13 @@ use crate::transport::{RequestBody, Transport};
 ///
 /// More than four optional keyword arguments, per this port's conventions
 /// (`.claude/tasks/briefs/v8/g7-backup-members.md` "rules" reference,
-/// `.claude/tasks/briefs/v8/phase-g-rules.md` item 2). `connectivity`, `created` and
-/// `last_updated_at` are kept as opaque [`Value`]s rather than a narrower Rust type: Python
-/// forwards each of `update`'s keyword arguments verbatim with no shape validation
-/// (`backup_access_points.py:174-188`), and the wire shape of these three specifically (an
-/// object, a timestamp, or something else server-defined) is not established by anything read
-/// while porting this domain.
+/// `.claude/tasks/briefs/v8/phase-g-rules.md` item 2). `connectivity` is kept as an opaque
+/// [`Value`] rather than a narrower Rust type: Python declares it `Optional[Mapping[str, Any]]`
+/// (`backup_access_points.py:128`) with no further shape validation, and the wire shape of a
+/// "connectivity status" object is not established by anything read while porting this domain.
+/// `created`/`last_updated_at`, by contrast, are `Option<&'a str>` — Python types both
+/// `Optional[str]` (`backup_access_points.py:129-130`), not an opaque mapping (phase-G fix list
+/// item 25).
 #[derive(Debug, Default, Clone)]
 pub struct UpdateBackupAccessPointOptions<'a> {
     /// New SSID for the access point.
@@ -43,10 +44,10 @@ pub struct UpdateBackupAccessPointOptions<'a> {
     pub uuid: Option<&'a str>,
     /// Opaque connectivity-state value, forwarded verbatim.
     pub connectivity: Option<Value>,
-    /// Opaque creation-timestamp value, forwarded verbatim.
-    pub created: Option<Value>,
-    /// Opaque last-updated-timestamp value, forwarded verbatim.
-    pub last_updated_at: Option<Value>,
+    /// The backup network's creation timestamp, forwarded verbatim.
+    pub created: Option<&'a str>,
+    /// The backup network's last-updated timestamp, forwarded verbatim.
+    pub last_updated_at: Option<&'a str>,
 }
 
 /// `eero-api`'s `BackupAccessPointsAPI` (`src/eero/api/backup_access_points.py`, new in
@@ -161,11 +162,14 @@ impl BackupAccessPointsApi {
         if let Some(connectivity) = options.connectivity.clone() {
             body.insert("connectivity".to_owned(), connectivity);
         }
-        if let Some(created) = options.created.clone() {
-            body.insert("created".to_owned(), created);
+        if let Some(created) = options.created {
+            body.insert("created".to_owned(), Value::String(created.to_owned()));
         }
-        if let Some(last_updated_at) = options.last_updated_at.clone() {
-            body.insert("last_updated_at".to_owned(), last_updated_at);
+        if let Some(last_updated_at) = options.last_updated_at {
+            body.insert(
+                "last_updated_at".to_owned(),
+                Value::String(last_updated_at.to_owned()),
+            );
         }
         crate::links::warn_uncharacterised_write("update backup access point for network");
         self.transport

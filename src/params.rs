@@ -20,6 +20,59 @@ use crate::util::id_from_url;
 /// Ported from `CADENCE_VALUES` (`_params.py:25`).
 pub const CADENCE_VALUES: &[&str] = &["daily", "hourly"];
 
+/// Renders a single value the way Python's `repr()` renders a `str`: single-quoted, verbatim.
+///
+/// Every value this crate ever formats this way (mode names, actions, cadences, IP literals) is
+/// plain ASCII with no embedded quote or backslash, so this is always exactly Python's `repr()`
+/// output for that value — it is not a general-purpose Python `repr()` implementation.
+#[must_use]
+pub fn py_quote(value: &str) -> String {
+    format!("'{value}'")
+}
+
+/// Renders `items` as Python's `repr()` renders a `list` of `str`, **sorted** ascending first —
+/// every call site that formats a vocabulary this way ports a Python `sorted(...)` call (e.g.
+/// `eeros.py:681-683`), so the sort is not optional.
+///
+/// # Examples
+///
+/// ```
+/// # use rusteero::params::py_list;
+/// assert_eq!(py_list(&["b", "a"]), "['a', 'b']");
+/// ```
+#[must_use]
+pub fn py_list(items: &[&str]) -> String {
+    let mut sorted: Vec<&str> = items.to_vec();
+    sorted.sort_unstable();
+    let joined = sorted
+        .iter()
+        .map(|item| py_quote(item))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{joined}]")
+}
+
+/// Renders `items` as Python's `repr()` renders a `tuple` of `str`, in the exact order given —
+/// every call site that formats a vocabulary this way ports a Python `tuple(...)` call over a
+/// sequence that is already in the order the message must show (e.g. `_params.py:47-50`'s
+/// `tuple(allowed)`), so, unlike [`py_list`], this never sorts.
+///
+/// # Examples
+///
+/// ```
+/// # use rusteero::params::py_tuple;
+/// assert_eq!(py_tuple(&["daily", "hourly"]), "('daily', 'hourly')");
+/// ```
+#[must_use]
+pub fn py_tuple(items: &[&str]) -> String {
+    let joined = items
+        .iter()
+        .map(|item| py_quote(item))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({joined})")
+}
+
 /// Validates a `cadence` value against its endpoint's accepted buckets.
 ///
 /// Ported from `validate_cadence` (`_params.py:28-53`).
@@ -31,7 +84,11 @@ pub fn validate_cadence<'a>(value: &'a str, allowed: &[&str]) -> Result<&'a str,
     if !allowed.contains(&value) {
         return Err(Error::validation(
             "cadence",
-            format!("must be one of {allowed:?}, got {value:?}"),
+            format!(
+                "must be one of {}, got {}",
+                py_tuple(allowed),
+                py_quote(value)
+            ),
         ));
     }
     Ok(value)

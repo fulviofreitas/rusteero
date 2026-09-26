@@ -65,8 +65,11 @@ fn validate_link_path(link: &str) -> Result<&str, Error> {
 /// response envelope (has both a `meta` key and an object `data` key); otherwise returns `parent`
 /// unchanged.
 ///
-/// Ported from `_as_data` (`links.py:108-124`).
-fn as_data(parent: &Value) -> &Value {
+/// Ported from `_as_data` (`links.py:108-124`). `pub(crate)` so other modules that need the
+/// identical "is this a full envelope or an already-unwrapped `data` object?" rule (e.g.
+/// `crate::endpoints::eeros`'s nightlight-URL reader) share this one implementation instead of
+/// reimplementing — and potentially loosening — the same check.
+pub(crate) fn as_data(parent: &Value) -> &Value {
     if let Some(object) = parent.as_object()
         && object.contains_key("meta")
         && object.get("data").is_some_and(Value::is_object)

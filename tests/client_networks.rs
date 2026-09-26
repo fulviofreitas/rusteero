@@ -328,26 +328,6 @@ async fn get_speed_tests_forwards_every_kwarg() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ===================== reboot_network (no `client.py` precedent) =====================
-
-#[tokio::test]
-async fn reboot_network_invalidates_the_network_bucket() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("POST"))
-        .and(path("/2.2/networks/network-0001/reboot"))
-        .and(session_cookie())
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
-        )
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let client = client(&mock).await;
-    client.reboot_network(Some("network-0001")).await?;
-    Ok(())
-}
-
 // ===================== `account`/`networks` survive a network[nid] invalidation =====================
 
 #[tokio::test]

@@ -145,7 +145,7 @@ impl DevicesApi {
     /// Ported from `DevicesAPI._update_device` via `DevicesAPI.set_device_nickname`
     /// (`devices.py:44-65,201-225`), sending body `{"nickname": nickname}` (`devices.py:225`).
     /// `mac` is normalised through [`crate::util::id_from_url`] **before** being resolved against
-    /// the 2.3 route — exactly like `_update_device` (`devices.py:96-104`'s docstring) —
+    /// the 2.3 route — exactly like `_update_device` (`devices.py:82-112`'s docstring) —
     /// specifically so a path/URL-form `mac` (which could carry its own, different version
     /// segment) cannot smuggle a device write past the 2.3 version pin. **Must**, and does, use
     /// `routes::devices::V8_SET_DEVICE_NICKNAME` (`ApiVersion::V2_3`), never a `/2.2` route: the
@@ -221,7 +221,7 @@ impl DevicesApi {
     ///
     /// Ported from `DevicesAPI.update_device_via_link` (`devices.py:259-328`). New in `v8.0.4`
     /// (unverified write). Sends a JSON body of only the fields the caller supplied among
-    /// `nickname`/`paused`/`profile` (`devices.py:314-320`) — `mac` is never itself added to the
+    /// `nickname`/`paused`/`profile` (`devices.py:304-315`) — `mac` is never itself added to the
     /// payload, despite the module docstring's wording (`devices.py:96-99`'s docstring mismatch;
     /// see this module's own port brief for the citation), targets the **default** (2.2) API
     /// version, not 2.3, and prefers `parent`'s own `self_url` exactly like

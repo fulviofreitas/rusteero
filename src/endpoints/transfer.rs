@@ -47,10 +47,10 @@ impl TransferApi {
     ///   containing a stray `{`/`}` from corrupting the rendered template — the exact regression
     ///   `test_get_transfer_stats_device_id_with_brace_does_not_break_template` pins.
     ///
-    /// Divergence from `eero-api`: Python's `if device_id:` also falls back to the network-level
-    /// path for an *empty* `device_id` string, not just `None`. This method takes `Some("")` as a
-    /// (degenerate) device id and renders the device-level path — real Eero device ids are never
-    /// empty, so this is a documented edge case, not a behavioural change for any real caller.
+    /// Matches Python's `if device_id:` exactly (`transfer.py:71`): a truthy check, not an
+    /// `is None` check. `Some("")` is therefore treated identically to `None` — the network-level
+    /// path is used, `parent` is honoured, and the (never actually reachable) device-level branch
+    /// is not taken for an empty device id.
     ///
     /// # Errors
     ///
@@ -63,7 +63,7 @@ impl TransferApi {
         device_id: Option<&str>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        match device_id {
+        match device_id.filter(|id| !id.is_empty()) {
             Some(device_id) => {
                 self.transport
                     .nested(

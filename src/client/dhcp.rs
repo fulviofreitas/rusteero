@@ -20,10 +20,10 @@ impl Client {
     /// itself validates.
     pub async fn set_dhcp(
         &self,
-        network_id: Option<&str>,
         mode: Option<&str>,
         custom: Option<&Map<String, Value>>,
         custom_v2: Option<&Map<String, Value>>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         let parent = self.network_parent(&network_id);

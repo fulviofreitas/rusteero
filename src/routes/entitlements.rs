@@ -9,7 +9,7 @@ use reqwest::Method;
 ///
 /// Ported from `EntitlementsAPI.get_features` (`entitlements.py:37-61`). No `parent` in Python;
 /// `link: None` — this resource is never published as a named link.
-pub const GET_FEATURES: Resource = Resource {
+pub const ENTITLEMENTS_GET_FEATURES: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
     template: "entitlements/networks/{id}/features",

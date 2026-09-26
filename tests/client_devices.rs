@@ -13,6 +13,7 @@ use wiremock::{Mock, ResponseTemplate};
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use rusteero::error::Error;
 
 /// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
 /// default 60-second cache TTL.
@@ -273,5 +274,20 @@ async fn get_device_priority_never_touches_the_devices_cache() -> anyhow::Result
     client
         .get_device_priority("device-0001", Some("network-0001"))
         .await?;
+    Ok(())
+}
+
+/// `get_device_priority` resolves `network_id` with `auto_discover = false` (`client.py:2199`) —
+/// unlike most `devices` wrappers, it never falls back to probing `/networks` when no
+/// `network_id`/preferred network is set.
+#[tokio::test]
+async fn get_device_priority_resolves_the_network_without_auto_discovery() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+    let err = client
+        .get_device_priority("device-0001", None)
+        .await
+        .expect_err("no network_id and no preferred network must fail without auto-discovery");
+    assert!(matches!(err, Error::MissingNetworkId));
     Ok(())
 }

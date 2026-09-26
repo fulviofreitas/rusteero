@@ -42,7 +42,7 @@ async fn set_dhcp_invalidates_the_network_bucket() -> anyhow::Result<()> {
     let client = client(&mock).await;
     client.get_network(Some("network-0001"), false).await?;
     client
-        .set_dhcp(Some("network-0001"), Some("automatic"), None, None)
+        .set_dhcp(Some("automatic"), None, None, Some("network-0001"))
         .await?;
     client.get_network(Some("network-0001"), false).await?;
     Ok(())

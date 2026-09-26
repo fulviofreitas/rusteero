@@ -47,16 +47,16 @@ pub const GET_NETWORKS: Resource = Resource {
 /// ([`crate::links::self_url`]), which is exactly [`crate::params::resolve_network_url`]'s
 /// behaviour. `NetworksApi::network_own_url` calls that helper directly; this constant exists
 /// purely so a server-side path rename to this resource is still a one-line, grep-able fix.
-pub const NETWORK: Resource = Resource {
+pub const NETWORKS_GET_NETWORK: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
     template: "networks/{id}",
     link: None,
 };
 
-/// Same wire resource as [`NETWORK`]: `NetworksAPI.get_premium_status` (`networks.py:122-149`)
+/// Same wire resource as [`NETWORKS_GET_NETWORK`]: `NetworksAPI.get_premium_status` (`networks.py:122-149`)
 /// reads Eero Plus/Secure fields out of the same full network object, resolved the same way.
-pub const PREMIUM_STATUS: Resource = NETWORK;
+pub const PREMIUM_STATUS: Resource = NETWORKS_GET_NETWORK;
 
 /// `POST /2.2/networks/{id}/reboot` — reboot every Eero node on the network, preferring the
 /// network's own published `reboot` link.
@@ -84,7 +84,7 @@ pub const RUN_SPEED_TEST_V8: Resource = Resource {
 /// [`RUN_SPEED_TEST_V8`] but a different verb.
 ///
 /// Ported from `NetworksAPI.get_speed_tests` (`networks.py:223-267`).
-pub const GET_SPEED_TESTS: Resource = Resource {
+pub const NETWORKS_GET_SPEED_TESTS: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
     template: "networks/{id}/speedtest",

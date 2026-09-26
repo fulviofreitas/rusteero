@@ -230,7 +230,14 @@ async fn configure_security_with_no_fields_is_validation_error_with_no_requests(
         .configure_security("network-0001", None, None, None, None, None)
         .await
         .expect_err("an empty call must be rejected before any request");
-    assert!(matches!(err, Error::Validation { .. }));
+    let Error::Validation { field, message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(field, "settings");
+    assert_eq!(
+        message,
+        "at least one of wpa3, band_steering, upnp, ipv6 must be supplied"
+    );
 
     let requests = mock
         .server

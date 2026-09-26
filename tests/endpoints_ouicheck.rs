@@ -11,7 +11,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 fn ouicheck_api(mock: &MockEero) -> OUICheckApi {
     OUICheckApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
@@ -32,6 +32,7 @@ async fn get_ouicheck_sends_serial_and_version_as_query_params() -> anyhow::Resu
         .and(query_param("serial", "ABC123"))
         .and(query_param("version", "1"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -53,6 +54,7 @@ async fn get_ouicheck_prefers_the_parents_own_self_url() -> anyhow::Result<()> {
         .and(query_param("serial", "ABC123"))
         .and(query_param("version", "1"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"meta": {}, "data": {}})))
         .expect(1)
         .mount(&mock.server)
@@ -110,6 +112,7 @@ async fn get_ouicheck_empty_body_response_is_still_a_valid_envelope() -> anyhow:
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/ouicheck"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(query_param_is_missing("resource"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)

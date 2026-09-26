@@ -20,8 +20,10 @@
 //! §5) — reach the domain methods directly via `client.api().schedule()` if needed.
 
 use super::Client;
+use crate::endpoints::schedule::UpdateScheduleOptions;
 use crate::envelope::Envelope;
 use crate::error::Error;
+use serde_json::Value;
 
 impl Client {
     /// Gets the scheduled pauses for a profile — returns the raw Eero API response.
@@ -81,41 +83,47 @@ impl Client {
             .await
     }
 
-    /// Updates a scheduled pause via its own path/URL — returns the raw Eero API response.
+    /// Updates a scheduled pause via its own path/URL, or its own cached envelope — returns the
+    /// raw Eero API response.
     ///
     /// Ported from `update_schedule` (`eero-api src/eero/client.py:2015-2044`). No `network_id`
     /// parameter at all — `schedule` alone resolves the pause's URL, matching Python's own
-    /// signature. No cache invalidation.
+    /// signature. `parent` accepts the pause's own cached envelope (Python's `schedule: Any`
+    /// accepts either a path/URL string or a mapping; this port always splits that into an
+    /// `id_or_url` plus a `parent`, per phase-G fix list item 19), placed right after `schedule`
+    /// since this method has no `network_id` to place it before. No cache invalidation.
     ///
     /// # Errors
     ///
     /// See [`crate::endpoints::schedule::ScheduleApi::update_schedule`].
-    #[allow(clippy::too_many_arguments)] // mirrors client.py:2015-2024's own signature
     pub async fn update_schedule(
         &self,
         schedule: &str,
-        name: Option<&str>,
-        days: Option<&[&str]>,
-        start: Option<&str>,
-        end: Option<&str>,
-        enabled: Option<bool>,
+        options: &UpdateScheduleOptions<'_>,
+        parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         self.api
             .schedule()
-            .update_schedule(schedule, name, days, start, end, enabled, None)
+            .update_schedule(schedule, options, parent)
             .await
     }
 
-    /// Deletes a scheduled pause via its own path/URL — returns the raw Eero API response.
+    /// Deletes a scheduled pause via its own path/URL, or its own cached envelope — returns the
+    /// raw Eero API response.
     ///
     /// Ported from `delete_schedule` (`eero-api src/eero/client.py:2044-2053`). No `network_id`
-    /// parameter. No cache invalidation.
+    /// parameter. `parent` accepts the pause's own cached envelope, for the same reason as
+    /// [`Client::update_schedule`] (phase-G fix list item 19). No cache invalidation.
     ///
     /// # Errors
     ///
     /// See [`crate::endpoints::schedule::ScheduleApi::delete_schedule`].
-    pub async fn delete_schedule(&self, schedule: &str) -> Result<Envelope, Error> {
-        self.api.schedule().delete_schedule(schedule, None).await
+    pub async fn delete_schedule(
+        &self,
+        schedule: &str,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        self.api.schedule().delete_schedule(schedule, parent).await
     }
 
     /// Deletes every scheduled pause currently set on a profile — returns one raw response per

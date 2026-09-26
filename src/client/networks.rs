@@ -1,4 +1,10 @@
 //! `Client` methods for the `NetworksAPI` domain (plus the `get_premium_status` alias read).
+//!
+//! **No `reboot_network` wrapper.** `v8.0.4`'s `client.py` has never wrapped
+//! `NetworksAPI.reboot_network` (`api/networks.py:151`) on `EeroClient` at all — an earlier
+//! phase of this port added one anyway, with no Python precedent to cite; removed (phase-G fix
+//! list item 6) to match `client.py` exactly. [`crate::endpoints::networks::NetworksApi::reboot_network`]
+//! itself is unaffected and still callable directly through [`crate::api::EeroApi`].
 
 use super::Client;
 use crate::cache::CacheKey;
@@ -191,33 +197,6 @@ impl Client {
             .networks()
             .get_speed_tests(&network_id, limit, start_time, end_time, parent.as_ref())
             .await
-    }
-
-    /// Reboots every Eero node on the network — returns the raw Eero API response.
-    ///
-    /// No `client.py` precedent: `eero-api` has never wrapped `NetworksAPI.reboot_network`
-    /// (`api/networks.py:151`) on `EeroClient` at all, so there is nothing to port faithfully
-    /// here — this method exists only because [`crate::endpoints::NetworksApi::reboot_network`]
-    /// does. `auto_discover = true`, matching its two closest siblings,
-    /// [`Client::set_guest_network`] and [`Client::run_speed_test`]. Passes the cached network
-    /// envelope as `parent=`, for the same reason (this is a judgement call, not a citation —
-    /// there is no Python behaviour here to diverge from or match). On success, invalidates
-    /// `network[nid]`.
-    ///
-    /// # Errors
-    ///
-    /// See [`Client::set_guest_network`].
-    pub async fn reboot_network(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
-        let network_id = self.ensure_network_id(network_id, true).await?;
-        let parent = self.network_parent(network_id.as_str());
-        let response = self
-            .api
-            .networks()
-            .reboot_network(&network_id, parent.as_ref())
-            .await?;
-        self.cache
-            .invalidate(&CacheKey::network(network_id.as_str()));
-        Ok(response)
     }
 
     /// Sets the network name (SSID) — returns the raw Eero API response.

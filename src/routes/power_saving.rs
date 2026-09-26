@@ -9,7 +9,7 @@ use reqwest::Method;
 /// Ported from `eero-api src/eero/api/power_saving.py:38-96` (`PowerSavingAPI.set_power_saving`).
 /// Resolved via [`Resource::resolve`]: prefers a parent envelope's `resources.power_saving`
 /// link, falls back to the `networks/{id}/power_saving` template.
-pub const SET_POWER_SAVING: Resource = Resource {
+pub const POWER_SAVING_SET_POWER_SAVING: Resource = Resource {
     method: Method::PUT,
     version: ApiVersion::V2_2,
     template: "networks/{id}/power_saving",
@@ -25,19 +25,19 @@ pub const SET_POWER_SAVING: Resource = Resource {
 /// [`Resource::resolve`] with `link: None` reproduces that exactly: [`Resource::resolve`] only
 /// consults `parent` when `link` is `Some`, so a caller-supplied `parent` here is structurally
 /// inert regardless of what it carries.
-pub const GET_SCHEDULES: Resource = Resource {
+pub const POWER_SAVING_GET_SCHEDULES: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
     template: "networks/{id}/power_saving/schedules",
     link: None,
 };
 
-/// Alias of [`GET_SCHEDULES`], `POST`: create a power-saving schedule.
+/// Alias of [`POWER_SAVING_GET_SCHEDULES`], `POST`: create a power-saving schedule.
 ///
 /// Ported from `eero-api src/eero/api/power_saving.py:123-165` (`PowerSavingAPI.create_schedule`).
-/// No `parent=` parameter in Python at all (unlike [`GET_SCHEDULES`], which at least accepts one
+/// No `parent=` parameter in Python at all (unlike [`POWER_SAVING_GET_SCHEDULES`], which at least accepts one
 /// even though it goes unused) — resolved from `network_id` alone.
-pub const CREATE_SCHEDULE: Resource = Resource {
+pub const POWER_SAVING_CREATE_SCHEDULE: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
     template: "networks/{id}/power_saving/schedules",
@@ -50,7 +50,7 @@ pub const CREATE_SCHEDULE: Resource = Resource {
 /// Ported from `eero-api src/eero/api/power_saving.py:167-224` (`PowerSavingAPI.update_schedule`).
 /// Resolved via [`Nested::resolve`] (`crate::params::resolve_nested_url`); no `link` (Python
 /// calls `resolve_nested_url` with no `link=` at all) and no `parent=` parameter in Python.
-pub const UPDATE_SCHEDULE: Nested = Nested {
+pub const POWER_SAVING_UPDATE_SCHEDULE: Nested = Nested {
     method: Method::PUT,
     version: ApiVersion::V2_2,
     prefix: "power_saving/schedules",
@@ -58,10 +58,10 @@ pub const UPDATE_SCHEDULE: Nested = Nested {
     link: None,
 };
 
-/// Alias of [`UPDATE_SCHEDULE`], `DELETE`: delete a power-saving schedule.
+/// Alias of [`POWER_SAVING_UPDATE_SCHEDULE`], `DELETE`: delete a power-saving schedule.
 ///
 /// Ported from `eero-api src/eero/api/power_saving.py:226-248` (`PowerSavingAPI.delete_schedule`).
-pub const DELETE_SCHEDULE: Nested = Nested {
+pub const POWER_SAVING_DELETE_SCHEDULE: Nested = Nested {
     method: Method::DELETE,
     version: ApiVersion::V2_2,
     prefix: "power_saving/schedules",

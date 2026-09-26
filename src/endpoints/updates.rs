@@ -61,7 +61,7 @@ impl UpdatesApi {
     ///
     /// Ported from `eero-api src/eero/api/updates.py:65-98` (`UpdatesAPI.apply_update`). Sends
     /// the literal two-byte body `""` ([`RequestBody::EmptyJsonString`]) to
-    /// [`crate::routes::updates::APPLY_UPDATE`], preferring `parent`'s own published `updates`
+    /// [`crate::routes::updates::UPDATES_APPLY_UPDATE`], preferring `parent`'s own published `updates`
     /// link. **Reboot-class write**: applying an update reboots every node on the network.
     /// Unverified against a live network: logs one `WARNING` via [`warn_uncharacterised_write`]
     /// before issuing the request (`updates.py:97`).
@@ -77,7 +77,7 @@ impl UpdatesApi {
         warn_uncharacterised_write("apply update for network — reboots every node");
         self.transport
             .resource(
-                &routes::updates::APPLY_UPDATE,
+                &routes::updates::UPDATES_APPLY_UPDATE,
                 network_id,
                 parent,
                 &[],

@@ -10,6 +10,7 @@ use wiremock::{Mock, ResponseTemplate};
 use common::{MockEero, TEST_TOKEN, session_cookie};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use rusteero::endpoints::power_saving::UpdatePowerSavingScheduleOptions;
 use rusteero::error::Error;
 
 async fn client(mock: &MockEero) -> Client {
@@ -124,11 +125,10 @@ async fn update_power_saving_schedule_sends_only_supplied_fields() -> anyhow::Re
         .update_power_saving_schedule(
             "schedule-0001",
             Some("network-0001"),
-            None,
-            None,
-            None,
-            None,
-            Some(false),
+            &UpdatePowerSavingScheduleOptions {
+                enabled: Some(false),
+                ..UpdatePowerSavingScheduleOptions::default()
+            },
         )
         .await?;
     Ok(())

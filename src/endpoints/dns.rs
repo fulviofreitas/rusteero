@@ -26,7 +26,7 @@
 //! and silently discards them (issue #123) — the entire pre-v7.0.0 `dns.rs` body this file
 //! replaces was dead code that reported success while changing nothing server-side.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -328,9 +328,10 @@ impl DnsApi {
             _ => Err(Error::validation(
                 "mode",
                 format!(
-                    "{mode:?} is not a valid DNS mode; expected 'auto' or 'custom'. Provider \
+                    "{} is not a valid DNS mode; expected 'auto' or 'custom'. Provider \
                      presets are available from the API at data.dns.default_test_servers — pass \
-                     those addresses as custom_servers"
+                     those addresses as custom_servers",
+                    crate::params::py_quote(mode)
                 ),
             )),
         }
@@ -392,7 +393,7 @@ fn split_by_family(servers: &[&str], field: &str) -> Result<(Vec<String>, Vec<St
     let mut ipv4_raw = Vec::new();
     let mut ipv6_raw = Vec::new();
     for &entry in servers {
-        let (family, _) = parse_one_server(entry, field)?;
+        let family = family_for_split(entry, field)?;
         match family {
             4 => ipv4_raw.push(entry),
             _ => ipv6_raw.push(entry),
@@ -401,6 +402,41 @@ fn split_by_family(servers: &[&str], field: &str) -> Result<(Vec<String>, Vec<St
     let ipv4 = validate_family_servers(&ipv4_raw, 4, field)?;
     let ipv6 = validate_family_servers(&ipv6_raw, 6, field)?;
     Ok((ipv4, ipv6))
+}
+
+/// Determines the IP family of `entry`'s trimmed form, mirroring `_split_by_family`'s per-entry
+/// check (`dns.py:135-159`) — **not** [`parse_one_server`]/`_validate_servers`'s rules.
+///
+/// Unlike [`parse_one_server`], this performs no dedicated empty-string check: an empty entry
+/// falls straight through to the generic parse-failure branch, producing
+/// `"'' is not a valid IP address"` rather than `_validate_servers`'s `"IP address must not be
+/// empty"` wording. This divergence between the two Python helpers is real (`_split_by_family`,
+/// `dns.py:139-165`, has no `if not candidate` guard that `_validate_servers`, `dns.py:105-108`,
+/// does) and observable: [`DnsApi::set_custom_dns`] goes through `_split_by_family` first, so an
+/// empty entry there gets the `"is not a valid IP address"` message, while
+/// [`DnsApi::set_custom_dns_ipv4`]/[`DnsApi::set_custom_dns_ipv6`] call `_validate_servers`
+/// (ported as [`validate_family_servers`]) directly and get the other message.
+fn family_for_split(entry: &str, field: &str) -> Result<u8, Error> {
+    let candidate = entry.trim();
+    if candidate.contains('%') {
+        return Err(Error::validation(
+            field,
+            format!(
+                "{} has a zone identifier, which is not valid for a DNS server",
+                crate::params::py_quote(entry)
+            ),
+        ));
+    }
+    let address: IpAddr = candidate.parse().map_err(|_| {
+        Error::validation(
+            field,
+            format!(
+                "{} is not a valid IP address",
+                crate::params::py_quote(entry)
+            ),
+        )
+    })?;
+    Ok(if address.is_ipv4() { 4 } else { 6 })
 }
 
 /// Validates and normalises a list of DNS server literals for exactly one address family.
@@ -450,7 +486,10 @@ fn validate_family_servers(
         if got_family != family {
             return Err(Error::validation(
                 field,
-                format!("{entry:?} is an IPv{got_family} address, expected IPv{family}"),
+                format!(
+                    "{} is an IPv{got_family} address, expected IPv{family}",
+                    crate::params::py_quote(entry)
+                ),
             ));
         }
         normalized.push(address);
@@ -468,13 +507,10 @@ fn validate_family_servers(
 /// expanded from the *server*, but what this crate sends on the wire is always compressed,
 /// exactly like Python).
 ///
-/// See g5 brief §6 note 4 for one known residual divergence this function does **not** attempt
-/// to reconcile: Python's `ipaddress` module renders an IPv4-mapped IPv6 address (e.g.
-/// `"::ffff:192.168.1.1"`) as hex groups (`"::ffff:c0a8:101"`), while Rust's
-/// `std::net::Ipv6Addr::fmt` special-cases the same address family and renders it in dotted-quad
-/// form (`"::ffff:192.168.1.1"`) instead. No live capture has exercised an IPv4-mapped literal
-/// against the real API as of this port, so which wire form the server actually expects is
-/// unconfirmed; this is flagged, not silently "fixed" in either direction.
+/// IPv4-mapped IPv6 literals (e.g. `"::ffff:192.168.1.1"`) are serialised via [`format_ipv6`],
+/// matching Python's `ipaddress.IPv6Address.__str__` hex-group form (`"::ffff:c0a8:101"`) rather
+/// than `std::net::Ipv6Addr::fmt`'s dotted-quad special case for the same address family (phase-G
+/// fix list item 13) — see that function's own docs.
 fn parse_one_server(entry: &str, field: &str) -> Result<(u8, String), Error> {
     let candidate = entry.trim();
     if candidate.is_empty() {
@@ -483,12 +519,41 @@ fn parse_one_server(entry: &str, field: &str) -> Result<(u8, String), Error> {
     if candidate.contains('%') {
         return Err(Error::validation(
             field,
-            format!("{entry:?} has a zone identifier, which is not valid for a DNS server"),
+            format!(
+                "{} has a zone identifier, which is not valid for a DNS server",
+                crate::params::py_quote(entry)
+            ),
         ));
     }
-    let address: IpAddr = candidate
-        .parse()
-        .map_err(|_| Error::validation(field, format!("{entry:?} is not a valid IP address")))?;
-    let family = if address.is_ipv4() { 4 } else { 6 };
-    Ok((family, address.to_string()))
+    let address: IpAddr = candidate.parse().map_err(|_| {
+        Error::validation(
+            field,
+            format!(
+                "{} is not a valid IP address",
+                crate::params::py_quote(entry)
+            ),
+        )
+    })?;
+    match address {
+        IpAddr::V4(v4) => Ok((4, v4.to_string())),
+        IpAddr::V6(v6) => Ok((6, format_ipv6(v6))),
+    }
+}
+
+/// Serialises an [`Ipv6Addr`] the way Python's `ipaddress.IPv6Address.__str__`/`.compressed`
+/// does, which differs from `std::net::Ipv6Addr`'s own `Display` for exactly one address family:
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`, RFC 4291 §2.5.5.2). Python always renders the low
+/// 32 bits as two hex groups (`"::ffff:c0a8:101"` for `192.168.1.1`); Rust's `Display` renders the
+/// low 32 bits as a dotted-quad (`"::ffff:192.168.1.1"`) instead — confirmed by this module's own
+/// unit test. Every other IPv6 address (including the deprecated IPv4-*compatible* form, which a
+/// DNS-server literal is vanishingly unlikely to ever be) is delegated to `Ipv6Addr::to_string`,
+/// whose RFC 5952 compression already matches Python's.
+fn format_ipv6(address: Ipv6Addr) -> String {
+    let segments = address.segments();
+    let is_ipv4_mapped = segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff;
+    if is_ipv4_mapped {
+        format!("::ffff:{:x}:{:x}", segments[6], segments[7])
+    } else {
+        address.to_string()
+    }
 }

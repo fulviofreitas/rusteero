@@ -87,8 +87,8 @@ impl Client {
     pub async fn delete_reservation(
         &self,
         reservation_id: &str,
-        network_id: Option<&str>,
         delete_forwards: Option<bool>,
+        network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api

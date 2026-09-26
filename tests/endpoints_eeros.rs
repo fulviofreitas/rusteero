@@ -784,7 +784,13 @@ async fn get_eero_support_returns_the_raw_response() -> anyhow::Result<()> {
 
     let api = eeros_api(&mock);
     let env = api.get_eero_support("SERIAL123").await?;
-    assert_eq!(env.into_value(), json!({"diagnostics": []}));
+    // Ported from `EerosAPI.get_eero_support` (`eeros.py:836-863`): returns the raw, unmodified
+    // `{"meta": ..., "data": ...}` envelope, like every other endpoint method in this crate --
+    // never the stripped `data` object alone.
+    assert_eq!(
+        env.into_value(),
+        json!({"meta": {}, "data": {"diagnostics": []}})
+    );
     Ok(())
 }
 

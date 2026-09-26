@@ -82,12 +82,16 @@ impl BlacklistApi {
         mac: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::blacklist::V8_ADD_TO_BLACKLIST.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         crate::links::warn_uncharacterised_write("add_to_blacklist");
         self.transport
-            .resource(
-                &routes::blacklist::V8_ADD_TO_BLACKLIST,
-                network_id,
-                parent,
+            .request(
+                Method::POST,
+                url,
                 &[],
                 RequestBody::Form(vec![("mac".to_owned(), mac.to_owned())]),
             )

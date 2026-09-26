@@ -173,22 +173,22 @@ async fn get_device_falls_back_to_the_template_when_parent_has_no_url() -> anyho
 // ===================== path-segment safety =====================
 
 #[tokio::test]
-async fn get_device_with_slash_in_mac_cannot_traverse_out_of_its_path_segment() -> anyhow::Result<()>
-{
+async fn get_device_with_dot_dot_mac_is_rejected_before_any_request() -> anyhow::Result<()> {
+    // Ported from `DevicesAPI._device_url` -> `resolve_nested_url` -> `links.child_url` ->
+    // `_validate_identifier` (`links.py:44-68`): a bare child id containing `".."` is rejected
+    // with `EeroValidationException("id", ...)` *before* any request is built -- Python never
+    // percent-encodes a traversal sequence into a single opaque path segment, it refuses to
+    // resolve the URL at all. No mock is registered: any HTTP request at all is a failure here.
     let mock = MockEero::start().await;
     let malicious_id = "../../secrets";
-    Mock::given(method("GET"))
-        .and(path("/2.2/networks/network-0001/devices/..%2F..%2Fsecrets"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
 
     let api = devices_api(&mock);
-    let env = api.get_device("network-0001", malicious_id, None).await?;
+    let err = api
+        .get_device("network-0001", malicious_id, None)
+        .await
+        .expect_err("a \"..\"-bearing mac must be rejected, never resolved into a request");
 
-    assert_eq!(env.into_value(), fixture_json("device.json"));
+    assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
     Ok(())
 }
 

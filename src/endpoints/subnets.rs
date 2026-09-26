@@ -87,14 +87,21 @@ impl SubnetsApi {
 
     /// Deletes a subnet's configuration — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/subnets.py:113-141` (`SubnetsAPI.delete_subnet`).
-    /// Sends `DELETE` [`crate::routes::subnets::SUBNETS_DELETE_SUBNET`] with `network_id` and
-    /// `subnet_type` (as returned in `get_config`'s `subnet_type` field). Logs
-    /// [`crate::links::warn_uncharacterised_write`] (`"delete subnet for network"`) immediately
-    /// before issuing the request — the log line never includes `subnet_type` itself.
+    /// Ported from `eero-api src/eero/api/subnets.py:113-141` (`SubnetsAPI.delete_subnet`):
+    /// `child_url(resource_url(network_id, "networks/{id}/subnets_config"), subnet_type)`. Sends
+    /// `DELETE` against [`crate::routes::subnets::SUBNETS_CONFIG_COLLECTION`]'s resolved URL with
+    /// `subnet_type` appended via [`crate::links::child_url`] — **not** a
+    /// [`crate::routes::Nested`] route, unlike every other two-level resource in this crate; see
+    /// that constant's own docs for why (phase-G fix list item 12: `subnet_type` must be a bare
+    /// single-segment identifier, and a path or absolute URL must be rejected, not resolved).
+    /// Logs [`crate::links::warn_uncharacterised_write`] (`"delete subnet for network"`)
+    /// immediately before issuing the request, after `subnet_type` has already been validated —
+    /// the log line never includes `subnet_type` itself.
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Validation`] with `field: "id"` if `subnet_type` is not a single
+    /// path-segment identifier (e.g. a path or absolute URL), before any request is sent.
     /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
     /// status-mapped [`Error`] the request produces otherwise.
     pub async fn delete_subnet(
@@ -102,13 +109,17 @@ impl SubnetsApi {
         network_id: &str,
         subnet_type: &str,
     ) -> Result<Envelope, Error> {
+        let collection = routes::subnets::SUBNETS_CONFIG_COLLECTION.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
+        let url = links::child_url(&collection, subnet_type)?;
         links::warn_uncharacterised_write("delete subnet for network");
         self.transport
-            .nested(
-                &routes::subnets::SUBNETS_DELETE_SUBNET,
-                network_id,
-                subnet_type,
-                None,
+            .request(
+                routes::subnets::SUBNETS_CONFIG_COLLECTION.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )

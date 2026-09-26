@@ -5,13 +5,13 @@ mod common;
 
 use std::sync::Arc;
 
-use rusteero::endpoints::power_saving::PowerSavingApi;
+use rusteero::endpoints::power_saving::{PowerSavingApi, UpdatePowerSavingScheduleOptions};
 use rusteero::error::Error;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 fn power_saving_api(mock: &MockEero) -> PowerSavingApi {
     PowerSavingApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
@@ -25,6 +25,7 @@ async fn set_power_saving_sends_only_the_supplied_fields() -> anyhow::Result<()>
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/power_saving"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "enable": true })))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -43,6 +44,7 @@ async fn set_power_saving_sends_both_fields() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/power_saving"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(
             json!({ "enable": true, "power_saving_schedule_enabled": false }),
         ))
@@ -63,6 +65,7 @@ async fn set_power_saving_prefers_a_parent_supplied_link() -> anyhow::Result<()>
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/power_saving"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
@@ -103,6 +106,7 @@ async fn get_schedules_returns_the_raw_response() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/power_saving/schedules"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -123,6 +127,7 @@ async fn get_schedules_ignores_a_parent_supplied_link() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/power_saving/schedules"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{\"meta\":{},\"data\":{}}"))
         .expect(1)
         .mount(&mock.server)
@@ -151,6 +156,7 @@ async fn create_schedule_sends_all_five_keys() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/power_saving/schedules"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({
             "name": "Overnight",
             "days": days,
@@ -186,6 +192,7 @@ async fn update_schedule_sends_only_the_supplied_fields() -> anyhow::Result<()> 
             "/2.2/networks/network-0001/power_saving/schedules/schedule-0001",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "enabled": false })))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -196,11 +203,10 @@ async fn update_schedule_sends_only_the_supplied_fields() -> anyhow::Result<()> 
     api.update_schedule(
         "network-0001",
         "schedule-0001",
-        None,
-        None,
-        None,
-        None,
-        Some(false),
+        &UpdatePowerSavingScheduleOptions {
+            enabled: Some(false),
+            ..UpdatePowerSavingScheduleOptions::default()
+        },
     )
     .await?;
     Ok(())
@@ -214,11 +220,7 @@ async fn update_schedule_rejects_no_fields_with_zero_requests() -> anyhow::Resul
         .update_schedule(
             "network-0001",
             "schedule-0001",
-            None,
-            None,
-            None,
-            None,
-            None,
+            &UpdatePowerSavingScheduleOptions::default(),
         )
         .await
         .expect_err("an empty call must be rejected before any request is sent");
@@ -243,6 +245,7 @@ async fn delete_schedule_sends_a_delete_to_the_nested_path() -> anyhow::Result<(
             "/2.2/networks/network-0001/power_saving/schedules/schedule-0001",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)

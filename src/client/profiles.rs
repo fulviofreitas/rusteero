@@ -203,10 +203,10 @@ impl Client {
     /// Sets the devices assigned to a profile — returns the raw Eero API response.
     ///
     /// Ported from `set_profile_devices` (`eero-api src/eero/client.py:2280-2288`).
-    /// `auto_discover = true`. No `parent=`. On success, invalidates `profiles[{nid}_{pid}]`
-    /// **only** — the list key (`profiles[{nid}_profiles]`) is left untouched, matching Python's
-    /// `_invalidate_profile_cache` call exactly (`client.py:2288-2289`, the wiki's own
-    /// "Caching-and-Rate-Limits" gotcha).
+    /// `auto_discover = true`. No `parent=`. On success, invalidates **both**
+    /// `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]` — Python's `_invalidate_profile_cache`
+    /// (`client.py:1012-1020`, called at `:2289`) drops both keys, unlike
+    /// [`Client::create_profile`], which only ever had the list key to drop.
     ///
     /// # Errors
     ///
@@ -225,8 +225,7 @@ impl Client {
             .profiles()
             .set_profile_devices(&network_id, profile_id, device_urls, None)
             .await?;
-        self.cache
-            .invalidate(&CacheKey::profile(network_id.as_str(), profile_id));
+        self.invalidate_profile_cache(network_id.as_str(), profile_id);
         Ok(response)
     }
 }

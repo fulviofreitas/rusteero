@@ -63,7 +63,7 @@ impl NetworksApi {
     ///
     /// Prefers `parent`'s own top-level `url` field ([`crate::links::self_url`]) over the
     /// `networks/{id}` template — **not** a named `resources.<link>` lookup, so this does not go
-    /// through [`crate::routes::Resource::resolve`]; see [`crate::routes::networks::NETWORK`]'s
+    /// through [`crate::routes::Resource::resolve`]; see [`crate::routes::networks::NETWORKS_GET_NETWORK`]'s
     /// doc comment for why. Exactly [`crate::params::resolve_network_url`]'s behaviour.
     ///
     /// # Errors
@@ -193,7 +193,7 @@ impl NetworksApi {
     /// Gets past speed-test results — returns the raw Eero API response.
     ///
     /// Ported from `NetworksAPI.get_speed_tests` (`networks.py:223-267`). Sends `GET`
-    /// [`crate::routes::networks::GET_SPEED_TESTS`] (the same `speedtest` sub-resource
+    /// [`crate::routes::networks::NETWORKS_GET_SPEED_TESTS`] (the same `speedtest` sub-resource
     /// [`NetworksApi::run_speed_test`] posts to), preferring `parent`'s own published `speedtest`
     /// link. `limit` is sent as `limit`, `start_time`/`end_time` as `startTime`/`endTime` — each
     /// omitted from the query entirely when `None` (`networks.py:257-263`); the request is always
@@ -223,7 +223,7 @@ impl NetworksApi {
         }
         self.transport
             .resource(
-                &routes::networks::GET_SPEED_TESTS,
+                &routes::networks::NETWORKS_GET_SPEED_TESTS,
                 network_id,
                 parent,
                 &query,

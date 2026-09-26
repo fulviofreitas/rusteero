@@ -6,6 +6,7 @@ mod common;
 use std::sync::Arc;
 
 use rusteero::endpoints::subnets::SubnetsApi;
+use rusteero::error::Error;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -128,6 +129,30 @@ async fn delete_subnet_sends_delete_to_subnet_type_path() -> anyhow::Result<()> 
     let env = api.delete_subnet("network-0001", "guest").await?;
 
     assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+/// Ported from `SubnetsAPI.delete_subnet`'s use of `child_url` (`subnets.py:113-141`), stricter
+/// than a [`crate::routes::Nested`] route: a path/URL-shaped `subnet_type` must be rejected
+/// outright, never resolved as an already-encoded nested path (phase-G fix list item 12).
+#[tokio::test]
+async fn delete_subnet_rejects_a_path_shaped_subnet_type() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = subnets_api(&mock);
+    let err = api
+        .delete_subnet(
+            "network-0001",
+            "/2.2/networks/network-0001/subnets_config/guest",
+        )
+        .await
+        .expect_err("a path-shaped subnet_type must be rejected, never resolved");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
     Ok(())
 }
 

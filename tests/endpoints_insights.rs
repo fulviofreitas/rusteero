@@ -53,6 +53,49 @@ async fn get_insights_sends_all_four_parameters_in_the_query_string() -> anyhow:
     Ok(())
 }
 
+/// Pins the raw query-string order Python builds (`insights.py:134-139`): `start`, `end`,
+/// `cadence`, `insight_type` — NOT the declaration order of `get_insights`'s own parameters.
+/// `wiremock::matchers::query_param` alone cannot catch an order regression (it matches by key,
+/// not position), so this test inspects the server's recorded request directly.
+#[tokio::test]
+async fn get_insights_sends_query_parameters_in_pythons_exact_order() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/insights"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"meta": {"code": 200}})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = insights_api(&mock);
+    api.get_insights(
+        "network-0001",
+        "2026-07-21T00:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "adblock",
+        "hourly",
+    )
+    .await?;
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("wiremock records requests by default");
+    let request = requests
+        .iter()
+        .find(|r| r.url.path() == "/2.2/networks/network-0001/insights")
+        .expect("the get_insights request was recorded");
+    assert_eq!(
+        request.url.query(),
+        Some(
+            "start=2026-07-21T00%3A00%3A00Z&end=2026-07-22T00%3A00%3A00Z&cadence=hourly&\
+             insight_type=adblock"
+        )
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_insights_rejects_cadence_outside_the_api_set_before_any_request() -> anyhow::Result<()>
 {

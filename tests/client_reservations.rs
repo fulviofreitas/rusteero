@@ -127,7 +127,7 @@ async fn delete_reservation_forwards_delete_forwards_as_a_query_param() -> anyho
 
     let client = client(&mock).await;
     client
-        .delete_reservation("res-0001", Some("network-0001"), Some(true))
+        .delete_reservation("res-0001", Some(true), Some("network-0001"))
         .await?;
     Ok(())
 }

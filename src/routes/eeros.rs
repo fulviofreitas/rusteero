@@ -55,7 +55,7 @@ pub const GET_LED_STATUS: Resource = GET_EERO;
 /// Ported from `eero-api src/eero/api/eeros.py:401-441` (`EerosAPI.set_location`). Same
 /// self-url-preferred resolution as [`GET_EERO`] (not [`Resource::resolve`]) — see this module's
 /// own docs.
-pub const SET_LOCATION: Resource = Resource {
+pub const EEROS_SET_LOCATION: Resource = Resource {
     method: Method::PUT,
     version: ApiVersion::V2_2,
     template: "eeros/{id}",
@@ -107,7 +107,7 @@ pub const GET_CONNECTIONS: Resource = Resource {
 ///
 /// Ported from `eero-api src/eero/api/eeros.py:641-693` (`EerosAPI.node_action`). `action` must
 /// be one of `_NODE_ACTIONS`; see [`crate::endpoints::eeros::EerosApi::node_action`].
-pub const NODE_ACTION: Resource = Resource {
+pub const EEROS_NODE_ACTION: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
     template: "eeros/{id}/action",
@@ -121,7 +121,7 @@ pub const NODE_ACTION: Resource = Resource {
 /// parameter and no `parent=` support in Python — resolved from a bare id/path/URL only, via
 /// [`Resource::resolve`] with `link: None`. Form-encoded, with a repeated `colors[]` field per
 /// colour.
-pub const LED_CYCLE: Resource = Resource {
+pub const EEROS_LED_CYCLE: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
     template: "eeros/{id}/led_cycle",

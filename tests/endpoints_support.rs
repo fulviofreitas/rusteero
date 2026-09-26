@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rusteero::endpoints::support::SupportApi;
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
@@ -84,6 +84,8 @@ async fn request_support_passthrough_body_arrives_byte_identical_including_neste
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/support"))
         .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/json"))
         .and(body_json(payload.clone()))
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)

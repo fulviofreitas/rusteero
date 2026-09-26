@@ -32,7 +32,7 @@ impl EntitlementsApi {
     /// Gets the network's entitled features — returns the raw Eero API response.
     ///
     /// Ported from `EntitlementsAPI.get_features` (`entitlements.py:37-61`). Sends `GET`
-    /// [`crate::routes::entitlements::GET_FEATURES`] with `network_id` substituted into the
+    /// [`crate::routes::entitlements::ENTITLEMENTS_GET_FEATURES`] with `network_id` substituted into the
     /// path (bare id, host-relative path, or absolute API URL — no `parent`).
     ///
     /// # Errors
@@ -42,7 +42,7 @@ impl EntitlementsApi {
     pub async fn get_features(&self, network_id: &str) -> Result<Envelope, Error> {
         self.transport
             .resource(
-                &routes::entitlements::GET_FEATURES,
+                &routes::entitlements::ENTITLEMENTS_GET_FEATURES,
                 network_id,
                 None,
                 &[],

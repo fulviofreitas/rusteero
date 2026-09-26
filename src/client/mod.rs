@@ -73,8 +73,9 @@
 //!   that synthesised shape should look like. This is the **one** documented exception to "every
 //!   endpoint method returns the envelope unmodified" in this crate.
 //! - **G6 (silent exception swallowing) — NOT reproduced.** Python wraps the entire fallback
-//!   attempt in `except Exception: _LOGGER.debug(...)`, so an authentication failure, timeout,
-//!   or any other error while fetching `/account` is invisible to the caller — `get_networks()`
+//!   attempt in `except Exception: _LOGGER.debug(...)` (`client.py:462-465`), so an
+//!   authentication failure, timeout, or any other error while fetching `/account` is invisible
+//!   to the caller — `get_networks()`
 //!   just returns the original, still-empty `/networks` envelope. This crate instead propagates
 //!   that error with `?`: if the `/networks` list is empty and the `/account` fallback itself
 //!   fails, [`Client::get_networks`] returns that `Err` rather than a silently-degraded `Ok`.

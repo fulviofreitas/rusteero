@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::links;
-use crate::routes;
+use crate::routes::{self, Resource};
 use crate::transport::{RequestBody, Transport};
 use crate::util::id_from_url;
 
@@ -50,6 +50,25 @@ impl DnsPoliciesApi {
     #[must_use]
     pub fn new(transport: Arc<Transport>) -> Self {
         Self { transport }
+    }
+
+    /// Resolves `route`'s URL for `network_id`/`parent`, logs the fixed uncharacterised-write
+    /// `operation` warning, then `PUT`s `body` — in that exact order, mirroring every write in
+    /// `dns_policies.py` (resolve the URL, build the payload, warn, then `put(...)`), rather than
+    /// warning before URL resolution/validation can fail.
+    async fn put_policy(
+        &self,
+        route: &Resource,
+        network_id: &str,
+        parent: Option<&Value>,
+        operation: &str,
+        body: Value,
+    ) -> Result<Envelope, Error> {
+        let url = route.resolve(self.transport.api_host(), network_id, parent)?;
+        links::warn_uncharacterised_write(operation);
+        self.transport
+            .request(route.method.clone(), url, &[], RequestBody::Json(body))
+            .await
     }
 
     /// Gets the network's advanced content filter allow/block lists — returns the raw Eero API
@@ -114,16 +133,14 @@ impl DnsPoliciesApi {
                 ("keep_profiles", keep_profiles.map(to_string_array)),
             ],
         );
-        links::warn_uncharacterised_write("allow domain for network");
-        self.transport
-            .resource(
-                &routes::dns_policies::DNS_POLICIES_ALLOW_DOMAIN,
-                network_id,
-                parent,
-                &[],
-                RequestBody::Json(body),
-            )
-            .await
+        self.put_policy(
+            &routes::dns_policies::DNS_POLICIES_ALLOW_DOMAIN,
+            network_id,
+            parent,
+            "allow domain for network",
+            body,
+        )
+        .await
     }
 
     /// Allows a list of CNAME domains network-wide — returns the raw Eero API response.
@@ -142,16 +159,14 @@ impl DnsPoliciesApi {
         domains: &[&str],
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        links::warn_uncharacterised_write("allow CNAMEs for network");
-        self.transport
-            .resource(
-                &routes::dns_policies::DNS_POLICIES_ALLOW_CNAMES,
-                network_id,
-                parent,
-                &[],
-                RequestBody::Json(json!({ "domains": domains })),
-            )
-            .await
+        self.put_policy(
+            &routes::dns_policies::DNS_POLICIES_ALLOW_CNAMES,
+            network_id,
+            parent,
+            "allow CNAMEs for network",
+            json!({ "domains": domains }),
+        )
+        .await
     }
 
     /// Adds (or, with `is_delete: Some(true)`, removes) a domain from the network-wide block
@@ -179,16 +194,14 @@ impl DnsPoliciesApi {
                 ("keep_profiles", keep_profiles.map(to_string_array)),
             ],
         );
-        links::warn_uncharacterised_write("block domain for network");
-        self.transport
-            .resource(
-                &routes::dns_policies::DNS_POLICIES_BLOCK_DOMAIN,
-                network_id,
-                parent,
-                &[],
-                RequestBody::Json(body),
-            )
-            .await
+        self.put_policy(
+            &routes::dns_policies::DNS_POLICIES_BLOCK_DOMAIN,
+            network_id,
+            parent,
+            "block domain for network",
+            body,
+        )
+        .await
     }
 
     /// Adds (or, with `is_delete: Some(true)`, removes) a domain from one or more profiles'
@@ -229,16 +242,14 @@ impl DnsPoliciesApi {
                 ("is_delete", is_delete.map(Value::Bool)),
             ],
         );
-        links::warn_uncharacterised_write("allow domain for profiles on network");
-        self.transport
-            .resource(
-                &routes::dns_policies::DNS_POLICIES_ALLOW_DOMAIN_FOR_PROFILES,
-                network_id,
-                parent,
-                &[],
-                RequestBody::Json(body),
-            )
-            .await
+        self.put_policy(
+            &routes::dns_policies::DNS_POLICIES_ALLOW_DOMAIN_FOR_PROFILES,
+            network_id,
+            parent,
+            "allow domain for profiles on network",
+            body,
+        )
+        .await
     }
 
     /// Allows a list of CNAME domains for one or more profiles — returns the raw Eero API
@@ -260,16 +271,14 @@ impl DnsPoliciesApi {
         profiles: &[&str],
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        links::warn_uncharacterised_write("allow CNAMEs for profiles on network");
-        self.transport
-            .resource(
-                &routes::dns_policies::DNS_POLICIES_ALLOW_CNAMES_FOR_PROFILES,
-                network_id,
-                parent,
-                &[],
-                RequestBody::Json(json!({ "domains": domains, "profiles": profiles })),
-            )
-            .await
+        self.put_policy(
+            &routes::dns_policies::DNS_POLICIES_ALLOW_CNAMES_FOR_PROFILES,
+            network_id,
+            parent,
+            "allow CNAMEs for profiles on network",
+            json!({ "domains": domains, "profiles": profiles }),
+        )
+        .await
     }
 
     /// Adds (or, with `is_delete: Some(true)`, removes) a domain from one or more profiles'
@@ -305,16 +314,14 @@ impl DnsPoliciesApi {
                 ("override", override_.map(Value::Bool)),
             ],
         );
-        links::warn_uncharacterised_write("block domain for profiles on network");
-        self.transport
-            .resource(
-                &routes::dns_policies::DNS_POLICIES_BLOCK_DOMAIN_FOR_PROFILES,
-                network_id,
-                parent,
-                &[],
-                RequestBody::Json(body),
-            )
-            .await
+        self.put_policy(
+            &routes::dns_policies::DNS_POLICIES_BLOCK_DOMAIN_FOR_PROFILES,
+            network_id,
+            parent,
+            "block domain for profiles on network",
+            body,
+        )
+        .await
     }
 
     /// Gets the applications a profile can block, and which are blocked — returns the raw Eero
@@ -376,13 +383,19 @@ impl DnsPoliciesApi {
         applications: &[&str],
     ) -> Result<Envelope, Error> {
         let child = id_from_url(profile_id)?;
+        let url = routes::dns_policies::DNS_POLICIES_SET_PROFILE_BLOCKED_APPLICATIONS.resolve(
+            self.transport.api_host(),
+            network_id,
+            &child,
+            None,
+        )?;
         links::warn_uncharacterised_write("set blocked applications for profile on network");
         self.transport
-            .nested(
-                &routes::dns_policies::DNS_POLICIES_SET_PROFILE_BLOCKED_APPLICATIONS,
-                network_id,
-                &child,
-                None,
+            .request(
+                routes::dns_policies::DNS_POLICIES_SET_PROFILE_BLOCKED_APPLICATIONS
+                    .method
+                    .clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "applications": applications })),
             )

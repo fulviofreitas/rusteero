@@ -120,6 +120,35 @@ async fn get_transfer_stats_with_device_id_hits_the_device_level_path() -> anyho
     Ok(())
 }
 
+/// Ported from `transfer.py:71`'s `if device_id:` — a truthy check, not `is None`. An empty
+/// `device_id` must be treated exactly like `None`: network-level path, `parent` honoured.
+#[tokio::test]
+async fn get_transfer_stats_with_empty_device_id_hits_the_network_level_path() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": { "download": 1, "upload": 2 } });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/transfer"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices//transfer"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = transfer_api(&mock);
+    let env = api
+        .get_transfer_stats("network-0001", Some(""), None)
+        .await?;
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_transfer_stats_device_id_with_brace_does_not_break_the_template() -> anyhow::Result<()>
 {

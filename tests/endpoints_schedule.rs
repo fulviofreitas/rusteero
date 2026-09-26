@@ -5,7 +5,7 @@ mod common;
 
 use std::sync::Arc;
 
-use rusteero::endpoints::schedule::ScheduleApi;
+use rusteero::endpoints::schedule::{ScheduleApi, UpdateScheduleOptions};
 use rusteero::error::Error;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
@@ -122,11 +122,10 @@ async fn update_schedule_from_a_bare_path_sends_only_the_supplied_fields() -> an
     let api = schedule_api(&mock);
     api.update_schedule(
         "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
-        None,
-        None,
-        None,
-        None,
-        Some(false),
+        &UpdateScheduleOptions {
+            enabled: Some(false),
+            ..UpdateScheduleOptions::default()
+        },
         None,
     )
     .await?;
@@ -155,11 +154,10 @@ async fn update_schedule_from_an_envelope_uses_its_own_self_url() -> anyhow::Res
     // `url` resolves.
     api.update_schedule(
         "ignored",
-        None,
-        None,
-        Some("20:00"),
-        None,
-        None,
+        &UpdateScheduleOptions {
+            start: Some("20:00"),
+            ..UpdateScheduleOptions::default()
+        },
         Some(&parent),
     )
     .await?;
@@ -180,11 +178,10 @@ async fn update_schedule_envelope_without_url_is_a_validation_error() -> anyhow:
     let err = api
         .update_schedule(
             "ignored",
-            Some("New name"),
-            None,
-            None,
-            None,
-            None,
+            &UpdateScheduleOptions {
+                name: Some("New name"),
+                ..UpdateScheduleOptions::default()
+            },
             Some(&parent),
         )
         .await
@@ -206,11 +203,7 @@ async fn update_schedule_with_no_fields_supplied_fails_before_any_request() -> a
     let err = api
         .update_schedule(
             "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
-            None,
-            None,
-            None,
-            None,
-            None,
+            &UpdateScheduleOptions::default(),
             None,
         )
         .await
@@ -310,6 +303,45 @@ async fn clear_profile_schedule_with_no_pauses_issues_no_deletes() -> anyhow::Re
         .clear_profile_schedule("network-0001", "profile-0001", None)
         .await?;
     assert!(results.is_empty());
+    Ok(())
+}
+
+/// Ported from `_resolve_schedule_url`'s `Mapping` branch (`schedule.py:60-63`), reached via
+/// `delete_schedule(pause)` (`schedule.py:313`): a pause with no `url` field (or an empty one)
+/// must raise the identical `Error::Validation { field: "schedule", message: "envelope has no
+/// resolvable 'url' field" }` every other unresolvable-schedule case in this module raises — not
+/// a `clear_profile_schedule`-specific message.
+#[tokio::test]
+async fn clear_profile_schedule_with_an_unresolvable_pause_uses_the_shared_message()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"meta":{"code":200},"data":[{"name":"Bedtime","url":""}]}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let err = api
+        .clear_profile_schedule("network-0001", "profile-0001", None)
+        .await
+        .expect_err("an empty `url` field must be treated as missing, not as an empty path");
+    let Error::Validation { field, message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(field, "schedule");
+    assert_eq!(message, "envelope has no resolvable 'url' field");
     Ok(())
 }
 

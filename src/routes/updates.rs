@@ -22,7 +22,7 @@ pub const GET_UPDATES_V8: Resource = Resource {
 /// Ported from `eero-api src/eero/api/updates.py:65-98` (`UpdatesAPI.apply_update`). New at
 /// v8.0.4; no legacy `Route` equivalent (`apply_update` never existed pre-v8.0.0), so no rename
 /// collision.
-pub const APPLY_UPDATE: Resource = Resource {
+pub const UPDATES_APPLY_UPDATE: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
     template: "networks/{id}/updates",

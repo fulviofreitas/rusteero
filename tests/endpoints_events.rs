@@ -244,10 +244,40 @@ async fn get_channel_utilization_rejects_an_invalid_band_with_zero_requests() ->
         .get_channel_utilization("network-0001", "s", "e", &options, None)
         .await
         .expect_err("an unrecognised band must be rejected locally");
-    let Error::Validation { field, .. } = &err else {
+    let Error::Validation { field, message, .. } = &err else {
         panic!("expected Error::Validation, got {err:?}");
     };
     assert_eq!(field, "band");
+    assert_eq!(
+        message,
+        "must be one of ('band_2_4GHz', 'band_5GHz_low', 'band_5GHz_high', 'band_5GHz_full', \
+         'band_6GHz'), got 'not_a_real_band'"
+    );
+    Ok(())
+}
+
+/// Ported from `events.py:216-223`: `busy_threshold` is validated before `band`, which is
+/// validated before `granularity`. A caller passing an invalid `busy_threshold` alongside an
+/// invalid `band` must see the `busy_threshold` error, not the `band` one.
+#[tokio::test]
+async fn get_channel_utilization_validates_busy_threshold_before_band() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let options = GetChannelUtilizationOptions {
+        busy_threshold: Some(0),
+        band: Some("not_a_real_band"),
+        ..GetChannelUtilizationOptions::default()
+    };
+    let err = api(&mock)
+        .get_channel_utilization("network-0001", "s", "e", &options, None)
+        .await
+        .expect_err("busy_threshold=0 must be rejected before band is even checked");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "busy_threshold"));
     Ok(())
 }
 

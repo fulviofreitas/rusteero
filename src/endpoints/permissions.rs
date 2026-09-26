@@ -39,7 +39,7 @@ impl PermissionsApi {
     /// `f"{resolve_network_url(network_id, parent)}/permissions"`
     /// ([`crate::params::resolve_network_url`], which prefers `parent`'s own top-level `url`
     /// field over the `networks/{id}` template — see
-    /// [`crate::routes::permissions::GET_PERMISSIONS`]'s doc comment for why this is not an
+    /// [`crate::routes::permissions::PERMISSIONS_GET_PERMISSIONS`]'s doc comment for why this is not an
     /// ordinary [`crate::routes::Resource::resolve`] call).
     ///
     /// # Errors

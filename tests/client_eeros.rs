@@ -9,8 +9,7 @@
 
 mod common;
 
-use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
@@ -82,14 +81,21 @@ async fn get_eero_forwards_a_cached_eero_as_parent() -> anyhow::Result<()> {
         .expect(1)
         .mount(&mock.server)
         .await;
-    // `eeros.json`'s first entry has no `resources`/`url` override this test relies on, so a
-    // `parent` being forwarded is confirmed indirectly: without a cached eeros list at all,
-    // `get_eero` would still succeed via the bare-id template — the assertion that matters here
-    // is that seeding the cache first does not change the request path (no published link on
-    // this fixture entry means the template still wins), while proving `eero_parent` lookup
-    // itself does not error or panic when it finds a match.
+    // `eeros.json`'s first entry publishes its own `url`
+    // (`/2.2/networks/network-0001/eeros/eero-0001`), which `find_by_id_or_url` matches on the
+    // trailing `eero-0001` segment even though the entry carries no bare `id` field. `get_eero`
+    // then prefers that entry's `self_url` over the bare-id template (`resolve_self_preferred`),
+    // so seeding the eeros cache first changes the request path — proving `eero_parent` really is
+    // forwarded, not just looked up harmlessly. The bare-id template
+    // (`/2.2/eeros/eero-0001`) must NOT be hit once the cache is warm.
     Mock::given(method("GET"))
         .and(path("/2.2/eeros/eero-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eero.json")))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/eeros/eero-0001"))
         .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eero.json")))
         .expect(1)
@@ -148,7 +154,11 @@ async fn set_led_reaches_the_led_endpoint_and_invalidates_eeros() -> anyhow::Res
     Mock::given(method("PUT"))
         .and(path("/2.2/eeros/eero-0001/led"))
         .and(session_cookie())
-        .and(body_json(json!({ "led_on": true })))
+        // `EerosApi::set_led` sends a form-encoded body (`RequestBody::Form`), not JSON --
+        // `body_json` would never match a `led_on=true` wire body, silently leaving this mock
+        // unhit and the request unmatched.
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("led_on=true"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)

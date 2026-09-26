@@ -179,16 +179,22 @@ impl EventsApi {
         options: &GetChannelUtilizationOptions<'_>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        // Validated in Python's exact order (`events.py:216-223`): `busy_threshold`, then
+        // `band`, then `granularity`.
+        if let Some(busy_threshold) = options.busy_threshold {
+            validate_positive("busy_threshold", busy_threshold)?;
+        }
         if let Some(band) = options.band
             && !CHANNEL_UTILIZATION_BANDS.contains(&band)
         {
             return Err(Error::validation(
                 "band",
-                format!("must be one of {CHANNEL_UTILIZATION_BANDS:?}, got '{band}'"),
+                format!(
+                    "must be one of {}, got {}",
+                    crate::params::py_tuple(CHANNEL_UTILIZATION_BANDS),
+                    crate::params::py_quote(band)
+                ),
             ));
-        }
-        if let Some(busy_threshold) = options.busy_threshold {
-            validate_positive("busy_threshold", busy_threshold)?;
         }
         if let Some(granularity) = options.granularity {
             validate_positive("granularity", granularity)?;

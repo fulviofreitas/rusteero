@@ -191,14 +191,15 @@ impl SecurityApi {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation` if every argument is `None`, before any request is sent. This
-    /// is a **deliberate, permanent divergence** from Python, which instead fabricates a local
-    /// `{"meta": {"code": 400}, "data": {}}` response (`security.py:352-353`) — a response that
-    /// never actually came from the wire. `SecurityApi::configure_security` diverged from that
-    /// shape before v8.0.4 already (raising rather than fabricating), consistent with
-    /// [`DnsApi::set_dns_mode`](crate::endpoints::dns::DnsApi::set_dns_mode)'s own documented
-    /// divergence; this port keeps it (g5 brief §3 note 7, §6 open question 3). Otherwise see
-    /// [`SecurityApi::get_security_settings`].
+    /// Returns `Error::Validation { field: "settings", message: "at least one of wpa3,
+    /// band_steering, upnp, ipv6 must be supplied" }` if every argument is `None`, before any
+    /// request is sent. This is a **deliberate, permanent divergence** from Python, which instead
+    /// fabricates a local `{"meta": {"code": 400}, "data": {}}` response (`security.py:356-358`)
+    /// — a response that never actually came from the wire. `SecurityApi::configure_security`
+    /// diverged from that shape before v8.0.4 already (raising rather than fabricating),
+    /// consistent with [`DnsApi::set_dns_mode`](crate::endpoints::dns::DnsApi::set_dns_mode)'s own
+    /// documented divergence; this port keeps it (g5 brief §3 note 7, §6 open question 3).
+    /// Otherwise see [`SecurityApi::get_security_settings`].
     #[allow(clippy::too_many_arguments)]
     pub async fn configure_security(
         &self,
@@ -225,8 +226,8 @@ impl SecurityApi {
         }
         if payload.is_empty() {
             return Err(Error::validation(
-                "wpa3, band_steering, upnp, ipv6",
-                "at least one security setting must be provided",
+                "settings",
+                "at least one of wpa3, band_steering, upnp, ipv6 must be supplied",
             ));
         }
 

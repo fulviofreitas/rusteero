@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rusteero::endpoints::networks::NetworksApi;
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{body_string, header, method, path, query_param};
+use wiremock::matchers::{body_string, header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
@@ -271,6 +271,9 @@ async fn get_speed_tests_omits_unsupplied_params() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/speedtest"))
         .and(session_cookie())
+        .and(query_param_is_missing("limit"))
+        .and(query_param_is_missing("startTime"))
+        .and(query_param_is_missing("endTime"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":[]})),
         )

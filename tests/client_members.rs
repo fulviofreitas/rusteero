@@ -40,6 +40,49 @@ async fn get_members_resolves_the_network_id() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `get_members` passes the cached network as `parent=` (`+net`, `client.py:2577-2579`): a
+/// network that publishes its own `members` link must be preferred over the bare-id template.
+#[tokio::test]
+async fn get_members_prefers_the_cached_networks_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                json!({
+                    "meta": { "code": 200 },
+                    "data": {
+                        "url": "/2.2/networks/network-0001",
+                        "resources": { "members": "/2.4/networks/network-0001/members" },
+                    },
+                })
+                .to_string(),
+            ),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/members"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.4/networks/network-0001/members"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_members(Some("network-0001")).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_members_without_an_explicit_network_id_requires_a_preferred_network()
 -> anyhow::Result<()> {

@@ -103,7 +103,7 @@ pub const SET_DEVICE_LABELS: Nested = Nested {
     method: Method::PUT,
     version: ApiVersion::V2_2,
     prefix: "devices",
-    suffix: "",
+    suffix: "/labels",
     link: None,
 };
 

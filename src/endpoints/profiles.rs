@@ -85,6 +85,26 @@ impl ProfilesApi {
             .await
     }
 
+    /// Like [`ProfilesApi::profile_request`], but logs a fixed uncharacterised-write warning
+    /// after the URL is resolved and immediately before the request — mirroring
+    /// `_update_profile`'s exact statement order (`profiles.py:122-155`: resolve the URL, warn,
+    /// then `PUT`), rather than warning before URL resolution/validation can fail.
+    async fn profile_write(
+        &self,
+        route: &Nested,
+        network_id: &str,
+        profile_id: &str,
+        parent: Option<&Value>,
+        operation: &str,
+        body: RequestBody,
+    ) -> Result<Envelope, Error> {
+        let url = self.profile_url(route, network_id, profile_id, parent)?;
+        links::warn_uncharacterised_write(operation);
+        self.transport
+            .request(route.method.clone(), url, &[], body)
+            .await
+    }
+
     /// Lists every profile on a network — returns the raw Eero API response.
     ///
     /// Ported from `eero-api src/eero/api/profiles.py:53-80` (`ProfilesAPI.get_profiles`): sends
@@ -178,12 +198,12 @@ impl ProfilesApi {
         paused: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        links::warn_uncharacterised_write("update profile");
-        self.profile_request(
+        self.profile_write(
             &routes::profiles::PAUSE_PROFILE,
             network_id,
             profile_id,
             parent,
+            "update profile",
             RequestBody::Json(json!({ "paused": paused })),
         )
         .await
@@ -224,16 +244,22 @@ impl ProfilesApi {
             .iter()
             .map(|url| json!({ "url": url }))
             .collect();
-        links::warn_uncharacterised_write("set devices for profile");
-        links::warn_uncharacterised_write("update profile");
-        self.profile_request(
+        let url = self.profile_url(
             &routes::profiles::SET_PROFILE_DEVICES,
             network_id,
             profile_id,
             parent,
-            RequestBody::Json(json!({ "devices": devices })),
-        )
-        .await
+        )?;
+        links::warn_uncharacterised_write("set devices for profile");
+        links::warn_uncharacterised_write("update profile");
+        self.transport
+            .request(
+                routes::profiles::SET_PROFILE_DEVICES.method.clone(),
+                url,
+                &[],
+                RequestBody::Json(json!({ "devices": devices })),
+            )
+            .await
     }
 
     /// Creates a new profile on a network — returns the raw Eero API response.
@@ -259,6 +285,12 @@ impl ProfilesApi {
         paused: Option<bool>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::profiles::CREATE_PROFILE.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
+
         let mut payload = serde_json::Map::new();
         payload.insert("name".to_owned(), Value::String(name.to_owned()));
         if let Some(devices) = devices {
@@ -271,10 +303,9 @@ impl ProfilesApi {
 
         links::warn_uncharacterised_write("create profile for network");
         self.transport
-            .resource(
-                &routes::profiles::CREATE_PROFILE,
-                network_id,
-                parent,
+            .request(
+                routes::profiles::CREATE_PROFILE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(payload)),
             )
@@ -298,12 +329,12 @@ impl ProfilesApi {
         name: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        links::warn_uncharacterised_write("update profile");
-        self.profile_request(
+        self.profile_write(
             &routes::profiles::RENAME_PROFILE,
             network_id,
             profile_id,
             parent,
+            "update profile",
             RequestBody::Json(json!({ "name": name })),
         )
         .await
@@ -329,12 +360,12 @@ impl ProfilesApi {
         network_id: &str,
         profile_id: &str,
     ) -> Result<Envelope, Error> {
-        links::warn_uncharacterised_write("delete profile");
-        self.profile_request(
+        self.profile_write(
             &routes::profiles::DELETE_PROFILE,
             network_id,
             profile_id,
             None,
+            "delete profile",
             RequestBody::None,
         )
         .await

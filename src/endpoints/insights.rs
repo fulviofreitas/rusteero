@@ -33,6 +33,15 @@ use crate::params;
 use crate::routes;
 use crate::transport::{RequestBody, Transport};
 
+/// Valid values for `get_insights`'s `cadence` query parameter, in Python's declared order.
+///
+/// Ported from `INSIGHTS_CADENCES` (`insights.py:30`): `("hourly", "daily")` — note the order
+/// differs from [`crate::params::CADENCE_VALUES`] (`["daily", "hourly"]`), which every other
+/// method in this module validates against instead (`_insights_params`'s default `allowed=`,
+/// `_params.py:28-53`). The order only matters for the exact wording of a rejection's message
+/// (`params::validate_cadence`'s `{allowed:?}`); the accepted *set* is identical either way.
+const INSIGHTS_CADENCES: &[&str] = &["hourly", "daily"];
+
 /// `eero-api`'s `InsightsAPI` (`src/eero/api/insights.py`).
 ///
 /// Build one with [`InsightsApi::new`], wrapping a [`Transport`] already shared with the rest of
@@ -57,9 +66,10 @@ impl InsightsApi {
     /// argument — a deliberate divergence carried over from the pre-8.0.4 port, revisited and
     /// kept for this phase (`.claude/tasks/briefs/v8/g3-devices.md`, open question 3): callers
     /// wanting `"daily"` pass it explicitly. `cadence` is validated against
-    /// [`crate::params::CADENCE_VALUES`] (`"hourly"`/`"daily"` — `"weekly"` is no longer
-    /// accepted, see the module docs) before any request is sent. No `parent=` kwarg exists on
-    /// this Python method.
+    /// `INSIGHTS_CADENCES` (`"hourly"`/`"daily"` — `"weekly"` is no longer accepted, see the
+    /// module docs) before any request is sent. No `parent=` kwarg exists on this Python method.
+    /// Query parameters are sent in Python's exact order — `start`, `end`, `cadence`,
+    /// `insight_type` (`insights.py:134-139`) — not alphabetical or declaration order.
     ///
     /// # Errors
     ///
@@ -75,7 +85,7 @@ impl InsightsApi {
         insight_type: &str,
         cadence: &str,
     ) -> Result<Envelope, Error> {
-        let cadence = params::validate_cadence(cadence, params::CADENCE_VALUES)?;
+        let cadence = params::validate_cadence(cadence, INSIGHTS_CADENCES)?;
         self.transport
             .resource(
                 &routes::insights::V8_GET_INSIGHTS,
@@ -84,8 +94,8 @@ impl InsightsApi {
                 &[
                     ("start", start.to_owned()),
                     ("end", end.to_owned()),
-                    ("insight_type", insight_type.to_owned()),
                     ("cadence", cadence.to_owned()),
+                    ("insight_type", insight_type.to_owned()),
                 ],
                 RequestBody::None,
             )

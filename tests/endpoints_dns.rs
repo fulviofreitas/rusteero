@@ -418,6 +418,28 @@ async fn set_custom_dns_ipv6_compressed_form_is_sent_on_the_wire() -> anyhow::Re
     Ok(())
 }
 
+/// Phase-G fix list item 13: an IPv4-mapped IPv6 literal must be serialised in Python's hex-group
+/// form (`ipaddress.IPv6Address("::ffff:192.168.1.1")` -> `"::ffff:c0a8:101"`), not Rust
+/// `Ipv6Addr::Display`'s dotted-quad special case (`"::ffff:192.168.1.1"`).
+#[tokio::test]
+async fn set_custom_dns_ipv6_serialises_an_ipv4_mapped_literal_in_hex_form() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({
+            "ipv6": { "name_servers": { "mode": "custom", "custom": ["::ffff:c0a8:101"] } },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.set_custom_dns_ipv6("network-0001", &["::ffff:192.168.1.1"], None)
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn set_custom_dns_ipv4_empty_list_points_at_clear_custom_dns() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
@@ -430,6 +452,101 @@ async fn set_custom_dns_ipv4_empty_list_points_at_clear_custom_dns() -> anyhow::
         panic!("expected Error::Validation, got {err:?}");
     };
     assert!(message.contains("clear_custom_dns"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_ipv6_empty_list_points_at_clear_custom_dns() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns_ipv6("network-0001", &[], None)
+        .await
+        .expect_err("an empty per-family list must be rejected");
+    let Error::Validation { field, message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(field, "dns_servers");
+    assert!(message.contains("clear_custom_dns(family='ipv6')"));
+    Ok(())
+}
+
+/// Ported from `_validate_servers` (`dns.py:105-108`): a literal that does not parse as any IP
+/// address at all is rejected with `'{entry}' is not a valid IP address`.
+#[tokio::test]
+async fn set_custom_dns_ipv4_rejects_an_unparseable_literal() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns_ipv4("network-0001", &["1.2.3.x"], None)
+        .await
+        .expect_err("a non-IP literal must be rejected");
+    let Error::Validation { field, message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(field, "dns_servers");
+    assert_eq!(message, "'1.2.3.x' is not a valid IP address");
+    Ok(())
+}
+
+/// Ported from `_validate_servers` (`dns.py:112-116`): a `%`-scoped literal is meaningless to a
+/// cloud API and rejected locally, before any request is sent.
+#[tokio::test]
+async fn set_custom_dns_ipv6_rejects_a_zone_scoped_literal() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns_ipv6("network-0001", &["fe80::1%eth0"], None)
+        .await
+        .expect_err("a zone-scoped literal must be rejected");
+    let Error::Validation { field, message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(field, "dns_servers");
+    assert_eq!(
+        message,
+        "'fe80::1%eth0' has a zone identifier, which is not valid for a DNS server"
+    );
+    Ok(())
+}
+
+/// Ported from `_validate_servers`'s dedicated empty-string check (`dns.py:105-108`), reached
+/// directly by `set_custom_dns_ipv4`/`set_custom_dns_ipv6` (unlike `set_custom_dns`, which
+/// partitions by family via `_split_by_family` first — see the next test for that divergence).
+#[tokio::test]
+async fn set_custom_dns_ipv4_rejects_an_empty_entry_with_the_dedicated_message()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns_ipv4("network-0001", &["1.1.1.1", "  "], None)
+        .await
+        .expect_err("a blank entry must be rejected");
+    let Error::Validation { field, message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(field, "dns_servers");
+    assert_eq!(message, "IP address must not be empty");
+    Ok(())
+}
+
+/// `set_custom_dns` (unlike `set_custom_dns_ipv4`/`ipv6`) partitions its mixed list via
+/// `_split_by_family` before validating each family, and `_split_by_family` has no dedicated
+/// empty-string check (`dns.py:139-165`) — an empty entry falls through to the generic
+/// parse-failure message instead of `_validate_servers`'s `"must not be empty"` wording.
+#[tokio::test]
+async fn set_custom_dns_rejects_an_empty_entry_with_the_split_message() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns("network-0001", &["1.1.1.1", ""], None)
+        .await
+        .expect_err("a blank entry must be rejected");
+    let Error::Validation { field, message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(field, "dns_servers");
+    assert_eq!(message, "'' is not a valid IP address");
     Ok(())
 }
 

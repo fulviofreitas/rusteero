@@ -41,7 +41,7 @@ async fn get_data_usage_forwards_every_parameter() -> anyhow::Result<()> {
 
     let client = client(&mock).await;
     client
-        .get_data_usage(Some("network-0001"), "s", "e", "daily", Some("UTC"))
+        .get_data_usage("s", "e", "daily", Some("UTC"), Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -58,7 +58,7 @@ async fn get_data_usage_breakdown_hits_the_expected_path() -> anyhow::Result<()>
 
     let client = client(&mock).await;
     client
-        .get_data_usage_breakdown(Some("network-0001"), "s", "e", None, None)
+        .get_data_usage_breakdown("s", "e", None, None, Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -75,7 +75,7 @@ async fn get_devices_data_usage_hits_the_expected_path() -> anyhow::Result<()> {
 
     let client = client(&mock).await;
     client
-        .get_devices_data_usage(Some("network-0001"), "s", "e", None, None, None)
+        .get_devices_data_usage("s", "e", None, None, None, Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -94,7 +94,7 @@ async fn get_device_data_usage_hits_the_per_device_path() -> anyhow::Result<()> 
 
     let client = client(&mock).await;
     client
-        .get_device_data_usage("aa:bb:cc", Some("network-0001"), "s", "e", "daily", None)
+        .get_device_data_usage("aa:bb:cc", "s", "e", "daily", None, Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -111,7 +111,7 @@ async fn get_eeros_data_usage_summary_hits_the_expected_path() -> anyhow::Result
 
     let client = client(&mock).await;
     client
-        .get_eeros_data_usage_summary(Some("network-0001"), "s", "e", "daily", None)
+        .get_eeros_data_usage_summary("s", "e", "daily", None, Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -130,7 +130,7 @@ async fn get_eero_data_usage_hits_the_per_eero_path() -> anyhow::Result<()> {
 
     let client = client(&mock).await;
     client
-        .get_eero_data_usage("eero-0001", Some("network-0001"), "s", "e", "daily", None)
+        .get_eero_data_usage("eero-0001", "s", "e", "daily", None, Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -151,11 +151,11 @@ async fn get_profile_data_usage_hits_the_per_profile_path() -> anyhow::Result<()
     client
         .get_profile_data_usage(
             "profile-0001",
-            Some("network-0001"),
             "s",
             "e",
             "daily",
             None,
+            Some("network-0001"),
         )
         .await?;
     Ok(())
@@ -175,7 +175,7 @@ async fn get_unprofiled_devices_data_usage_hits_the_expected_path() -> anyhow::R
 
     let client = client(&mock).await;
     client
-        .get_unprofiled_devices_data_usage(Some("network-0001"), "s", "e", None, None)
+        .get_unprofiled_devices_data_usage("s", "e", None, None, Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -194,7 +194,7 @@ async fn get_unprofiled_data_usage_summary_hits_the_expected_path() -> anyhow::R
 
     let client = client(&mock).await;
     client
-        .get_unprofiled_data_usage_summary(Some("network-0001"), "s", "e", "daily", None)
+        .get_unprofiled_data_usage_summary("s", "e", "daily", None, Some("network-0001"))
         .await?;
     Ok(())
 }

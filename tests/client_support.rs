@@ -37,23 +37,5 @@ async fn get_support_resolves_the_explicit_network() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn request_support_forwards_the_payload_unchanged() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    let payload = json!({"issue": "wifi-dropping"});
-    let response = json!({ "meta": {"code": 200}, "data": {"ticket_id": "tick-0001"} });
-    Mock::given(method("POST"))
-        .and(path("/2.2/networks/network-0001/support"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(response.to_string()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let client = client(&mock).await;
-    let env = client
-        .request_support(payload, Some("network-0001"))
-        .await?;
-    assert_eq!(env.as_value(), &response);
-    Ok(())
-}
+// `request_support` has no `Client` wrapper (phase-G fix list item 6: no `client.py` precedent) —
+// see `tests/endpoints_support.rs` for `SupportApi::request_support` coverage directly.

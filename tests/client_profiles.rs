@@ -131,17 +131,26 @@ async fn create_profile_includes_devices_and_paused_when_supplied() -> anyhow::R
     Ok(())
 }
 
-// ===================== set_profile_devices: single-profile-key-only invalidation =====================
+// ===================== set_profile_devices: invalidates BOTH profile keys =====================
 
-/// `set_profile_devices` invalidates only `profiles[{nid}_{pid}]` — the list key is left
-/// untouched (`client.py:2288-2289`; see `Client::set_profile_devices`'s own docs).
+/// `set_profile_devices` invalidates both `profiles[{nid}_{pid}]` AND `profiles[{nid}_profiles]`
+/// — Python's `_invalidate_profile_cache` (`client.py:1012-1020`, called at `:2289`) drops both
+/// keys, not just the single-profile one (see `Client::set_profile_devices`'s own docs).
 #[tokio::test]
-async fn set_profile_devices_invalidates_the_single_profile_key_only() -> anyhow::Result<()> {
+async fn set_profile_devices_invalidates_both_the_single_profile_and_list_keys()
+-> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profiles.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
@@ -157,6 +166,7 @@ async fn set_profile_devices_invalidates_the_single_profile_key_only() -> anyhow
     client
         .get_profile("profile-0001", Some("network-0001"), false)
         .await?;
+    client.get_profiles(Some("network-0001"), false).await?;
     client
         .set_profile_devices(
             "profile-0001",
@@ -164,8 +174,11 @@ async fn set_profile_devices_invalidates_the_single_profile_key_only() -> anyhow
             Some("network-0001"),
         )
         .await?;
+    // Both caches were dropped by the write: both reads must hit the network again, not the
+    // (now-stale) cache.
     client
         .get_profile("profile-0001", Some("network-0001"), false)
         .await?;
+    client.get_profiles(Some("network-0001"), false).await?;
     Ok(())
 }

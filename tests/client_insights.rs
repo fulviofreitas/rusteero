@@ -41,7 +41,7 @@ async fn get_insights_forwards_every_parameter() -> anyhow::Result<()> {
 
     let client = client(&mock).await;
     client
-        .get_insights(Some("network-0001"), "s", "e", "adblock", "daily")
+        .get_insights("s", "e", "adblock", "daily", Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -70,7 +70,7 @@ async fn get_devices_insights_passes_the_cached_network_envelope_as_parent() -> 
     // Populate the `network[{nid}]` cache entry the parent-resolution helper reads.
     client.get_network(Some("network-0001"), false).await?;
     client
-        .get_devices_insights(Some("network-0001"), "s", "e", "daily", "adblock")
+        .get_devices_insights("s", "e", "daily", "adblock", Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -91,11 +91,11 @@ async fn get_device_insights_hits_the_per_device_path() -> anyhow::Result<()> {
     client
         .get_device_insights(
             "device-0001",
-            Some("network-0001"),
             "s",
             "e",
             "daily",
             "adblock",
+            Some("network-0001"),
         )
         .await?;
     Ok(())
@@ -113,7 +113,7 @@ async fn get_profiles_insights_hits_the_expected_path() -> anyhow::Result<()> {
 
     let client = client(&mock).await;
     client
-        .get_profiles_insights(Some("network-0001"), "s", "e", "daily", "adblock")
+        .get_profiles_insights("s", "e", "daily", "adblock", Some("network-0001"))
         .await?;
     Ok(())
 }
@@ -134,11 +134,11 @@ async fn get_profile_insights_hits_the_per_profile_path() -> anyhow::Result<()> 
     client
         .get_profile_insights(
             "profile-0001",
-            Some("network-0001"),
             "s",
             "e",
             "daily",
             "adblock",
+            Some("network-0001"),
         )
         .await?;
     Ok(())
@@ -160,11 +160,11 @@ async fn get_profile_devices_insights_hits_the_expected_path() -> anyhow::Result
     client
         .get_profile_devices_insights(
             "profile-0001",
-            Some("network-0001"),
             "s",
             "e",
             "daily",
             "adblock",
+            Some("network-0001"),
         )
         .await?;
     Ok(())
