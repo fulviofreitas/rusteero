@@ -16,17 +16,17 @@
 //! Phase 5 (see the "Mutating pass-throughs" section near the bottom of this file) adds every
 //! *mutating* `EeroClient` method (every `set_*`/`run_*`/`reboot_*`/`create_*`/`delete_*`/
 //! `pause_*`/`block_*` that has a corresponding endpoint method in [`crate::endpoints`]), plus
-//! the cache invalidation the behaviour brief's §2 table specifies for each — including the two
-//! deliberate improvements over Python `rust-port-plan.md` §3.8 records (`set_led_brightness`,
-//! and every DNS/SQM/security setter, invalidating cache entries Python's own setters forget to),
-//! plus two more added by a later security review (findings F2, F3):
-//! [`Client::add_to_blacklist`]/[`Client::remove_from_blacklist`] now invalidate `devices`
-//! (matching [`Client::block_device`], which shares the same wire resource), and
-//! [`Client::enable_bedtime`]/[`Client::clear_profile_schedule`]/[`Client::set_weekday_bedtime`]/
-//! [`Client::set_weekend_bedtime`] now invalidate the profile keys (matching
-//! [`Client::set_profile_schedule`], which they all delegate to at the wire level). See each
-//! method's own doc comment for the citation. `set_device_priority`/`get_device_priority` and the
-//! `get_activity*` family remain unported — see the phase-5 section's own banner comment for why.
+//! the cache invalidation the behaviour brief's §2 table specifies for each — including a
+//! deliberate improvement over Python `rust-port-plan.md` §3.8 records (`set_led_brightness`,
+//! and every DNS/SQM/security setter, invalidating cache entries Python's own setters forget to)
+//! and, for the device-blacklist family, [`Client::block_device`]/[`Client::unblock_device`]
+//! invalidating both the single-device and the device-list cache entries on success (security
+//! finding F2). See each method's own doc comment for the citation. The v8.0.4 rework of the
+//! `schedule` domain ([`Client::enable_bedtime`], [`Client::clear_profile_schedule`],
+//! [`Client::update_schedule`]) deliberately does **not** invalidate any cache entry — see
+//! `src/client/schedule.rs`'s own doc comments for why the earlier (pre-v8) F3 divergence no
+//! longer applies. `set_device_priority`/`get_device_priority` and the `get_activity*` family
+//! remain unported — see the phase-5 section's own banner comment for why.
 //!
 //! # No `login`/`verify` on `Client` (architectural divergence from the port plan)
 //!
@@ -54,8 +54,8 @@
 //! `AuthenticatedAPI`'s `_refresh_hook` wired. This is **not** true of this port:
 //! [`crate::endpoints::NetworksApi::get_account`] (where the equivalent Rust call lives — see
 //! that method's own docs for why) sends its request through the ordinary
-//! [`crate::transport::Transport::send`], the exact same one-shot-refresh-and-retry path every
-//! other cached getter in this file uses. That decision was already made at the endpoints layer
+//! [`crate::transport::Transport::resource`], the exact same one-shot-refresh-and-retry path
+//! every other cached getter in this file uses. That decision was already made at the endpoints layer
 //! before this phase started; [`Client::get_account`] simply inherits it. Recorded here, and in
 //! `PARITY.md`, as a deliberate behavioural improvement over Python, not an oversight.
 //!

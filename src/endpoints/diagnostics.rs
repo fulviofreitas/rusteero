@@ -1,28 +1,21 @@
-//! Diagnostics API: `eero-api`'s `DiagnosticsAPI`.
+//! Diagnostics API: `eero-api`'s `DiagnosticsAPI` (`src/eero/api/diagnostics.py` at v8.0.4).
 //!
-//! Ported from `eero-api src/eero/api/diagnostics.py`: `DiagnosticsAPI.get_diagnostics` and
-//! `DiagnosticsAPI.run_diagnostics`.
-//!
-//! Every method here funnels through [`crate::transport::Transport::send`], which already
-//! implements the "not authenticated" precondition Python repeats at the top of each method
-//! (`get_auth_token()` / `EeroAuthenticationException("Not authenticated")`) and every
-//! status-to-error mapping a response can produce — so, unlike the Python source, no method
-//! below duplicates that guard.
+//! Implements both `DiagnosticsAPI` methods: [`DiagnosticsApi::get_diagnostics`] and
+//! [`DiagnosticsApi::run_diagnostics`].
 
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{Map, Value};
 
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
-use crate::transport::Transport;
+use crate::transport::{RequestBody, Transport};
 
 /// `eero-api`'s `DiagnosticsAPI` (`src/eero/api/diagnostics.py`).
 ///
 /// Build one with [`DiagnosticsApi::new`], wrapping a [`Transport`] already shared with the rest
-/// of the (not-yet-built) `EeroApi` aggregator — `DiagnosticsApi` never constructs or owns a
-/// `Transport` itself.
+/// of the `EeroApi` aggregator — `DiagnosticsApi` never constructs or owns a `Transport` itself.
 #[derive(Debug)]
 pub struct DiagnosticsApi {
     transport: Arc<Transport>,
@@ -37,41 +30,57 @@ impl DiagnosticsApi {
 
     /// Gets network diagnostics information — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/diagnostics.py:33-54`
-    /// (`DiagnosticsAPI.get_diagnostics`). Sends `GET` [`crate::routes::GET_DIAGNOSTICS`]
-    /// (`networks/{network_id}/diagnostics`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
-    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
-    pub async fn get_diagnostics(&self, network_id: &str) -> Result<Envelope, Error> {
+    /// Ported from `eero-api src/eero/api/diagnostics.py:35-64` (`DiagnosticsAPI.get_diagnostics`).
+    /// Sends `GET` [`crate::routes::GET_DIAGNOSTICS`], preferring `parent`'s
+    /// `resources.diagnostics` link over the `networks/{id}/diagnostics` template.
+    pub async fn get_diagnostics(
+        &self,
+        network_id: &str,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
         self.transport
-            .send(
+            .resource(
                 &routes::GET_DIAGNOSTICS,
-                &[("network_id", network_id)],
-                None,
+                network_id,
+                parent,
+                &[],
+                RequestBody::None,
             )
             .await
     }
 
     /// Runs network diagnostics — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/diagnostics.py:56-78` (`DiagnosticsAPI.run_diagnostics`).
-    /// Sends `POST` [`crate::routes::RUN_DIAGNOSTICS`] (`networks/{network_id}/diagnostics`,
-    /// the same path as [`crate::routes::GET_DIAGNOSTICS`]) with an empty JSON object `{}` as
-    /// the body (`diagnostics.py:77`), not an absent body.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
-    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
-    pub async fn run_diagnostics(&self, network_id: &str) -> Result<Envelope, Error> {
+    /// Ported from `eero-api src/eero/api/diagnostics.py:66-113` (`DiagnosticsAPI.run_diagnostics`).
+    /// Sends `POST` [`crate::routes::RUN_DIAGNOSTICS`] (the same path as
+    /// [`crate::routes::GET_DIAGNOSTICS`]) with a JSON body carrying only the caller-supplied
+    /// `device`/`symptom` keys — an empty JSON object `{}` when neither is given, never an absent
+    /// body, matching `diagnostics.py:105-111` exactly. **Unverified body shape against a live
+    /// network.**
+    pub async fn run_diagnostics(
+        &self,
+        network_id: &str,
+        device: Option<&str>,
+        symptom: Option<&str>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        crate::links::warn_uncharacterised_write("run diagnostics for network");
+
+        let mut body = Map::new();
+        if let Some(device) = device {
+            body.insert("device".to_owned(), Value::String(device.to_owned()));
+        }
+        if let Some(symptom) = symptom {
+            body.insert("symptom".to_owned(), Value::String(symptom.to_owned()));
+        }
+
         self.transport
-            .send(
+            .resource(
                 &routes::RUN_DIAGNOSTICS,
-                &[("network_id", network_id)],
-                Some(json!({})),
+                network_id,
+                parent,
+                &[],
+                RequestBody::Json(Value::Object(body)),
             )
             .await
     }

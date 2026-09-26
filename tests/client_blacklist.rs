@@ -1,13 +1,18 @@
-//! `Client` integration suite for `BlacklistApi`'s cache invalidation (security review finding
-//! F2).
+//! `Client` integration suite for `BlacklistApi`'s cache invalidation at `v8.0.4`.
+//!
+//! `Client::add_to_blacklist`/`Client::remove_from_blacklist` were removed at v8.0.4 (no
+//! `client.py` precedent — see `src/client/blacklist.rs`'s module docs); their coverage moved to
+//! `tests/client_devices.rs`'s `block_device_invalidates_the_devices_bucket`/
+//! `unblock_device_invalidates_the_devices_bucket`, which exercise the same underlying
+//! `BlacklistApi::add_to_blacklist`/`remove_from_blacklist` calls through
+//! `Client::block_device`/`Client::unblock_device`.
 
 mod common;
 
-use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 
@@ -22,64 +27,18 @@ async fn client(mock: &MockEero) -> Client {
         .expect("a MockServer's own URI is always a valid base URL")
 }
 
-/// **F2**: `add_to_blacklist` issues the identical `POST .../blacklist` call
-/// `block_device(blocked: true)` makes, and `block_device` already invalidates the `devices`
-/// bucket on success. Before the fix, `add_to_blacklist` invalidated nothing, so a `get_devices`
-/// call right after would keep reporting the device as unblocked for the rest of the TTL.
 #[tokio::test]
-async fn add_to_blacklist_invalidates_the_devices_bucket() -> anyhow::Result<()> {
+async fn get_blacklist_hits_the_blacklist_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
-        .and(path("/2.2/networks/network-0001/devices"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
-        .expect(2)
-        .mount(&mock.server)
-        .await;
-    Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/blacklist"))
         .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let client = client(&mock).await;
-    client.get_devices(Some("network-0001"), false).await?;
-    client
-        .add_to_blacklist("AA:BB:CC:00:00:01", Some("network-0001"))
-        .await?;
-    client.get_devices(Some("network-0001"), false).await?;
-    Ok(())
-}
-
-/// **F2**: `remove_from_blacklist` must invalidate the `devices` bucket too, for the same reason
-/// as `add_to_blacklist` above.
-#[tokio::test]
-async fn remove_from_blacklist_invalidates_the_devices_bucket() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("GET"))
-        .and(path("/2.2/networks/network-0001/devices"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
-        .expect(2)
-        .mount(&mock.server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path(
-            "/2.2/networks/network-0001/blacklist/AA:BB:CC:00:00:01",
-        ))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let client = client(&mock).await;
-    client.get_devices(Some("network-0001"), false).await?;
-    client
-        .remove_from_blacklist("AA:BB:CC:00:00:01", Some("network-0001"))
-        .await?;
-    client.get_devices(Some("network-0001"), false).await?;
+    client.get_blacklist(Some("network-0001")).await?;
     Ok(())
 }

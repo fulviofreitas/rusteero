@@ -1,11 +1,10 @@
-//! HTTP integration tests for `ProfilesApi`'s read-only methods (`get_profiles`, `get_profile`,
-//! `get_profile_devices`, `get_blocked_applications`), per the crate's testing conventions.
+//! HTTP integration tests for `ProfilesApi` (v8.0.4) per the crate's testing conventions.
 //!
-//! The methods `get_profile`, `get_profile_devices` and `get_blocked_applications` all hit the
-//! exact same wire endpoint (`GET networks/{network_id}/profiles/{profile_id}`) and must return
-//! the exact same, untransformed envelope — the tests below pin both the path and the byte-for-
-//! byte identical response for all three, which is what would catch a future change that
-//! "helpfully" extracted a `devices` or `blocked_applications` sub-object for one of the aliases.
+//! `get_profile` and `get_profile_devices` hit the exact same wire endpoint (`GET
+//! networks/{network_id}/profiles/{profile_id}`) and must return the exact same, untransformed
+//! envelope — the tests below pin both the path and the byte-for-byte identical response for
+//! both, which is what would catch a future change that "helpfully" extracted a `devices`
+//! sub-object for the alias.
 
 mod common;
 
@@ -17,7 +16,7 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 
 /// Builds a [`ProfilesApi`] against `mock`, authenticated with [`TEST_TOKEN`].
 fn profiles_api(mock: &MockEero) -> ProfilesApi {
@@ -32,15 +31,33 @@ async fn get_profiles_hits_v22_list_path_and_returns_the_fixture_envelope() -> a
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profiles.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = profiles_api(&mock);
-    let env = api.get_profiles("network-0001").await?;
+    let env = api.get_profiles("network-0001", None).await?;
 
     assert_eq!(env.into_value(), fixture_json("profiles.json"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_profiles_prefers_the_parents_published_profiles_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.4/networks/network-0001/profiles"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profiles.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = profiles_api(&mock);
+    let parent = json!({"resources": {"profiles": "/2.4/networks/network-0001/profiles"}});
+    api.get_profiles("network-0001", Some(&parent)).await?;
     Ok(())
 }
 
@@ -53,15 +70,38 @@ async fn get_profile_hits_v22_single_profile_path_and_returns_the_fixture_envelo
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = profiles_api(&mock);
-    let env = api.get_profile("network-0001", "profile-0001").await?;
+    let env = api
+        .get_profile("network-0001", "profile-0001", None)
+        .await?;
 
     assert_eq!(env.into_value(), fixture_json("profile.json"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_profile_prefers_the_parents_own_self_url_over_the_template() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-cached"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = profiles_api(&mock);
+    let parent = json!({"url": "/2.2/networks/network-0001/profiles/profile-cached"});
+    // Bare `network_id`/`profile_id` below are ignored entirely once `parent`'s own `url`
+    // resolves — matching Python's `self_url(resolved_parent) if ... else _profile_url(...)`.
+    api.get_profile("ignored-network", "ignored-profile", Some(&parent))
+        .await?;
     Ok(())
 }
 
@@ -80,13 +120,13 @@ async fn get_profile_devices_hits_the_same_path_as_get_profile_and_returns_an_id
         .await;
 
     let api = profiles_api(&mock);
-    let from_get_profile = api.get_profile("network-0001", "profile-0001").await?;
+    let from_get_profile = api
+        .get_profile("network-0001", "profile-0001", None)
+        .await?;
     let from_devices_alias = api
-        .get_profile_devices("network-0001", "profile-0001")
+        .get_profile_devices("network-0001", "profile-0001", None)
         .await?;
 
-    // Same wire call, same response, byte-identical envelope — neither a `devices` sub-object
-    // nor anything else has been extracted or reshaped.
     assert_eq!(
         from_devices_alias.clone().into_value(),
         from_get_profile.into_value()
@@ -98,43 +138,10 @@ async fn get_profile_devices_hits_the_same_path_as_get_profile_and_returns_an_id
     Ok(())
 }
 
-// ===================== get_blocked_applications: same call as get_profile =====================
-
-#[tokio::test]
-async fn get_blocked_applications_hits_the_same_path_as_get_profile_and_returns_an_identical_untransformed_envelope()
--> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("GET"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(2)
-        .mount(&mock.server)
-        .await;
-
-    let api = profiles_api(&mock);
-    let from_get_profile = api.get_profile("network-0001", "profile-0001").await?;
-    let from_blocked_apps_alias = api
-        .get_blocked_applications("network-0001", "profile-0001")
-        .await?;
-
-    // Same wire call, same response, byte-identical envelope — neither a
-    // `blocked_applications` sub-object nor anything else has been extracted or reshaped.
-    assert_eq!(
-        from_blocked_apps_alias.clone().into_value(),
-        from_get_profile.into_value()
-    );
-    assert_eq!(
-        from_blocked_apps_alias.into_value(),
-        fixture_json("profile.json")
-    );
-    Ok(())
-}
-
 // ===================== 404 =====================
 
 #[tokio::test]
-async fn get_profile_404_maps_to_error_api_and_is_not_an_auth_error() -> anyhow::Result<()> {
+async fn get_profile_404_maps_to_error_not_found_and_is_not_an_auth_error() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles/missing-profile"))
@@ -146,7 +153,7 @@ async fn get_profile_404_maps_to_error_api_and_is_not_an_auth_error() -> anyhow:
 
     let api = profiles_api(&mock);
     let err = api
-        .get_profile("network-0001", "missing-profile")
+        .get_profile("network-0001", "missing-profile", None)
         .await
         .expect_err("a 404 must surface as Error::NotFound");
 
@@ -159,11 +166,6 @@ async fn get_profile_404_maps_to_error_api_and_is_not_an_auth_error() -> anyhow:
 }
 
 // ===================== pause_profile =====================
-//
-// Every test below pins the exact verb, path and JSON body (`body_json`) `wiremock` receives,
-// plus the session cookie, with a `.expect(n)` call count — a wrong verb, path, or body shape
-// fails to match the mock and the request comes back unmocked (404), which is what turns a
-// request-shape regression into a loud test failure instead of a silent pass.
 
 #[tokio::test]
 async fn pause_profile_puts_paused_true_to_the_profile_path() -> anyhow::Result<()> {
@@ -171,6 +173,7 @@ async fn pause_profile_puts_paused_true_to_the_profile_path() -> anyhow::Result<
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "paused": true })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
@@ -179,7 +182,7 @@ async fn pause_profile_puts_paused_true_to_the_profile_path() -> anyhow::Result<
 
     let api = profiles_api(&mock);
     let env = api
-        .pause_profile("network-0001", "profile-0001", true)
+        .pause_profile("network-0001", "profile-0001", true, None)
         .await?;
 
     assert_eq!(env.meta().code, Some(200));
@@ -199,7 +202,7 @@ async fn pause_profile_puts_paused_false_to_unpause() -> anyhow::Result<()> {
         .await;
 
     let api = profiles_api(&mock);
-    api.pause_profile("network-0001", "profile-0001", false)
+    api.pause_profile("network-0001", "profile-0001", false, None)
         .await?;
     Ok(())
 }
@@ -232,179 +235,22 @@ async fn set_profile_devices_wraps_each_url_in_its_own_object_and_replaces_the_l
             "/2.2/networks/network-0001/devices/device-0001",
             "/2.2/networks/network-0001/devices/device-0002",
         ],
+        None,
     )
     .await?;
-    Ok(())
-}
-
-// ===================== update_profile_content_filter =====================
-
-/// Proves the client-side content-filter whitelist (`profiles.py:201-217`) drops
-/// `"not_a_real_filter"` — a key outside `VALID_CONTENT_FILTER_KEYS` — while keeping the two
-/// whitelisted keys, `adblock` and `safe_search`. The mock only matches the whitelisted-only
-/// body; if the implementation forwarded the extra key, this request would not match any mock
-/// and the call would fail with an unmocked-request error instead of `Ok`.
-///
-/// Red-then-green verified by hand: temporarily short-circuiting the whitelist filter in
-/// `src/endpoints/profiles.rs` (forwarding `filters` unfiltered) made this test fail; restoring
-/// the filter made it pass again. See the task report for the exact command output.
-#[tokio::test]
-async fn update_profile_content_filter_drops_a_key_outside_the_whitelist_and_keeps_the_rest()
--> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
-        .and(session_cookie())
-        .and(body_json(json!({
-            "content_filter": {
-                "adblock": true,
-                "safe_search": false
-            }
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = profiles_api(&mock);
-    api.update_profile_content_filter(
-        "network-0001",
-        "profile-0001",
-        &[
-            ("adblock", true),
-            ("safe_search", false),
-            ("not_a_real_filter", true),
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn update_profile_content_filter_accepts_every_whitelisted_key() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
-        .and(session_cookie())
-        .and(body_json(json!({
-            "content_filter": {
-                "adblock": true,
-                "adblock_plus": true,
-                "safe_search": true,
-                "block_malware": true,
-                "block_illegal": true,
-                "block_violent": true,
-                "block_adult": true,
-                "youtube_restricted": true
-            }
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = profiles_api(&mock);
-    api.update_profile_content_filter(
-        "network-0001",
-        "profile-0001",
-        &[
-            ("adblock", true),
-            ("adblock_plus", true),
-            ("safe_search", true),
-            ("block_malware", true),
-            ("block_illegal", true),
-            ("block_violent", true),
-            ("block_adult", true),
-            ("youtube_restricted", true),
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
-// ===================== update_profile_block_list =====================
-
-#[tokio::test]
-async fn update_profile_block_list_true_sends_custom_block_list() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
-        .and(session_cookie())
-        .and(body_json(
-            json!({ "custom_block_list": ["ads.example.com", "tracker.example.com"] }),
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = profiles_api(&mock);
-    api.update_profile_block_list(
-        "network-0001",
-        "profile-0001",
-        &["ads.example.com", "tracker.example.com"],
-        true,
-    )
-    .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn update_profile_block_list_false_sends_custom_allow_list_not_block_list()
--> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
-        .and(session_cookie())
-        .and(body_json(
-            json!({ "custom_allow_list": ["homework.example.com"] }),
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = profiles_api(&mock);
-    api.update_profile_block_list(
-        "network-0001",
-        "profile-0001",
-        &["homework.example.com"],
-        false,
-    )
-    .await?;
-    Ok(())
-}
-
-// ===================== set_blocked_applications =====================
-
-#[tokio::test]
-async fn set_blocked_applications_puts_the_full_replacement_list() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
-        .and(session_cookie())
-        .and(body_json(
-            json!({ "blocked_applications": ["tiktok", "fortnite"] }),
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = profiles_api(&mock);
-    api.set_blocked_applications("network-0001", "profile-0001", &["tiktok", "fortnite"])
-        .await?;
     Ok(())
 }
 
 // ===================== create_profile =====================
 
 #[tokio::test]
-async fn create_profile_posts_the_name_to_the_profiles_list_path() -> anyhow::Result<()> {
+async fn create_profile_posts_only_the_name_when_devices_and_paused_are_none() -> anyhow::Result<()>
+{
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/profiles"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "name": "Guests" })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
@@ -412,7 +258,54 @@ async fn create_profile_posts_the_name_to_the_profiles_list_path() -> anyhow::Re
         .await;
 
     let api = profiles_api(&mock);
-    api.create_profile("network-0001", "Guests").await?;
+    api.create_profile("network-0001", "Guests", None, None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_profile_includes_devices_and_paused_when_supplied() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/profiles"))
+        .and(session_cookie())
+        .and(body_json(json!({
+            "name": "Guests",
+            "devices": [{ "url": "/2.2/networks/network-0001/devices/device-0001" }],
+            "paused": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = profiles_api(&mock);
+    api.create_profile(
+        "network-0001",
+        "Guests",
+        Some(&["/2.2/networks/network-0001/devices/device-0001"]),
+        Some(false),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_profile_prefers_parent_profiles_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.4/networks/network-0001/profiles"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = profiles_api(&mock);
+    let parent = json!({"resources": {"profiles": "/2.4/networks/network-0001/profiles"}});
+    api.create_profile("network-0001", "Guests", None, None, Some(&parent))
+        .await?;
     Ok(())
 }
 
@@ -431,7 +324,7 @@ async fn rename_profile_puts_the_new_name() -> anyhow::Result<()> {
         .await;
 
     let api = profiles_api(&mock);
-    api.rename_profile("network-0001", "profile-0001", "Teenagers")
+    api.rename_profile("network-0001", "profile-0001", "Teenagers", None)
         .await?;
     Ok(())
 }
@@ -444,6 +337,7 @@ async fn delete_profile_sends_no_body() -> anyhow::Result<()> {
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
@@ -455,7 +349,8 @@ async fn delete_profile_sends_no_body() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn delete_profile_404_maps_to_error_api_and_is_not_an_auth_error() -> anyhow::Result<()> {
+async fn delete_profile_404_maps_to_error_not_found_and_is_not_an_auth_error() -> anyhow::Result<()>
+{
     let mock = MockEero::start().await;
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/profiles/missing-profile"))

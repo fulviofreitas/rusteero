@@ -1,35 +1,41 @@
-//! DNS routes (`DnsAPI`) — all aliases of `networks::GET_NETWORK`/`networks::PUT_NETWORK_SETTINGS`.
+//! DNS routes (`DnsAPI`), v8.0.4.
+//!
+//! Ported from `eero-api src/eero/api/dns.py` at v8.0.4. Every write funnels through the
+//! network's `settings` sub-resource — `DNS_PUT_SETTINGS` below — resolved via the v8
+//! [`Resource`] model (`crate::links::sub_resource_url`, preferring a supplied parent's
+//! published `settings` link over the bare-id template). The read (`GET_DNS_SETTINGS`) never
+//! receives a `parent` from Python (`dns.py:222`'s `get_dns_settings` has no `parent` keyword at
+//! all), so it resolves via the plain bare-id template every time — see
+//! [`crate::endpoints::dns::DnsApi::get_dns_settings`].
 
-// ------------------------------------ dns (`DnsAPI`) ------------------------------------
+use super::{ApiVersion, Resource};
+use reqwest::Method;
 
-use super::Route;
-use super::networks::{GET_NETWORK, PUT_NETWORK_SETTINGS};
-
-/// Alias of `GET_NETWORK`: `DnsAPI.get_dns_settings` reads DNS fields (`dns_caching`,
-/// `custom_dns`, `ipv6_upstream`, ...) out of the full network object — same wire call.
+/// `GET /2.2/networks/{id}` — DNS settings live inside the full network object; there is no
+/// dedicated DNS sub-resource on the wire.
 ///
-/// Ported from `eero-api src/eero/api/dns.py:36` (`DnsAPI.get_dns_settings`).
-pub const GET_DNS_SETTINGS: Route = GET_NETWORK;
+/// Ported from `eero-api src/eero/api/dns.py:222-249` (`DnsAPI.get_dns_settings`), which resolves
+/// via `_params.resolve_network_url(network_id)` with no `parent` argument at all — since this
+/// route's `link` is `None`, [`Resource::resolve`] falls straight to
+/// [`crate::links::resource_url`] regardless of what `parent` a caller passes, matching that
+/// behaviour exactly.
+pub const GET_DNS_SETTINGS: Resource = Resource {
+    method: Method::GET,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}",
+    link: None,
+};
 
-/// Alias of `PUT_NETWORK_SETTINGS`: `DnsAPI.set_dns_caching` PUTs `{"dns_caching": bool}`.
+/// `PUT /2.2/networks/{id}/settings` — the network's settings sub-resource, the single wire
+/// endpoint behind every `DnsAPI` write.
 ///
-/// Ported from `eero-api src/eero/api/dns.py:59` (`DnsAPI.set_dns_caching`).
-pub const SET_DNS_CACHING: Route = PUT_NETWORK_SETTINGS;
-
-/// Alias of `PUT_NETWORK_SETTINGS`: `DnsAPI.set_custom_dns` PUTs `{"custom_dns": [..]}`
-/// (truncated to at most 2 servers). Also the target of `DnsAPI.clear_custom_dns`
-/// (`dns.py:126`), which delegates to `set_custom_dns([])` — no separate route needed there.
-///
-/// Ported from `eero-api src/eero/api/dns.py:89` (`DnsAPI.set_custom_dns`).
-pub const SET_CUSTOM_DNS: Route = PUT_NETWORK_SETTINGS;
-
-/// Alias of `PUT_NETWORK_SETTINGS`: `DnsAPI.set_dns_mode` PUTs a `custom_dns` list resolved
-/// from a named preset (`"cloudflare"`, `"google"`, `"opendns"`, `"custom"`, `"auto"`).
-///
-/// Ported from `eero-api src/eero/api/dns.py:137` (`DnsAPI.set_dns_mode`).
-pub const SET_DNS_MODE: Route = PUT_NETWORK_SETTINGS;
-
-/// Alias of `PUT_NETWORK_SETTINGS`: `DnsAPI.set_ipv6_dns` PUTs `{"ipv6_upstream": bool}`.
-///
-/// Ported from `eero-api src/eero/api/dns.py:186` (`DnsAPI.set_ipv6_dns`).
-pub const SET_IPV6_DNS: Route = PUT_NETWORK_SETTINGS;
+/// Ported from `eero-api src/eero/api/dns.py:183-220` (`DnsAPI._put_settings`), which resolves
+/// via `links.sub_resource_url(network_id, "networks/{id}/settings", link="settings",
+/// parent=...)` — preferring a supplied parent's published `settings` link over the bare-id
+/// template, exactly what [`Resource::resolve`] does when [`Resource::link`] is `Some("settings")`.
+pub const DNS_PUT_SETTINGS: Resource = Resource {
+    method: Method::PUT,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}/settings",
+    link: Some("settings"),
+};

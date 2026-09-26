@@ -1,41 +1,53 @@
-//! Backup-network routes (`BackupAPI`).
+//! Backup-internet routes (`BackupAPI`, rewritten for v8.0.4).
+//!
+//! `BackupAPI.get_backup_network`/`get_backup_status`/`set_backup_network`/
+//! `configure_backup_network` were removed upstream in `eero-api` v8.0.0 — the `networks/{id}/
+//! backup` resource they targeted no longer exists. `get_backup_internet`/`set_backup_internet`
+//! below target a different resource (`networks/{id}/backupinternet`) with a narrower shape (no
+//! `phone_number` field); see `.claude/tasks/briefs/v8/g7-backup-members.md` §2.
 
-// -------------------------------- backup (`BackupAPI`) ---------------------------------
-
-use super::{ApiVersion, Route};
+use super::{ApiVersion, Resource};
 use reqwest::Method;
 
-/// `GET /2.2/networks/{network_id}/backup` — backup-network (Eero Plus) configuration.
+/// `GET /2.2/networks/{network_id}/backupinternet` — cellular-backup-internet configuration.
 ///
-/// Ported from `eero-api src/eero/api/backup.py:37` (`BackupAPI.get_backup_network`).
-pub const GET_BACKUP_NETWORK: Route = Route {
+/// Built directly via `resource_url`, never a published `resources` link (module docstring,
+/// `backup.py:22-27`), so [`Resource::link`] is `None`. Ported from `eero-api
+/// src/eero/api/backup.py:41` (`BackupAPI.get_backup_internet`).
+pub const GET_BACKUP_INTERNET: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/backup",
+    template: "networks/{id}/backupinternet",
+    link: None,
 };
 
-/// `GET /2.2/networks/{network_id}/backup/status` — current backup-network status.
+/// `PUT /2.2/networks/{network_id}/backupinternet` — enable/disable cellular-backup internet.
 ///
-/// Ported from `eero-api src/eero/api/backup.py:57` (`BackupAPI.get_backup_status`).
-pub const GET_BACKUP_STATUS: Route = Route {
-    method: Method::GET,
-    version: ApiVersion::V2_2,
-    path: "networks/{network_id}/backup/status",
-};
-
-/// `PUT /2.2/networks/{network_id}/backup` — enable/disable or configure the backup network.
-///
-/// Ported from `eero-api src/eero/api/backup.py:80` (`BackupAPI.set_backup_network`). Also
-/// the target of `BackupAPI.configure_backup_network` (`backup.py:114`; see
-/// `CONFIGURE_BACKUP_NETWORK`) — same endpoint, a subset payload.
-pub const SET_BACKUP_NETWORK: Route = Route {
+/// Same resource `GET_BACKUP_INTERNET` reads. Ported from `eero-api src/eero/api/backup.py:66`
+/// (`BackupAPI.set_backup_internet`).
+pub const SET_BACKUP_INTERNET: Resource = Resource {
     method: Method::PUT,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/backup",
+    template: "networks/{id}/backupinternet",
+    link: None,
 };
 
-/// Alias of `SET_BACKUP_NETWORK`: `BackupAPI.configure_backup_network` PUTs the same
-/// `networks/{network_id}/backup` resource with a partial `{enabled?, phone_number?}` body.
+/// `GET /2.2/networks/{network_id}/cellular_backup_usage` — cellular-backup data usage.
 ///
-/// Ported from `eero-api src/eero/api/backup.py:114`.
-pub const CONFIGURE_BACKUP_NETWORK: Route = SET_BACKUP_NETWORK;
+/// Ported from `eero-api src/eero/api/backup.py:105` (`BackupAPI.get_cellular_backup_usage`).
+pub const GET_CELLULAR_BACKUP_USAGE: Resource = Resource {
+    method: Method::GET,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}/cellular_backup_usage",
+    link: None,
+};
+
+/// `GET /2.2/networks/{network_id}/cellular_backup_events` — cellular-backup event log.
+///
+/// Ported from `eero-api src/eero/api/backup.py:130` (`BackupAPI.get_cellular_backup_events`).
+pub const GET_CELLULAR_BACKUP_EVENTS: Resource = Resource {
+    method: Method::GET,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}/cellular_backup_events",
+    link: None,
+};

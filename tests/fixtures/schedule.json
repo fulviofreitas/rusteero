@@ -1,0 +1,11 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:56Z" },
+  "data": {
+    "url": "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+    "name": "Bedtime",
+    "days": ["monday", "tuesday"],
+    "start": "21:00",
+    "end": "07:00",
+    "enabled": true
+  }
+}

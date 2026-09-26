@@ -2,47 +2,64 @@
 
 // ------------------------------ reservations (`ReservationsAPI`) ------------------------
 
-use super::{ApiVersion, Route};
+use super::{ApiVersion, Nested, Resource};
 use reqwest::Method;
 
-/// `GET /2.2/networks/{network_id}/reservations` — list DHCP reservations.
+// ------------------------------------ v8.0.4 routes --------------------------------------
+
+/// `GET /2.2/networks/{id}/reservations` (or the parent's own `reservations` link) — list DHCP
+/// reservations.
 ///
-/// Ported from `eero-api src/eero/api/reservations.py:33`
-/// (`ReservationsAPI.get_reservations`).
-pub const GET_RESERVATIONS: Route = Route {
+/// Ported from `eero-api src/eero/api/reservations.py:82-107` (v8.0.4,
+/// `ReservationsAPI.get_reservations`): `sub_resource_url(network,
+/// "networks/{id}/reservations", link="reservations", parent=.., version=API_VERSION_DEFAULT)`.
+pub const RESERVATIONS_GET: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/reservations",
+    template: "networks/{id}/reservations",
+    link: Some("reservations"),
 };
 
-/// `POST /2.2/networks/{network_id}/reservations` — create a DHCP reservation.
+/// `POST /2.2/networks/{id}/reservations` (or the parent's own `reservations` link) — create a
+/// DHCP reservation.
 ///
-/// Ported from `eero-api src/eero/api/reservations.py:56`
-/// (`ReservationsAPI.create_reservation`).
-pub const CREATE_RESERVATION: Route = Route {
+/// Ported from `eero-api src/eero/api/reservations.py:114-153` (v8.0.4,
+/// `ReservationsAPI.create_reservation`): same URL resolution as [`RESERVATIONS_GET`].
+pub const RESERVATIONS_CREATE: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/reservations",
+    template: "networks/{id}/reservations",
+    link: Some("reservations"),
 };
 
-/// `PUT /2.2/networks/{network_id}/reservations/{reservation_id}` — update a DHCP
-/// reservation.
+/// `PUT /2.2/networks/{network}/reservations/{reservation}` (or an already-resolved path/URL) —
+/// update a DHCP reservation.
 ///
-/// Ported from `eero-api src/eero/api/reservations.py:83`
-/// (`ReservationsAPI.update_reservation`).
-pub const UPDATE_RESERVATION: Route = Route {
+/// Ported from `eero-api src/eero/api/reservations.py:154-184` (v8.0.4,
+/// `ReservationsAPI.update_reservation` via the free function `_resolve_reservation_url`):
+/// `resolve_nested_url(network, reservation, prefix="reservations")`, used by
+/// [`crate::endpoints::reservations::ReservationsApi::update_reservation`] only for its bare-id
+/// and path/URL dispatch branches — the "`reservation` is a cached envelope" branch resolves via
+/// [`crate::links::self_url`] directly instead, never through this route. No `link`: Python's
+/// `_resolve_reservation_url` never consults a parent's `resources` map.
+pub const RESERVATIONS_UPDATE: Nested = Nested {
     method: Method::PUT,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/reservations/{reservation_id}",
+    prefix: "reservations",
+    suffix: "",
+    link: None,
 };
 
-/// `DELETE /2.2/networks/{network_id}/reservations/{reservation_id}` — delete a DHCP
-/// reservation.
+/// `DELETE /2.2/networks/{network}/reservations/{reservation}` (bare id, path, or URL) — delete
+/// a DHCP reservation.
 ///
-/// Ported from `eero-api src/eero/api/reservations.py:116`
-/// (`ReservationsAPI.delete_reservation`).
-pub const DELETE_RESERVATION: Route = Route {
+/// Ported from `eero-api src/eero/api/reservations.py:187-216` (v8.0.4,
+/// `ReservationsAPI.delete_reservation`): `resolve_nested_url(network, reservation,
+/// prefix="reservations")`.
+pub const RESERVATIONS_DELETE: Nested = Nested {
     method: Method::DELETE,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/reservations/{reservation_id}",
+    prefix: "reservations",
+    suffix: "",
+    link: None,
 };

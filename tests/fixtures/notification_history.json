@@ -1,0 +1,8 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:01:00Z" },
+  "data": {
+    "notifications": [
+      { "id": "notif_1", "type": "device.new", "read": false, "timestamp": "2026-01-01T00:00:00Z" }
+    ]
+  }
+}

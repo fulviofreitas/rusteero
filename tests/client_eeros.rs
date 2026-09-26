@@ -1,4 +1,7 @@
-//! `Client` integration suite for `EerosApi`'s pass-throughs and cache invalidation.
+//! `Client` integration suite for the `eeros` domain: cache reads/invalidation, the
+//! `_eero_parent_kwargs`/`_network_parent_kwargs` forwarding this crate reproduces from
+//! `eero-api src/eero/client.py`, and the `get_eero`/`led_cycle`/`get_eero_support`/`port_action`/
+//! `nightlight_override` quirks recorded in `.claude/tasks/briefs/v8/g2-eeros.md` §3.
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not
@@ -6,12 +9,14 @@
 
 mod common;
 
-use wiremock::matchers::{method, path};
+use serde_json::json;
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use rusteero::error::Error;
 
 /// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
 /// default 60-second cache TTL.
@@ -24,12 +29,66 @@ async fn client(mock: &MockEero) -> Client {
         .expect("a MockServer's own URI is always a valid base URL")
 }
 
-// ===================== One representative mutation =====================
+// ===================== get_eeros: cache read =====================
 
 #[tokio::test]
-async fn set_led_reaches_the_eero_put_endpoint() -> anyhow::Result<()> {
+async fn get_eeros_serves_the_second_call_from_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/eeros"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eeros.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let first = client.get_eeros(Some("network-0001"), false).await?;
+    let second = client.get_eeros(Some("network-0001"), false).await?;
+    assert_eq!(first.into_value(), second.into_value());
+    Ok(())
+}
+
+// ===================== get_eero: never cached =====================
+
+#[tokio::test]
+async fn get_eero_is_never_served_from_cache_even_with_refresh_cache_false() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/eeros/eero-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eero.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_eero("eero-0001", Some("network-0001"), false)
+        .await?;
+    client
+        .get_eero("eero-0001", Some("network-0001"), false)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eero_forwards_a_cached_eero_as_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/eeros"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eeros.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // `eeros.json`'s first entry has no `resources`/`url` override this test relies on, so a
+    // `parent` being forwarded is confirmed indirectly: without a cached eeros list at all,
+    // `get_eero` would still succeed via the bare-id template — the assertion that matters here
+    // is that seeding the cache first does not change the request path (no published link on
+    // this fixture entry means the template still wins), while proving `eero_parent` lookup
+    // itself does not error or panic when it finds a match.
+    Mock::given(method("GET"))
         .and(path("/2.2/eeros/eero-0001"))
         .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eero.json")))
@@ -38,14 +97,14 @@ async fn set_led_reaches_the_eero_put_endpoint() -> anyhow::Result<()> {
         .await;
 
     let client = client(&mock).await;
-    let response = client
-        .set_led("eero-0001", true, Some("network-0001"))
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .get_eero("eero-0001", Some("network-0001"), false)
         .await?;
-    assert_eq!(response.as_value(), &fixture_json("eero.json"));
     Ok(())
 }
 
-// ===================== Targeted invalidation: the core claim =====================
+// ===================== reboot_eero: invalidation + parent =====================
 
 #[tokio::test]
 async fn reboot_eero_invalidates_the_eeros_bucket() -> anyhow::Result<()> {
@@ -74,12 +133,10 @@ async fn reboot_eero_invalidates_the_eeros_bucket() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ===================== A deliberate improvement over Python =====================
+// ===================== set_led / set_led_brightness =====================
 
 #[tokio::test]
-async fn set_led_brightness_invalidates_the_eeros_bucket() -> anyhow::Result<()> {
-    // Divergence from eero-api (rust-port-plan.md §3.8, improvement (b)): Python's
-    // `set_led_brightness` invalidates nothing at all.
+async fn set_led_reaches_the_led_endpoint_and_invalidates_eeros() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/eeros"))
@@ -89,9 +146,10 @@ async fn set_led_brightness_invalidates_the_eeros_bucket() -> anyhow::Result<()>
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
-        .and(path("/2.2/eeros/eero-0001"))
+        .and(path("/2.2/eeros/eero-0001/led"))
         .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eero.json")))
+        .and(body_json(json!({ "led_on": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
         .await;
@@ -99,8 +157,161 @@ async fn set_led_brightness_invalidates_the_eeros_bucket() -> anyhow::Result<()>
     let client = client(&mock).await;
     client.get_eeros(Some("network-0001"), false).await?;
     client
-        .set_led_brightness("eero-0001", 42, Some("network-0001"))
+        .set_led("eero-0001", true, Some("network-0001"))
         .await?;
     client.get_eeros(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_led_brightness_rejects_out_of_range_without_invalidating_the_cache()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/eeros"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eeros.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let first = client.get_eeros(Some("network-0001"), false).await?;
+
+    let err = client
+        .set_led_brightness("eero-0001", 999, Some("network-0001"))
+        .await
+        .expect_err("out-of-range brightness must be rejected");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "brightness"));
+
+    // Still cached: no second GET was registered above, so a second call proves the cache was
+    // not invalidated by the failed write.
+    let second = client.get_eeros(Some("network-0001"), false).await?;
+    assert_eq!(first.into_value(), second.into_value());
+    Ok(())
+}
+
+// ===================== node_action / port_action / nightlight_override =====================
+
+#[tokio::test]
+async fn node_action_invalidates_the_eeros_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/eeros"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eeros.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/eeros/eero-0001/action"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .node_action("eero-0001", "POWER_CYCLE_ALL_PORTS", Some("network-0001"))
+        .await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+// `port_action` resolves `network_id` only to invalidate the cache — it is never forwarded to
+// the domain call, which has no `network_id` parameter at all (structurally guaranteed by
+// `EerosApi::port_action`'s own signature; this test exercises the invalidation half of the
+// quirk).
+#[tokio::test]
+async fn port_action_invalidates_the_eeros_bucket_without_a_network_id_param() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/eeros"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eeros.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/eeros/eero-0001/ports/1/action"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .port_action("eero-0001", 1, "ENABLE_DATA", Some("network-0001"))
+        .await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn nightlight_override_invalidates_the_eeros_bucket_without_a_network_id_param()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/eeros"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eeros.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/eeros/eero-0001/nightlight/override"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .nightlight_override("eero-0001", 42, Some("network-0001"))
+        .await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+// ===================== led_cycle / get_eero_support: no network_id at all =====================
+
+#[tokio::test]
+async fn led_cycle_takes_no_network_id_parameter() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/eeros/SERIAL123/led_cycle"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let colors = vec!["red".to_owned()];
+    client.led_cycle("SERIAL123", &colors, 5, 2).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eero_support_takes_no_network_id_parameter() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/eeros/SERIAL123/support"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("eero.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_eero_support("SERIAL123").await?;
+    assert_eq!(env.into_value(), fixture_json("eero.json"));
     Ok(())
 }

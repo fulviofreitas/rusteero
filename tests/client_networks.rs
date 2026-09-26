@@ -1,15 +1,9 @@
 //! `Client` integration suite for `NetworksApi`'s pass-throughs, cache invalidation, and the
-//! `/account` fallback of `get_networks`.
+//! `/account` fallback of `get_networks`, at v8.0.4.
 //!
-//! **Judgment call (test-file split, 2026-09-25)**: the `/account`-fallback tests
-//! (`get_networks_falls_back_to_account_when_the_list_is_empty`,
-//! `get_networks_does_not_fall_back_when_the_list_is_non_empty`) exercise a quirk specific to
-//! `Client::get_networks` (`src/client.rs`'s `NetworksApi`-facing accessor) — no other domain
-//! shares this fallback — so they are treated as networks-domain tests and live here rather than
-//! in `client_core.rs`. `account_and_networks_survive_a_write_that_invalidates_network_nid` and
-//! `a_failed_write_does_not_invalidate_the_cache` are likewise placed here: both are driven by
-//! `Client::set_network_name` (a `NetworksApi` write) proving its cache-invalidation contract,
-//! even though the second also documents a `Client`-wide "failed write never invalidates" rule.
+//! **Judgment call (test-file split, 2026-09-25, retained)**: the `/account`-fallback tests
+//! exercise a quirk specific to `Client::get_networks` — no other domain shares this fallback —
+//! so they are treated as networks-domain tests and live here rather than in `client_core.rs`.
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not
@@ -71,9 +65,6 @@ async fn get_networks_falls_back_to_account_when_the_list_is_empty() -> anyhow::
     let client = client(&mock).await;
     let env = client.get_networks(false).await?;
 
-    // The synthesised envelope's `meta` is the ORIGINAL `/networks` response's `meta`, not
-    // `/account`'s (whose `server_time` is a different, fixture-owned value — see
-    // `tests/fixtures/account.json`).
     assert_eq!(env.meta().code, Some(200));
     assert_eq!(
         env.meta().server_time.as_deref(),
@@ -119,7 +110,28 @@ async fn get_networks_does_not_fall_back_when_the_list_is_non_empty() -> anyhow:
     Ok(())
 }
 
-// ===================== One representative mutation =====================
+// ===================== get_premium_status =====================
+
+#[tokio::test]
+async fn get_premium_status_passes_the_cached_network_as_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    // Populate the `network[nid]` cache entry `get_premium_status` will pass as `parent=`.
+    client.get_network(Some("network-0001"), false).await?;
+    let env = client.get_premium_status(Some("network-0001")).await?;
+    assert_eq!(env.as_value(), &fixture_json("network.json"));
+    Ok(())
+}
+
+// ===================== One representative mutation: set_network_name =====================
 
 #[tokio::test]
 async fn set_network_name_reaches_the_settings_put_endpoint() -> anyhow::Result<()> {
@@ -142,12 +154,6 @@ async fn set_network_name_reaches_the_settings_put_endpoint() -> anyhow::Result<
 
 // ===================== Targeted invalidation: the core claim =====================
 
-/// **Broken/restored in place** (see this suite's module docs and the task's red/green
-/// requirement): the assertion below was temporarily changed to `.expect(1)` (asserting the
-/// second `get_network` call is served from cache), run, and observed to fail — RED — because
-/// `set_network_name` really does invalidate `network[nid]` and a second network request really
-/// is made. It was then restored to `.expect(2)` — GREEN. See this task's final report for the
-/// captured `cargo test` output of both runs.
 #[tokio::test]
 async fn set_network_name_invalidates_the_network_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
@@ -172,6 +178,173 @@ async fn set_network_name_invalidates_the_network_bucket() -> anyhow::Result<()>
         .set_network_name("New SSID", Some("network-0001"))
         .await?;
     client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_network_password_invalidates_the_network_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/password"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_network_password("hunter2", Some("network-0001"))
+        .await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_network_password_invalidates_the_network_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/password"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.clear_network_password(Some("network-0001")).await?;
+    Ok(())
+}
+
+// ===================== Guest network family =====================
+
+#[tokio::test]
+async fn get_guest_network_reaches_the_guestnetwork_get_endpoint() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({"meta": {"code": 200}, "data": {"enabled": true}});
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_guest_network(Some("network-0001")).await?;
+    assert_eq!(env.as_value(), &body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_guest_password_reaches_the_password_endpoint_and_invalidates_the_network()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork/password"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .set_guest_password("hunter2", Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_guest_password_reaches_the_password_endpoint() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/guestnetwork/password"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.clear_guest_password(Some("network-0001")).await?;
+    Ok(())
+}
+
+// ===================== Speed test family =====================
+
+#[tokio::test]
+async fn run_speed_test_invalidates_the_network_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/speedtest"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.run_speed_test(Some("network-0001")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_speed_tests_forwards_every_kwarg() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/speedtest"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":[]})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .get_speed_tests(Some("network-0001"), Some(3), None, None)
+        .await?;
+    assert_eq!(env.data(), &json!([]));
+    Ok(())
+}
+
+// ===================== reboot_network (no `client.py` precedent) =====================
+
+#[tokio::test]
+async fn reboot_network_invalidates_the_network_bucket() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/reboot"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.reboot_network(Some("network-0001")).await?;
     Ok(())
 }
 
@@ -259,15 +432,16 @@ async fn a_failed_write_does_not_invalidate_the_cache() -> anyhow::Result<()> {
 /// **F5** (superseded by the v8.0.4 error model, still worth pinning): a value that looks like a
 /// credential but sits under an unrelated key (e.g. a guest Wi-Fi password echoed back verbatim
 /// in a `400`'s `error` field) can no longer reach `Error::Api.message` at all — `message` is
-/// built entirely from `errors::message_for_error_code` (a catalogue string, or the fixed
-/// `"unrecognised error string"` fallback), never from the raw response body. This asserts the
-/// resulting `Error`'s `Display` never contains the submitted password.
+/// built entirely from `errors::message_for_error_code`, never from the raw response body. This
+/// asserts the resulting `Error`'s `Display` never contains the submitted password. Moved onto
+/// `set_guest_password` at v8.0.4, since `set_guest_network` no longer carries a `password=`
+/// argument at all.
 #[tokio::test]
 async fn a_password_echoed_under_a_non_sensitive_key_is_suppressed_from_the_error()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .and(path("/2.2/networks/network-0001/guestnetwork/password"))
         .and(session_cookie())
         .respond_with(
             ResponseTemplate::new(400)
@@ -279,7 +453,7 @@ async fn a_password_echoed_under_a_non_sensitive_key_is_suppressed_from_the_erro
 
     let client = client(&mock).await;
     let err = client
-        .set_guest_network(true, None, Some("hunter2"), Some("network-0001"))
+        .set_guest_password("hunter2", Some("network-0001"))
         .await
         .unwrap_err();
     let rendered = err.to_string();

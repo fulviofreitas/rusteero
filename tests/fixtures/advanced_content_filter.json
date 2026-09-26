@@ -1,0 +1,7 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:57Z" },
+  "data": {
+    "allowed_list": [{ "domain": "homework.example" }],
+    "blocked_list": [{ "domain": "ads.example" }]
+  }
+}

@@ -1,7 +1,12 @@
-//! `Client` methods for the `DnsAPI` domain.
+//! `Client` methods for the `DnsAPI` domain, v8.0.4.
+//!
+//! Ported from `eero-api src/eero/client.py:2080-2158` (the DNS group of `EeroClient`). Every
+//! write below passes `**self._network_parent_kwargs(network_id)` in Python
+//! (`client.py:2080-2158`) — this port's [`Client::network_parent`] equivalent — except
+//! [`Client::get_dns_settings`], whose underlying [`crate::endpoints::dns::DnsApi::get_dns_settings`]
+//! has no `parent` parameter at all (see that method's own docs).
 
 use super::Client;
-use crate::cache::CacheKey;
 use crate::envelope::Envelope;
 use crate::error::Error;
 
@@ -10,7 +15,7 @@ impl Client {
 
     /// Gets DNS settings — returns the raw Eero API response.
     ///
-    /// Ported from `get_dns_settings()` (`client.py:1173-1176`). `auto_discover = false` — see
+    /// Ported from `get_dns_settings()` (`client.py:2080-2083`). `auto_discover = false` — see
     /// [`Client::get_diagnostics`].
     ///
     /// # Errors
@@ -22,21 +27,13 @@ impl Client {
     }
 
     // ==================== DNS (mutations) ====================
-    //
-    // Divergence from eero-api: every setter in this group invalidates `network[nid]`, even
-    // though not one of them does in Python (behaviour brief §2/§2.1, gotcha G3). `DnsApi`'s six
-    // setters all `PUT networks/{nid}/settings` through the shared `put_network_settings` call
-    // site (`src/endpoints/networks.rs`) — the exact same resource `Client::get_network` caches —
-    // so a `get_network()` call served from cache right after any of these would echo back
-    // pre-write data for as long as the TTL lasts. `rust-port-plan.md` §3.8 and `cache.rs`'s own
-    // module docs ("what's new" (b)) name this as one of this port's two deliberate improvements
-    // over Python; it applies to every DNS setter uniformly, including the two below with no
-    // `client.py` precedent at all — not just the three Python happens to wrap.
 
     /// Enables or disables DNS caching — returns the raw Eero API response.
     ///
-    /// Ported from `set_dns_caching` (`eero-api src/eero/client.py:1178-1183`). `auto_discover =
-    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    /// Ported from `set_dns_caching` (`client.py:2094-2102`). `auto_discover = false`. On
+    /// success, invalidates `network[nid]` — DNS settings live inside the network resource, so
+    /// any DNS write makes a cached snapshot stale (mirrors `client.py`'s own
+    /// `_invalidate_network_cache`, `client.py:2085-2092`).
     ///
     /// # Errors
     ///
@@ -47,64 +44,128 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        let response = self.api.dns().set_dns_caching(&network_id, enabled).await?;
-        self.cache
-            .invalidate(&CacheKey::network(network_id.as_str()));
+        let parent = self.network_parent(&network_id);
+        let response = self
+            .api
+            .dns()
+            .set_dns_caching(&network_id, enabled, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(&network_id);
         Ok(response)
     }
 
-    /// Sets custom DNS servers — returns the raw Eero API response.
+    /// Sets custom DNS servers from a mixed IPv4/IPv6 list — returns the raw Eero API response.
     ///
-    /// Ported from `set_custom_dns` (`eero-api src/eero/client.py:1185-1190`). `auto_discover =
-    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    /// Ported from `set_custom_dns` (`client.py:2105-2113`). `auto_discover = false`. On success,
+    /// invalidates `network[nid]` — see [`Client::set_dns_caching`].
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    /// See [`crate::endpoints::dns::DnsApi::set_custom_dns`], otherwise
+    /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn set_custom_dns(
         &self,
         dns_servers: &[&str],
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent(&network_id);
         let response = self
             .api
             .dns()
-            .set_custom_dns(&network_id, dns_servers)
+            .set_custom_dns(&network_id, dns_servers, parent.as_ref())
             .await?;
-        self.cache
-            .invalidate(&CacheKey::network(network_id.as_str()));
+        self.invalidate_network_cache(&network_id);
         Ok(response)
     }
 
-    /// Clears custom DNS servers (reverts to automatic DNS) — returns the raw Eero API response.
+    /// Sets the IPv4 custom DNS servers, leaving IPv6 untouched — returns the raw Eero API
+    /// response.
     ///
-    /// No `client.py` precedent: `eero-api` never wrapped `DnsAPI.clear_custom_dns`
-    /// (`api/dns.py:126`) on `EeroClient`. [`crate::endpoints::DnsApi::clear_custom_dns`] itself
-    /// delegates to `DnsApi::set_custom_dns([])` — the same resource [`Client::set_custom_dns`]
-    /// mutates — so this method follows the same cache behaviour: `auto_discover = false`,
-    /// invalidates `network[nid]` on success.
+    /// Ported from `set_custom_dns_ipv4` (`client.py:2116-2124`). `auto_discover = false`. On
+    /// success, invalidates `network[nid]` — see [`Client::set_dns_caching`].
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
-    pub async fn clear_custom_dns(&self, network_id: Option<&str>) -> Result<Envelope, Error> {
+    /// See [`crate::endpoints::dns::DnsApi::set_custom_dns_ipv4`], otherwise
+    /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_custom_dns_ipv4(
+        &self,
+        dns_servers: &[&str],
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        let response = self.api.dns().clear_custom_dns(&network_id).await?;
-        self.cache
-            .invalidate(&CacheKey::network(network_id.as_str()));
+        let parent = self.network_parent(&network_id);
+        let response = self
+            .api
+            .dns()
+            .set_custom_dns_ipv4(&network_id, dns_servers, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(&network_id);
         Ok(response)
     }
 
-    /// Sets DNS mode to a preset or a custom server list — returns the raw Eero API response.
+    /// Sets the IPv6 custom DNS servers, leaving IPv4 untouched — returns the raw Eero API
+    /// response.
     ///
-    /// Ported from `set_dns_mode` (`eero-api src/eero/client.py:1192-1200`). `auto_discover =
-    /// false`. On success, invalidates `network[nid]` — see this group's banner comment above.
+    /// Ported from `set_custom_dns_ipv6` (`client.py:2127-2135`). `auto_discover = false`. On
+    /// success, invalidates `network[nid]` — see [`Client::set_dns_caching`].
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation { field: "mode", .. }` for an unrecognised `mode` — see
-    /// [`crate::endpoints::DnsApi::set_dns_mode`]'s own docs. Otherwise see
+    /// See [`crate::endpoints::dns::DnsApi::set_custom_dns_ipv6`], otherwise
+    /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_custom_dns_ipv6(
+        &self,
+        dns_servers: &[&str],
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent(&network_id);
+        let response = self
+            .api
+            .dns()
+            .set_custom_dns_ipv6(&network_id, dns_servers, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(&network_id);
+        Ok(response)
+    }
+
+    /// Switches DNS back to automatic (non-destructive) — returns the raw Eero API response.
+    ///
+    /// Ported from `clear_custom_dns` (`client.py:2138-2151`). `family = Some("ipv4")`/
+    /// `Some("ipv6")` clears one family only; `None` (the default) clears both.
+    /// `auto_discover = false`. On success, invalidates `network[nid]` — see
+    /// [`Client::set_dns_caching`].
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::endpoints::dns::DnsApi::clear_custom_dns`], otherwise
+    /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn clear_custom_dns(
+        &self,
+        family: Option<&str>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent(&network_id);
+        let response = self
+            .api
+            .dns()
+            .clear_custom_dns(&network_id, family, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(&network_id);
+        Ok(response)
+    }
+
+    /// Sets DNS mode — returns the raw Eero API response.
+    ///
+    /// Ported from `set_dns_mode` (`client.py:2153-2163`). `auto_discover = false`. On success,
+    /// invalidates `network[nid]` — see [`Client::set_dns_caching`].
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::endpoints::dns::DnsApi::set_dns_mode`], otherwise
     /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn set_dns_mode(
         &self,
@@ -113,33 +174,13 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent(&network_id);
         let response = self
             .api
             .dns()
-            .set_dns_mode(&network_id, mode, custom_servers)
+            .set_dns_mode(&network_id, mode, custom_servers, parent.as_ref())
             .await?;
-        self.cache
-            .invalidate(&CacheKey::network(network_id.as_str()));
-        Ok(response)
-    }
-
-    /// Enables or disables IPv6 DNS (upstream only) — returns the raw Eero API response.
-    ///
-    /// No `client.py` precedent — see [`Client::clear_custom_dns`]'s docs; the same reasoning
-    /// applies here. `auto_discover = false`. On success, invalidates `network[nid]`.
-    ///
-    /// # Errors
-    ///
-    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
-    pub async fn set_ipv6_dns(
-        &self,
-        enabled: bool,
-        network_id: Option<&str>,
-    ) -> Result<Envelope, Error> {
-        let network_id = self.ensure_network_id(network_id, false).await?;
-        let response = self.api.dns().set_ipv6_dns(&network_id, enabled).await?;
-        self.cache
-            .invalidate(&CacheKey::network(network_id.as_str()));
+        self.invalidate_network_cache(&network_id);
         Ok(response)
     }
 }

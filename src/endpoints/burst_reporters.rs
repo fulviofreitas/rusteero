@@ -1,12 +1,14 @@
-//! Burst Reporters API: `eero-api`'s `BurstReportersAPI`.
+//! Burst Reporters API: `eero-api`'s `BurstReportersAPI`, POST-only since v8.0.0.
 //!
-//! Ported from `eero-api src/eero/api/burst_reporters.py`:
-//! `BurstReportersAPI.get_burst_reporters` and `BurstReportersAPI.create_burst_reporter`.
+//! Ported from `eero-api src/eero/api/burst_reporters.py`: `BurstReportersAPI.get_burst_reporters`
+//! was removed upstream in v8.0.0 — the endpoint 404s; the resource is POST-only
+//! (`.claude/tasks/briefs/v8/g7-backup-members.md` §2) — and is **not** reproduced here. Only
+//! `create_burst_reporter` remains.
 //!
-//! Every method here funnels through `Transport::send`, which already implements the "not
-//! authenticated" precondition Python repeats at the top of each method (`get_auth_token()` /
-//! `EeroAuthenticationException("Not authenticated")`) and every status-to-error mapping a
-//! response can produce — so, unlike the Python source, no method below duplicates that guard.
+//! `create_burst_reporter` funnels through `Transport::resource`, which already implements the
+//! "not authenticated" precondition Python repeats at the top of the method (`get_auth_token()`
+//! / `EeroAuthenticationException("Not authenticated")`) and every status-to-error mapping a
+//! response can produce — so, unlike the Python source, this method never duplicates that guard.
 
 use std::sync::Arc;
 
@@ -15,13 +17,13 @@ use serde_json::Value;
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
-use crate::transport::Transport;
+use crate::transport::{RequestBody, Transport};
 
 /// `eero-api`'s `BurstReportersAPI` (`src/eero/api/burst_reporters.py`).
 ///
 /// Build one with `BurstReportersApi::new`, wrapping a `Transport` already shared with the rest
-/// of the (not-yet-built) `EeroApi` aggregator — `BurstReportersApi` never constructs or owns a
-/// `Transport` itself.
+/// of the `EeroApi` aggregator — `BurstReportersApi` never constructs or owns a `Transport`
+/// itself.
 #[derive(Debug)]
 pub struct BurstReportersApi {
     transport: Arc<Transport>,
@@ -39,50 +41,35 @@ impl BurstReportersApi {
         Self { transport }
     }
 
-    /// `GET /2.2/networks/{network_id}/burst_reporters` — list burst reporters.
-    ///
-    /// Ported from `BurstReportersAPI.get_burst_reporters` (`burst_reporters.py:33-54`).
-    /// Returns the raw `{"meta": …, "data": [...]}` envelope; this method never inspects or
-    /// reshapes it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
-    /// before any request is sent, or whatever other status-mapped error the request produces —
-    /// see `Transport::send`.
-    pub async fn get_burst_reporters(&self, network_id: &str) -> Result<Envelope, Error> {
-        self.transport
-            .send(
-                &routes::GET_BURST_REPORTERS,
-                &[("network_id", network_id)],
-                None,
-            )
-            .await
-    }
-
     /// `POST /2.2/networks/{network_id}/burst_reporters` — create a burst reporter.
     ///
     /// Ported from `BurstReportersAPI.create_burst_reporter` (`burst_reporters.py:56-81`).
-    /// Sends `routes::CREATE_BURST_REPORTER` with `reporter_data` attached as the request's JSON
-    /// body exactly as given. Python accepts an arbitrary `reporter_data: Dict[str, Any]` and
-    /// forwards it verbatim as the request JSON with no client-side key allowlist or shape
-    /// validation; this port does the same — a pure passthrough.
+    /// Prefers `parent`'s own published `burst_reporters` link over the literal template when
+    /// supplied (`routes::CREATE_BURST_REPORTER::link`) — new in this port; the pre-v8.0.4
+    /// revision of this method had no `parent=`/published-link concept at all. `reporter_data`
+    /// is forwarded verbatim as the request's JSON body; Python accepts an arbitrary
+    /// `reporter_data: Dict[str, Any]` with no client-side key allowlist or shape validation
+    /// (`burst_reporters.py:74-79`), and this port does the same — a pure passthrough.
     ///
     /// # Errors
     ///
     /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
     /// before any request is sent, or whatever other status-mapped error the request produces —
-    /// see `Transport::send`.
+    /// see `Transport::resource`.
     pub async fn create_burst_reporter(
         &self,
         network_id: &str,
         reporter_data: Value,
+        parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        crate::links::warn_uncharacterised_write("create burst reporter for network");
         self.transport
-            .send(
+            .resource(
                 &routes::CREATE_BURST_REPORTER,
-                &[("network_id", network_id)],
-                Some(reporter_data),
+                network_id,
+                parent,
+                &[],
+                RequestBody::Json(reporter_data),
             )
             .await
     }

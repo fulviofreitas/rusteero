@@ -5,11 +5,6 @@
 //! matching the shape exercised by the corresponding `eero-api` unit test
 //! (`tests/api/test_ac_compat.py`). No real MACs, serials, IPs or names appear in any fixture
 //! here.
-//!
-//! Per the crate's testing conventions, the test pins the exact verb, path and session cookie
-//! against a local `wiremock` server, and asserts the returned `Envelope` is byte-identical to
-//! the body served via `into_value()` — the raw wire payload is the contract, never a reshaped
-//! view of it.
 
 mod common;
 
@@ -20,12 +15,16 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
+
+fn ac_compat_api(mock: &MockEero) -> ACCompatApi {
+    ACCompatApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
+}
 
 // ===================== get_ac_compat =====================
 
 #[tokio::test]
-async fn get_ac_compat_hits_v22_path_with_session_cookie_and_matches_body() -> anyhow::Result<()> {
+async fn get_ac_compat_bare_id_falls_back_to_the_template() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let body = json!({
         "meta": {"code": 200},
@@ -34,14 +33,42 @@ async fn get_ac_compat_hits_v22_path_with_session_cookie_and_matches_body() -> a
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/ac_compat"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
-    let api = ACCompatApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    let env = api.get_ac_compat("network-0001").await?;
+    let env = ac_compat_api(&mock)
+        .get_ac_compat("network-0001", None)
+        .await?;
 
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_ac_compat_prefers_the_parents_ac_compat_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": {"code": 200}, "data": {"compatible": false} });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/ac_compat"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/custom-ac-compat"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"ac_compat": "/2.2/networks/network-0001/custom-ac-compat"}});
+    let env = ac_compat_api(&mock)
+        .get_ac_compat("network-0001", Some(&parent))
+        .await?;
     assert_eq!(env.into_value(), body);
     Ok(())
 }

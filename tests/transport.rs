@@ -1,10 +1,10 @@
-//! v8.0.4 transport suite: `Transport::send`/`send_with_query`'s status-code mapping, the 10 MiB
+//! v8.0.4 transport suite: `Transport::request`/`resource`'s status-code mapping, the 10 MiB
 //! response cap, redirect refusal, header construction, credential placement (`X-User-Token` +
 //! optional legacy cookie), `RequestBody` encoding, the bounded `GET`-only retry, and the
 //! server-driven refresh handshake (including single-flight coalescing), all against a local
 //! `wiremock` server per the crate's testing conventions. `Transport`'s own unit tests (in
-//! `src/transport.rs`) already cover `parse_retry_after`, `refresh_signal_detected`, `render_url`,
-//! and `matches_configured_host` in isolation; this file exercises the same logic end-to-end, over
+//! `src/transport.rs`) already cover `parse_retry_after`, `refresh_signal_detected`, and
+//! `matches_configured_host` in isolation; this file exercises the same logic end-to-end, over
 //! real HTTP.
 
 mod common;
@@ -17,7 +17,7 @@ use reqwest::header::COOKIE;
 use rusteero::auth::Session;
 use rusteero::consts::MAX_RESPONSE_BYTES;
 use rusteero::error::Error;
-use rusteero::routes::{ACCOUNT, ApiVersion, Route};
+use rusteero::routes::{ACCOUNT, ApiVersion, Nested, Resource};
 use rusteero::transport::{RequestBody, Transport};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
@@ -27,23 +27,26 @@ use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_t
 
 // ===================== shared helpers =====================
 
-/// A `PUT /2.3/networks/{network_id}/devices/{device_id}`-shaped route, assembled ad hoc exactly
-/// as `routes.rs`'s own doc comment permits.
-fn device_put_route() -> Route {
-    Route {
+/// A `PUT /2.3/networks/{network}/devices/{device}`-shaped route, assembled ad hoc exactly as
+/// `routes/mod.rs`'s own doc comment permits.
+fn device_put_route() -> Nested {
+    Nested {
         method: Method::PUT,
         version: ApiVersion::V2_3,
-        path: "networks/{network_id}/devices/{device_id}",
+        prefix: "devices",
+        suffix: "",
+        link: None,
     }
 }
 
-/// A `GET /2.2/networks/{network_id}/data_usage`-shaped route: the one place in the whole port
-/// that sends a `GET` with a JSON body attached.
-fn data_usage_route() -> Route {
-    Route {
+/// A `GET /2.2/networks/{id}/data_usage`-shaped route: the one place in the whole port that
+/// sends a `GET` with a JSON body attached.
+fn data_usage_route() -> Resource {
+    Resource {
         method: Method::GET,
         version: ApiVersion::V2_2,
-        path: "networks/{network_id}/data_usage",
+        template: "networks/{id}/data_usage",
+        link: None,
     }
 }
 
@@ -91,7 +94,9 @@ async fn status_200_returns_the_raw_envelope_byte_identically() -> anyhow::Resul
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    let env = transport.send(&ACCOUNT, &[], None).await?;
+    let env = transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
 
     assert_eq!(env.into_value(), fixture_json("account.json"));
     Ok(())
@@ -111,7 +116,9 @@ async fn empty_2xx_body_becomes_envelope_over_empty_object() -> anyhow::Result<(
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    let env = transport.send(&ACCOUNT, &[], None).await?;
+    let env = transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
 
     assert_eq!(env.into_value(), json!({}));
     Ok(())
@@ -130,7 +137,9 @@ async fn status_204_with_a_body_becomes_empty_object_without_ever_parsing_it() -
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    let env = transport.send(&ACCOUNT, &[], None).await?;
+    let env = transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
 
     assert_eq!(env.into_value(), json!({}));
     Ok(())
@@ -151,7 +160,7 @@ async fn invalid_json_on_a_2xx_is_api_error_not_json_error() -> anyhow::Result<(
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("malformed JSON on a 2xx must not parse as an envelope");
 
@@ -174,7 +183,7 @@ async fn status_401_is_authentication_error_and_is_auth_error_true() -> anyhow::
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a plain 401 must surface as Error::Authentication");
 
@@ -197,7 +206,7 @@ async fn status_404_is_not_found_with_the_catalogue_message_shape_and_is_not_an_
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a 404 must surface as Error::NotFound");
 
@@ -227,7 +236,7 @@ async fn status_429_with_delta_seconds_retry_after_carries_the_parsed_duration()
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("429 must surface as Error::RateLimit");
 
@@ -256,7 +265,7 @@ async fn status_500_is_api_error_with_the_fixed_unrecognised_message_never_the_b
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a 500 must surface as Error::Api");
 
@@ -303,7 +312,7 @@ async fn redirect_is_refused_and_never_reaches_the_location_host() -> anyhow::Re
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a 3xx with a Location header must be refused, not followed");
 
@@ -359,7 +368,7 @@ async fn injected_client_that_follows_redirects_is_still_refused() -> anyhow::Re
         .expect("builds with an injected client");
 
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a followed redirect must surface as an error, not the hop's body");
     let Error::Api {
@@ -389,7 +398,7 @@ async fn body_larger_than_the_cap_is_an_api_error() -> anyhow::Result<()> {
 
     let transport = transport_with_generous_timeouts(&mock, TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a body one byte over the cap must be rejected");
 
@@ -411,7 +420,7 @@ async fn body_exactly_at_the_cap_is_accepted() -> anyhow::Result<()> {
 
     let transport = transport_with_generous_timeouts(&mock, TEST_TOKEN);
     let env = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect("a body exactly at the cap must be accepted, not rejected");
 
@@ -431,7 +440,7 @@ async fn no_session_is_authentication_error_and_the_server_receives_zero_request
     let transport = mock.transport_anonymous();
 
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("no session configured means the precondition fires before any request");
     assert!(
@@ -466,7 +475,7 @@ async fn a_get_request_with_a_json_body_actually_arrives_with_that_body() -> any
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let env = transport
-        .send(&route, &[("network_id", "network-0001")], Some(body))
+        .resource(&route, "network-0001", None, &[], RequestBody::Json(body))
         .await?;
 
     assert_eq!(env.into_value(), json!({}));
@@ -496,12 +505,17 @@ async fn v2_3_routes_hit_the_2_3_host_while_v2_2_routes_hit_the_2_2_host() -> an
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    transport.send(&ACCOUNT, &[], None).await?;
     transport
-        .send(
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
+    transport
+        .nested(
             &device_put,
-            &[("network_id", "network-0001"), ("device_id", "aa:bb")],
-            Some(json!({ "nickname": "renamed" })),
+            "network-0001",
+            "aa:bb",
+            None,
+            &[],
+            RequestBody::Json(json!({ "nickname": "renamed" })),
         )
         .await?;
     Ok(())
@@ -523,7 +537,13 @@ async fn query_parameters_are_sent_via_send_with_query() -> anyhow::Result<()> {
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let env = transport
-        .send_with_query(&ACCOUNT, &[], &[("since", "1700000000".to_owned())], None)
+        .resource(
+            &ACCOUNT,
+            "",
+            None,
+            &[("since", "1700000000".to_owned())],
+            RequestBody::None,
+        )
         .await?;
 
     assert_eq!(env.meta().code, Some(200));
@@ -549,7 +569,9 @@ async fn every_request_carries_accept_user_agent_and_accept_language() -> anyhow
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    transport.send(&ACCOUNT, &[], None).await?;
+    transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
     Ok(())
 }
 
@@ -571,7 +593,9 @@ async fn user_agent_and_accept_language_can_be_overridden() -> anyhow::Result<()
         .user_agent(Some("custom-agent/1.0".to_owned()))
         .accept_language("fr-FR")
         .build()?;
-    transport.send(&ACCOUNT, &[], None).await?;
+    transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
     Ok(())
 }
 
@@ -599,7 +623,9 @@ async fn x_user_token_and_legacy_cookie_are_both_sent_by_default() -> anyhow::Re
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    transport.send(&ACCOUNT, &[], None).await?;
+    transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
     Ok(())
 }
 
@@ -620,7 +646,9 @@ async fn legacy_cookie_is_absent_when_disabled() -> anyhow::Result<()> {
         .session(Some(Session::from_token(TEST_TOKEN)))
         .send_legacy_cookie(false)
         .build()?;
-    transport.send(&ACCOUNT, &[], None).await?;
+    transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
     Ok(())
 }
 
@@ -748,7 +776,9 @@ async fn get_is_retried_on_a_5xx_and_succeeds_on_the_second_attempt() -> anyhow:
         .session(Some(Session::from_token(TEST_TOKEN)))
         .get_retries(1)
         .build()?;
-    let env = transport.send(&ACCOUNT, &[], None).await?;
+    let env = transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
     assert_eq!(env.meta().code, Some(200));
     Ok(())
 }
@@ -769,7 +799,7 @@ async fn a_post_is_never_retried_even_on_a_5xx() -> anyhow::Result<()> {
         .get_retries(3)
         .build()?;
     let err = transport
-        .send(&rusteero::routes::LOGOUT, &[], None)
+        .resource(&rusteero::routes::LOGOUT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a 503 still surfaces as an error");
     assert!(matches!(err, Error::Api { status: 503, .. }));
@@ -792,7 +822,7 @@ async fn a_404_is_never_retried() -> anyhow::Result<()> {
         .get_retries(3)
         .build()?;
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("a 404 still surfaces as an error");
     assert!(matches!(err, Error::NotFound { .. }));
@@ -811,7 +841,7 @@ async fn get_retries_zero_means_no_retry_at_all() -> anyhow::Result<()> {
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("no retries configured means a single failing attempt");
     assert!(matches!(err, Error::Api { status: 503, .. }));
@@ -852,7 +882,9 @@ async fn a_401_session_refresh_signal_triggers_one_replay_with_the_refreshed_tok
         .await;
 
     let transport = mock.transport_with_token(TEST_TOKEN);
-    let env = transport.send(&ACCOUNT, &[], None).await?;
+    let env = transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
     assert_eq!(env.into_value(), fixture_json("account.json"));
     Ok(())
 }

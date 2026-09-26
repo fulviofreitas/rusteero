@@ -1,230 +1,400 @@
-//! HTTP integration tests for `ScheduleApi` (`src/endpoints/schedule.rs`) against a local
-//! `wiremock` server per the crate's testing conventions.
-//!
-//! [`ScheduleApi::get_profile_schedule`] hits the exact same path as `ProfilesApi::get_profile`
-//! and returns the whole profile object untransformed — no `schedule`-field extraction.
-//!
-//! Every mutating test pins the exact verb, path and JSON body (`body_json`) `wiremock`
-//! receives, plus the session cookie, with a `.expect(n)` call count — a wrong verb, path, or
-//! body shape fails to match the mock and the request comes back unmocked (404), which is what
-//! turns a request-shape regression into a loud test failure instead of a silent pass.
-//!
-//! [`set_weekday_bedtime_emits_a_bedtime_block_scoped_to_monday_through_friday`] proves the
-//! weekday delegator emits the Monday-through-Friday day list, not all seven days; it was
-//! red-then-green verified by hand (see the task report for the exact command output).
+//! HTTP integration tests for `ScheduleApi` (v8.0.4) — scheduled pauses as sub-resources of a
+//! profile, per the crate's testing conventions.
 
 mod common;
 
 use std::sync::Arc;
 
 use rusteero::endpoints::schedule::ScheduleApi;
+use rusteero::error::Error;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 
 fn schedule_api(mock: &MockEero) -> ScheduleApi {
     ScheduleApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
 }
 
-// ===================== get_profile_schedule =====================
+// ===================== get_schedules =====================
 
 #[tokio::test]
-async fn get_profile_schedule_hits_networks_profiles_id_and_returns_the_whole_profile()
--> anyhow::Result<()> {
+async fn get_schedules_builds_the_profile_schedules_collection_url() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let response = json!({
-        "meta": { "code": 200 },
-        "data": {
-            "name": "Kids",
-            "schedule": [{ "days": ["monday"], "start": "21:00", "end": "07:00" }],
-        },
-    });
-
     Mock::given(method("GET"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
         .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedules.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = schedule_api(&mock);
     let env = api
-        .get_profile_schedule("network-0001", "profile-0001")
+        .get_schedules("network-0001", "profile-0001", None)
         .await?;
-    // Untransformed: the whole profile object comes back, not just its `schedule` field.
-    assert_eq!(env.into_value(), response);
+    assert_eq!(env.into_value(), fixture_json("schedules.json"));
     Ok(())
 }
 
-// ===================== set_profile_schedule =====================
-
 #[tokio::test]
-async fn set_profile_schedule_puts_the_time_blocks_verbatim() -> anyhow::Result<()> {
+async fn get_schedules_prefers_the_parents_published_schedules_link() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+    Mock::given(method("GET"))
+        .and(path(
+            "/2.5/networks/network-0001/profiles/profile-0001/schedules",
+        ))
         .and(session_cookie())
-        .and(body_json(json!({
-            "schedule": [
-                { "days": ["monday", "wednesday"], "start": "08:00", "end": "15:00" }
-            ]
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedules.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = schedule_api(&mock);
-    let block = json!({ "days": ["monday", "wednesday"], "start": "08:00", "end": "15:00" });
-    api.set_profile_schedule("network-0001", "profile-0001", &[block])
+    let parent = json!({
+        "resources": {
+            "schedules": "/2.5/networks/network-0001/profiles/profile-0001/schedules"
+        }
+    });
+    api.get_schedules("network-0001", "profile-0001", Some(&parent))
         .await?;
+    Ok(())
+}
+
+// ===================== create_schedule =====================
+
+#[tokio::test]
+async fn create_schedule_posts_all_five_fields_to_the_schedules_collection() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(json!({
+            "name": "Study Time",
+            "days": ["monday", "tuesday"],
+            "start": "15:00",
+            "end": "16:00",
+            "enabled": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    api.create_schedule(
+        "network-0001",
+        "profile-0001",
+        "Study Time",
+        &["monday", "tuesday"],
+        "15:00",
+        "16:00",
+        true,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+// ===================== update_schedule =====================
+
+#[tokio::test]
+async fn update_schedule_from_a_bare_path_sends_only_the_supplied_fields() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        ))
+        .and(session_cookie())
+        .and(body_json(json!({ "enabled": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    api.update_schedule(
+        "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        None,
+        None,
+        None,
+        None,
+        Some(false),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_schedule_from_an_envelope_uses_its_own_self_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        ))
+        .and(session_cookie())
+        .and(body_json(json!({ "start": "20:00" })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let parent = json!({
+        "url": "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001"
+    });
+    // The bare `"ignored"` id below is never used: `parent` takes over entirely once its own
+    // `url` resolves.
+    api.update_schedule(
+        "ignored",
+        None,
+        None,
+        Some("20:00"),
+        None,
+        None,
+        Some(&parent),
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_schedule_envelope_without_url_is_a_validation_error() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let parent = json!({"name": "no url field here"});
+    let err = api
+        .update_schedule(
+            "ignored",
+            Some("New name"),
+            None,
+            None,
+            None,
+            None,
+            Some(&parent),
+        )
+        .await
+        .expect_err("an envelope with no resolvable url must be a validation error");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "schedule"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_schedule_with_no_fields_supplied_fails_before_any_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let err = api
+        .update_schedule(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("no fields supplied must be a validation error, and must not hit the mock");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "schedule"));
+    Ok(())
+}
+
+// ===================== delete_schedule =====================
+
+#[tokio::test]
+async fn delete_schedule_deletes_its_own_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    api.delete_schedule(
+        "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
 // ===================== clear_profile_schedule =====================
 
 #[tokio::test]
-async fn clear_profile_schedule_puts_an_empty_array_not_null() -> anyhow::Result<()> {
+async fn clear_profile_schedule_issues_one_delete_per_pause() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+    Mock::given(method("GET"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
         .and(session_cookie())
-        .and(body_json(json!({ "schedule": [] })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedules.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0002",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = schedule_api(&mock);
-    api.clear_profile_schedule("network-0001", "profile-0001")
+    let results = api
+        .clear_profile_schedule("network-0001", "profile-0001", None)
         .await?;
+    assert_eq!(results.len(), 2);
     Ok(())
 }
 
-// ===================== enable_bedtime =====================
+#[tokio::test]
+async fn clear_profile_schedule_with_no_pauses_issues_no_deletes() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200},"data":[]}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let results = api
+        .clear_profile_schedule("network-0001", "profile-0001", None)
+        .await?;
+    assert!(results.is_empty());
+    Ok(())
+}
+
+// ===================== enable_bedtime / weekday / weekend =====================
 
 #[tokio::test]
 async fn enable_bedtime_with_no_days_defaults_to_all_seven() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
         .and(session_cookie())
         .and(body_json(json!({
-            "schedule": [{
-                "days": [
-                    "monday", "tuesday", "wednesday", "thursday",
-                    "friday", "saturday", "sunday"
-                ],
-                "start": "21:00",
-                "end": "07:00",
-                "type": "bedtime"
-            }]
+            "name": "Bedtime",
+            "days": [
+                "monday", "tuesday", "wednesday", "thursday",
+                "friday", "saturday", "sunday"
+            ],
+            "start": "21:00",
+            "end": "07:00",
+            "enabled": true
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = schedule_api(&mock);
-    api.enable_bedtime("network-0001", "profile-0001", "21:00", "07:00", None)
+    api.enable_bedtime("network-0001", "profile-0001", "21:00", "07:00", None, None)
         .await?;
     Ok(())
 }
 
-#[tokio::test]
-async fn enable_bedtime_with_explicit_days_uses_them_instead_of_the_default() -> anyhow::Result<()>
-{
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
-        .and(session_cookie())
-        .and(body_json(json!({
-            "schedule": [{
-                "days": ["friday"],
-                "start": "22:00",
-                "end": "06:00",
-                "type": "bedtime"
-            }]
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = schedule_api(&mock);
-    api.enable_bedtime(
-        "network-0001",
-        "profile-0001",
-        "22:00",
-        "06:00",
-        Some(&["friday"]),
-    )
-    .await?;
-    Ok(())
-}
-
-// ===================== set_weekday_bedtime =====================
-
-/// Proves the weekday delegator (`schedule.py:169-188`) scopes its bedtime block to Monday
-/// through Friday — not all seven days, and not some other subset.
-///
-/// Red-then-green verified by hand: temporarily changing `set_weekday_bedtime`'s call site in
-/// `src/endpoints/schedule.rs` to pass `Some(ALL_DAYS)` instead of `Some(WEEKDAYS)` made this
-/// test fail (the mocked body no longer matched, so the request came back unmocked); restoring
-/// `Some(WEEKDAYS)` made it pass again. See the task report for the exact command output.
+/// Proves the weekday delegator scopes its bedtime block to Monday through Friday only.
 #[tokio::test]
 async fn set_weekday_bedtime_emits_a_bedtime_block_scoped_to_monday_through_friday()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
         .and(session_cookie())
         .and(body_json(json!({
-            "schedule": [{
-                "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
-                "start": "20:30",
-                "end": "06:30",
-                "type": "bedtime"
-            }]
+            "name": "Bedtime",
+            "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+            "start": "20:30",
+            "end": "06:30",
+            "enabled": true
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = schedule_api(&mock);
-    api.set_weekday_bedtime("network-0001", "profile-0001", "20:30", "06:30")
+    api.set_weekday_bedtime("network-0001", "profile-0001", "20:30", "06:30", None)
         .await?;
     Ok(())
 }
-
-// ===================== set_weekend_bedtime =====================
 
 #[tokio::test]
 async fn set_weekend_bedtime_emits_a_bedtime_block_scoped_to_saturday_and_sunday()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
         .and(session_cookie())
         .and(body_json(json!({
-            "schedule": [{
-                "days": ["saturday", "sunday"],
-                "start": "23:00",
-                "end": "09:00",
-                "type": "bedtime"
-            }]
+            "name": "Bedtime",
+            "days": ["saturday", "sunday"],
+            "start": "23:00",
+            "end": "09:00",
+            "enabled": true
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = schedule_api(&mock);
-    api.set_weekend_bedtime("network-0001", "profile-0001", "23:00", "09:00")
+    api.set_weekend_bedtime("network-0001", "profile-0001", "23:00", "09:00", None)
         .await?;
     Ok(())
 }

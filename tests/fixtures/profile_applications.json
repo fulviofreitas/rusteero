@@ -1,0 +1,7 @@
+{
+  "meta": { "code": 200, "server_time": "2026-01-01T00:00:58Z" },
+  "data": {
+    "applications": [{ "id": "app_1", "name": "TikTok", "blocked": false }],
+    "categories_list": ["social", "gaming"]
+  }
+}

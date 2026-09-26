@@ -1,4 +1,5 @@
-//! `Client` integration suite for `BackupApi`'s faithful (Python-parity) non-invalidation.
+//! `Client` integration suite for `BackupApi` (rewritten for v8.0.4): network-id resolution and
+//! `set_backup_internet`'s `Net{nid}` cache invalidation.
 
 mod common;
 
@@ -21,30 +22,37 @@ async fn client(mock: &MockEero) -> Client {
         .expect("a MockServer's own URI is always a valid base URL")
 }
 
-/// **Broken/restored in place**: the assertion below was temporarily changed to `.expect(2)`
-/// (asserting the write *does* invalidate, matching `client_eeros.rs`/`client_dns.rs`), run, and
-/// observed to fail — RED — because `set_backup_network` faithfully invalidates nothing and the
-/// second `get_network` call really is served from cache. Restored to `.expect(1)` — GREEN. See
-/// this task's final report for the captured output of both runs.
-///
-/// This is the test that proves `set_led_brightness`/DNS invalidation (`client_eeros.rs`,
-/// `client_dns.rs`) is targeted rather than every write clearing every bucket:
-/// `set_backup_network` PUTs a completely different resource (`networks/{nid}/backup`, not
-/// `networks/{nid}/settings`) that Python never wires into any cache invalidation at all
-/// (behaviour brief §2, "Verified to invalidate nothing"), and this port does not add that as a
-/// third, uninstructed improvement.
 #[tokio::test]
-async fn backup_setter_does_not_invalidate_the_network_bucket() -> anyhow::Result<()> {
+async fn get_backup_internet_resolves_the_network_id_and_returns_the_envelope() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": { "enabled": false } });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/backupinternet"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_backup_internet(Some("network-0001")).await?;
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_backup_internet_invalidates_the_network_cache_entry() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
-        .expect(1)
+        .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/backup"))
+        .and(path("/2.2/networks/network-0001/backupinternet"))
         .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
@@ -54,10 +62,45 @@ async fn backup_setter_does_not_invalidate_the_network_bucket() -> anyhow::Resul
     let client = client(&mock).await;
     client.get_network(Some("network-0001"), false).await?;
     client
-        .set_backup_network(true, Some("network-0001"))
+        .set_backup_internet(true, Some("network-0001"))
         .await?;
     let second = client.get_network(Some("network-0001"), false).await?;
 
+    // Two `GET /2.2/networks/network-0001` calls (`.expect(2)` above) prove the second
+    // `get_network` re-hit the wire instead of serving the pre-write cached entry.
     assert_eq!(second.as_value(), &fixture_json("network.json"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_cellular_backup_usage_and_events_hit_their_own_paths() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let usage = json!({ "meta": { "code": 200 }, "data": { "bytes_used": 1024 } });
+    let events = json!({ "meta": { "code": 200 }, "data": { "events": [] } });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/cellular_backup_usage"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(usage.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/cellular_backup_events"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(events.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let usage_env = client
+        .get_cellular_backup_usage(Some("network-0001"))
+        .await?;
+    let events_env = client
+        .get_cellular_backup_events(Some("network-0001"))
+        .await?;
+
+    assert_eq!(usage_env.into_value(), usage);
+    assert_eq!(events_env.into_value(), events);
     Ok(())
 }

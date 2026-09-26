@@ -9,12 +9,10 @@
 //!
 //! # The v8.0.4 request API
 //!
-//! [`Transport::request`]/[`Transport::resource`]/[`Transport::nested`] are the current,
-//! `RequestBody`-aware entry points; see `.claude/tasks/briefs/v8/transport-api.md` for a worked
-//! example of each. [`Transport::send`]/[`Transport::send_with_query`] are kept as thin,
-//! JSON-only wrappers over [`Transport::request`] purely so the endpoint modules not yet migrated
-//! onto the `Resource`/`Nested` route model keep compiling and their tests keep passing; new code
-//! should prefer `request`/`resource`/`nested`.
+//! [`Transport::request`]/[`Transport::resource`]/[`Transport::nested`] are the request-building
+//! entry points; see `.claude/tasks/briefs/v8/transport-api.md` for a worked example of each.
+//! Every endpoint module builds on `resource`/`nested` (or, for the login handshake and session
+//! refresh, `request`/`request_with_token` directly against a fixed-path [`Resource`]).
 //!
 //! # Locking
 //!
@@ -53,7 +51,7 @@ use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::errors;
 use crate::redact;
-use crate::routes::{self, ApiVersion, Nested, Resource, Route};
+use crate::routes::{self, ApiVersion, Nested, Resource};
 use crate::storage::CredentialStore;
 
 /// The body a request carries, mirroring `eero-api`'s `RequestEncoding`
@@ -84,12 +82,10 @@ pub enum RequestBody {
 #[derive(Debug)]
 pub struct Transport {
     http: Client,
-    base_22: Url,
-    base_23: Url,
     /// Scheme + authority (host, and port when non-default) of the configured API host, with no
     /// path — what [`crate::links`]/[`crate::params`] and every [`Resource`]/[`Nested`] route
-    /// take as `host`. Derived from `base_22`'s origin at build time, so it already reflects a
-    /// `TransportBuilder::base_url` override (e.g. a wiremock server in tests).
+    /// take as `host`. Derived from the 2.2 base URL's origin at build time, so it already
+    /// reflects a `TransportBuilder::base_url` override (e.g. a wiremock server in tests).
     api_host: Url,
     session: RwLock<Option<Session>>,
     store: Option<Arc<dyn CredentialStore>>,
@@ -327,50 +323,6 @@ impl Transport {
         )
     }
 
-    /// Sends an authenticated request with no query-string parameters and a JSON-or-absent body,
-    /// through the legacy [`Route`] model. Equivalent to
-    /// `send_with_query(route, path_params, &[], body)`.
-    ///
-    /// **Legacy.** Kept only so endpoint modules not yet migrated onto [`Resource`]/[`Nested`]
-    /// keep compiling; see `.claude/tasks/briefs/v8/transport-api.md` for the migration this
-    /// wrapper stands in for.
-    ///
-    /// # Errors
-    ///
-    /// See [`Transport::send_with_query`].
-    pub async fn send(
-        &self,
-        route: &Route,
-        path_params: &[(&str, &str)],
-        body: Option<Value>,
-    ) -> Result<Envelope, Error> {
-        self.send_with_query(route, path_params, &[], body).await
-    }
-
-    /// Sends an authenticated request through the legacy [`Route`] model, JSON-only.
-    ///
-    /// **Legacy.** A thin wrapper over [`Transport::request`]: renders `route`'s path template
-    /// against `path_params` using this transport's configured base for `route`'s API version
-    /// (via `Transport::render_url`, which — unlike [`Resource`]/[`Nested`] — always targets
-    /// the *configured* base, so a `TransportBuilder::base_url` override still applies), then maps
-    /// `body` to [`RequestBody::Json`] (`Some`) or [`RequestBody::None`] (`None`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Validation`] if `route`'s template cannot be rendered against
-    /// `path_params`, otherwise as [`Transport::request`].
-    pub async fn send_with_query(
-        &self,
-        route: &Route,
-        path_params: &[(&str, &str)],
-        query: &[(&str, String)],
-        body: Option<Value>,
-    ) -> Result<Envelope, Error> {
-        let url = self.render_url(route, path_params)?;
-        let body = body.map_or(RequestBody::None, RequestBody::Json);
-        self.request(route.method.clone(), url, query, body).await
-    }
-
     /// Attempts to refresh the current session, ported from `AuthAPI._do_refresh`
     /// (`api/auth.py:415-477`) with single-flight coalescing ported from
     /// `AuthAPI.refresh_session` (`api/auth.py:331-413`).
@@ -470,7 +422,7 @@ impl Transport {
             ));
         };
 
-        let url = self.render_url(&routes::LOGIN_REFRESH, &[])?;
+        let url = routes::LOGIN_REFRESH.resolve(self.api_host(), "", None)?;
         match self
             .request_with_token(
                 Method::POST,
@@ -523,62 +475,6 @@ impl Transport {
     fn replace_session(&self, session: Option<Session>) {
         let mut guard = self.session.write().unwrap_or_else(PoisonError::into_inner);
         *guard = session;
-    }
-
-    /// Returns the configured base `Url` for `version`.
-    fn base_for(&self, version: ApiVersion) -> &Url {
-        match version {
-            ApiVersion::V2_2 => &self.base_22,
-            ApiVersion::V2_3 => &self.base_23,
-        }
-    }
-
-    /// Renders `route`'s path template against `params` into a full request `Url`, using this
-    /// transport's configured base for the route's API version.
-    ///
-    /// This intentionally duplicates the (small) segment-substitution loop from
-    /// `routes::Route::render` rather than calling it directly: `Route::render` always builds
-    /// against the *real* Eero host baked into `ApiVersion::base_url`, with no way to substitute
-    /// a test double, which is exactly what `TransportBuilder::base_url` needs. Every substituted
-    /// value is checked by `routes::validate_segment` — the same function `Route::render` calls —
-    /// before it is pushed onto the URL.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Validation` if the configured base URL cannot be extended
-    /// (`field: "base_url"`), if `route`'s template references a placeholder absent from
-    /// `params` (`field` is the placeholder name), or if a substituted value fails
-    /// `routes::validate_segment`.
-    pub(crate) fn render_url(&self, route: &Route, params: &[(&str, &str)]) -> Result<Url, Error> {
-        let mut url = self.base_for(route.version).clone();
-        {
-            let mut segments = url.path_segments_mut().map_err(|()| {
-                Error::validation(
-                    "base_url",
-                    "configured base URL cannot be used as a path base",
-                )
-            })?;
-            for part in route.path.split('/') {
-                if part.is_empty() {
-                    continue;
-                }
-                if let Some(name) = part.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                    let value = params
-                        .iter()
-                        .find(|(key, _)| *key == name)
-                        .map(|(_, value)| *value)
-                        .ok_or_else(|| {
-                            Error::validation(name, "missing value for path parameter")
-                        })?;
-                    routes::validate_segment(value)
-                        .map_err(|reason| Error::validation(name, reason.to_string()))?;
-                    segments.push(value);
-                } else {
-                    segments.push(part);
-                }
-            }
-        }
-        Ok(url)
     }
 
     /// Whether `url`'s scheme, host, and port (default-normalised) all match this transport's
@@ -1152,7 +1048,10 @@ impl TransportBuilder {
     /// outside the printable-ASCII range (or a CR/LF). Returns `Error::Network` if constructing
     /// the underlying `reqwest::Client` fails.
     pub fn build(self) -> Result<Transport, Error> {
-        let (base_22, base_23) = self.build_bases()?;
+        // Both bases are validated here, even though only the 2.2 base's origin is kept
+        // (`api_host`, below): a bad `base_url` override must fail at build time regardless of
+        // which API version a caller's first request happens to target.
+        let (base_22, _base_23) = self.build_bases()?;
         let api_host = {
             let origin = base_22.origin().ascii_serialization();
             Url::parse(&origin)
@@ -1181,8 +1080,6 @@ impl TransportBuilder {
 
         Ok(Transport {
             http,
-            base_22,
-            base_23,
             api_host,
             session: RwLock::new(self.session),
             store: self.store,
@@ -1201,8 +1098,8 @@ impl TransportBuilder {
             Some(root) => {
                 let trimmed = root.trim_end_matches('/');
                 (
-                    format!("{trimmed}/{}", version_segment(ApiVersion::V2_2)),
-                    format!("{trimmed}/{}", version_segment(ApiVersion::V2_3)),
+                    format!("{trimmed}/{}", ApiVersion::V2_2.segment()),
+                    format!("{trimmed}/{}", ApiVersion::V2_3.segment()),
                 )
             }
             None => (
@@ -1214,21 +1111,6 @@ impl TransportBuilder {
     }
 }
 
-/// The version path segment (e.g. `"2.2"`) baked into `version`'s production base URL.
-///
-/// # Panics
-///
-/// Never in practice: [`ApiVersion::base_url`] always returns one of `consts::API_BASE_22` /
-/// `consts::API_BASE_23`, both non-empty absolute URLs, so `rsplit('/').next()` always yields at
-/// least one item.
-fn version_segment(version: ApiVersion) -> &'static str {
-    version
-        .base_url()
-        .rsplit('/')
-        .next()
-        .expect("base_url is a non-empty static string; rsplit always yields at least one item")
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1236,11 +1118,9 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use url::Url;
 
-    use super::{
-        Route, Transport, parse_retry_after, refresh_signal_detected, validate_header_value,
-    };
+    use super::{Transport, parse_retry_after, refresh_signal_detected, validate_header_value};
     use crate::error::Error;
-    use crate::routes::{ACCOUNT, ApiVersion};
+    use crate::routes::{ACCOUNT, ApiVersion, Resource};
 
     // ===================== parse_retry_after =====================
 
@@ -1346,22 +1226,23 @@ mod tests {
         validate_header_value("x", "eero/3.0 (iPhone; iOS 17.0)").expect("printable ascii ok");
     }
 
-    // ===================== render_url / base selection =====================
+    // ===================== Resource::resolve / base selection =====================
 
-    fn v2_3_route() -> Route {
-        Route {
+    fn v2_3_resource() -> Resource {
+        Resource {
             method: reqwest::Method::PUT,
             version: ApiVersion::V2_3,
-            path: "networks/{network_id}/devices/{device_id}",
+            template: "networks/{id}/devices",
+            link: None,
         }
     }
 
     #[test]
-    fn default_bases_render_the_real_eero_hosts() {
+    fn default_bases_resolve_against_the_real_eero_host() {
         let transport = Transport::builder().build().expect("builds with defaults");
-        let url = transport
-            .render_url(&ACCOUNT, &[])
-            .expect("no placeholders needed");
+        let url = ACCOUNT
+            .resolve(transport.api_host(), "", None)
+            .expect("a fixed path always resolves");
         assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/account");
     }
 
@@ -1372,18 +1253,18 @@ mod tests {
             .build()
             .expect("builds with an overridden base");
 
-        let v22 = transport
-            .render_url(&ACCOUNT, &[])
-            .expect("v2.2 route renders");
+        let v22 = ACCOUNT
+            .resolve(transport.api_host(), "", None)
+            .expect("v2.2 resource resolves");
         assert_eq!(v22.as_str(), "http://127.0.0.1:9999/2.2/account");
 
-        let route = v2_3_route();
-        let v23 = transport
-            .render_url(&route, &[("network_id", "123"), ("device_id", "aa:bb")])
-            .expect("v2.3 route renders");
+        let resource = v2_3_resource();
+        let v23 = resource
+            .resolve(transport.api_host(), "123", None)
+            .expect("v2.3 resource resolves");
         assert_eq!(
             v23.as_str(),
-            "http://127.0.0.1:9999/2.3/networks/123/devices/aa:bb"
+            "http://127.0.0.1:9999/2.3/networks/123/devices"
         );
     }
 
@@ -1410,18 +1291,10 @@ mod tests {
             .base_url("http://127.0.0.1:9999/")
             .build()
             .expect("builds with a trailing-slash base");
-        let url = transport.render_url(&ACCOUNT, &[]).expect("route renders");
+        let url = ACCOUNT
+            .resolve(transport.api_host(), "", None)
+            .expect("resource resolves");
         assert_eq!(url.as_str(), "http://127.0.0.1:9999/2.2/account");
-    }
-
-    #[test]
-    fn render_url_missing_placeholder_is_a_validation_error() {
-        let transport = Transport::builder().build().expect("builds with defaults");
-        let route = v2_3_route();
-        let err = transport
-            .render_url(&route, &[("network_id", "123")])
-            .expect_err("device_id is missing");
-        assert!(matches!(err, Error::Validation { field, .. } if field == "device_id"));
     }
 
     #[test]
@@ -1431,26 +1304,6 @@ mod tests {
             .build()
             .expect_err("malformed base URL must fail fast");
         assert!(matches!(err, Error::Validation { field, .. } if field == "base_url"));
-    }
-
-    #[test]
-    fn render_url_rejects_a_value_that_becomes_a_dot_segment_after_stripping() {
-        let transport = Transport::builder().build().expect("builds with defaults");
-        let route = v2_3_route();
-        let err = transport
-            .render_url(&route, &[("network_id", "100"), ("device_id", "..\n")])
-            .expect_err("\"..\\n\" must not be allowed to collapse the rendered path");
-        assert!(matches!(err, Error::Validation { field, .. } if field == "device_id"));
-    }
-
-    #[test]
-    fn render_url_rejects_an_empty_placeholder_value() {
-        let transport = Transport::builder().build().expect("builds with defaults");
-        let route = v2_3_route();
-        let err = transport
-            .render_url(&route, &[("network_id", "100"), ("device_id", "")])
-            .expect_err("an empty value must not collapse the route onto its collection");
-        assert!(matches!(err, Error::Validation { field, .. } if field == "device_id"));
     }
 
     // ===================== session snapshot / is_authenticated =====================

@@ -8,8 +8,8 @@ impl Client {
     /// Gets transfer statistics for a network, or a single device on it — returns the raw Eero
     /// API response.
     ///
-    /// Ported from `get_transfer_stats()` (`client.py:929-934`). `auto_discover = false` — see
-    /// [`Client::get_diagnostics`].
+    /// Ported from `get_transfer_stats()` (`client.py:1571-1578`). `auto_discover = false` — see
+    /// [`Client::get_diagnostics`]. Passes the cached network envelope as `parent=` (`+net`).
     ///
     /// # Errors
     ///
@@ -20,9 +20,10 @@ impl Client {
         device_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent(network_id.as_str());
         self.api
             .transfer()
-            .get_transfer_stats(&network_id, device_id)
+            .get_transfer_stats(&network_id, device_id, parent.as_ref())
             .await
     }
 }

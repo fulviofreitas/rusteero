@@ -228,8 +228,18 @@ pub fn resource_url(
 
     let id = validate_identifier(id_or_url)?;
     let path = template.replacen(ID_PLACEHOLDER, id, 1);
-    let base = version.base_url().trim_end_matches('/');
-    let full = format!("{base}/{}", path.trim_start_matches('/'));
+    // Resolve against the *configured* host, never the production constant: `host` is the
+    // transport's `api_host()` (a wiremock server in tests, a caller-supplied `base_url` in
+    // production), exactly like the absolute-URL and path branches above and
+    // `Resource::resolve`'s fixed-path branch. Python's `resource_url` reads the global
+    // `api_endpoint(version)` (`links.py:277`), which is the same thing there because Python
+    // has no per-transport host override.
+    let base = host.as_str().trim_end_matches('/');
+    let full = format!(
+        "{base}/{}/{}",
+        version.segment(),
+        path.trim_start_matches('/')
+    );
     Url::parse(&full).map_err(|err| Error::validation("url", format!("not a valid URL: {err}")))
 }
 
@@ -300,8 +310,12 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
+    /// Deliberately NOT the production host: every helper must resolve against the `host` it is
+    /// given (the transport's configured base, a wiremock server in the integration suite), and a
+    /// fixture equal to `consts::API_HOST` once hid a branch that read the production constant
+    /// instead of `host`.
     fn host() -> Url {
-        Url::parse("https://api-user.e2ro.com").unwrap()
+        Url::parse("http://mock.test:1234").unwrap()
     }
 
     // ===================== validate_identifier / TestIdentifierValidation =====================
@@ -340,10 +354,7 @@ mod tests {
     #[test]
     fn join_api_path_joins_host_and_path() {
         let url = join_api_path(&host(), "/2.2/networks/1/eeros").unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/1/eeros"
-        );
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/1/eeros");
     }
 
     #[test]
@@ -357,7 +368,7 @@ mod tests {
     #[test]
     fn resource_url_bare_id_substitutes_into_template() {
         let url = resource_url(&host(), "100", "networks/{id}", ApiVersion::V2_2).unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/networks/100");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/100");
     }
 
     #[test]
@@ -365,7 +376,7 @@ mod tests {
         let url = resource_url(&host(), "100", "networks/{id}/settings", ApiVersion::V2_2).unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/settings"
+            "http://mock.test:1234/2.2/networks/100/settings"
         );
     }
 
@@ -373,14 +384,14 @@ mod tests {
     fn resource_url_absolute_url_on_host_is_validated_and_suffix_appended() {
         let url = resource_url(
             &host(),
-            "https://api-user.e2ro.com/2.3/networks/100",
+            "http://mock.test:1234/2.3/networks/100",
             "networks/{id}/settings",
             ApiVersion::V2_2,
         )
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.3/networks/100/settings"
+            "http://mock.test:1234/2.3/networks/100/settings"
         );
     }
 
@@ -400,7 +411,7 @@ mod tests {
     fn resource_url_userinfo_trick_is_rejected() {
         let err = resource_url(
             &host(),
-            "https://api-user.e2ro.com@evil.example/2.2/networks/100",
+            "http://mock.test:1234@evil.example/2.2/networks/100",
             "networks/{id}",
             ApiVersion::V2_2,
         )
@@ -412,7 +423,7 @@ mod tests {
     fn resource_url_suffix_trick_is_rejected() {
         let err = resource_url(
             &host(),
-            "https://api-user.e2ro.com.evil.example/2.2/networks/100",
+            "http://mock.test:1234.evil.example/2.2/networks/100",
             "networks/{id}",
             ApiVersion::V2_2,
         )
@@ -431,7 +442,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.3/networks/100/settings"
+            "http://mock.test:1234/2.3/networks/100/settings"
         );
     }
 
@@ -452,18 +463,18 @@ mod tests {
     #[test]
     fn version_constants_select_the_right_base_host() {
         let url = resource_url(&host(), "100", "networks/{id}", ApiVersion::V2_3).unwrap();
-        assert!(url.as_str().starts_with("https://api-user.e2ro.com/2.3/"));
+        assert!(url.as_str().starts_with("http://mock.test:1234/2.3/"));
     }
 
     // ===================== child_url =====================
 
     #[test]
     fn child_url_appends_validated_child_id() {
-        let base = Url::parse("https://api-user.e2ro.com/2.2/networks/100/blacklist").unwrap();
+        let base = Url::parse("http://mock.test:1234/2.2/networks/100/blacklist").unwrap();
         let url = child_url(&base, "aa:bb:cc").unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/blacklist/aa:bb:cc"
+            "http://mock.test:1234/2.2/networks/100/blacklist/aa:bb:cc"
         );
     }
 
@@ -476,20 +487,14 @@ mod tests {
             "data": {"resources": {"eeros": "/2.2/networks/100/eeros"}},
         });
         let url = resolve_link(&host(), &parent, "eeros").unwrap().unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/eeros"
-        );
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/100/eeros");
     }
 
     #[test]
     fn resolve_link_accepts_unwrapped_data_object() {
         let data = json!({"resources": {"eeros": "/2.2/networks/100/eeros"}});
         let url = resolve_link(&host(), &data, "eeros").unwrap().unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/eeros"
-        );
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/100/eeros");
     }
 
     #[test]
@@ -511,7 +516,7 @@ mod tests {
     fn self_url_reads_url_field() {
         let data = json!({"url": "/2.2/networks/100"});
         let url = self_url(&host(), &data).unwrap().unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/networks/100");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/100");
     }
 
     #[test]
@@ -536,7 +541,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.4/networks/100/settings"
+            "http://mock.test:1234/2.4/networks/100/settings"
         );
     }
 
@@ -553,7 +558,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/settings"
+            "http://mock.test:1234/2.2/networks/100/settings"
         );
     }
 
@@ -571,7 +576,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/settings"
+            "http://mock.test:1234/2.2/networks/100/settings"
         );
     }
 

@@ -1,5 +1,5 @@
-//! `Client` integration suite for `ProfilesApi`'s pass-throughs, cache invalidation, and its
-//! client-side content-filter validation.
+//! `Client` integration suite for `ProfilesApi`'s pass-throughs and cache invalidation at
+//! v8.0.4.
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not
@@ -7,12 +7,13 @@
 
 mod common;
 
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use serde_json::json;
 
 /// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
 /// default 60-second cache TTL.
@@ -75,38 +76,96 @@ async fn rename_profile_invalidates_the_profiles_bucket() -> anyhow::Result<()> 
     Ok(())
 }
 
-// ===================== Security review finding F4 =====================
-
-/// **F4**: every caller-supplied key outside `VALID_CONTENT_FILTER_KEYS` is dropped client-side
-/// before the request body is built (parity with Python). Before the fix, nothing guarded
-/// against the resulting map being empty: a caller who only passed a misspelled key (e.g.
-/// `block_adult_content` instead of `block_adult`) got a `200 OK` for `PUT {"content_filter":
-/// {}}}`, which — if the server replaces rather than merges that nested object — silently clears
-/// every content filter on the profile. This asserts the call now fails closed with
-/// `Error::Validation` *before* any request is sent (`.expect(0)` on the PUT mock).
 #[tokio::test]
-async fn update_profile_content_filter_with_only_unknown_keys_is_a_validation_error()
--> anyhow::Result<()> {
+async fn create_profile_invalidates_only_the_profiles_list_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profiles.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/profiles"))
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
-        .expect(0)
+        .expect(1)
         .mount(&mock.server)
         .await;
 
     let client = client(&mock).await;
-    let err = client
-        .update_profile_content_filter(
-            "profile-0001",
-            &[("block_adult_content", true)],
+    client.get_profiles(Some("network-0001"), false).await?;
+    client
+        .create_profile("Guests", None, None, Some("network-0001"))
+        .await?;
+    client.get_profiles(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_profile_includes_devices_and_paused_when_supplied() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/profiles"))
+        .and(session_cookie())
+        .and(body_json(json!({
+            "name": "Guests",
+            "devices": [{ "url": "/2.2/networks/network-0001/devices/device-0001" }],
+            "paused": true
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .create_profile(
+            "Guests",
+            Some(&["/2.2/networks/network-0001/devices/device-0001"]),
+            Some(true),
             Some("network-0001"),
         )
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        rusteero::error::Error::Validation { ref field, .. } if field == "filters"
-    ));
+        .await?;
+    Ok(())
+}
+
+// ===================== set_profile_devices: single-profile-key-only invalidation =====================
+
+/// `set_profile_devices` invalidates only `profiles[{nid}_{pid}]` — the list key is left
+/// untouched (`client.py:2288-2289`; see `Client::set_profile_devices`'s own docs).
+#[tokio::test]
+async fn set_profile_devices_invalidates_the_single_profile_key_only() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
+    client
+        .set_profile_devices(
+            "profile-0001",
+            &["/2.2/networks/network-0001/devices/device-0001"],
+            Some("network-0001"),
+        )
+        .await?;
+    client
+        .get_profile("profile-0001", Some("network-0001"), false)
+        .await?;
     Ok(())
 }

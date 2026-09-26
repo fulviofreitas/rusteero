@@ -23,7 +23,7 @@ use rusteero::auth::AuthApi;
 use rusteero::auth::Session;
 use rusteero::auth::flow::LoginFlow;
 use rusteero::routes::ACCOUNT;
-use rusteero::transport::Transport;
+use rusteero::transport::{RequestBody, Transport};
 
 /// Returns `Some(token)` only when both `RUSTEERO_LIVE=1` and a non-empty `RUSTEERO_SESSION_TOKEN`
 /// are set in the environment.
@@ -109,7 +109,7 @@ async fn live_get_account_smoke() {
 
     let envelope = auth
         .transport()
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect("GET /account should succeed with a valid session token");
     assert_eq!(envelope.meta().code, Some(200));
@@ -139,6 +139,9 @@ async fn live_get_account_smoke() {
 /// expectation.
 #[tokio::test]
 #[ignore = "hits the real Eero cloud API; see this file's module docs for how to run it"]
+// A long, flat list of `probe!` calls is the whole point of a sweep — splitting it into helper
+// functions would only hide which endpoints are covered, not reduce real complexity.
+#[allow(clippy::too_many_lines)]
 async fn live_read_only_endpoint_sweep() {
     let Some(token) = live_credentials() else {
         eprintln!(
@@ -203,8 +206,12 @@ async fn live_read_only_endpoint_sweep() {
     let n = Some(nid.as_str());
     probe!("account", client.get_account(false));
     probe!("network", client.get_network(n, false));
+    // Fetched once more here (in addition to the `probe!` below) purely to source a real eero's
+    // serial/version for the `ouicheck` probe further down — an extra read against a diagnostic,
+    // human-run-only suite, never part of `cargo test`.
+    let eeros_for_ouicheck = client.get_eeros(n, false).await;
     probe!("eeros", client.get_eeros(n, false));
-    probe!("devices", client.get_devices(n, false));
+    probe!("devices", client.get_devices(n, false, None, None));
     probe!("profiles", client.get_profiles(n, false));
     probe!("dns_settings", client.get_dns_settings(n));
     probe!("security_settings", client.get_security_settings(n));
@@ -219,11 +226,64 @@ async fn live_read_only_endpoint_sweep() {
     probe!("support", client.get_support(n));
     probe!("diagnostics", client.get_diagnostics(n));
     probe!("transfer_stats", client.get_transfer_stats(n, None));
-    probe!("burst_reporters", client.get_burst_reporters(n));
-    probe!("backup_network", client.get_backup_network(n));
-    probe!("backup_status", client.get_backup_status(n));
-    probe!("ouicheck", client.get_ouicheck(n));
+    probe!("backup_internet", client.get_backup_internet(n));
+    probe!("cellular_backup_usage", client.get_cellular_backup_usage(n));
+    probe!(
+        "cellular_backup_events",
+        client.get_cellular_backup_events(n)
+    );
     probe!("premium_status", client.get_premium_status(n));
+
+    // `get_ouicheck` needs a real eero's serial + firmware version; take them from the first
+    // entry `get_eeros` (probed above) returned, and skip this probe entirely (never fail the
+    // sweep) if that data is unavailable for any reason — an empty network, a prior probe
+    // failure, or a live account whose eero objects simply don't carry a version-shaped field.
+    match eeros_for_ouicheck {
+        Ok(eeros) => {
+            let first = eeros.data().get(0);
+            let serial = first.and_then(|e| e.get("serial")).and_then(|v| v.as_str());
+            let version = first
+                .and_then(|e| e.get("os_version").or_else(|| e.get("version")))
+                .and_then(|v| v.as_str());
+            match (serial, version) {
+                (Some(serial), Some(version)) => {
+                    probe!("ouicheck", client.get_ouicheck(serial, version, n));
+                }
+                _ => println!(
+                    "  {:<22} skipped (no eero serial/version field available)",
+                    "ouicheck"
+                ),
+            }
+        }
+        Err(_) => println!(
+            "  {:<22} skipped (get_eeros itself failed above)",
+            "ouicheck"
+        ),
+    }
+
+    // ==================== new-since-v8.0.0 domain families ====================
+    // Each of these is genuinely new surface (entitlements, permissions, notifications,
+    // members, events, power-saving, wpa3, dns-policies, subnets, backup access points,
+    // multistaticip) — probed read-only, same fail-soft treatment as everything above: a
+    // 403/404/premium-required error is reported, not fatal, exactly like the pre-existing
+    // probes.
+    probe!("entitlement_features", client.get_entitlement_features(n));
+    probe!("permissions", client.get_permissions(n));
+    probe!("notification_settings", client.get_notification_settings(n));
+    probe!("members", client.get_members(n));
+    probe!("app_events", client.get_app_events(None, None, n));
+    probe!(
+        "power_saving_schedules",
+        client.get_power_saving_schedules(n)
+    );
+    probe!("wpa3_per_band", client.get_wpa3_per_band(n));
+    probe!(
+        "dns_policies_advanced_filter",
+        client.get_advanced_content_filter(n)
+    );
+    probe!("subnets_config", client.get_subnets_config(n));
+    probe!("backup_access_points", client.list_backup_access_points(n));
+    probe!("multistaticip", client.get_multistaticip(n));
 
     println!(
         "\nlive sweep: {ok} endpoints returned an envelope, {} errored",

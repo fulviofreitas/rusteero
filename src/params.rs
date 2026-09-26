@@ -211,7 +211,7 @@ mod tests {
     use url::Url;
 
     fn host() -> Url {
-        Url::parse("https://api-user.e2ro.com").unwrap()
+        Url::parse("http://mock.test:1234").unwrap()
     }
 
     // ===================== TestValidateCadence =====================
@@ -245,13 +245,13 @@ mod tests {
     fn resolve_network_url_prefers_parents_self_url() {
         let parent = json!({"url": "/2.4/networks/100"});
         let url = resolve_network_url(&host(), "100", Some(&parent), ApiVersion::V2_2).unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.4/networks/100");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.4/networks/100");
     }
 
     #[test]
     fn resolve_network_url_falls_back_to_bare_id() {
         let url = resolve_network_url(&host(), "100", None, ApiVersion::V2_2).unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/networks/100");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/100");
     }
 
     // ===================== TestResolveNestedUrlChildValidation =====================
@@ -271,7 +271,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/profiles/p1"
+            "http://mock.test:1234/2.2/networks/100/profiles/p1"
         );
     }
 
@@ -307,7 +307,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.5/networks/100/profiles/p1/schedules"
+            "http://mock.test:1234/2.5/networks/100/profiles/p1/schedules"
         );
     }
 
@@ -344,7 +344,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/profiles/p1"
+            "http://mock.test:1234/2.2/networks/100/profiles/p1"
         );
     }
 
@@ -395,7 +395,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/insights/devices/aa:bb:cc/history"
+            "http://mock.test:1234/2.2/networks/100/insights/devices/aa:bb:cc/history"
         );
     }
 }

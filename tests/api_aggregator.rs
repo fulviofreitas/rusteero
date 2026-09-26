@@ -102,13 +102,16 @@ async fn each_domain_accessor_routes_only_to_its_own_wire_endpoint() -> anyhow::
     let networks_env = api.networks().get_networks().await?;
     assert_eq!(networks_env.into_value(), fixture_json("networks.json"));
 
-    let devices_env = api.devices().get_devices(NETWORK_ID).await?;
+    let devices_env = api
+        .devices()
+        .get_devices(NETWORK_ID, None, None, None)
+        .await?;
     assert_eq!(devices_env.into_value(), fixture_json("devices.json"));
 
-    let eeros_env = api.eeros().get_eeros(NETWORK_ID).await?;
+    let eeros_env = api.eeros().get_eeros(NETWORK_ID, None).await?;
     assert_eq!(eeros_env.into_value(), fixture_json("eeros.json"));
 
-    let profiles_env = api.profiles().get_profiles(NETWORK_ID).await?;
+    let profiles_env = api.profiles().get_profiles(NETWORK_ID, None).await?;
     assert_eq!(profiles_env.into_value(), fixture_json("profiles.json"));
 
     Ok(())

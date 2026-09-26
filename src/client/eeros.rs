@@ -1,16 +1,24 @@
-//! `Client` methods for the `EerosAPI` domain.
+//! `Client` methods for the `EerosAPI` domain (`eero-api src/eero/client.py`, eeros section).
+//!
+//! See `.claude/tasks/briefs/v8/g2-eeros.md` §3 for the full "facade name/shape divergences"
+//! list this file reproduces: which methods pass `_eero_parent_kwargs`/`_network_parent_kwargs`,
+//! which invalidate `eeros[{nid}_eeros]`, and the two "resolves `network_id` only for cache
+//! invalidation, never forwards it to the domain call" quirks ([`Client::port_action`],
+//! [`Client::nightlight_override`]).
 
 use super::Client;
 use crate::cache::CacheKey;
 use crate::envelope::Envelope;
 use crate::error::Error;
+use serde_json::Value;
 
 impl Client {
     /// Gets the list of Eero devices (mesh nodes) on a network — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `get_eeros()` (`client.py:361-386`); see [`Client::get_network`] for the
-    /// shared `auto_discover = true` note.
+    /// Ported from `get_eeros()` (`eero-api src/eero/client.py:565-592`). `auto_discover = true`
+    /// — see [`Client::get_network`]. On a cache miss, passes the cached network envelope (if
+    /// any) as `parent=`, so a fresh `resources.eeros` link wins over the hand-built template.
     ///
     /// # Errors
     ///
@@ -25,64 +33,22 @@ impl Client {
         if !refresh_cache && let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
-        let response = self.api.eeros().get_eeros(&network_id).await?;
+        let parent = self.network_parent(&network_id);
+        let response = self
+            .api
+            .eeros()
+            .get_eeros(&network_id, parent.as_ref())
+            .await?;
         self.cache.put(key, response.clone());
         Ok(response)
     }
 
-    // ==================== LED & Nightlight ====================
-
-    /// Gets LED status for an Eero device — returns the raw Eero API response.
-    ///
-    /// Ported from `get_led_status()` (`client.py:1032-1037`). `auto_discover = false` — see
-    /// [`Client::get_diagnostics`]. `network_id` is still resolved and validated even though it
-    /// is never forwarded to the underlying request: [`crate::endpoints::EerosApi::get_led_status`]
-    /// drops it entirely, since Python's own `network_id` parameter here is unused (see that
-    /// method's own docs) — this method keeps resolving it anyway, purely for call-signature and
-    /// validation parity with `client.py`.
-    ///
-    /// # Errors
-    ///
-    /// See [`Client::get_diagnostics`].
-    pub async fn get_led_status(
-        &self,
-        eero_id: &str,
-        network_id: Option<&str>,
-    ) -> Result<Envelope, Error> {
-        let _network_id = self.ensure_network_id(network_id, false).await?;
-        self.api.eeros().get_led_status(eero_id).await
-    }
-
-    /// Gets nightlight settings for an Eero Beacon device — returns the raw Eero API response.
-    ///
-    /// Ported from `get_nightlight()` (`client.py:1059-1064`). `auto_discover = false` — see
-    /// [`Client::get_diagnostics`]; see [`Client::get_led_status`] for why `network_id` is
-    /// resolved but not forwarded.
-    ///
-    /// # Errors
-    ///
-    /// See [`Client::get_diagnostics`].
-    pub async fn get_nightlight(
-        &self,
-        eero_id: &str,
-        network_id: Option<&str>,
-    ) -> Result<Envelope, Error> {
-        let _network_id = self.ensure_network_id(network_id, false).await?;
-        self.api.eeros().get_nightlight(eero_id).await
-    }
-
-    // ==================== Eeros (uncached pass-through) ====================
-
     /// Gets information about a specific Eero device — returns the raw Eero API response.
     ///
-    /// Ported from `get_eero()` (`client.py:388-408`). Unlike [`Client::get_eeros`] (the list),
-    /// this single-item getter is **not** cached (brief §2.1/G9's asymmetry note is about
-    /// `get_device_priority` specifically, but the same "list is cached, single item is not"
-    /// shape applies here by construction — `get_eero` was never one of the eight cached
-    /// getters in the first place). `auto_discover = true` (Python omits the argument, matching
-    /// `get_network`/`get_eeros`/etc., since this method appears before the `client.py:809`
-    /// section boundary). `network_id` is resolved and validated but never forwarded to the
-    /// underlying request — see [`Client::get_led_status`] for why.
+    /// Ported from `get_eero()` (`eero-api src/eero/client.py:594-616`). `auto_discover = true` —
+    /// see [`Client::get_network`]. **Never cached**: `refresh_cache` is accepted for signature
+    /// parity with Python but intentionally never consulted (`wiki/API-Reference.md:144`) — this
+    /// is always a live call. Passes the cached eero entry (if any) as `parent=`.
     ///
     /// # Errors
     ///
@@ -91,21 +57,18 @@ impl Client {
         &self,
         eero_id: &str,
         network_id: Option<&str>,
+        refresh_cache: bool,
     ) -> Result<Envelope, Error> {
-        let _network_id = self.ensure_network_id(network_id, true).await?;
-        self.api.eeros().get_eero(eero_id).await
+        let _ = refresh_cache;
+        let network_id = self.ensure_network_id(network_id, true).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        self.api.eeros().get_eero(eero_id, parent.as_ref()).await
     }
-
-    // ==================== Eeros (mutations) ====================
 
     /// Reboots a single Eero device — returns the raw Eero API response.
     ///
-    /// Ported from `reboot_eero` (`eero-api src/eero/client.py:410-432`). `auto_discover = true`
-    /// (before the `client.py:809` boundary, matching [`Client::get_eero`] just above it in this
-    /// file). `network_id` is resolved only to build the `eeros[{nid}_eeros]` cache key below —
-    /// it is never forwarded to [`crate::endpoints::EerosApi::reboot_eero`], which drops it for
-    /// the same reason [`Client::get_led_status`] does (see that method's docs). On success,
-    /// invalidates `eeros[{nid}_eeros]` (`client.py:427-430`).
+    /// Ported from `reboot_eero()` (`eero-api src/eero/client.py:618-643`). `auto_discover = true`
+    /// — see [`Client::get_network`]. On success, invalidates `eeros[{nid}_eeros]`.
     ///
     /// # Errors
     ///
@@ -116,17 +79,90 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, true).await?;
-        let response = self.api.eeros().reboot_eero(eero_id).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        let response = self
+            .api
+            .eeros()
+            .reboot_eero(eero_id, parent.as_ref())
+            .await?;
         self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
         Ok(response)
     }
 
+    /// Sets an Eero device's Wi-Fi location label — returns the raw Eero API response.
+    ///
+    /// Ported from `set_location()` (`eero-api src/eero/client.py:645-661`). `auto_discover =
+    /// false` — see [`Client::get_diagnostics`]. On success, invalidates `eeros[{nid}_eeros]`.
+    /// **Unverified against a live network.**
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_location(
+        &self,
+        eero_id: &str,
+        location: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        let response = self
+            .api
+            .eeros()
+            .set_location(eero_id, location, parent.as_ref())
+            .await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Gets a single Eero device's client connections — returns the raw Eero API response.
+    ///
+    /// Ported from `get_connections()` (`eero-api src/eero/client.py:663-673`). `auto_discover =
+    /// false` — see [`Client::get_diagnostics`]. Not cached (`connections` has no cache bucket).
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn get_connections(
+        &self,
+        eero_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        self.api
+            .eeros()
+            .get_connections(eero_id, parent.as_ref())
+            .await
+    }
+
+    // ==================== LED & Nightlight ====================
+
+    /// Gets LED status for an Eero device — returns the raw Eero API response.
+    ///
+    /// Ported from `get_led_status()` (`eero-api src/eero/client.py:1854-1861`). `auto_discover =
+    /// false` — see [`Client::get_diagnostics`]. Not cached.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn get_led_status(
+        &self,
+        eero_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        self.api
+            .eeros()
+            .get_led_status(eero_id, parent.as_ref())
+            .await
+    }
+
     /// Turns an Eero device's status LED on or off — returns the raw Eero API response.
     ///
-    /// Ported from `set_led` (`eero-api src/eero/client.py:1039-1050`). `auto_discover = false`
-    /// — see [`Client::get_diagnostics`]. `network_id` is resolved but not forwarded; see
-    /// [`Client::reboot_eero`]. On success, invalidates `eeros[{nid}_eeros]`
-    /// (`client.py:1046-1048`).
+    /// Ported from `set_led()` (`eero-api src/eero/client.py:1863-1872`). `auto_discover = false`
+    /// — see [`Client::get_diagnostics`]. On success, invalidates `eeros[{nid}_eeros]`.
     ///
     /// # Errors
     ///
@@ -138,30 +174,28 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        let response = self.api.eeros().set_led(eero_id, enabled).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        let response = self
+            .api
+            .eeros()
+            .set_led(eero_id, enabled, parent.as_ref())
+            .await?;
         self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
         Ok(response)
     }
 
     /// Sets an Eero device's status LED brightness — returns the raw Eero API response.
     ///
-    /// Ported from `set_led_brightness` (`eero-api src/eero/client.py:1052-1057`). `auto_discover
-    /// = false` — see [`Client::get_diagnostics`]. `network_id` is resolved but not forwarded;
-    /// see [`Client::reboot_eero`].
-    ///
-    /// Divergence from eero-api: Python invalidates nothing here, even though its sibling
-    /// [`Client::set_led`] invalidates `eeros[{nid}_eeros]` for the exact same underlying node
-    /// object — the behaviour brief calls this out as a likely oversight (gotcha G3), not a
-    /// deliberate design choice. This port does not reproduce the gap: on success, this method
-    /// also invalidates `eeros[{nid}_eeros]`, exactly like [`Client::set_led`] and
-    /// [`Client::set_nightlight`] do. `rust-port-plan.md` §3.8 and `cache.rs`'s own module docs
-    /// ("what's new" (b)) name this exact method as one of the two intentional improvements over
-    /// Python this crate makes — do not remove this call later thinking it restores parity; it
-    /// would reintroduce a bug, not fix one.
+    /// Ported from `set_led_brightness()` (`eero-api src/eero/client.py:1874-1883`).
+    /// `auto_discover = false` — see [`Client::get_diagnostics`]. On success, invalidates
+    /// `eeros[{nid}_eeros]`.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    /// Returns `Error::Validation { field: "brightness", .. }` if `brightness` is outside
+    /// `0..=100` (v8.0.4 rejects rather than clamping — see
+    /// [`crate::endpoints::EerosApi::set_led_brightness`]). Otherwise see
+    /// [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
     pub async fn set_led_brightness(
         &self,
         eero_id: &str,
@@ -169,67 +203,70 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
         let response = self
             .api
             .eeros()
-            .set_led_brightness(eero_id, brightness)
+            .set_led_brightness(eero_id, brightness, parent.as_ref())
             .await?;
-        // Divergence from eero-api (rust-port-plan.md §3.8, improvement (b)): Python never
-        // invalidates `eeros` after a brightness-only write; this port does, since the field it
-        // just wrote lives in the same cached node object `set_led` already invalidates for.
         self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
         Ok(response)
     }
 
-    /// Sets nightlight settings for an Eero Beacon device — returns the raw Eero API response.
+    /// Gets nightlight settings for an Eero Beacon device — returns the raw Eero API response.
     ///
-    /// Ported from `set_nightlight` (`eero-api src/eero/client.py:1066-1094`). Every setting is
-    /// optional and independent, exactly like
-    /// [`crate::endpoints::EerosApi::set_nightlight`], which this delegates to unchanged — see
-    /// that method's own docs for the brightness clamp and the request body shape. `auto_discover
-    /// = false` — see [`Client::get_diagnostics`]. `network_id` is resolved but not forwarded;
-    /// see [`Client::reboot_eero`]. On success, invalidates `eeros[{nid}_eeros]`
-    /// (`client.py:1090-1092`).
-    ///
-    /// Takes eight parameters (including the receiver), one more than
-    /// [`crate::endpoints::EerosApi::set_nightlight`]'s seven, to additionally mirror
-    /// `client.py:1066-1075`'s own `network_id` parameter — the same reasoning that method's own
-    /// docs give for not splitting its six independent, self-describing scalar settings into a
-    /// params struct: doing so would break the direct correspondence with the Python source
-    /// without making any call site clearer.
+    /// Ported from `get_nightlight()` (`eero-api src/eero/client.py:1885-1892`). `auto_discover =
+    /// false` — see [`Client::get_diagnostics`]. Not cached.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation { field: "nightlight", .. }` if every one of `enabled`,
-    /// `brightness`, `schedule_enabled`, `schedule_on`, `schedule_off` and
-    /// `ambient_light_enabled` is `None` — see
-    /// [`crate::endpoints::EerosApi::set_nightlight`]'s own docs for why this port refuses rather
-    /// than fabricating Python's local `400` envelope. Otherwise see [`Client::get_diagnostics`].
-    /// The cache is left untouched on any `Err`.
-    #[allow(clippy::too_many_arguments)] // mirrors client.py:1066-1075's own 8-parameter signature, like EerosApi::set_nightlight's identical allow
+    /// Returns [`Error::FeatureUnavailable`] if the eero has no nightlight. Otherwise see
+    /// [`Client::get_diagnostics`].
+    pub async fn get_nightlight(
+        &self,
+        eero_id: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        self.api
+            .eeros()
+            .get_nightlight(eero_id, parent.as_ref())
+            .await
+    }
+
+    /// Sets nightlight settings for an Eero Beacon device — returns the raw Eero API response.
+    ///
+    /// Ported from `set_nightlight()` (`eero-api src/eero/client.py:1894-1920`). Every setting is
+    /// optional and independent, delegating unchanged to
+    /// [`crate::endpoints::EerosApi::set_nightlight`] — see that method's own docs for the
+    /// brightness validation, the "at least one field" rule, and the discovery/URL-resolution
+    /// order. `auto_discover = false` — see [`Client::get_diagnostics`]. On success, invalidates
+    /// `eeros[{nid}_eeros]`. **Unverified against a live network.**
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::endpoints::EerosApi::set_nightlight`], and [`Client::get_diagnostics`]. The
+    /// cache is left untouched on any `Err`.
     pub async fn set_nightlight(
         &self,
         eero_id: &str,
         enabled: Option<bool>,
-        brightness: Option<i32>,
-        schedule_enabled: Option<bool>,
-        schedule_on: Option<&str>,
-        schedule_off: Option<&str>,
-        ambient_light_enabled: Option<bool>,
+        brightness_percentage: Option<i32>,
+        schedule: Option<Value>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
         let response = self
             .api
             .eeros()
             .set_nightlight(
                 eero_id,
                 enabled,
-                brightness,
-                schedule_enabled,
-                schedule_on,
-                schedule_off,
-                ambient_light_enabled,
+                brightness_percentage,
+                schedule,
+                parent.as_ref(),
             )
             .await?;
         self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
@@ -239,63 +276,163 @@ impl Client {
     /// Sets only the nightlight brightness for an Eero Beacon device — returns the raw Eero API
     /// response.
     ///
-    /// No `client.py` precedent: `eero-api` never wrapped `EerosAPI.set_nightlight_brightness`
-    /// (`api/eeros.py:282`) on `EeroClient`, even though it wraps its sibling
-    /// [`Client::set_nightlight`]. [`crate::endpoints::EerosApi::set_nightlight_brightness`]
-    /// itself is a pure delegator to `EerosApi::set_nightlight` — the exact same wire call — so
-    /// this method's cache behaviour simply follows suit: `auto_discover = false`, and on success
-    /// invalidates `eeros[{nid}_eeros]`, identically to [`Client::set_nightlight`]. This is not a
-    /// third invented improvement over Python; it is the same wire call `set_nightlight` already
-    /// makes, which already invalidates that bucket.
+    /// Ported from `set_nightlight_brightness()` (`eero-api src/eero/client.py:1922-1935`); a
+    /// pure delegator to [`Client::set_nightlight`], sharing its cache invalidation and `parent=`
+    /// resolution exactly — matches `eeros.py:551-579`'s own delegation shape one layer up.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`]. Never returns `Error::Validation`: a `brightness` value
-    /// is always supplied here. The cache is left untouched on any `Err`.
+    /// See [`Client::set_nightlight`]. Never returns the "at least one field" validation error: a
+    /// `brightness_percentage` value is always supplied here.
     pub async fn set_nightlight_brightness(
         &self,
         eero_id: &str,
-        brightness: i32,
+        brightness_percentage: i32,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
-        let network_id = self.ensure_network_id(network_id, false).await?;
-        let response = self
-            .api
-            .eeros()
-            .set_nightlight_brightness(eero_id, brightness)
-            .await?;
-        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
-        Ok(response)
+        self.set_nightlight(eero_id, None, Some(brightness_percentage), None, network_id)
+            .await
     }
 
     /// Sets only the nightlight schedule for an Eero Beacon device — returns the raw Eero API
     /// response.
     ///
-    /// No `client.py` precedent — see [`Client::set_nightlight_brightness`]'s docs, which apply
-    /// identically here: [`crate::endpoints::EerosApi::set_nightlight_schedule`] delegates to the
-    /// same `EerosApi::set_nightlight` call [`Client::set_nightlight`] itself uses, so this method
-    /// follows the same cache behaviour: `auto_discover = false`, invalidates `eeros[{nid}_eeros]`
-    /// on success.
+    /// Ported from `set_nightlight_schedule()` (`eero-api src/eero/client.py:1937-1950`); a pure
+    /// delegator to [`Client::set_nightlight`], sharing its cache invalidation and `parent=`
+    /// resolution exactly.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_diagnostics`]. Never returns `Error::Validation`: `enabled` is always
-    /// supplied here. The cache is left untouched on any `Err`.
+    /// See [`Client::set_nightlight`]. Never returns the "at least one field" validation error:
+    /// `schedule` is always supplied here.
     pub async fn set_nightlight_schedule(
         &self,
         eero_id: &str,
-        enabled: bool,
-        on_time: Option<&str>,
-        off_time: Option<&str>,
+        schedule: Value,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        self.set_nightlight(eero_id, None, None, Some(schedule), network_id)
+            .await
+    }
+
+    /// Performs a node-level action on an Eero device — returns the raw Eero API response.
+    ///
+    /// Ported from `node_action()` (`eero-api src/eero/client.py:3074-3087`). `auto_discover =
+    /// false` — see [`Client::get_diagnostics`]. On success, invalidates `eeros[{nid}_eeros]`.
+    /// **Unverified against a live network.**
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::endpoints::EerosApi::node_action`], and [`Client::get_diagnostics`]. The
+    /// cache is left untouched on any `Err`.
+    pub async fn node_action(
+        &self,
+        eero_id: &str,
+        action: &str,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.eero_parent(&network_id, eero_id);
+        let response = self
+            .api
+            .eeros()
+            .node_action(eero_id, action, parent.as_ref())
+            .await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Performs a port-level action on an Eero device's interface — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `port_action()` (`eero-api src/eero/client.py:3088-3096`). `auto_discover =
+    /// false` — see [`Client::get_diagnostics`]. **Quirk, reproduced deliberately**: `network_id`
+    /// is resolved only to invalidate `eeros[{nid}_eeros]` on success — it is never forwarded to
+    /// [`crate::endpoints::EerosApi::port_action`], which has no `network_id` parameter at all
+    /// (see that method's own docs).
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::endpoints::EerosApi::port_action`], and [`Client::get_diagnostics`]. The
+    /// cache is left untouched on any `Err`.
+    pub async fn port_action(
+        &self,
+        eero_id: &str,
+        interface_number: u32,
+        action: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         let response = self
             .api
             .eeros()
-            .set_nightlight_schedule(eero_id, enabled, on_time, off_time)
+            .port_action(eero_id, interface_number, action)
             .await?;
         self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
         Ok(response)
+    }
+
+    /// Cycles an Eero device's status LED through a colour sequence — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `led_cycle()` (`eero-api src/eero/client.py:3097-3104`). No `network_id`
+    /// parameter at all, matching [`crate::endpoints::EerosApi::led_cycle`] — addressed by
+    /// `eero_serial` alone, so nothing is invalidated (there is no network context to key a
+    /// cache invalidation on). **Unverified against a live network.**
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::endpoints::EerosApi::led_cycle`].
+    pub async fn led_cycle(
+        &self,
+        eero_serial: &str,
+        colors: &[String],
+        duration: u32,
+        time_per_color: u32,
+    ) -> Result<Envelope, Error> {
+        self.api
+            .eeros()
+            .led_cycle(eero_serial, colors, duration, time_per_color)
+            .await
+    }
+
+    /// Previews a nightlight brightness value without persisting it — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `nightlight_override()` (`eero-api src/eero/client.py:3105-3115`).
+    /// `auto_discover = false` — see [`Client::get_diagnostics`]. **Quirk, reproduced
+    /// deliberately**: `network_id` is resolved only to invalidate `eeros[{nid}_eeros]` on
+    /// success — it is never forwarded to
+    /// [`crate::endpoints::EerosApi::nightlight_override`], which has no `network_id` parameter
+    /// at all (see that method's own docs).
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::endpoints::EerosApi::nightlight_override`], and [`Client::get_diagnostics`].
+    /// The cache is left untouched on any `Err`.
+    pub async fn nightlight_override(
+        &self,
+        eero_id: &str,
+        brightness_percentage: i32,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .eeros()
+            .nightlight_override(eero_id, brightness_percentage)
+            .await?;
+        self.cache.invalidate(&CacheKey::eeros(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Gets an Eero device's support/diagnostics summary — returns the raw Eero API response.
+    ///
+    /// Ported from `get_eero_support()` (`eero-api src/eero/client.py:3116-3122`). No
+    /// `network_id` parameter at all, matching
+    /// [`crate::endpoints::EerosApi::get_eero_support`] — addressed by `eero_serial` alone. Not
+    /// cached.
+    pub async fn get_eero_support(&self, eero_serial: &str) -> Result<Envelope, Error> {
+        self.api.eeros().get_eero_support(eero_serial).await
     }
 }

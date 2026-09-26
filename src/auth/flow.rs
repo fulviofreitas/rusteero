@@ -99,7 +99,7 @@ impl LoginFlow {
     /// uniformly; `Error::Authentication` (an actual `401`) and `Error::Network`/`Error::Timeout`
     /// propagate unmodified.
     pub async fn start(&self, user_identifier: &str) -> Result<PendingLogin, Error> {
-        let url = self.transport.render_url(&routes::LOGIN, &[])?;
+        let url = routes::LOGIN.resolve(self.transport.api_host(), "", None)?;
         let body = RequestBody::Form(login_request_body(user_identifier));
         let envelope = self
             .transport
@@ -148,7 +148,7 @@ impl PendingLogin {
     /// attempt to reproduce that partial catch; every failure mode surfaces as its matching
     /// [`Error`] variant here.
     pub async fn resend(&self) -> Result<Envelope, Error> {
-        let url = self.transport.render_url(&routes::LOGIN_RESEND, &[])?;
+        let url = routes::LOGIN_RESEND.resolve(self.transport.api_host(), "", None)?;
         self.transport
             .request_with_token(
                 reqwest::Method::POST,
@@ -180,7 +180,7 @@ impl PendingLogin {
     /// .. }`, the same shape [`LoginFlow::start`] applies. `Error::Network`/`Error::Timeout`
     /// propagate unmodified.
     pub async fn verify(self, code: &str) -> Result<Session, Error> {
-        let url = self.transport.render_url(&routes::LOGIN_VERIFY, &[])?;
+        let url = routes::LOGIN_VERIFY.resolve(self.transport.api_host(), "", None)?;
         let body = RequestBody::Form(verify_request_body(code));
         self.transport
             .request_with_token(

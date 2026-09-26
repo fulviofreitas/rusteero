@@ -81,8 +81,12 @@ async fn get_devices_second_call_is_served_from_cache() -> anyhow::Result<()> {
         .await;
 
     let client = client(&mock).await;
-    let first = client.get_devices(Some("network-0001"), false).await?;
-    let second = client.get_devices(Some("network-0001"), false).await?;
+    let first = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    let second = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
 
     assert_eq!(first.as_value(), &fixture_json("devices.json"));
     assert_eq!(second.as_value(), &fixture_json("devices.json"));
@@ -101,8 +105,12 @@ async fn get_devices_with_refresh_cache_true_always_hits_the_network() -> anyhow
         .await;
 
     let client = client(&mock).await;
-    client.get_devices(Some("network-0001"), true).await?;
-    client.get_devices(Some("network-0001"), true).await?;
+    client
+        .get_devices(Some("network-0001"), true, None, None)
+        .await?;
+    client
+        .get_devices(Some("network-0001"), true, None, None)
+        .await?;
     Ok(())
 }
 
@@ -139,12 +147,16 @@ async fn get_devices_refetches_after_the_ttl_expires() -> anyhow::Result<()> {
         .await
         .expect("a MockServer's own URI is always a valid base URL");
 
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
 
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
 
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     Ok(())
 }
 
@@ -160,8 +172,12 @@ async fn get_devices_with_zero_ttl_never_serves_from_cache() -> anyhow::Result<(
         .await;
 
     let client = client_with_ttl(&mock, Duration::ZERO).await;
-    client.get_devices(Some("network-0001"), false).await?;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     Ok(())
 }
 
@@ -185,8 +201,12 @@ async fn falsy_cached_value_is_never_served_from_cache() -> anyhow::Result<()> {
         .await;
 
     let client = client(&mock).await;
-    let first = client.get_devices(Some("network-0001"), false).await?;
-    let second = client.get_devices(Some("network-0001"), false).await?;
+    let first = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    let second = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
 
     assert_eq!(first.as_value(), &json!({}));
     assert_eq!(second.as_value(), &json!({}));
@@ -219,10 +239,10 @@ async fn devices_for_different_networks_do_not_collide() -> anyhow::Result<()> {
         .await;
 
     let client = client(&mock).await;
-    let a_first = client.get_devices(Some("net-a"), false).await?;
-    let b_first = client.get_devices(Some("net-b"), false).await?;
-    let a_second = client.get_devices(Some("net-a"), false).await?;
-    let b_second = client.get_devices(Some("net-b"), false).await?;
+    let a_first = client.get_devices(Some("net-a"), false, None, None).await?;
+    let b_first = client.get_devices(Some("net-b"), false, None, None).await?;
+    let a_second = client.get_devices(Some("net-a"), false, None, None).await?;
+    let b_second = client.get_devices(Some("net-b"), false, None, None).await?;
 
     assert_eq!(a_first.as_value(), &network_a_devices);
     assert_eq!(b_first.as_value(), &network_b_devices);
@@ -267,7 +287,9 @@ async fn explicit_network_id_wins_over_the_preferred_one() -> anyhow::Result<()>
     let client = client(&mock).await;
     client.set_preferred_network("preferred-net");
 
-    let env = client.get_devices(Some("explicit-net"), false).await?;
+    let env = client
+        .get_devices(Some("explicit-net"), false, None, None)
+        .await?;
     assert_eq!(env.as_value(), &fixture_json("devices.json"));
     Ok(())
 }
@@ -286,7 +308,7 @@ async fn preferred_network_is_used_when_no_explicit_id_is_given() -> anyhow::Res
     let client = client(&mock).await;
     client.set_preferred_network("preferred-net");
 
-    let env = client.get_devices(None, false).await?;
+    let env = client.get_devices(None, false, None, None).await?;
     assert_eq!(env.as_value(), &fixture_json("devices.json"));
     Ok(())
 }
@@ -313,7 +335,7 @@ async fn auto_discovery_uses_the_first_networks_bare_id() -> anyhow::Result<()> 
         .await;
 
     let client = client(&mock).await;
-    let env = client.get_devices(None, false).await?;
+    let env = client.get_devices(None, false, None, None).await?;
 
     assert_eq!(env.as_value(), &fixture_json("devices.json"));
     assert_eq!(client.preferred_network_id().as_deref(), Some("auto-net-a"));
@@ -344,7 +366,7 @@ async fn auto_discovery_falls_back_to_the_url_tail_when_id_is_absent() -> anyhow
         .await;
 
     let client = client(&mock).await;
-    let env = client.get_devices(None, false).await?;
+    let env = client.get_devices(None, false, None, None).await?;
 
     assert_eq!(env.as_value(), &fixture_json("devices.json"));
     assert_eq!(client.preferred_network_id().as_deref(), Some("auto-net-b"));
@@ -378,7 +400,7 @@ async fn missing_network_id_after_failed_auto_discovery_makes_no_downstream_requ
 
     let client = client(&mock).await;
     let err = client
-        .get_devices(None, false)
+        .get_devices(None, false, None, None)
         .await
         .expect_err("no network id can be resolved");
     assert!(matches!(err, Error::MissingNetworkId));
@@ -409,9 +431,13 @@ async fn clear_cache_forces_the_next_call_to_re_hit_the_network() -> anyhow::Res
         .await;
 
     let client = client(&mock).await;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     client.clear_cache();
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     Ok(())
 }
 
@@ -433,7 +459,9 @@ async fn logout_clears_the_cache_so_a_subsequent_get_re_hits_the_network() -> an
         .await;
 
     let client = client(&mock).await;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
 
     client.logout().await?;
 
@@ -444,7 +472,9 @@ async fn logout_clears_the_cache_so_a_subsequent_get_re_hits_the_network() -> an
     // used here instead, this test could pass even if `Client::logout` never cleared the cache
     // at all.
     client.api().auth().set_session_token(TEST_TOKEN)?;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     Ok(())
 }
 
@@ -460,10 +490,14 @@ async fn set_session_token_clears_the_cache() -> anyhow::Result<()> {
         .await;
 
     let client = client(&mock).await;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
 
     client.set_session_token(TEST_TOKEN)?;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     Ok(())
 }
 
@@ -479,7 +513,9 @@ async fn clear_session_token_clears_the_cache() -> anyhow::Result<()> {
         .await;
 
     let client = client(&mock).await;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
 
     client.clear_session_token()?;
     // `clear_session_token` nulls the in-memory session token itself, so — exactly as in the
@@ -487,7 +523,9 @@ async fn clear_session_token_clears_the_cache() -> anyhow::Result<()> {
     // `Client::set_session_token`, so this call cannot be the one masking a missing cache clear
     // in `clear_session_token` itself.
     client.api().auth().set_session_token(TEST_TOKEN)?;
-    client.get_devices(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     Ok(())
 }
 
@@ -564,7 +602,9 @@ async fn send_legacy_cookie_false_omits_the_cookie_header_but_keeps_the_user_tok
         .await
         .expect("a MockServer's own URI is always a valid base URL");
 
-    let env = client.get_devices(Some("network-0001"), false).await?;
+    let env = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     assert_eq!(env.as_value(), &fixture_json("devices.json"));
     Ok(())
 }
@@ -585,7 +625,9 @@ async fn send_legacy_cookie_defaults_to_true_when_never_called() -> anyhow::Resu
         .await;
 
     let client = client(&mock).await;
-    let env = client.get_devices(Some("network-0001"), false).await?;
+    let env = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     assert_eq!(env.as_value(), &fixture_json("devices.json"));
     Ok(())
 }
@@ -611,7 +653,9 @@ async fn accept_language_is_forwarded_to_the_transport() -> anyhow::Result<()> {
         .await
         .expect("a MockServer's own URI is always a valid base URL");
 
-    let env = client.get_devices(Some("network-0001"), false).await?;
+    let env = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     assert_eq!(env.as_value(), &fixture_json("devices.json"));
     Ok(())
 }

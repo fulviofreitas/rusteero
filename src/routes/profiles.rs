@@ -1,111 +1,118 @@
-//! Profile routes (`ProfilesAPI`).
+//! Profile routes (`ProfilesAPI`) at v8.0.4.
+//!
+//! Ported from `eero-api src/eero/api/profiles.py` (v8.0.4). Every wire endpoint below uses the
+//! v8 [`Resource`]/[`Nested`] model (`crate::routes::mod`'s module docs), resolved through
+//! [`crate::links`]/[`crate::params`] so id-or-URL polymorphism and parent-link preference are
+//! shared code, not hand-rolled per method.
+//!
+//! `GET_PROFILE`/`PAUSE_PROFILE`/`SET_PROFILE_DEVICES`/`RENAME_PROFILE`/`DELETE_PROFILE` all
+//! share the same `networks/{network}/profiles/{profile}` resource family (`prefix: "profiles"`,
+//! `suffix: ""`), one [`Nested`] constant per HTTP verb — mirroring how the pre-v8 `routes.rs`
+//! declared one `Route` alias per verb for the same path. `link: None` on every one of them is
+//! deliberate: none of these five is resolved via a *named* link lookup
+//! (`crate::links::resolve_link`/`sub_resource_url`) the way [`GET_PROFILES`]/[`CREATE_PROFILE`]
+//! are — `ProfilesAPI.get_profile`/`_update_profile` (`profiles.py:86-154`) instead prefer
+//! [`crate::links::self_url`] on the caller-supplied `parent` (the *profile's own* cached
+//! envelope, not the network's), which is a different preference rule than [`Nested::resolve`]
+//! implements. [`crate::endpoints::profiles::ProfilesApi`]'s private `profile_url` helper
+//! resolves that preference explicitly before falling back to `.resolve(host, network, profile,
+//! None)` on these constants — see that module's docs for the full rationale.
+//!
+//! Removed since v6.2.0/pre-v8 (`eero-api` `tests/api/test_profiles.py::
+//! TestProfilesAPIRemovedContentFilterSurface`): `update_profile_content_filter`,
+//! `update_profile_block_list`, `get_blocked_applications`, `set_blocked_applications` — every
+//! one PUT/GOT a field a profile does not have (silent no-op, live-verified). Their legacy
+//! `Route` aliases (`UPDATE_PROFILE_CONTENT_FILTER`, `UPDATE_PROFILE_BLOCK_LIST`,
+//! `GET_BLOCKED_APPLICATIONS`, `SET_BLOCKED_APPLICATIONS`) are deleted along with the endpoint
+//! methods that used them; replaced by `crate::routes::dns_policies`.
 
-// --------------------------------- profiles (`ProfilesAPI`) -----------------------------
-
-use super::{ApiVersion, Route};
+use super::{ApiVersion, Nested, Resource};
 use reqwest::Method;
 
 /// `GET /2.2/networks/{network_id}/profiles` — list profiles on a network.
 ///
-/// Ported from `eero-api src/eero/api/profiles.py:33` (`ProfilesAPI.get_profiles`).
-pub const GET_PROFILES: Route = Route {
+/// Prefers the parent network envelope's own `profiles` link when supplied.
+///
+/// Ported from `eero-api src/eero/api/profiles.py:53-80` (`ProfilesAPI.get_profiles`).
+pub const GET_PROFILES: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/profiles",
+    template: "networks/{id}/profiles",
+    link: Some("profiles"),
 };
 
 /// `POST /2.2/networks/{network_id}/profiles` — create a profile.
 ///
-/// Ported from `eero-api src/eero/api/profiles.py:336` (`ProfilesAPI.create_profile`).
-pub const CREATE_PROFILE: Route = Route {
+/// Prefers the parent network envelope's own `profiles` link when supplied.
+///
+/// Ported from `eero-api src/eero/api/profiles.py:247-300` (`ProfilesAPI.create_profile`).
+pub const CREATE_PROFILE: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/profiles",
+    template: "networks/{id}/profiles",
+    link: Some("profiles"),
 };
 
 /// `GET /2.2/networks/{network_id}/profiles/{profile_id}` — a single profile's full object.
 ///
-/// Shared by four Python methods that all read fields out of the same full profile object:
-/// `ProfilesAPI.get_profile`, `ProfilesAPI.get_profile_devices` (`GET_PROFILE_DEVICES`),
-/// `ProfilesAPI.get_blocked_applications` (`GET_BLOCKED_APPLICATIONS`), and
-/// `ScheduleAPI.get_profile_schedule` (`GET_PROFILE_SCHEDULE`). Ported from
-/// `eero-api src/eero/api/profiles.py:53` (`ProfilesAPI.get_profile`).
-pub const GET_PROFILE: Route = Route {
+/// See the module docs for why `link` is `None` here: parent preference is resolved via
+/// [`crate::links::self_url`] at the call site, not via this constant's (absent) named link.
+///
+/// Ported from `eero-api src/eero/api/profiles.py:86-118` (`ProfilesAPI.get_profile`).
+pub const GET_PROFILE: Nested = Nested {
     method: Method::GET,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/profiles/{profile_id}",
+    prefix: "profiles",
+    suffix: "",
+    link: None,
 };
 
-/// `PUT /2.2/networks/{network_id}/profiles/{profile_id}` — the profile mutation endpoint.
+/// `PUT /2.2/networks/{network_id}/profiles/{profile_id}` — pause/unpause a profile.
 ///
-/// The single wire endpoint behind seven Python setters across `ProfilesAPI` and
-/// `ScheduleAPI` (`PAUSE_PROFILE`, `SET_PROFILE_DEVICES`, `UPDATE_PROFILE_CONTENT_FILTER`,
-/// `UPDATE_PROFILE_BLOCK_LIST`, `SET_BLOCKED_APPLICATIONS`, `RENAME_PROFILE`,
-/// `SET_PROFILE_SCHEDULE`) — each PUTs a different JSON key onto the same profile object.
-/// Ported from `eero-api src/eero/api/profiles.py:77` (`ProfilesAPI.pause_profile`), the
-/// first setter of this resource in the port plan's endpoint catalogue.
-pub const PUT_PROFILE: Route = Route {
+/// Ported from `eero-api src/eero/api/profiles.py:157-181` (`ProfilesAPI.pause_profile`, via
+/// `_update_profile`). See [`GET_PROFILE`]'s docs for the `link: None` rationale.
+pub const PAUSE_PROFILE: Nested = Nested {
     method: Method::PUT,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/profiles/{profile_id}",
+    prefix: "profiles",
+    suffix: "",
+    link: None,
 };
 
-/// Alias of `PUT_PROFILE`: `ProfilesAPI.pause_profile` PUTs `{"paused": bool}`.
+/// `PUT /2.2/networks/{network_id}/profiles/{profile_id}` — replace a profile's device list.
 ///
-/// Ported from `eero-api src/eero/api/profiles.py:77` (`ProfilesAPI.pause_profile`).
-pub const PAUSE_PROFILE: Route = PUT_PROFILE;
+/// Ported from `eero-api src/eero/api/profiles.py:208-245` (`ProfilesAPI.set_profile_devices`,
+/// via `_update_profile`). See [`GET_PROFILE`]'s docs for the `link: None` rationale.
+pub const SET_PROFILE_DEVICES: Nested = Nested {
+    method: Method::PUT,
+    version: ApiVersion::V2_2,
+    prefix: "profiles",
+    suffix: "",
+    link: None,
+};
 
-/// Alias of `GET_PROFILE`: `ProfilesAPI.get_profile_devices` reads the `devices` field out
-/// of the same full profile object.
+/// `PUT /2.2/networks/{network_id}/profiles/{profile_id}` — rename a profile.
 ///
-/// Ported from `eero-api src/eero/api/profiles.py:104` (`ProfilesAPI.get_profile_devices`).
-pub const GET_PROFILE_DEVICES: Route = GET_PROFILE;
-
-/// Alias of `PUT_PROFILE`: `ProfilesAPI.set_profile_devices` PUTs
-/// `{"devices": [{"url": ...}, ...]}`, replacing all device assignments.
-///
-/// Ported from `eero-api src/eero/api/profiles.py:130` (`ProfilesAPI.set_profile_devices`).
-pub const SET_PROFILE_DEVICES: Route = PUT_PROFILE;
-
-/// Alias of `PUT_PROFILE`: `ProfilesAPI.update_profile_content_filter` PUTs
-/// `{"content_filter": {...}}` (server-side key allowlist applied client-side first).
-///
-/// Ported from `eero-api src/eero/api/profiles.py:179`
-/// (`ProfilesAPI.update_profile_content_filter`).
-pub const UPDATE_PROFILE_CONTENT_FILTER: Route = PUT_PROFILE;
-
-/// Alias of `PUT_PROFILE`: `ProfilesAPI.update_profile_block_list` PUTs
-/// `{"custom_block_list": [..]}` or `{"custom_allow_list": [..]}`.
-///
-/// Ported from `eero-api src/eero/api/profiles.py:227`
-/// (`ProfilesAPI.update_profile_block_list`).
-pub const UPDATE_PROFILE_BLOCK_LIST: Route = PUT_PROFILE;
-
-/// Alias of `GET_PROFILE`: `ProfilesAPI.get_blocked_applications` reads the
-/// `blocked_applications` (or `premium_dns.blocked_applications`) field out of the same full
-/// profile object.
-///
-/// Ported from `eero-api src/eero/api/profiles.py:267`
-/// (`ProfilesAPI.get_blocked_applications`).
-pub const GET_BLOCKED_APPLICATIONS: Route = GET_PROFILE;
-
-/// Alias of `PUT_PROFILE`: `ProfilesAPI.set_blocked_applications` PUTs
-/// `{"blocked_applications": [..]}`.
-///
-/// Ported from `eero-api src/eero/api/profiles.py:294`
-/// (`ProfilesAPI.set_blocked_applications`).
-pub const SET_BLOCKED_APPLICATIONS: Route = PUT_PROFILE;
-
-/// Alias of `PUT_PROFILE`: `ProfilesAPI.rename_profile` PUTs `{"name": str}`.
-///
-/// Ported from `eero-api src/eero/api/profiles.py:364` (`ProfilesAPI.rename_profile`).
-pub const RENAME_PROFILE: Route = PUT_PROFILE;
+/// Ported from `eero-api src/eero/api/profiles.py:304-330` (`ProfilesAPI.rename_profile`, via
+/// `_update_profile`). See [`GET_PROFILE`]'s docs for the `link: None` rationale.
+pub const RENAME_PROFILE: Nested = Nested {
+    method: Method::PUT,
+    version: ApiVersion::V2_2,
+    prefix: "profiles",
+    suffix: "",
+    link: None,
+};
 
 /// `DELETE /2.2/networks/{network_id}/profiles/{profile_id}` — delete a profile.
 ///
-/// Ported from `eero-api src/eero/api/profiles.py:391` (`ProfilesAPI.delete_profile`).
-pub const DELETE_PROFILE: Route = Route {
+/// Unlike its four siblings above, `ProfilesAPI.delete_profile` takes no `parent` kwarg at all
+/// (`profiles.py:330-355`) — there is nothing to prefer over the template, ever.
+///
+/// Ported from `eero-api src/eero/api/profiles.py:330-355` (`ProfilesAPI.delete_profile`).
+pub const DELETE_PROFILE: Nested = Nested {
     method: Method::DELETE,
     version: ApiVersion::V2_2,
-    path: "networks/{network_id}/profiles/{profile_id}",
+    prefix: "profiles",
+    suffix: "",
+    link: None,
 };

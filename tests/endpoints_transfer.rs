@@ -14,7 +14,11 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
+
+fn transfer_api(mock: &MockEero) -> TransferApi {
+    TransferApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
+}
 
 // ===================== get_transfer_stats =====================
 
@@ -28,15 +32,11 @@ async fn get_transfer_stats_with_none_hits_the_network_level_path() -> anyhow::R
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/transfer"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
         .await;
-    // If `get_transfer_stats(None)` ever rendered the device-level path instead, this mock
-    // would never be hit for the network-level call above and this `.expect(0)` would still be
-    // satisfied — so it is the network-level mock's own `.expect(1)` that catches that
-    // regression; this mock exists to catch the opposite mistake (both branches somehow hitting
-    // the device path).
     Mock::given(method("GET"))
         .and(path(
             "/2.2/networks/network-0001/devices/device-0002/transfer",
@@ -47,9 +47,36 @@ async fn get_transfer_stats_with_none_hits_the_network_level_path() -> anyhow::R
         .mount(&mock.server)
         .await;
 
-    let api = TransferApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    let env = api.get_transfer_stats("network-0001", None).await?;
+    let api = transfer_api(&mock);
+    let env = api.get_transfer_stats("network-0001", None, None).await?;
 
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_transfer_stats_prefers_the_parents_transfer_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": { "total_download": 1 } });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/transfer"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/custom-transfer"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"transfer": "/2.2/networks/network-0001/custom-transfer"}});
+    let api = transfer_api(&mock);
+    let env = api
+        .get_transfer_stats("network-0001", None, Some(&parent))
+        .await?;
     assert_eq!(env.into_value(), body);
     Ok(())
 }
@@ -84,11 +111,24 @@ async fn get_transfer_stats_with_device_id_hits_the_device_level_path() -> anyho
         .mount(&mock.server)
         .await;
 
-    let api = TransferApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    let api = transfer_api(&mock);
     let env = api
-        .get_transfer_stats("network-0001", Some("device-0002"))
+        .get_transfer_stats("network-0001", Some("device-0002"), None)
         .await?;
 
     assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_transfer_stats_device_id_with_brace_does_not_break_the_template() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let api = transfer_api(&mock);
+    let err = api
+        .get_transfer_stats("network-0001", Some("device{0}002"), None)
+        .await
+        .expect_err("a stray brace in device_id must be rejected, not treated as a placeholder");
+    assert!(matches!(err, rusteero::error::Error::Validation { .. }));
     Ok(())
 }

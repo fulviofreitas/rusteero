@@ -13,7 +13,7 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 fn support_api(mock: &MockEero) -> SupportApi {
     SupportApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
@@ -22,7 +22,7 @@ fn support_api(mock: &MockEero) -> SupportApi {
 // ===================== get_support =====================
 
 #[tokio::test]
-async fn get_support_hits_v22_path_with_session_cookie_and_matches_body() -> anyhow::Result<()> {
+async fn get_support_bare_id_falls_back_to_the_template() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let body = json!({
         "meta": { "code": 200 },
@@ -31,14 +31,40 @@ async fn get_support_hits_v22_path_with_session_cookie_and_matches_body() -> any
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/support"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = support_api(&mock);
-    let env = api.get_support("network-0001").await?;
+    let env = api.get_support("network-0001", None).await?;
 
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_support_prefers_the_parents_support_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/support"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/custom-support"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"support": "/2.2/networks/network-0001/custom-support"}});
+    let api = support_api(&mock);
+    let env = api.get_support("network-0001", Some(&parent)).await?;
     assert_eq!(env.into_value(), body);
     Ok(())
 }
@@ -65,7 +91,7 @@ async fn request_support_passthrough_body_arrives_byte_identical_including_neste
         .await;
 
     let api = support_api(&mock);
-    let env = api.request_support("network-0001", payload).await?;
+    let env = api.request_support("network-0001", payload, None).await?;
 
     assert_eq!(env.into_value(), response);
     Ok(())

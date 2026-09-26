@@ -31,10 +31,10 @@ pub const API_HOST: &str = "https://api-user.e2ro.com";
 /// Builds the base endpoint URL for a given API version segment (e.g. `"2.2"` or `"2.3"`).
 ///
 /// Ported from `api_endpoint` (`const.py:11-25`): the single place that joins a version segment
-/// onto [`API_HOST`]. `routes::ApiVersion::base_url` serves the same role for the two versions
-/// this crate actually uses today, pre-computed as `'static` strings; this function stays
-/// available for call sites (e.g. `links`/`params`) that only have a version segment string, not
-/// an `ApiVersion`.
+/// onto [`API_HOST`]. `API_BASE_22`/`API_BASE_23` are this same join, pre-computed as `'static`
+/// strings for the two versions this crate actually uses today; this function stays available
+/// for call sites (e.g. `links`/`params`) that only have a version segment string, not an
+/// `ApiVersion`.
 #[must_use]
 pub fn api_endpoint(version: &str) -> String {
     format!("{API_HOST}/{version}")

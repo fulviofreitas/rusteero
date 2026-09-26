@@ -1,23 +1,9 @@
-//! HTTP integration tests for `SqmApi` (`src/endpoints/sqm.rs`) against a local `wiremock`
-//! server per the crate's testing conventions.
+//! HTTP integration tests for `SqmApi` (`src/endpoints/sqm.rs`), v8.0.4, against a local
+//! `wiremock` server per the crate's testing conventions.
 //!
-//! One test pins the exact verb, path and session cookie for `get_sqm_settings`, and asserts the
-//! returned [`rusteero::envelope::Envelope`] is byte-identical to its fixture. See
-//! `endpoints_dns.rs`'s `dns_security_and_sqm_settings_all_hit_the_same_network_path` for the
-//! cross-domain proof that this method, `DnsApi::get_dns_settings` and
-//! `SecurityApi::get_security_settings` all hit the exact same `networks/{network_id}` resource
-//! (a judgment call recorded there).
-//!
-//! `sqm_enabled_is_flat_while_bandwidth_configure_and_auto_all_nest_under_sqm` asserts, in one
-//! test, that `set_sqm_enabled` sends a **flat** `{"sqm": bool}` while `set_sqm_bandwidth`,
-//! `configure_sqm` and `set_sqm_auto` all send a **nested** `{"sqm": {...}}` — the flat/nested
-//! split `sqm.py`'s three `TODO: Verify` comments (`sqm.py:128`, `:173`, `:197`) leave
-//! unconfirmed upstream; see each method's own doc comment in `src/endpoints/sqm.rs`.
-//! `PARITY.md` rows for `set_sqm_bandwidth`/`configure_sqm`/`set_sqm_auto` must read "ported —
-//! shape unverified upstream", not "ported". This test, plus
-//! `set_sqm_enabled_puts_settings_with_flat_sqm_bool` below, were each red/green-verified by
-//! hand (expected body deliberately broken, observed panic, restored, observed pass); see this
-//! crate's task report for the captured output.
+//! See `endpoints_dns.rs`'s `dns_security_and_sqm_settings_all_hit_the_same_network_path` for the
+//! cross-domain proof that `get_sqm_settings` (with no `parent`), `DnsApi::get_dns_settings` and
+//! `SecurityApi::get_security_settings` all hit the exact same `networks/{network_id}` resource.
 
 mod common;
 
@@ -25,10 +11,10 @@ use std::sync::Arc;
 
 use rusteero::endpoints::sqm::SqmApi;
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_string, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 
 /// Builds a [`SqmApi`] pointed at `mock`, wrapping a `Transport` already authenticated with
 /// [`TEST_TOKEN`].
@@ -50,205 +36,69 @@ async fn get_sqm_settings_hits_networks_id_and_returns_the_fixture_envelope() ->
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("sqm_settings.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = sqm_api(&mock);
-    let env = api.get_sqm_settings("network-0001").await?;
-    assert_eq!(env.into_value(), fixture_json("network.json"));
-    Ok(())
-}
-
-// ================================== SqmApi::set_sqm_enabled ==================================
-
-#[tokio::test]
-async fn set_sqm_enabled_puts_settings_with_flat_sqm_bool() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    // Exact-match FLAT body `{"sqm": true}` — not `{"sqm": {"enabled": true}}`. See
-    // `sqm_enabled_is_flat_while_bandwidth_configure_and_auto_all_nest_under_sqm` below for the
-    // explicit flat-vs-nested contrast across all four SQM setters.
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "sqm": true })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = sqm_api(&mock);
-    let env = api.set_sqm_enabled("network-0001", true).await?;
-    assert_eq!(env.into_value(), ok_envelope());
-    Ok(())
-}
-
-// ================================ SqmApi::set_sqm_bandwidth ================================
-
-#[tokio::test]
-async fn set_sqm_bandwidth_with_both_limits_nests_them_under_sqm() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({
-            "sqm": { "enabled": true, "upload_bandwidth": 100, "download_bandwidth": 50 },
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = sqm_api(&mock);
-    let env = api
-        .set_sqm_bandwidth("network-0001", Some(100), Some(50))
-        .await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    let env = api.get_sqm_settings("network-0001", None).await?;
+    assert_eq!(env.into_value(), fixture_json("sqm_settings.json"));
     Ok(())
 }
 
 #[tokio::test]
-async fn set_sqm_bandwidth_with_no_limits_sends_enabled_only() -> anyhow::Result<()> {
+async fn get_sqm_settings_prefers_a_parent_supplied_self_url() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    // Exact-match body proves the bandwidth keys are omitted entirely, not sent as `null`, when
-    // neither argument is supplied.
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "sqm": { "enabled": true } })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+    Mock::given(method("GET"))
+        .and(path("/2.4/networks/network-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("sqm_settings.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
+    let parent = fixture_json("dns_network_with_settings_link.json");
     let api = sqm_api(&mock);
-    let env = api.set_sqm_bandwidth("network-0001", None, None).await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    api.get_sqm_settings("network-0001", Some(&parent)).await?;
     Ok(())
 }
 
-// =================================== SqmApi::configure_sqm ===================================
+// ================================== SqmApi::set_sqm ==================================
 
 #[tokio::test]
-async fn configure_sqm_enabled_with_limits_nests_them_under_sqm() -> anyhow::Result<()> {
+async fn set_sqm_sends_the_query_param_with_no_body() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({
-            "sqm": { "enabled": true, "upload_bandwidth": 200, "download_bandwidth": 20 },
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
+    for (enabled, expected) in [(true, "true"), (false, "false")] {
+        Mock::given(method("PUT"))
+            .and(path("/2.2/networks/network-0001/settings"))
+            .and(query_param("sqm", expected))
+            .and(body_string(""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
 
-    let api = sqm_api(&mock);
-    let env = api
-        .configure_sqm("network-0001", true, Some(200), Some(20))
-        .await?;
-    assert_eq!(env.into_value(), ok_envelope());
+        let api = sqm_api(&mock);
+        let env = api.set_sqm("network-0001", enabled, None).await?;
+        assert_eq!(env.into_value(), ok_envelope());
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn configure_sqm_disabled_omits_bandwidth_keys_even_if_provided() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    // `enabled: false` must drop the bandwidth keys entirely, even though both are supplied
-    // (`sqm.py:165-169`'s `if enabled:` gate) — an exact-match body on `{"sqm": {"enabled":
-    // false}}` alone proves it.
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "sqm": { "enabled": false } })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = sqm_api(&mock);
-    let env = api
-        .configure_sqm("network-0001", false, Some(200), Some(20))
-        .await?;
-    assert_eq!(env.into_value(), ok_envelope());
-    Ok(())
-}
-
-// =================================== SqmApi::set_sqm_auto ===================================
-
-#[tokio::test]
-async fn set_sqm_auto_puts_settings_with_fixed_auto_payload() -> anyhow::Result<()> {
+async fn set_sqm_prefers_the_parents_published_settings_link() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(
-            json!({ "sqm": { "enabled": true, "mode": "auto" } }),
-        ))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(query_param("sqm", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
+    let parent = fixture_json("dns_network_with_settings_link.json");
     let api = sqm_api(&mock);
-    let env = api.set_sqm_auto("network-0001").await?;
-    assert_eq!(env.into_value(), ok_envelope());
-    Ok(())
-}
-
-// ============================= SQM flat-vs-nested, asserted together =============================
-
-#[tokio::test]
-async fn sqm_enabled_is_flat_while_bandwidth_configure_and_auto_all_nest_under_sqm()
--> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    // Four separate mocks, each matching one setter's exact body shape. If `set_sqm_enabled`
-    // ever nested its bool (or any of the other three ever flattened theirs), the corresponding
-    // mock would never match and this test would fail at server-drop verification — see this
-    // phase's report for the red/green capture proving that.
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "sqm": true })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({
-            "sqm": { "enabled": true, "upload_bandwidth": 10 },
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "sqm": { "enabled": false } })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(
-            json!({ "sqm": { "enabled": true, "mode": "auto" } }),
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = sqm_api(&mock);
-    api.set_sqm_enabled("network-0001", true).await?;
-    api.set_sqm_bandwidth("network-0001", Some(10), None)
-        .await?;
-    api.configure_sqm("network-0001", false, None, None).await?;
-    api.set_sqm_auto("network-0001").await?;
+    api.set_sqm("network-0001", true, Some(&parent)).await?;
     Ok(())
 }

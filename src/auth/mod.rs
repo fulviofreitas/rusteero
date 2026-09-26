@@ -109,7 +109,7 @@ impl AuthApi {
         };
         let token = session.token().clone();
 
-        let url = self.transport.render_url(&routes::LOGOUT, &[])?;
+        let url = routes::LOGOUT.resolve(self.transport.api_host(), "", None)?;
         let cookie_value = format!(
             "{}{}",
             consts::SESSION_COOKIE_PREFIX,

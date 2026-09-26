@@ -1,31 +1,16 @@
-//! HTTP integration tests for `DnsApi` (`src/endpoints/dns.rs`) against a local `wiremock`
-//! server per the crate's testing conventions.
+//! HTTP integration tests for `DnsApi` (`src/endpoints/dns.rs`), v8.0.4, against a local
+//! `wiremock` server per the crate's testing conventions.
 //!
-//! One test per read method pins the exact verb, path and session cookie, and asserts the
-//! returned [`rusteero::envelope::Envelope`] is byte-identical to its fixture. A final
-//! error-path test proves a `404` on an unknown network id maps to
-//! `Error::NotFound { status: 404, .. }`.
+//! Every authenticated request test pins both `X-User-Token` (primary, v8.0.4) and the legacy
+//! `Cookie: s=...` header (secondary, on by default) — see `.claude/tasks/briefs/v8/transport-api.md`.
 //!
-//! Every mutating test pins the exact verb, path, session cookie and request body (`body_json`,
-//! an exact deep-equality match, not a subset match) with a wiremock `.expect(n)` call count
-//! verified at server-drop time.
-//!
-//! - `set_custom_dns_truncates_three_servers_to_two` proves the silent 2-entry cap
-//!   (`dns.py:114-116`).
-//! - `set_dns_mode_invalid_mode_is_validation_error_with_no_requests` and
-//!   `set_dns_mode_custom_without_servers_is_validation_error_with_no_requests` prove an
-//!   unrecognised (or under-supplied `"custom"`) mode never reaches the network — no `Mock` is
-//!   registered at all, so a regression that *did* send a request would hit wiremock's default
-//!   404-for-unmatched-request behaviour and fail the `Error::Validation` assertion, and the
-//!   explicit `received_requests().await` check makes that assertion airtight.
-//!
-//! **Judgment call (test-file split, 2026-09-25)**: `dns_security_and_sqm_settings_all_hit_
-//! the_same_network_path` exercises `DnsApi`, `SecurityApi` and `SqmApi` together — it proves
-//! all three read the exact same `GET /2.2/networks/{id}` resource `NetworksApi::get_network`
-//! does. It cannot be assigned to a single domain without duplicating or fragmenting the
-//! assertion, so it is kept here (alphabetically first of the three domains it touches); a
-//! change to `SecurityApi` or `SqmApi` that breaks this test's expectations will need to touch
-//! this file too, alongside `endpoints_security.rs`/`endpoints_sqm.rs`.
+//! **Judgment call (test-file split, kept from the pre-v8.0.4 suite)**:
+//! `dns_security_and_sqm_settings_all_hit_the_same_network_path` exercises `DnsApi`,
+//! `SecurityApi` and `SqmApi` together — `DnsApi::get_dns_settings` resolves via the bare-id
+//! `networks/{id}` template unconditionally (it has no `parent` parameter at all), while
+//! `SecurityApi`/`SqmApi`'s reads additionally accept (but are not given one here) a `parent` for
+//! `self_url` preference; with no `parent` supplied, all three land on the exact same path. This
+//! group owns all three domains, so the test lives here (alphabetically first).
 
 mod common;
 
@@ -39,24 +24,22 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 
 /// Builds a [`DnsApi`] pointed at `mock`, wrapping a `Transport` already authenticated with
-/// [`TEST_TOKEN`] (see [`MockEero::transport_with_token`]).
+/// [`TEST_TOKEN`].
 fn dns_api(mock: &MockEero) -> DnsApi {
     DnsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
 }
 
-/// Builds a [`SecurityApi`] pointed at `mock`, wrapping a `Transport` already authenticated with
-/// [`TEST_TOKEN`] (see [`MockEero::transport_with_token`]) — used only by the shared-path proof
-/// below; see this file's module docs for why.
+/// Builds a [`SecurityApi`] pointed at `mock` — used only by the shared-path proof below; see
+/// this file's module docs for why.
 fn security_api(mock: &MockEero) -> SecurityApi {
     SecurityApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
 }
 
-/// Builds a [`SqmApi`] pointed at `mock`, wrapping a `Transport` already authenticated with
-/// [`TEST_TOKEN`] (see [`MockEero::transport_with_token`]) — used only by the shared-path proof
-/// below; see this file's module docs for why.
+/// Builds a [`SqmApi`] pointed at `mock` — used only by the shared-path proof below; see this
+/// file's module docs for why.
 fn sqm_api(mock: &MockEero) -> SqmApi {
     SqmApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
 }
@@ -75,14 +58,15 @@ async fn get_dns_settings_hits_networks_id_and_returns_the_fixture_envelope() ->
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("dns_settings.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
     let env = api.get_dns_settings("network-0001").await?;
-    assert_eq!(env.into_value(), fixture_json("network.json"));
+    assert_eq!(env.into_value(), fixture_json("dns_settings.json"));
     Ok(())
 }
 
@@ -91,15 +75,10 @@ async fn get_dns_settings_hits_networks_id_and_returns_the_fixture_envelope() ->
 #[tokio::test]
 async fn dns_security_and_sqm_settings_all_hit_the_same_network_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    // A single mock registered against the shared `GET /2.2/networks/{id}` path, expected
-    // exactly 3 times: if any of `get_dns_settings`/`get_security_settings`/`get_sqm_settings`
-    // rendered a different path (e.g. a `.../dns`, `.../security` or `.../sqm` sub-resource),
-    // this mock would never match that call and the request would fail with a wiremock "no
-    // match" error rather than a response — proving all three hit the exact same wire endpoint
-    // as `NetworksApi::get_network`, the full network object.
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(3)
         .mount(&mock.server)
@@ -107,9 +86,11 @@ async fn dns_security_and_sqm_settings_all_hit_the_same_network_path() -> anyhow
 
     let dns_env = dns_api(&mock).get_dns_settings("network-0001").await?;
     let security_env = security_api(&mock)
-        .get_security_settings("network-0001")
+        .get_security_settings("network-0001", None)
         .await?;
-    let sqm_env = sqm_api(&mock).get_sqm_settings("network-0001").await?;
+    let sqm_env = sqm_api(&mock)
+        .get_sqm_settings("network-0001", None)
+        .await?;
 
     let expected = fixture_json("network.json");
     assert_eq!(dns_env.into_value(), expected);
@@ -148,198 +129,502 @@ async fn get_dns_settings_with_unknown_id_maps_404_to_api_error() -> anyhow::Res
 // =================================== DnsApi::set_dns_caching ===================================
 
 #[tokio::test]
-async fn set_dns_caching_puts_settings_with_dns_caching() -> anyhow::Result<()> {
+async fn set_dns_caching_puts_nested_caching_field() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
-        .and(body_json(json!({ "dns_caching": true })))
+        .and(user_token_header())
+        .and(body_json(json!({ "dns": { "caching": true } })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api.set_dns_caching("network-0001", true).await?;
+    let env = api.set_dns_caching("network-0001", true, None).await?;
     assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_dns_caching_does_not_send_the_legacy_flat_field() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // Exact-match body: `dns_caching` (issue #123's dead field) must never appear.
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({ "dns": { "caching": false } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.set_dns_caching("network-0001", false, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_dns_caching_prefers_a_parent_supplied_settings_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(body_json(json!({ "dns": { "caching": true } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = fixture_json("dns_network_with_settings_link.json");
+    let api = dns_api(&mock);
+    api.set_dns_caching("network-0001", true, Some(&parent))
+        .await?;
     Ok(())
 }
 
 // =================================== DnsApi::set_custom_dns ===================================
 
 #[tokio::test]
-async fn set_custom_dns_truncates_three_servers_to_two() -> anyhow::Result<()> {
+async fn set_custom_dns_ipv4_only_writes_only_the_dns_object() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    // Exactly 2 entries expected — the 3rd ("9.9.9.9") must never appear in the body. See this
-    // phase's report for the red/green capture proving this assertion actually catches a
-    // regression (temporarily expecting all 3 entries fails; restoring the 2-entry expectation
-    // below passes again).
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "custom_dns": ["1.1.1.1", "1.0.0.1"] })))
+        .and(body_json(json!({
+            "dns": { "mode": "custom", "custom": { "ips": ["1.1.1.1", "1.0.0.1"] } },
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api
-        .set_custom_dns("network-0001", &["1.1.1.1", "1.0.0.1", "9.9.9.9"])
+    api.set_custom_dns("network-0001", &["1.1.1.1", "1.0.0.1"], None)
         .await?;
-    assert_eq!(env.into_value(), ok_envelope());
     Ok(())
 }
 
 #[tokio::test]
-async fn set_custom_dns_with_two_servers_sends_both_unchanged() -> anyhow::Result<()> {
+async fn set_custom_dns_ipv6_only_writes_only_the_ipv6_object() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "custom_dns": ["8.8.8.8", "8.8.4.4"] })))
+        .and(body_json(json!({
+            "ipv6": { "name_servers": { "mode": "custom", "custom": ["2606:4700:4700::1111"] } },
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api
-        .set_custom_dns("network-0001", &["8.8.8.8", "8.8.4.4"])
+    api.set_custom_dns("network-0001", &["2606:4700:4700::1111"], None)
         .await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_dual_stack_configures_both_families_in_one_write() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({
+            "dns": { "mode": "custom", "custom": { "ips": ["1.1.1.1", "1.0.0.1"] } },
+            "ipv6": {
+                "name_servers": {
+                    "mode": "custom",
+                    "custom": ["2606:4700:4700::1111", "2606:4700:4700::1001"],
+                },
+            },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.set_custom_dns(
+        "network-0001",
+        &[
+            "1.1.1.1",
+            "1.0.0.1",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1001",
+        ],
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_over_limit_raises_and_does_not_write() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns("network-0001", &["1.1.1.1", "1.0.0.1", "8.8.8.8"], None)
+        .await
+        .expect_err("exceeding the per-family cap must be rejected before any request");
+    assert!(matches!(err, Error::Validation { .. }));
+    assert!(err.to_string().contains('2'));
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_per_family_cap_is_not_a_total_cap() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.set_custom_dns(
+        "network-0001",
+        &[
+            "1.1.1.1",
+            "1.0.0.1",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1001",
+        ],
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_empty_list_raises_without_writing() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns("network-0001", &[], None)
+        .await
+        .expect_err("an empty list must be rejected rather than silently clearing DNS");
+    match &err {
+        Error::Validation { field, message, .. } => {
+            assert_eq!(field, "dns_servers");
+            assert!(message.contains("clear_custom_dns"));
+        }
+        other => panic!("expected Error::Validation, got {other:?}"),
+    }
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
+    Ok(())
+}
+
+// ============================== DnsApi::set_custom_dns_ipv4 / ipv6 ==============================
+
+#[tokio::test]
+async fn set_custom_dns_ipv4_leaves_ipv6_untouched() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({
+            "dns": { "mode": "custom", "custom": { "ips": ["8.8.8.8", "8.8.4.4"] } },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.set_custom_dns_ipv4("network-0001", &["8.8.8.8", "8.8.4.4"], None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_ipv6_leaves_ipv4_untouched() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({
+            "ipv6": { "name_servers": { "mode": "custom", "custom": ["2606:4700:4700::1111"] } },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.set_custom_dns_ipv6("network-0001", &["2606:4700:4700::1111"], None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_ipv4_rejects_an_ipv6_literal() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns_ipv4("network-0001", &["2606:4700:4700::1111"], None)
+        .await
+        .expect_err("a family mismatch must be reported distinctly from malformed input");
+    let Error::Validation { message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert!(message.contains("IPv6"));
+    assert!(message.contains("expected IPv4"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_ipv6_rejects_an_ipv4_literal() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns_ipv6("network-0001", &["1.1.1.1"], None)
+        .await
+        .expect_err("a family mismatch must be reported distinctly from malformed input");
+    let Error::Validation { message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert!(message.contains("expected IPv6"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_ipv6_compressed_form_is_sent_on_the_wire() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // The API stores addresses fully expanded, but this crate always sends the compressed
+    // (RFC 5952) form on the wire — matching Python's `str(ipaddress.ip_address(...))`.
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({
+            "ipv6": { "name_servers": { "mode": "custom", "custom": ["2606:4700:4700::1111"] } },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.set_custom_dns_ipv6("network-0001", &["2606:4700:4700:0:0:0:0:1111"], None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_custom_dns_ipv4_empty_list_points_at_clear_custom_dns() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .set_custom_dns_ipv4("network-0001", &[], None)
+        .await
+        .expect_err("an empty per-family list must be rejected");
+    let Error::Validation { message, .. } = &err else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert!(message.contains("clear_custom_dns"));
     Ok(())
 }
 
 // ================================== DnsApi::clear_custom_dns ==================================
 
 #[tokio::test]
-async fn clear_custom_dns_puts_settings_with_an_empty_list() -> anyhow::Result<()> {
+async fn clear_custom_dns_clears_both_families_by_default() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "custom_dns": [] })))
+        .and(body_json(json!({
+            "dns": { "mode": "automatic" },
+            "ipv6": { "name_servers": { "mode": "automatic" } },
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api.clear_custom_dns("network-0001").await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    api.clear_custom_dns("network-0001", None, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_custom_dns_is_non_destructive_no_custom_key_sent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // Exact-match body with no `custom` key anywhere: sending one (even empty) would erase the
+    // servers the API retains.
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({
+            "dns": { "mode": "automatic" },
+            "ipv6": { "name_servers": { "mode": "automatic" } },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.clear_custom_dns("network-0001", None, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_custom_dns_ipv4_only_leaves_ipv6_selector_alone() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(json!({ "dns": { "mode": "automatic" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.clear_custom_dns("network-0001", Some("ipv4"), None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_custom_dns_ipv6_only_leaves_ipv4_selector_alone() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(body_json(
+            json!({ "ipv6": { "name_servers": { "mode": "automatic" } } }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_api(&mock);
+    api.clear_custom_dns("network-0001", Some("ipv6"), None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_custom_dns_invalid_family_raises_without_writing() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = dns_api(&mock);
+    let err = api
+        .clear_custom_dns("network-0001", Some("ipv5"), None)
+        .await
+        .expect_err("an unknown family must be rejected");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "family"));
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
     Ok(())
 }
 
 // ===================================== DnsApi::set_dns_mode =====================================
 
 #[tokio::test]
-async fn set_dns_mode_cloudflare_sends_cloudflare_resolvers() -> anyhow::Result<()> {
+async fn set_dns_mode_provider_names_are_rejected_as_modes() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "custom_dns": ["1.1.1.1", "1.0.0.1"] })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
     let api = dns_api(&mock);
-    let env = api.set_dns_mode("network-0001", "cloudflare", None).await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    for preset in ["cloudflare", "google", "opendns", "quad9"] {
+        let err = api
+            .set_dns_mode("network-0001", preset, None, None)
+            .await
+            .expect_err(&format!("{preset:?} must not be accepted as a mode"));
+        let Error::Validation { message, .. } = &err else {
+            panic!("expected Error::Validation, got {err:?}");
+        };
+        assert!(message.contains("default_test_servers"));
+    }
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
     Ok(())
 }
 
 #[tokio::test]
-async fn set_dns_mode_google_sends_google_resolvers() -> anyhow::Result<()> {
+async fn set_dns_mode_auto_switches_mode_without_discarding_servers() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "custom_dns": ["8.8.8.8", "8.8.4.4"] })))
+        .and(body_json(json!({
+            "dns": { "mode": "automatic" },
+            "ipv6": { "name_servers": { "mode": "automatic" } },
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
+        .expect(3)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api.set_dns_mode("network-0001", "google", None).await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    for mode in ["auto", "automatic", "AUTO"] {
+        api.set_dns_mode("network-0001", mode, None, None).await?;
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn set_dns_mode_opendns_sends_opendns_resolvers() -> anyhow::Result<()> {
+async fn set_dns_mode_custom_with_servers_forwards_them() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(
-            json!({ "custom_dns": ["208.67.222.222", "208.67.220.220"] }),
-        ))
+        .and(body_json(json!({
+            "dns": { "mode": "custom", "custom": { "ips": ["9.9.9.9"] } },
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api.set_dns_mode("network-0001", "opendns", None).await?;
-    assert_eq!(env.into_value(), ok_envelope());
-    Ok(())
-}
-
-#[tokio::test]
-async fn set_dns_mode_custom_sends_provided_servers_truncated_to_two() -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(
-            json!({ "custom_dns": ["9.9.9.9", "149.112.112.112"] }),
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-
-    let api = dns_api(&mock);
-    let servers = ["9.9.9.9", "149.112.112.112", "1.1.1.1"];
-    let env = api
-        .set_dns_mode("network-0001", "custom", Some(&servers))
+    let servers = ["9.9.9.9"];
+    api.set_dns_mode("network-0001", "custom", Some(&servers), None)
         .await?;
-    assert_eq!(env.into_value(), ok_envelope());
     Ok(())
 }
 
 #[tokio::test]
-async fn set_dns_mode_auto_sends_empty_custom_dns() -> anyhow::Result<()> {
+async fn set_dns_mode_custom_without_servers_reenables_stored_servers() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
+    // Exact-match body: mode-only, no `custom` key on either family — sending one would erase
+    // the servers this write is meant to re-enable.
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "custom_dns": [] })))
+        .and(body_json(json!({
+            "dns": { "mode": "custom" },
+            "ipv6": { "name_servers": { "mode": "custom" } },
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api.set_dns_mode("network-0001", "auto", None).await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    api.set_dns_mode("network-0001", "custom", None, None)
+        .await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn set_dns_mode_invalid_mode_is_validation_error_with_no_requests() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    // No `Mock` registered: if `set_dns_mode` ever reached the network for an unrecognised
-    // mode, the request would hit wiremock's default 404-for-unmatched-request response and
-    // surface as `Error::NotFound { status: 404, .. }`, not `Error::Validation` — failing the
-    // assertion below.
     let api = dns_api(&mock);
     let err = api
-        .set_dns_mode("network-0001", "not-a-real-mode", None)
+        .set_dns_mode("network-0001", "not-a-real-mode", None, None)
         .await
         .expect_err("an unrecognised mode must be rejected before any request");
     assert!(matches!(err, Error::Validation { ref field, .. } if field == "mode"));
@@ -353,46 +638,45 @@ async fn set_dns_mode_invalid_mode_is_validation_error_with_no_requests() -> any
     Ok(())
 }
 
+// ===================== parent link preference (Resource/link-wiring proofs) =====================
+
 #[tokio::test]
-async fn set_dns_mode_custom_without_servers_is_validation_error_with_no_requests()
+async fn set_custom_dns_prefers_a_parent_supplied_settings_link_over_the_template()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    // Mirrors Python's `mode == "custom" and custom_servers` truthiness check (`dns.py:170`):
-    // `"custom"` with no servers supplied is just as invalid as an unrecognised mode string.
-    let api = dns_api(&mock);
-    let err = api
-        .set_dns_mode("network-0001", "custom", None)
-        .await
-        .expect_err("\"custom\" with no servers must be rejected before any request");
-    assert!(matches!(err, Error::Validation { ref field, .. } if field == "mode"));
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(body_json(json!({
+            "dns": { "mode": "custom", "custom": { "ips": ["1.1.1.1"] } },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
 
-    let requests = mock
-        .server
-        .received_requests()
-        .await
-        .expect("request recording is enabled by default");
-    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
+    let parent = fixture_json("dns_network_with_settings_link.json");
+    let api = dns_api(&mock);
+    api.set_custom_dns("network-0001", &["1.1.1.1"], Some(&parent))
+        .await?;
     Ok(())
 }
 
-// =================================== DnsApi::set_ipv6_dns ===================================
-
 #[tokio::test]
-async fn set_ipv6_dns_puts_settings_with_ipv6_upstream_only() -> anyhow::Result<()> {
+async fn set_custom_dns_falls_back_to_the_template_with_a_bare_id_and_no_parent()
+-> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    // Exact-match body: if `set_ipv6_dns` ever also sent `ipv6_downstream` (copying
-    // `SecurityApi::set_ipv6`'s fan-out by mistake), this mock would never match.
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
-        .and(session_cookie())
-        .and(body_json(json!({ "ipv6_upstream": true })))
+        .and(body_json(json!({
+            "dns": { "mode": "custom", "custom": { "ips": ["1.1.1.1"] } },
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let api = dns_api(&mock);
-    let env = api.set_ipv6_dns("network-0001", true).await?;
-    assert_eq!(env.into_value(), ok_envelope());
+    api.set_custom_dns("network-0001", &["1.1.1.1"], None)
+        .await?;
     Ok(())
 }
