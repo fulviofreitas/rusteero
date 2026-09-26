@@ -124,8 +124,16 @@ Baseline before the port was 568 / 558.
 
 ## 6. CI verification
 
-Filled in after the pull request's checks completed — see the section at the end of this
-file.
+Pull request: <https://github.com/fulviofreitas/rusteero/pull/3> (`feat/eero-api-8.0.4-parity`
+→ `master`, opened with `gh pr create` because no GitHub MCP server was available; not merged).
+
+| Run | Result |
+|---|---|
+| 36268240890 (first push, `c123a75`) | every job green except **Test (ubuntu-latest)**: the `cargo test --no-default-features` step died with `No space left on device` while compiling the test binaries — the v8 port doubled the number of integration-test binaries and two full debuginfo builds exhausted the runner's disk; macOS and Windows passed |
+| 36269597748 (after `cea1768`, `ci:` fix: line-tables-only debuginfo for test targets, free the runner image's unused SDKs) | **all green**: Commit Lint, Format & Lint, Test (ubuntu / macos / windows, incl. the keyring round trip on macOS and Windows), Docs, Supply chain, MSRV, CI Success |
+
+Also pushed: the private design-docs repository (`817bac3`) with the updated architecture,
+technical reference, rules and the v8 briefs.
 
 ## 7. Outstanding
 
