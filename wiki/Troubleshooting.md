@@ -172,8 +172,9 @@ keeps discovery failing for one TTL window — call `get_networks(true)` to forc
 
 Defaults: 30 s total, 10 s per read (`consts::REQUEST_TIMEOUT` / `consts::READ_TIMEOUT`). A
 `GET` that times out is retried only if `get_retries` is above 0. To change the timeouts,
-supply your own `reqwest::Client` via `.http(..)` — and rebuild redirect refusal as well
-(`.redirect(reqwest::redirect::Policy::none())`), since a caller-supplied client discards both.
+supply your own `reqwest::ClientBuilder` via `.http_builder(..)`. Redirect refusal is applied
+by `rusteero` on top of whatever the builder sets, so it cannot be lost; timeouts are the
+builder's own responsibility.
 
 ## DNS writes
 

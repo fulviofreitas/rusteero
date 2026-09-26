@@ -175,7 +175,7 @@ persistence.
 | `user_agent(Option<String>)` | The `User-Agent` header; `None` sends the crate default. Same validation |
 | `get_retries(u32)` | Additional attempts for a `GET` that fails with `Error::Network`, `Error::Timeout` or a `5xx`, 500 ms apart, each logged at `WARN`. Writes are never retried; `4xx` and `429` are never retried; the one-shot 401 refresh-and-replay is separate |
 | `base_url(..)` | Replaces the API host for **both** `/2.2` and `/2.3`; also what link resolution and the credential gate compare against. Meant for a local mock server in tests |
-| `http(reqwest::Client)` | Your own HTTP client. Discards the crate's redirect refusal and its timeouts; rebuild both (`.redirect(reqwest::redirect::Policy::none())`, `.timeout(..)`, `.read_timeout(..)`) if you need them |
+| `http_builder(reqwest::ClientBuilder)` | Your own HTTP client builder. The crate applies `reqwest::redirect::Policy::none()` on top before building; set `.timeout(..)` / `.read_timeout(..)` yourself if you need them |
 
 Timeouts are 30 s per request and 10 s per read (`consts::REQUEST_TIMEOUT`,
 `consts::READ_TIMEOUT`). `ClientBuilder` has no timeout setters; `Transport::builder()` exposes
@@ -226,8 +226,8 @@ carries the Wi-Fi password.
     error messages. `Envelope`'s `Debug` prints only `meta.code` and the *shape* of `data`.
 *   The credential goes only to the configured API host (scheme, host and port compared), and
     redirects are refused (`reqwest::redirect::Policy::none()`), so a `3xx` can never carry the
-    token elsewhere. A caller-supplied client that followed a redirect is still detected and
-    refused before the body is read.
+    token elsewhere. A caller-supplied `reqwest::ClientBuilder` gets the same policy applied
+    before it is built, so an injected client cannot follow one either.
 *   A bare id must be a single path segment (`[A-Za-z0-9][A-Za-z0-9._:-]*`, no `..`); a link
     value read from an envelope must be host-relative; an absolute URL must be on the API host.
     All of this is checked before a request is built.

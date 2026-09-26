@@ -91,7 +91,7 @@ let client = Client::builder()
     .send_legacy_cookie(true)                         // also send Cookie: s=<token>; default true
     .get_retries(0)                                   // extra GET attempts on transport error / 5xx; default 0
     .base_url("http://127.0.0.1:8080")                // tests only: derives /2.2 and /2.3 from one root
-    .http(reqwest::Client::new())                     // optional custom HTTP client (see warning)
+    .http_builder(reqwest::Client::builder())         // optional custom HTTP client builder (see warning)
     .build()
     .await?;
 ```
@@ -107,7 +107,7 @@ let client = Client::builder()
 | `send_legacy_cookie` | `bool` | `true` | `false` sends only the `X-User-Token` header |
 | `get_retries` | `u32` | `0` | Never applies to writes, never to `4xx`/`429`; distinct from the one-shot 401 refresh-and-replay |
 | `base_url` | `impl Into<String>` | real Eero hosts | `Error::Validation` at `build()` if not an absolute URL |
-| `http` | `reqwest::Client` | built by the crate | **Discards redirect refusal and the request/read timeouts** — rebuild both yourself |
+| `http_builder` | `reqwest::ClientBuilder` | built by the crate | Redirect refusal is always applied on top; the request/read timeouts are yours to set |
 
 Every setter takes `self` by value and returns `Self`; `build()` is the only fallible and only
 `async` step.
@@ -130,7 +130,7 @@ let session = pending.verify("123456").await?;                        // consume
 ```
 
 `LoginFlow::new(None)` builds a transport against the real Eero cloud hosts; pass
-`Some(reqwest::Client)` to supply your own, or use `LoginFlow::with_transport(transport)` to
+`Some(reqwest::ClientBuilder)` to supply your own, or use `LoginFlow::with_transport(transport)` to
 point it at a test server. There is no `Client::login`/`Client::verify` — an unverified login
 token can never reach an authenticated endpoint by construction, since only
 `PendingLogin::verify` can produce a `Session`. The login token itself becomes the session
