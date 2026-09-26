@@ -263,14 +263,18 @@ impl SecurityApi {
                 format!("must be one of {MLO_MODES:?}, got {mode:?}"),
             ));
         }
+        let url = routes::security::SET_MLO_MODE.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write(
             "set MLO mode for network -- may reboot every eero, like the confirmed DNS write path",
         );
         self.transport
-            .resource(
-                &routes::security::SET_MLO_MODE,
-                network_id,
-                parent,
+            .request(
+                routes::security::SET_MLO_MODE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "mlo_mode": mode })),
             )
@@ -316,12 +320,16 @@ impl SecurityApi {
         enabled: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::security::SET_FAST_TRANSITION.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("set fast transition for network");
         self.transport
-            .resource(
-                &routes::security::SET_FAST_TRANSITION,
-                network_id,
-                parent,
+            .request(
+                routes::security::SET_FAST_TRANSITION.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "fast_transition": enabled })),
             )
@@ -343,12 +351,16 @@ impl SecurityApi {
         enabled: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::security::SET_PASSPOINT_ENABLED.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("set Passpoint enabled for network");
         self.transport
-            .resource(
-                &routes::security::SET_PASSPOINT_ENABLED,
-                network_id,
-                parent,
+            .request(
+                routes::security::SET_PASSPOINT_ENABLED.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "enabled": enabled })),
             )
@@ -370,12 +382,16 @@ impl SecurityApi {
         enabled: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::security::SET_PROXIED_NODES.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("set proxied nodes for network");
         self.transport
-            .resource(
-                &routes::security::SET_PROXIED_NODES,
-                network_id,
-                parent,
+            .request(
+                routes::security::SET_PROXIED_NODES.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "enabled": enabled })),
             )
@@ -394,14 +410,18 @@ impl SecurityApi {
         parent: Option<&Value>,
         operation: &str,
     ) -> Result<Envelope, Error> {
+        let url = routes::security::SECURITY_PUT_SETTINGS.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write(&format!(
             "{operation} -- may reboot every eero, like the confirmed DNS write path"
         ));
         self.transport
-            .resource(
-                &routes::security::SECURITY_PUT_SETTINGS,
-                network_id,
-                parent,
+            .request(
+                routes::security::SECURITY_PUT_SETTINGS.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(payload),
             )

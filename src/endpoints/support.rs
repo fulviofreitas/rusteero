@@ -78,12 +78,16 @@ impl SupportApi {
         request_data: Value,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::support::REQUEST_SUPPORT_V8.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("request support for network");
         self.transport
-            .resource(
-                &routes::support::REQUEST_SUPPORT_V8,
-                network_id,
-                parent,
+            .request(
+                routes::support::REQUEST_SUPPORT_V8.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(request_data),
             )

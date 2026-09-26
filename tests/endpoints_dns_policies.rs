@@ -54,6 +54,7 @@ async fn get_advanced_content_filter_prefers_the_parents_published_link() -> any
             "/2.4/networks/network-0001/dns_policies/advanced_content_filter",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(fixture("advanced_content_filter.json")),
         )
@@ -81,6 +82,7 @@ async fn get_advanced_content_filter_premium_required_maps_correctly() -> anyhow
             "/2.2/networks/network-0001/dns_policies/advanced_content_filter",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(402).set_body_string(
             r#"{"meta":{"code":402,"error":"error.premium.user_not_subscribed"}}"#,
         ))
@@ -143,6 +145,7 @@ async fn allow_domain_sends_only_the_given_optional_keys() -> anyhow::Result<()>
             "domain": "homework.example",
             "is_delete": true
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -162,6 +165,48 @@ async fn allow_domain_sends_only_the_given_optional_keys() -> anyhow::Result<()>
     Ok(())
 }
 
+#[tokio::test]
+async fn allow_domain_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/dns_policies/network/allowed",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.4/networks/network-0001/dns_policies/network/allowed",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_policies_api(&mock);
+    let parent = json!({
+        "resources": {
+            "dns_policies_network_allowed":
+                "/2.4/networks/network-0001/dns_policies/network/allowed"
+        }
+    });
+    api.allow_domain(
+        "network-0001",
+        "homework.example",
+        None,
+        None,
+        None,
+        None,
+        Some(&parent),
+    )
+    .await?;
+    Ok(())
+}
+
 // ===================== allow_cnames =====================
 
 #[tokio::test]
@@ -173,6 +218,7 @@ async fn allow_cnames_sends_only_the_domains_field() -> anyhow::Result<()> {
         ))
         .and(session_cookie())
         .and(body_json(json!({ "domains": ["cdn.example"] })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -180,6 +226,40 @@ async fn allow_cnames_sends_only_the_domains_field() -> anyhow::Result<()> {
 
     let api = dns_policies_api(&mock);
     api.allow_cnames("network-0001", &["cdn.example"], None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn allow_cnames_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/dns_policies/network/allowed/cnames",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.4/networks/network-0001/dns_policies/network/allowed/cnames",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_policies_api(&mock);
+    let parent = json!({
+        "resources": {
+            "dns_policies_network_allowed_cnames":
+                "/2.4/networks/network-0001/dns_policies/network/allowed/cnames"
+        }
+    });
+    api.allow_cnames("network-0001", &["cdn.example"], Some(&parent))
         .await?;
     Ok(())
 }
@@ -195,6 +275,7 @@ async fn block_domain_sends_only_domain_by_default() -> anyhow::Result<()> {
         ))
         .and(session_cookie())
         .and(body_json(json!({ "domain": "ads.example" })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -218,6 +299,7 @@ async fn block_domain_sends_only_the_given_optional_keys() -> anyhow::Result<()>
             "domain": "ads.example",
             "keep_profiles": ["profile-0001"]
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -235,6 +317,40 @@ async fn block_domain_sends_only_the_given_optional_keys() -> anyhow::Result<()>
     Ok(())
 }
 
+#[tokio::test]
+async fn block_domain_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/dns_policies/network/blocked",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.4/networks/network-0001/dns_policies/network/blocked",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_policies_api(&mock);
+    let parent = json!({
+        "resources": {
+            "dns_policies_network_blocked":
+                "/2.4/networks/network-0001/dns_policies/network/blocked"
+        }
+    });
+    api.block_domain("network-0001", "ads.example", None, None, Some(&parent))
+        .await?;
+    Ok(())
+}
+
 // ===================== allow_domain_for_profiles =====================
 
 #[tokio::test]
@@ -249,6 +365,7 @@ async fn allow_domain_for_profiles_always_sends_domain_and_profiles() -> anyhow:
             "domain": "homework.example",
             "profiles": ["profile-0001"]
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -283,6 +400,7 @@ async fn allow_domain_for_profiles_sends_only_the_given_optional_keys() -> anyho
             "override": true,
             "reason_to_allow": 3
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -303,6 +421,49 @@ async fn allow_domain_for_profiles_sends_only_the_given_optional_keys() -> anyho
     Ok(())
 }
 
+#[tokio::test]
+async fn allow_domain_for_profiles_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/dns_policies/profiles/allowed",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.4/networks/network-0001/dns_policies/profiles/allowed",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_policies_api(&mock);
+    let parent = json!({
+        "resources": {
+            "dns_policies_profiles_allowed":
+                "/2.4/networks/network-0001/dns_policies/profiles/allowed"
+        }
+    });
+    api.allow_domain_for_profiles(
+        "network-0001",
+        "homework.example",
+        &["profile-0001"],
+        None,
+        None,
+        None,
+        None,
+        Some(&parent),
+    )
+    .await?;
+    Ok(())
+}
+
 // ===================== allow_cnames_for_profiles =====================
 
 #[tokio::test]
@@ -317,6 +478,7 @@ async fn allow_cnames_for_profiles_sends_domains_and_profiles() -> anyhow::Resul
             "domains": ["cdn.example"],
             "profiles": ["profile-0001"]
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -325,6 +487,45 @@ async fn allow_cnames_for_profiles_sends_domains_and_profiles() -> anyhow::Resul
     let api = dns_policies_api(&mock);
     api.allow_cnames_for_profiles("network-0001", &["cdn.example"], &["profile-0001"], None)
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn allow_cnames_for_profiles_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/dns_policies/profiles/allowed/cnames",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.4/networks/network-0001/dns_policies/profiles/allowed/cnames",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_policies_api(&mock);
+    let parent = json!({
+        "resources": {
+            "dns_policies_profiles_allowed_cnames":
+                "/2.4/networks/network-0001/dns_policies/profiles/allowed/cnames"
+        }
+    });
+    api.allow_cnames_for_profiles(
+        "network-0001",
+        &["cdn.example"],
+        &["profile-0001"],
+        Some(&parent),
+    )
+    .await?;
     Ok(())
 }
 
@@ -342,6 +543,7 @@ async fn block_domain_for_profiles_always_sends_domain_and_profiles() -> anyhow:
             "domain": "ads.example",
             "profiles": ["profile-0001"]
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -373,6 +575,7 @@ async fn block_domain_for_profiles_sends_only_the_given_optional_keys() -> anyho
             "profiles": ["profile-0001"],
             "is_delete": true
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -386,6 +589,47 @@ async fn block_domain_for_profiles_sends_only_the_given_optional_keys() -> anyho
         Some(true),
         None,
         None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn block_domain_for_profiles_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/dns_policies/profiles/blocked",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.4/networks/network-0001/dns_policies/profiles/blocked",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dns_policies_api(&mock);
+    let parent = json!({
+        "resources": {
+            "dns_policies_profiles_blocked":
+                "/2.4/networks/network-0001/dns_policies/profiles/blocked"
+        }
+    });
+    api.block_domain_for_profiles(
+        "network-0001",
+        "ads.example",
+        &["profile-0001"],
+        None,
+        None,
+        Some(&parent),
     )
     .await?;
     Ok(())
@@ -444,6 +688,7 @@ async fn set_profile_blocked_applications_sends_the_full_applications_list() -> 
         ))
         .and(session_cookie())
         .and(body_json(json!({ "applications": ["app_1", "app_2"] })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)

@@ -62,6 +62,8 @@ async fn get_insights_sends_query_parameters_in_pythons_exact_order() -> anyhow:
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/insights"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"meta": {"code": 200}})))
         .expect(1)
         .mount(&mock.server)
@@ -133,6 +135,8 @@ async fn get_devices_insights_builds_url_and_params() -> anyhow::Result<()> {
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
         .and(query_param("insight_type", "adblock"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -151,6 +155,8 @@ async fn get_devices_insights_prefers_parents_insights_devices_link() -> anyhow:
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001/insights/devices"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -194,6 +200,8 @@ async fn get_device_insights_builds_url() -> anyhow::Result<()> {
         .and(query_param("end", "e"))
         .and(query_param("cadence", "hourly"))
         .and(query_param("insight_type", "adblock"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -232,6 +240,8 @@ async fn get_profiles_insights_builds_url() -> anyhow::Result<()> {
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
         .and(query_param("insight_type", "adblock"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -239,6 +249,37 @@ async fn get_profiles_insights_builds_url() -> anyhow::Result<()> {
 
     let api = insights_api(&mock);
     api.get_profiles_insights("network-0001", "s", "e", "daily", "adblock", None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_profiles_insights_prefers_the_parents_insights_profiles_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/insights/profiles"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/insights/profiles"))
+        .and(query_param("start", "s"))
+        .and(query_param("end", "e"))
+        .and(query_param("cadence", "daily"))
+        .and(query_param("insight_type", "adblock"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({
+        "resources": {"insights_profiles": "/2.3/networks/network-0001/insights/profiles"},
+    });
+    let api = insights_api(&mock);
+    api.get_profiles_insights("network-0001", "s", "e", "daily", "adblock", Some(&parent))
         .await?;
     Ok(())
 }
@@ -254,6 +295,8 @@ async fn get_profile_insights_builds_url() -> anyhow::Result<()> {
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
         .and(query_param("insight_type", "adblock"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -276,6 +319,8 @@ async fn get_profile_devices_insights_builds_url() -> anyhow::Result<()> {
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
         .and(query_param("insight_type", "adblock"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)

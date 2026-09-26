@@ -52,6 +52,7 @@ async fn list_prefers_a_parent_supplied_link_over_the_template() -> anyhow::Resu
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/backup_access_points"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -72,6 +73,7 @@ async fn list_falls_back_to_the_bare_id_template_with_no_parent() -> anyhow::Res
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/backup_access_points"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -94,6 +96,7 @@ async fn add_sends_ssid_and_password_and_omits_uuid_when_not_given() -> anyhow::
         .and(body_json(
             json!({ "ssid": "guest-ap", "password": "s3cr3t-pass" }),
         ))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -116,6 +119,7 @@ async fn add_includes_uuid_when_given() -> anyhow::Result<()> {
         .and(body_json(
             json!({ "ssid": "guest-ap", "password": "s3cr3t-pass", "uuid": "uuid-0001" }),
         ))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -142,6 +146,7 @@ async fn update_sends_only_the_supplied_fields() -> anyhow::Result<()> {
         // No `password`/`uuid`/`connectivity`/`created`/`last_updated_at` keys at all — proves
         // the omitted fields' keys are absent from the body entirely, never sent as `null`.
         .and(body_json(json!({ "ssid": "new-ssid", "enabled": true })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -169,6 +174,7 @@ async fn delete_backup_access_point_sends_delete() -> anyhow::Result<()> {
             "/2.2/networks/network-0001/backup_access_points/backup-0001",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -192,6 +198,7 @@ async fn rearrange_sends_rearranged_ids_in_order() -> anyhow::Result<()> {
         ))
         .and(session_cookie())
         .and(body_json(json!({ "rearranged_ids": ["b1", "b2", "b3"] })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -215,6 +222,7 @@ async fn discover_ssids_hits_ssid_discovery_path_with_get() -> anyhow::Result<()
             "/2.2/networks/network-0001/backup_access_points/ssid_discovery",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -237,6 +245,7 @@ async fn start_ssid_discovery_sends_the_literal_empty_json_string_body() -> anyh
         .and(session_cookie())
         .and(header("content-type", "application/json"))
         .and(body_string("\"\""))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -258,6 +267,7 @@ async fn connectivity_check_sends_the_literal_empty_json_string_body() -> anyhow
         .and(session_cookie())
         .and(header("content-type", "application/json"))
         .and(body_string("\"\""))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)

@@ -118,6 +118,35 @@ async fn get_premium_status_hits_the_same_path_as_get_network() -> anyhow::Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn get_premium_status_prefers_parents_self_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // Same self-url resolution as `get_network` (`NetworksApi::network_own_url`): the parent's
+    // own `url` field wins over the bare-id template.
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.4/networks/network-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"url": "/2.4/networks/network-0001"});
+    let api = networks_api(&mock);
+    let env = api
+        .get_premium_status("network-0001", Some(&parent))
+        .await?;
+    assert_eq!(env.into_value(), fixture_json("network.json"));
+    Ok(())
+}
+
 // ===================== get_account =====================
 
 #[tokio::test]
@@ -146,6 +175,7 @@ async fn get_network_with_unknown_id_maps_404_to_api_error() -> anyhow::Result<(
     Mock::given(method("GET"))
         .and(path("/2.2/networks/does-not-exist"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(404).set_body_string("no such network"))
         .expect(1)
         .mount(&mock.server)
@@ -199,6 +229,7 @@ async fn reboot_network_prefers_parents_reboot_link() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/custom-reboot"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -233,6 +264,31 @@ async fn run_speed_test_posts_the_empty_json_string_to_the_speedtest_path() -> a
     Ok(())
 }
 
+#[tokio::test]
+async fn run_speed_test_prefers_parents_speedtest_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/speedtest"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network-0001/speedtest"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"speedtest": "/2.3/networks/network-0001/speedtest"}});
+    let api = networks_api(&mock);
+    let env = api.run_speed_test("network-0001", Some(&parent)).await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
 // ================================ NetworksApi::get_speed_tests ================================
 
 #[tokio::test]
@@ -244,6 +300,7 @@ async fn get_speed_tests_sends_every_supplied_query_param() -> anyhow::Result<()
         .and(query_param("startTime", "2026-01-01T00:00:00Z"))
         .and(query_param("endTime", "2026-01-02T00:00:00Z"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":[]})),
         )
@@ -274,6 +331,7 @@ async fn get_speed_tests_omits_unsupplied_params() -> anyhow::Result<()> {
         .and(query_param_is_missing("limit"))
         .and(query_param_is_missing("startTime"))
         .and(query_param_is_missing("endTime"))
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":[]})),
         )
@@ -284,6 +342,35 @@ async fn get_speed_tests_omits_unsupplied_params() -> anyhow::Result<()> {
     let api = networks_api(&mock);
     let env = api
         .get_speed_tests("network-0001", None, None, None, None)
+        .await?;
+    assert_eq!(env.data(), &json!([]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_speed_tests_prefers_parents_speedtest_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/speedtest"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/speedtest"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":[]})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"speedtest": "/2.3/networks/network-0001/speedtest"}});
+    let api = networks_api(&mock);
+    let env = api
+        .get_speed_tests("network-0001", None, None, None, Some(&parent))
         .await?;
     assert_eq!(env.data(), &json!([]));
     Ok(())
@@ -313,6 +400,33 @@ async fn set_network_name_sends_a_form_encoded_payload() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn set_network_name_prefers_parents_settings_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"settings": "/2.3/networks/network-0001/settings"}});
+    let api = networks_api(&mock);
+    let env = api
+        .set_network_name("network-0001", "New-Network-Name", Some(&parent))
+        .await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
 // ============================= NetworksApi::set_network_password =============================
 
 #[tokio::test]
@@ -323,6 +437,7 @@ async fn set_network_password_sends_a_form_encoded_payload() -> anyhow::Result<(
         .and(session_cookie())
         .and(header("content-type", "application/x-www-form-urlencoded"))
         .and(body_string("password=hunter2"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -336,6 +451,33 @@ async fn set_network_password_sends_a_form_encoded_payload() -> anyhow::Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn set_network_password_prefers_parents_password_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/password"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/password"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"password": "/2.3/networks/network-0001/password"}});
+    let api = networks_api(&mock);
+    let env = api
+        .set_network_password("network-0001", "hunter2", Some(&parent))
+        .await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
 // ============================ NetworksApi::clear_network_password ============================
 
 #[tokio::test]
@@ -344,6 +486,7 @@ async fn clear_network_password_deletes_the_password_link() -> anyhow::Result<()
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/password"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -351,6 +494,33 @@ async fn clear_network_password_deletes_the_password_link() -> anyhow::Result<()
 
     let api = networks_api(&mock);
     let env = api.clear_network_password("network-0001", None).await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_network_password_prefers_parents_password_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/password"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.3/networks/network-0001/password"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"password": "/2.3/networks/network-0001/password"}});
+    let api = networks_api(&mock);
+    let env = api
+        .clear_network_password("network-0001", Some(&parent))
+        .await?;
     assert_eq!(env.into_value(), ok_envelope());
     Ok(())
 }
@@ -364,6 +534,7 @@ async fn get_guest_network_returns_the_raw_response() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/guestnetwork"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -371,6 +542,32 @@ async fn get_guest_network_returns_the_raw_response() -> anyhow::Result<()> {
 
     let api = networks_api(&mock);
     let env = api.get_guest_network("network-0001", None).await?;
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_guest_network_prefers_parents_guestnetwork_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": {"code": 200}, "data": {"enabled": true} });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"guestnetwork": "/2.3/networks/network-0001/guestnetwork"}});
+    let api = networks_api(&mock);
+    let env = api.get_guest_network("network-0001", Some(&parent)).await?;
     assert_eq!(env.into_value(), body);
     Ok(())
 }
@@ -408,6 +605,7 @@ async fn set_guest_network_omits_name_when_not_given() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/guestnetwork"))
         .and(session_cookie())
         .and(body_string("enabled=false"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -433,6 +631,7 @@ async fn set_guest_network_prefers_parents_guestnetwork_link() -> anyhow::Result
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/custom-guest"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -457,6 +656,7 @@ async fn set_guest_password_uses_the_literal_template_with_no_parent() -> anyhow
         .and(session_cookie())
         .and(header("content-type", "application/x-www-form-urlencoded"))
         .and(body_string("password=guestpass"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -484,6 +684,7 @@ async fn set_guest_password_prefers_the_guest_parents_password_link() -> anyhow:
             "/2.2/networks/network-0001/guestnetwork/custom-password",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -510,6 +711,7 @@ async fn clear_guest_password_deletes_the_guest_password_link() -> anyhow::Resul
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/guestnetwork/password"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -517,6 +719,38 @@ async fn clear_guest_password_deletes_the_guest_password_link() -> anyhow::Resul
 
     let api = networks_api(&mock);
     let env = api.clear_guest_password("network-0001", None).await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_guest_password_prefers_the_guest_parents_password_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/guestnetwork/password"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/2.2/networks/network-0001/guestnetwork/custom-password",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    // Same as `set_guest_password`: `parent` here is the *guest network's own* envelope.
+    let guest_parent = json!({
+        "resources": {"password": "/2.2/networks/network-0001/guestnetwork/custom-password"},
+    });
+    let api = networks_api(&mock);
+    let env = api
+        .clear_guest_password("network-0001", Some(&guest_parent))
+        .await?;
     assert_eq!(env.into_value(), ok_envelope());
     Ok(())
 }

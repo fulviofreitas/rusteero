@@ -64,7 +64,7 @@ impl DiagnosticsApi {
         symptom: Option<&str>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        crate::links::warn_uncharacterised_write("run diagnostics for network");
+        let url = routes::RUN_DIAGNOSTICS.resolve(self.transport.api_host(), network_id, parent)?;
 
         let mut body = Map::new();
         if let Some(device) = device {
@@ -74,11 +74,11 @@ impl DiagnosticsApi {
             body.insert("symptom".to_owned(), Value::String(symptom.to_owned()));
         }
 
+        crate::links::warn_uncharacterised_write("run diagnostics for network");
         self.transport
-            .resource(
-                &routes::RUN_DIAGNOSTICS,
-                network_id,
-                parent,
+            .request(
+                routes::RUN_DIAGNOSTICS.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(body)),
             )

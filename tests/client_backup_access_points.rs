@@ -133,3 +133,117 @@ async fn update_backup_access_point_forwards_the_supplied_options() -> anyhow::R
     assert_eq!(env.into_value(), response);
     Ok(())
 }
+
+#[tokio::test]
+async fn delete_backup_access_point_resolves_network_id_and_sends_the_delete() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/2.2/networks/network-0001/backup_access_points/backup-0001",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .delete_backup_access_point("backup-0001", Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rearrange_backup_access_points_resolves_network_id_and_sends_the_order()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/backup_access_points/rearrange",
+        ))
+        .and(session_cookie())
+        .and(body_json(
+            json!({ "rearranged_ids": ["backup-0002", "backup-0001"] }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .rearrange_backup_access_points(&["backup-0002", "backup-0001"], Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn discover_backup_ssids_resolves_network_id_and_sends_the_get() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": { "ssids": [] } });
+    Mock::given(method("GET"))
+        .and(path(
+            "/2.2/networks/network-0001/backup_access_points/ssid_discovery",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.discover_backup_ssids(Some("network-0001")).await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn start_backup_ssid_discovery_resolves_network_id_and_sends_the_post() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/backup_access_points/ssid_discovery",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .start_backup_ssid_discovery(Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backup_connectivity_check_resolves_network_id_and_sends_the_post() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/backup_access_points/connectivity_check",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .backup_connectivity_check(Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}

@@ -107,6 +107,7 @@ async fn get_dns_settings_with_unknown_id_maps_404_to_api_error() -> anyhow::Res
     Mock::given(method("GET"))
         .and(path("/2.2/networks/does-not-exist"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(404).set_body_string("no such network"))
         .expect(1)
         .mount(&mock.server)
@@ -154,6 +155,8 @@ async fn set_dns_caching_does_not_send_the_legacy_flat_field() -> anyhow::Result
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(body_json(json!({ "dns": { "caching": false } })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -170,6 +173,8 @@ async fn set_dns_caching_prefers_a_parent_supplied_settings_link() -> anyhow::Re
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(body_json(json!({ "dns": { "caching": true } })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -192,6 +197,8 @@ async fn set_custom_dns_ipv4_only_writes_only_the_dns_object() -> anyhow::Result
         .and(body_json(json!({
             "dns": { "mode": "custom", "custom": { "ips": ["1.1.1.1", "1.0.0.1"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -211,6 +218,8 @@ async fn set_custom_dns_ipv6_only_writes_only_the_ipv6_object() -> anyhow::Resul
         .and(body_json(json!({
             "ipv6": { "name_servers": { "mode": "custom", "custom": ["2606:4700:4700::1111"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -236,6 +245,8 @@ async fn set_custom_dns_dual_stack_configures_both_families_in_one_write() -> an
                 },
             },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -281,6 +292,8 @@ async fn set_custom_dns_per_family_cap_is_not_a_total_cap() -> anyhow::Result<()
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -336,6 +349,8 @@ async fn set_custom_dns_ipv4_leaves_ipv6_untouched() -> anyhow::Result<()> {
         .and(body_json(json!({
             "dns": { "mode": "custom", "custom": { "ips": ["8.8.8.8", "8.8.4.4"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -355,6 +370,8 @@ async fn set_custom_dns_ipv6_leaves_ipv4_untouched() -> anyhow::Result<()> {
         .and(body_json(json!({
             "ipv6": { "name_servers": { "mode": "custom", "custom": ["2606:4700:4700::1111"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -407,6 +424,8 @@ async fn set_custom_dns_ipv6_compressed_form_is_sent_on_the_wire() -> anyhow::Re
         .and(body_json(json!({
             "ipv6": { "name_servers": { "mode": "custom", "custom": ["2606:4700:4700::1111"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -429,6 +448,8 @@ async fn set_custom_dns_ipv6_serialises_an_ipv4_mapped_literal_in_hex_form() -> 
         .and(body_json(json!({
             "ipv6": { "name_servers": { "mode": "custom", "custom": ["::ffff:c0a8:101"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -561,6 +582,8 @@ async fn clear_custom_dns_clears_both_families_by_default() -> anyhow::Result<()
             "dns": { "mode": "automatic" },
             "ipv6": { "name_servers": { "mode": "automatic" } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -582,6 +605,8 @@ async fn clear_custom_dns_is_non_destructive_no_custom_key_sent() -> anyhow::Res
             "dns": { "mode": "automatic" },
             "ipv6": { "name_servers": { "mode": "automatic" } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -598,6 +623,8 @@ async fn clear_custom_dns_ipv4_only_leaves_ipv6_selector_alone() -> anyhow::Resu
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(body_json(json!({ "dns": { "mode": "automatic" } })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -617,6 +644,8 @@ async fn clear_custom_dns_ipv6_only_leaves_ipv4_selector_alone() -> anyhow::Resu
         .and(body_json(
             json!({ "ipv6": { "name_servers": { "mode": "automatic" } } }),
         ))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -682,6 +711,8 @@ async fn set_dns_mode_auto_switches_mode_without_discarding_servers() -> anyhow:
             "dns": { "mode": "automatic" },
             "ipv6": { "name_servers": { "mode": "automatic" } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(3)
         .mount(&mock.server)
@@ -702,6 +733,8 @@ async fn set_dns_mode_custom_with_servers_forwards_them() -> anyhow::Result<()> 
         .and(body_json(json!({
             "dns": { "mode": "custom", "custom": { "ips": ["9.9.9.9"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -725,6 +758,8 @@ async fn set_dns_mode_custom_without_servers_reenables_stored_servers() -> anyho
             "dns": { "mode": "custom" },
             "ipv6": { "name_servers": { "mode": "custom" } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -766,6 +801,8 @@ async fn set_custom_dns_prefers_a_parent_supplied_settings_link_over_the_templat
         .and(body_json(json!({
             "dns": { "mode": "custom", "custom": { "ips": ["1.1.1.1"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -787,6 +824,8 @@ async fn set_custom_dns_falls_back_to_the_template_with_a_bare_id_and_no_parent(
         .and(body_json(json!({
             "dns": { "mode": "custom", "custom": { "ips": ["1.1.1.1"] } },
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)

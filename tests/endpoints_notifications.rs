@@ -44,6 +44,7 @@ async fn get_settings_prefers_the_parents_own_self_url() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001/notifications"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(fixture("notification_settings.json")),
         )
@@ -69,6 +70,7 @@ async fn set_settings_sends_the_supplied_pairs_verbatim() -> anyhow::Result<()> 
             "network.updated": false,
             "permissions.updates": true
         })))
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(fixture("notification_settings.json")),
         )
@@ -124,6 +126,7 @@ async fn mark_read_posts_the_literal_empty_json_string_body() -> anyhow::Result<
         .and(session_cookie())
         .and(header("content-type", "application/json"))
         .and(body_string("\"\""))
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200},"data":{}}"#),
         )
@@ -145,6 +148,7 @@ async fn get_history_sends_the_timestamp_query_param_when_supplied() -> anyhow::
         .and(path("/2.2/networks/network-0001/notifications_history"))
         .and(query_param("timestamp", "ts-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(fixture("notification_history.json")),
         )
@@ -164,6 +168,7 @@ async fn get_history_omits_the_timestamp_query_param_when_not_given() -> anyhow:
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/notifications_history"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(fixture("notification_history.json")),
         )

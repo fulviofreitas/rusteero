@@ -61,6 +61,8 @@ async fn get_security_settings_prefers_a_parent_supplied_self_url() -> anyhow::R
     // The parent's own `url` (self_url preference, not a `resources.<name>` link) must win.
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -99,6 +101,8 @@ async fn set_wpa3_uses_the_default_template_with_no_parent() -> anyhow::Result<(
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -115,6 +119,8 @@ async fn set_wpa3_prefers_the_parents_published_settings_link() -> anyhow::Resul
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(body_json(json!({ "wpa3": true })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -134,6 +140,8 @@ async fn set_band_steering_puts_settings_with_band_steering() -> anyhow::Result<
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(body_json(json!({ "band_steering": false })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -153,6 +161,8 @@ async fn set_upnp_puts_settings_with_upnp() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(body_json(json!({ "upnp": true })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -176,6 +186,8 @@ async fn set_ipv6_puts_settings_with_both_upstream_and_downstream() -> anyhow::R
         .and(body_json(
             json!({ "ipv6_upstream": true, "ipv6_downstream": true }),
         ))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -201,6 +213,8 @@ async fn configure_security_with_all_fields_merges_them_into_one_payload() -> an
             "ipv6_upstream": false,
             "ipv6_downstream": false,
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -257,6 +271,8 @@ async fn set_mlo_mode_sends_json_for_every_declared_mode() -> anyhow::Result<()>
         Mock::given(method("PUT"))
             .and(path("/2.2/networks/network-0001/mlo_mode"))
             .and(body_json(json!({ "mlo_mode": candidate })))
+            .and(session_cookie())
+            .and(user_token_header())
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
             .expect(1)
             .mount(&mock.server)
@@ -276,6 +292,8 @@ async fn set_mlo_mode_prefers_the_parents_published_link() -> anyhow::Result<()>
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/mlo_mode"))
         .and(body_json(json!({ "mlo_mode": "single" })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -315,6 +333,8 @@ async fn get_fast_transition_hits_the_sub_resource() -> anyhow::Result<()> {
     let body = json!({ "meta": { "code": 200 }, "data": { "fast_transition": true } });
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/fast_transition"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -327,12 +347,43 @@ async fn get_fast_transition_hits_the_sub_resource() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn get_fast_transition_prefers_the_parents_fast_transition_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": { "fast_transition": true } });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/fast_transition"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/fast_transition"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent =
+        json!({"resources": {"fast_transition": "/2.3/networks/network-0001/fast_transition"}});
+    let api = security_api(&mock);
+    let env = api
+        .get_fast_transition("network-0001", Some(&parent))
+        .await?;
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_fast_transition_sends_json_for_both_values() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     for enabled in [true, false] {
         Mock::given(method("PUT"))
             .and(path("/2.2/networks/network-0001/fast_transition"))
             .and(body_json(json!({ "fast_transition": enabled })))
+            .and(session_cookie())
+            .and(user_token_header())
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
             .expect(1)
             .mount(&mock.server)
@@ -347,6 +398,32 @@ async fn set_fast_transition_sends_json_for_both_values() -> anyhow::Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn set_fast_transition_prefers_the_parents_fast_transition_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/fast_transition"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/fast_transition"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent =
+        json!({"resources": {"fast_transition": "/2.3/networks/network-0001/fast_transition"}});
+    let api = security_api(&mock);
+    api.set_fast_transition("network-0001", true, Some(&parent))
+        .await?;
+    Ok(())
+}
+
 // ============================== SecurityApi::set_passpoint_enabled ==============================
 
 #[tokio::test]
@@ -355,6 +432,8 @@ async fn set_passpoint_enabled_sends_json() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/passpoint/enabled"))
         .and(body_json(json!({ "enabled": true })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -362,6 +441,32 @@ async fn set_passpoint_enabled_sends_json() -> anyhow::Result<()> {
 
     let api = security_api(&mock);
     api.set_passpoint_enabled("network-0001", true, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_passpoint_enabled_prefers_the_parents_passpoint_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/passpoint/enabled"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/passpoint/enabled"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent =
+        json!({"resources": {"passpoint": "/2.3/networks/network-0001/passpoint/enabled"}});
+    let api = security_api(&mock);
+    api.set_passpoint_enabled("network-0001", true, Some(&parent))
         .await?;
     Ok(())
 }
@@ -374,6 +479,8 @@ async fn set_proxied_nodes_sends_json() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/proxied_nodes"))
         .and(body_json(json!({ "enabled": false })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -381,5 +488,31 @@ async fn set_proxied_nodes_sends_json() -> anyhow::Result<()> {
 
     let api = security_api(&mock);
     api.set_proxied_nodes("network-0001", false, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_proxied_nodes_prefers_the_parents_proxied_nodes_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/proxied_nodes"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/proxied_nodes"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent =
+        json!({"resources": {"proxied_nodes": "/2.3/networks/network-0001/proxied_nodes"}});
+    let api = security_api(&mock);
+    api.set_proxied_nodes("network-0001", true, Some(&parent))
+        .await?;
     Ok(())
 }

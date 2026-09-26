@@ -64,6 +64,7 @@ async fn get_forwards_prefers_the_parents_published_link_over_the_template() -> 
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/forwards"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -85,6 +86,7 @@ async fn get_forwards_falls_back_to_template_when_parent_has_no_link() -> anyhow
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/forwards"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -131,6 +133,38 @@ async fn create_forward_passthrough_body_arrives_byte_identical() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+async fn create_forward_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let payload = json!({"mac": "aa:bb:cc:00:00:02"});
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/forwards"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network-0001/forwards"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(payload.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"forwards": "/2.3/networks/network-0001/forwards"}});
+    let api = forwards_api(&mock);
+    let env = api
+        .create_forward("network-0001", payload, Some(&parent))
+        .await?;
+
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
 // ===================== update_forward =====================
 
 #[tokio::test]
@@ -144,6 +178,7 @@ async fn update_forward_from_path_string_needs_no_network() -> anyhow::Result<()
         .and(session_cookie())
         .and(header("content-type", "application/json"))
         .and(body_json(payload.clone()))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -174,6 +209,7 @@ async fn update_forward_from_envelope_uses_its_own_url_even_on_a_different_versi
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/forwards/fwd-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -210,6 +246,7 @@ async fn update_forward_bare_id_with_network_resolves_to_the_template() -> anyho
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/forwards/fwd-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)

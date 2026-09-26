@@ -545,15 +545,15 @@ impl EerosApi {
                 ),
             ));
         }
+        let url = routes::EEROS_NODE_ACTION.resolve(self.transport.api_host(), eero_id, parent)?;
         crate::links::warn_uncharacterised_write(&format!(
             "perform node action '{action}' on eero -- power-cycles ports and, for \
              POWER_CYCLE_ALL_PORTS_AND_REBOOT, reboots the eero"
         ));
         self.transport
-            .resource(
-                &routes::EEROS_NODE_ACTION,
-                eero_id,
-                parent,
+            .request(
+                routes::EEROS_NODE_ACTION.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "action": action })),
             )
@@ -639,6 +639,7 @@ impl EerosApi {
         duration: u32,
         time_per_color: u32,
     ) -> Result<Envelope, Error> {
+        let url = routes::EEROS_LED_CYCLE.resolve(self.transport.api_host(), eero_serial, None)?;
         crate::links::warn_uncharacterised_write("cycle LED for eero");
         let mut pairs: Vec<(String, String)> = colors
             .iter()
@@ -648,10 +649,9 @@ impl EerosApi {
         pairs.push(("time_per_color".to_owned(), time_per_color.to_string()));
 
         self.transport
-            .resource(
-                &routes::EEROS_LED_CYCLE,
-                eero_serial,
-                None,
+            .request(
+                routes::EEROS_LED_CYCLE.method.clone(),
+                url,
                 &[],
                 RequestBody::Form(pairs),
             )
@@ -675,12 +675,12 @@ impl EerosApi {
     ) -> Result<Envelope, Error> {
         let brightness_percentage =
             validate_brightness(brightness_percentage, "brightness_percentage")?;
+        let url = routes::NIGHTLIGHT_OVERRIDE.resolve(self.transport.api_host(), eero_id, None)?;
         crate::links::warn_uncharacterised_write("override nightlight preview for eero");
         self.transport
-            .resource(
-                &routes::NIGHTLIGHT_OVERRIDE,
-                eero_id,
-                None,
+            .request(
+                routes::NIGHTLIGHT_OVERRIDE.method.clone(),
+                url,
                 &[],
                 RequestBody::Form(vec![(
                     "brightness_percentage".to_owned(),

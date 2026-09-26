@@ -48,6 +48,8 @@ async fn get_thread_prefers_the_parents_published_link() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001/thread"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("thread_status.json")))
         .expect(1)
         .mount(&mock.server)
@@ -90,6 +92,8 @@ async fn set_thread_enabled_ignores_a_supplied_parent_and_still_uses_the_literal
     // the literal `/2.2` path — `parent` is accepted but never consulted for Thread writes.
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/thread"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({ "meta": {"code": 200}, "data": {} })),
         )
@@ -112,6 +116,8 @@ async fn update_thread_sends_only_the_supplied_keys() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/thread"))
         .and(body_string(json!({ "thread_enable": true }).to_string()))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({ "meta": {"code": 200}, "data": {} })),
         )
@@ -154,6 +160,8 @@ async fn regenerate_thread_credentials_posts_the_empty_json_string() -> anyhow::
         .and(path("/2.2/networks/network-0001/thread"))
         .and(body_string("\"\""))
         .and(header("content-type", "application/json"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)

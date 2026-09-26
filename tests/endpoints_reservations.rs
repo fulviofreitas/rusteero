@@ -59,6 +59,7 @@ async fn get_reservations_prefers_the_parents_published_link_over_the_template()
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/reservations"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -80,6 +81,7 @@ async fn get_reservations_falls_back_to_template_when_parent_has_no_link() -> an
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/reservations"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -122,6 +124,38 @@ async fn create_reservation_passthrough_body_arrives_byte_identical() -> anyhow:
     Ok(())
 }
 
+#[tokio::test]
+async fn create_reservation_prefers_the_parents_published_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let payload = json!({ "mac": "aa:bb:cc:00:00:09" });
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/reservations"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network-0001/reservations"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(payload.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"reservations": "/2.3/networks/network-0001/reservations"}});
+    let api = reservations_api(&mock);
+    let env = api
+        .create_reservation("network-0001", payload, Some(&parent))
+        .await?;
+
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
 // ===================== update_reservation =====================
 
 #[tokio::test]
@@ -134,6 +168,7 @@ async fn update_reservation_from_path_string_needs_no_network() -> anyhow::Resul
         .and(path("/2.2/networks/network-0001/reservations/res-0001"))
         .and(session_cookie())
         .and(body_json(payload.clone()))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -164,6 +199,7 @@ async fn update_reservation_from_envelope_uses_its_own_url_even_on_a_different_v
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/reservations/res-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -200,6 +236,7 @@ async fn update_reservation_bare_id_with_network_resolves_to_the_template() -> a
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/reservations/res-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -263,6 +300,7 @@ async fn delete_reservation_delete_forwards_true_sends_string_true() -> anyhow::
         .and(path("/2.2/networks/network-0001/reservations/res-0001"))
         .and(session_cookie())
         .and(query_param("delete_forwards", "true"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -286,6 +324,7 @@ async fn delete_reservation_delete_forwards_false_sends_string_false() -> anyhow
         .and(path("/2.2/networks/network-0001/reservations/res-0001"))
         .and(session_cookie())
         .and(query_param("delete_forwards", "false"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)

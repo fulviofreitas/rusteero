@@ -49,6 +49,7 @@ async fn get_schedules_prefers_the_parents_published_schedules_link() -> anyhow:
             "/2.5/networks/network-0001/profiles/profile-0001/schedules",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedules.json")))
         .expect(1)
         .mount(&mock.server)
@@ -103,6 +104,48 @@ async fn create_schedule_posts_all_five_fields_to_the_schedules_collection() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn create_schedule_prefers_the_parents_published_schedules_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/profiles/profile-0001/schedules",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.5/networks/network-0001/profiles/profile-0001/schedules",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = schedule_api(&mock);
+    let parent = json!({
+        "resources": {
+            "schedules": "/2.5/networks/network-0001/profiles/profile-0001/schedules"
+        }
+    });
+    api.create_schedule(
+        "network-0001",
+        "profile-0001",
+        "Study Time",
+        &["monday", "tuesday"],
+        "15:00",
+        "16:00",
+        true,
+        Some(&parent),
+    )
+    .await?;
+    Ok(())
+}
+
 // ===================== update_schedule =====================
 
 #[tokio::test]
@@ -114,6 +157,7 @@ async fn update_schedule_from_a_bare_path_sends_only_the_supplied_fields() -> an
         ))
         .and(session_cookie())
         .and(body_json(json!({ "enabled": false })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
@@ -141,6 +185,7 @@ async fn update_schedule_from_an_envelope_uses_its_own_self_url() -> anyhow::Res
         ))
         .and(session_cookie())
         .and(body_json(json!({ "start": "20:00" })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
@@ -247,6 +292,7 @@ async fn clear_profile_schedule_issues_one_delete_per_pause() -> anyhow::Result<
             "/2.2/networks/network-0001/profiles/profile-0001/schedules",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedules.json")))
         .expect(1)
         .mount(&mock.server)
@@ -256,6 +302,7 @@ async fn clear_profile_schedule_issues_one_delete_per_pause() -> anyhow::Result<
             "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -265,6 +312,7 @@ async fn clear_profile_schedule_issues_one_delete_per_pause() -> anyhow::Result<
             "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0002",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -286,6 +334,7 @@ async fn clear_profile_schedule_with_no_pauses_issues_no_deletes() -> anyhow::Re
             "/2.2/networks/network-0001/profiles/profile-0001/schedules",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200},"data":[]}"#),
         )
@@ -319,6 +368,8 @@ async fn clear_profile_schedule_with_an_unresolvable_pause_uses_the_shared_messa
         .and(path(
             "/2.2/networks/network-0001/profiles/profile-0001/schedules",
         ))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"meta":{"code":200},"data":[{"name":"Bedtime","url":""}]}"#),
@@ -365,6 +416,7 @@ async fn enable_bedtime_with_no_days_defaults_to_all_seven() -> anyhow::Result<(
             "end": "07:00",
             "enabled": true
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
@@ -393,6 +445,7 @@ async fn set_weekday_bedtime_emits_a_bedtime_block_scoped_to_monday_through_frid
             "end": "06:30",
             "enabled": true
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
@@ -420,6 +473,7 @@ async fn set_weekend_bedtime_emits_a_bedtime_block_scoped_to_saturday_and_sunday
             "end": "09:00",
             "enabled": true
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)

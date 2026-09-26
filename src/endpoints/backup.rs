@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use crate::envelope::Envelope;
 use crate::error::Error;
+use crate::links::warn_uncharacterised_write;
 use crate::routes;
 use crate::transport::{RequestBody, Transport};
 
@@ -93,12 +94,13 @@ impl BackupApi {
         enabled: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        crate::links::warn_uncharacterised_write("set backup internet for network");
+        let url =
+            routes::SET_BACKUP_INTERNET.resolve(self.transport.api_host(), network_id, parent)?;
+        warn_uncharacterised_write("set backup internet for network");
         self.transport
-            .resource(
-                &routes::SET_BACKUP_INTERNET,
-                network_id,
-                parent,
+            .request(
+                routes::SET_BACKUP_INTERNET.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "backup_internet_enabled": enabled })),
             )

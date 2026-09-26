@@ -141,6 +141,184 @@ async fn configure_security_no_longer_accepts_a_thread_argument_and_still_invali
 }
 
 #[tokio::test]
+async fn set_band_steering_forwards_the_cached_network_as_parent_and_invalidates_it()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(body_json(json!({ "band_steering": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.set_band_steering(true, Some("network-0001")).await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_upnp_forwards_the_cached_network_as_parent_and_invalidates_it() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(body_json(json!({ "upnp": false })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.set_upnp(false, Some("network-0001")).await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_forwards_the_cached_network_as_parent_and_invalidates_it() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.set_ipv6(true, Some("network-0001")).await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_mlo_mode_forwards_the_cached_network_as_parent_and_invalidates_it()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/mlo_mode"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_mlo_mode("disabled", Some("network-0001"))
+        .await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_passpoint_enabled_forwards_the_cached_network_as_parent_and_invalidates_it()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/passpoint/enabled"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_passpoint_enabled(true, Some("network-0001"))
+        .await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_proxied_nodes_forwards_the_cached_network_as_parent_and_invalidates_it()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/proxied_nodes"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.set_proxied_nodes(true, Some("network-0001")).await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_fast_transition_never_invalidates_and_set_fast_transition_does() -> anyhow::Result<()>
 {
     let mock = MockEero::start().await;

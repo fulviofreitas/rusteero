@@ -116,6 +116,150 @@ async fn create_invite_forwards_the_role_and_resolves_the_network_id() -> anyhow
 }
 
 #[tokio::test]
+async fn get_invites_resolves_the_network_id() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": { "invites": [] } });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/invites"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.get_invites(Some("network-0001")).await?;
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_invite_sends_the_nickname_and_resolves_the_network_id() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/invites/invite-0001"))
+        .and(session_cookie())
+        .and(body_json(json!({ "invite_nickname": "Guest" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .update_invite("invite-0001", "Guest", Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_invite_resolves_the_network_id_and_sends_the_delete() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/invites/invite-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .delete_invite("invite-0001", Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn respond_to_invite_sends_accept_and_the_invite_id() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/invites/response"))
+        .and(session_cookie())
+        .and(body_json(
+            json!({ "accept": true, "invite_id": "invite-0001" }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .respond_to_invite(true, Some("invite-0001"), None, Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_pending_admin_resolves_the_network_id_and_sends_the_empty_json_string()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("POST"))
+        .and(path(
+            "/2.2/networks/network-0001/invites/cancel_pending_admin",
+        ))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.cancel_pending_admin(Some("network-0001")).await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promote_member_sends_the_member_id_and_resolves_the_network_id() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/member_promotion"))
+        .and(session_cookie())
+        .and(body_json(json!({ "member_id": "member-0001" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .promote_member("member-0001", Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remove_admin_resolves_the_network_id_and_sends_the_delete() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/admins/user-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .remove_admin("user-0001", Some("network-0001"))
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
 async fn query_invite_never_resolves_a_network_id() -> anyhow::Result<()> {
     // No network exists on this client at all (no `set_preferred_network`, and `query_invite`
     // never calls `ensure_network_id`); if it accidentally did, this test would fail with

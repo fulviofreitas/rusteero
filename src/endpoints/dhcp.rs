@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::links;
+use crate::params::{py_list, py_quote};
 use crate::routes;
 use crate::transport::{RequestBody, Transport};
 
@@ -83,7 +84,11 @@ impl DhcpApi {
             if !DHCP_MODES.contains(&mode) {
                 return Err(Error::validation(
                     "mode",
-                    format!("must be one of {DHCP_MODES:?}, got {mode:?}"),
+                    format!(
+                        "must be one of {}, got {}",
+                        py_list(DHCP_MODES),
+                        py_quote(mode)
+                    ),
                 ));
             }
             dhcp.insert("mode".to_owned(), Value::String(mode.to_owned()));
@@ -144,7 +149,11 @@ impl DhcpApi {
         if !CONNECTION_MODES.contains(&mode) {
             return Err(Error::validation(
                 "mode",
-                format!("must be one of {CONNECTION_MODES:?}, got {mode:?}"),
+                format!(
+                    "must be one of {}, got {}",
+                    py_list(CONNECTION_MODES),
+                    py_quote(mode)
+                ),
             ));
         }
         links::warn_uncharacterised_write(
@@ -218,12 +227,16 @@ impl DhcpApi {
         username: &str,
         password: &str,
     ) -> Result<Envelope, Error> {
+        let url = routes::dhcp::DHCP_SET_PPPOE.resolve(
+            self.transport.api_host(),
+            eero_serial_or_id,
+            None,
+        )?;
         links::warn_uncharacterised_write("encrypt PPPoE credentials for eero");
         self.transport
-            .resource(
-                &routes::dhcp::DHCP_SET_PPPOE,
-                eero_serial_or_id,
-                None,
+            .request(
+                routes::dhcp::DHCP_SET_PPPOE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({
                     "pppoe": { "username": username, "password": password }
@@ -245,18 +258,19 @@ fn filter_given_keys(
     mapping: &Map<String, Value>,
     allowed: &[&str],
 ) -> Result<Map<String, Value>, Error> {
-    let mut unknown: Vec<&str> = mapping
+    let unknown: Vec<&str> = mapping
         .keys()
         .map(String::as_str)
         .filter(|key| !allowed.contains(key))
         .collect();
     if !unknown.is_empty() {
-        unknown.sort_unstable();
-        let mut allowed_sorted = allowed.to_vec();
-        allowed_sorted.sort_unstable();
         return Err(Error::validation(
             "field",
-            format!("unrecognised field(s): {unknown:?}; expected one of {allowed_sorted:?}"),
+            format!(
+                "unrecognised field(s): {}; expected one of {}",
+                py_list(&unknown),
+                py_list(allowed)
+            ),
         ));
     }
     Ok(mapping.clone())

@@ -57,6 +57,7 @@ async fn get_updates_prefers_the_parents_updates_link() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/custom-updates"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -91,6 +92,38 @@ async fn apply_update_posts_the_empty_json_string_to_the_updates_path() -> anyho
 
     let env = updates_api(&mock)
         .apply_update("network-0001", None)
+        .await?;
+    assert_eq!(
+        env.into_value(),
+        json!({ "meta": { "code": 200 }, "data": {} })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_update_prefers_the_parents_updates_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/updates"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/custom-updates"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "meta": { "code": 200 }, "data": {} })),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"updates": "/2.2/networks/network-0001/custom-updates"}});
+    let env = updates_api(&mock)
+        .apply_update("network-0001", Some(&parent))
         .await?;
     assert_eq!(
         env.into_value(),

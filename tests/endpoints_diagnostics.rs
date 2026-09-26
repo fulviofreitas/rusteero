@@ -151,3 +151,29 @@ async fn run_diagnostics_sends_both_supplied_keys() -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn run_diagnostics_prefers_a_parent_supplied_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/diagnostics"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network-0001/diagnostics"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"diagnostics": "/2.3/networks/network-0001/diagnostics"}});
+    let api = diagnostics_api(&mock);
+    api.run_diagnostics("network-0001", None, None, Some(&parent))
+        .await?;
+    Ok(())
+}

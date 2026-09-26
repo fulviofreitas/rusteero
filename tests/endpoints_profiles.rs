@@ -50,6 +50,7 @@ async fn get_profiles_prefers_the_parents_published_profiles_link() -> anyhow::R
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001/profiles"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profiles.json")))
         .expect(1)
         .mount(&mock.server)
@@ -91,6 +92,7 @@ async fn get_profile_prefers_the_parents_own_self_url_over_the_template() -> any
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles/profile-cached"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
@@ -114,6 +116,7 @@ async fn get_profile_devices_hits_the_same_path_as_get_profile_and_returns_an_id
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(2)
         .mount(&mock.server)
@@ -146,6 +149,7 @@ async fn get_profile_404_maps_to_error_not_found_and_is_not_an_auth_error() -> a
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles/missing-profile"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(404).set_body_string("no such profile"))
         .expect(1)
         .mount(&mock.server)
@@ -196,6 +200,7 @@ async fn pause_profile_puts_paused_false_to_unpause() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
         .and(body_json(json!({ "paused": false })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
@@ -203,6 +208,31 @@ async fn pause_profile_puts_paused_false_to_unpause() -> anyhow::Result<()> {
 
     let api = profiles_api(&mock);
     api.pause_profile("network-0001", "profile-0001", false, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_profile_prefers_the_parents_self_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"url": "/2.3/networks/network-0001/profiles/profile-0001"});
+    let api = profiles_api(&mock);
+    api.pause_profile("network-0001", "profile-0001", true, Some(&parent))
         .await?;
     Ok(())
 }
@@ -222,6 +252,7 @@ async fn set_profile_devices_wraps_each_url_in_its_own_object_and_replaces_the_l
                 { "url": "/2.2/networks/network-0001/devices/device-0002" }
             ]
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
@@ -236,6 +267,36 @@ async fn set_profile_devices_wraps_each_url_in_its_own_object_and_replaces_the_l
             "/2.2/networks/network-0001/devices/device-0002",
         ],
         None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_profile_devices_prefers_the_parents_self_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"url": "/2.3/networks/network-0001/profiles/profile-0001"});
+    let api = profiles_api(&mock);
+    api.set_profile_devices(
+        "network-0001",
+        "profile-0001",
+        &["/2.2/networks/network-0001/devices/device-0001"],
+        Some(&parent),
     )
     .await?;
     Ok(())
@@ -274,6 +335,7 @@ async fn create_profile_includes_devices_and_paused_when_supplied() -> anyhow::R
             "devices": [{ "url": "/2.2/networks/network-0001/devices/device-0001" }],
             "paused": false
         })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
@@ -297,6 +359,7 @@ async fn create_profile_prefers_parent_profiles_link() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/2.4/networks/network-0001/profiles"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
@@ -318,6 +381,7 @@ async fn rename_profile_puts_the_new_name() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
         .and(body_json(json!({ "name": "Teenagers" })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(1)
         .mount(&mock.server)
@@ -325,6 +389,31 @@ async fn rename_profile_puts_the_new_name() -> anyhow::Result<()> {
 
     let api = profiles_api(&mock);
     api.rename_profile("network-0001", "profile-0001", "Teenagers", None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rename_profile_prefers_the_parents_self_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"url": "/2.3/networks/network-0001/profiles/profile-0001"});
+    let api = profiles_api(&mock);
+    api.rename_profile("network-0001", "profile-0001", "Teenagers", Some(&parent))
         .await?;
     Ok(())
 }
@@ -355,6 +444,7 @@ async fn delete_profile_404_maps_to_error_not_found_and_is_not_an_auth_error() -
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/profiles/missing-profile"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(404).set_body_string("no such profile"))
         .expect(1)
         .mount(&mock.server)

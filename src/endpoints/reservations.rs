@@ -98,12 +98,16 @@ impl ReservationsApi {
         reservation_data: Value,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::reservations::RESERVATIONS_CREATE.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         links::warn_uncharacterised_write("create reservation for network");
         self.transport
-            .resource(
-                &routes::reservations::RESERVATIONS_CREATE,
-                network_id,
-                parent,
+            .request(
+                routes::reservations::RESERVATIONS_CREATE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(reservation_data),
             )
@@ -166,18 +170,22 @@ impl ReservationsApi {
         reservation: &str,
         delete_forwards: Option<bool>,
     ) -> Result<Envelope, Error> {
-        links::warn_uncharacterised_write("delete reservation for network");
+        let url = routes::reservations::RESERVATIONS_DELETE.resolve(
+            self.transport.api_host(),
+            network_id,
+            reservation,
+            None,
+        )?;
         let query: Vec<(&str, String)> = match delete_forwards {
             Some(true) => vec![("delete_forwards", "true".to_owned())],
             Some(false) => vec![("delete_forwards", "false".to_owned())],
             None => Vec::new(),
         };
+        links::warn_uncharacterised_write("delete reservation for network");
         self.transport
-            .nested(
-                &routes::reservations::RESERVATIONS_DELETE,
-                network_id,
-                reservation,
-                None,
+            .request(
+                routes::reservations::RESERVATIONS_DELETE.method.clone(),
+                url,
                 &query,
                 RequestBody::None,
             )

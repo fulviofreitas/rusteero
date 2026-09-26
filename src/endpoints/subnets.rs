@@ -73,12 +73,16 @@ impl SubnetsApi {
     /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
     /// status-mapped [`Error`] the request produces otherwise.
     pub async fn set_config(&self, network_id: &str, config: Value) -> Result<Envelope, Error> {
+        let url = routes::subnets::SUBNETS_SET_CONFIG.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
         links::warn_uncharacterised_write("set subnet configuration for network");
         self.transport
-            .resource(
-                &routes::subnets::SUBNETS_SET_CONFIG,
-                network_id,
-                None,
+            .request(
+                routes::subnets::SUBNETS_SET_CONFIG.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(config),
             )
@@ -143,12 +147,16 @@ impl SubnetsApi {
         network_id: &str,
         filters: Value,
     ) -> Result<Envelope, Error> {
+        let url = routes::subnets::SUBNETS_SET_CONTENT_FILTERS.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
         links::warn_uncharacterised_write("set subnet content filters for network");
         self.transport
-            .resource(
-                &routes::subnets::SUBNETS_SET_CONTENT_FILTERS,
-                network_id,
-                None,
+            .request(
+                routes::subnets::SUBNETS_SET_CONTENT_FILTERS.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(filters),
             )

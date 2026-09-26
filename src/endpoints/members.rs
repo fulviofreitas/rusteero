@@ -110,12 +110,13 @@ impl MembersApi {
                 format!("must be one of ['admin', 'owner'], got '{role}'"),
             ));
         }
+        let url =
+            routes::MEMBERS_CREATE_INVITE.resolve(self.transport.api_host(), network_id, None)?;
         crate::links::warn_uncharacterised_write("create invite for network");
         self.transport
-            .resource(
-                &routes::MEMBERS_CREATE_INVITE,
-                network_id,
-                None,
+            .request(
+                routes::MEMBERS_CREATE_INVITE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "invite_role": normalised })),
             )
@@ -139,13 +140,17 @@ impl MembersApi {
         invite_id: &str,
         invite_nickname: &str,
     ) -> Result<Envelope, Error> {
+        let url = routes::MEMBERS_UPDATE_INVITE.resolve(
+            self.transport.api_host(),
+            network_id,
+            invite_id,
+            None,
+        )?;
         crate::links::warn_uncharacterised_write("update invite for network");
         self.transport
-            .nested(
-                &routes::MEMBERS_UPDATE_INVITE,
-                network_id,
-                invite_id,
-                None,
+            .request(
+                routes::MEMBERS_UPDATE_INVITE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "invite_nickname": invite_nickname })),
             )
@@ -165,13 +170,17 @@ impl MembersApi {
         network_id: &str,
         invite_id: &str,
     ) -> Result<Envelope, Error> {
+        let url = routes::MEMBERS_DELETE_INVITE.resolve(
+            self.transport.api_host(),
+            network_id,
+            invite_id,
+            None,
+        )?;
         crate::links::warn_uncharacterised_write("delete invite for network");
         self.transport
-            .nested(
-                &routes::MEMBERS_DELETE_INVITE,
-                network_id,
-                invite_id,
-                None,
+            .request(
+                routes::MEMBERS_DELETE_INVITE.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )
@@ -214,12 +223,16 @@ impl MembersApi {
                 Value::String(invite_code.to_owned()),
             );
         }
+        let url = routes::MEMBERS_RESPOND_TO_INVITE.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
         crate::links::warn_uncharacterised_write("respond to invite for network");
         self.transport
-            .resource(
-                &routes::MEMBERS_RESPOND_TO_INVITE,
-                network_id,
-                None,
+            .request(
+                routes::MEMBERS_RESPOND_TO_INVITE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(body)),
             )
@@ -238,12 +251,16 @@ impl MembersApi {
     ///
     /// See [`Self::get_members`].
     pub async fn cancel_pending_admin(&self, network_id: &str) -> Result<Envelope, Error> {
+        let url = routes::MEMBERS_CANCEL_PENDING_ADMIN.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
         crate::links::warn_uncharacterised_write("cancel pending admin invites for network");
         self.transport
-            .resource(
-                &routes::MEMBERS_CANCEL_PENDING_ADMIN,
-                network_id,
-                None,
+            .request(
+                routes::MEMBERS_CANCEL_PENDING_ADMIN.method.clone(),
+                url,
                 &[],
                 RequestBody::EmptyJsonString,
             )
@@ -263,12 +280,13 @@ impl MembersApi {
         network_id: &str,
         member_id: &str,
     ) -> Result<Envelope, Error> {
+        let url =
+            routes::MEMBERS_PROMOTE_MEMBER.resolve(self.transport.api_host(), network_id, None)?;
         crate::links::warn_uncharacterised_write("promote member for network");
         self.transport
-            .resource(
-                &routes::MEMBERS_PROMOTE_MEMBER,
-                network_id,
-                None,
+            .request(
+                routes::MEMBERS_PROMOTE_MEMBER.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "member_id": member_id })),
             )
@@ -284,13 +302,17 @@ impl MembersApi {
     ///
     /// See [`Self::get_members`].
     pub async fn remove_admin(&self, network_id: &str, user_id: &str) -> Result<Envelope, Error> {
+        let url = routes::MEMBERS_REMOVE_ADMIN.resolve(
+            self.transport.api_host(),
+            network_id,
+            user_id,
+            None,
+        )?;
         crate::links::warn_uncharacterised_write("remove admin from network");
         self.transport
-            .nested(
-                &routes::MEMBERS_REMOVE_ADMIN,
-                network_id,
-                user_id,
-                None,
+            .request(
+                routes::MEMBERS_REMOVE_ADMIN.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )

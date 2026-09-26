@@ -57,6 +57,7 @@ async fn get_support_prefers_the_parents_support_link() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/custom-support"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -94,6 +95,38 @@ async fn request_support_passthrough_body_arrives_byte_identical_including_neste
 
     let api = support_api(&mock);
     let env = api.request_support("network-0001", payload, None).await?;
+
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_support_prefers_the_parents_support_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let payload = json!({"issue": "wifi-dropping"});
+    let response = json!({ "meta": { "code": 200 }, "data": { "ticket_id": "tick-0002" } });
+
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/support"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/custom-support"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(payload.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"support": "/2.2/networks/network-0001/custom-support"}});
+    let api = support_api(&mock);
+    let env = api
+        .request_support("network-0001", payload, Some(&parent))
+        .await?;
 
     assert_eq!(env.into_value(), response);
     Ok(())

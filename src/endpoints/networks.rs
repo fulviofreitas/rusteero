@@ -152,12 +152,16 @@ impl NetworksApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::networks::REBOOT_NETWORK_V8.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("reboot network");
         self.transport
-            .resource(
-                &routes::networks::REBOOT_NETWORK_V8,
-                network_id,
-                parent,
+            .request(
+                routes::networks::REBOOT_NETWORK_V8.method.clone(),
+                url,
                 &[],
                 RequestBody::EmptyJsonString,
             )
@@ -251,12 +255,16 @@ impl NetworksApi {
         name: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::networks::NETWORK_SETTINGS_FORM.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("set network name for network");
         self.transport
-            .resource(
-                &routes::networks::NETWORK_SETTINGS_FORM,
-                network_id,
-                parent,
+            .request(
+                routes::networks::NETWORK_SETTINGS_FORM.method.clone(),
+                url,
                 &[],
                 RequestBody::Form(vec![("name".to_owned(), name.to_owned())]),
             )
@@ -280,12 +288,16 @@ impl NetworksApi {
         password: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::networks::SET_NETWORK_PASSWORD.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("set network password for network");
         self.transport
-            .resource(
-                &routes::networks::SET_NETWORK_PASSWORD,
-                network_id,
-                parent,
+            .request(
+                routes::networks::SET_NETWORK_PASSWORD.method.clone(),
+                url,
                 &[],
                 RequestBody::Form(vec![("password".to_owned(), password.to_owned())]),
             )
@@ -307,12 +319,16 @@ impl NetworksApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::networks::CLEAR_NETWORK_PASSWORD.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("clear network password for network");
         self.transport
-            .resource(
-                &routes::networks::CLEAR_NETWORK_PASSWORD,
-                network_id,
-                parent,
+            .request(
+                routes::networks::CLEAR_NETWORK_PASSWORD.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )

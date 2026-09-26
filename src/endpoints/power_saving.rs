@@ -91,12 +91,16 @@ impl PowerSavingApi {
             ));
         }
 
+        let url = routes::POWER_SAVING_SET_POWER_SAVING.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         crate::links::warn_uncharacterised_write("set power saving for network");
         self.transport
-            .resource(
-                &routes::POWER_SAVING_SET_POWER_SAVING,
-                network_id,
-                parent,
+            .request(
+                routes::POWER_SAVING_SET_POWER_SAVING.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(body)),
             )
@@ -142,12 +146,16 @@ impl PowerSavingApi {
         end_time: &str,
         enabled: bool,
     ) -> Result<Envelope, Error> {
+        let url = routes::POWER_SAVING_CREATE_SCHEDULE.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
         crate::links::warn_uncharacterised_write("create power saving schedule for network");
         self.transport
-            .resource(
-                &routes::POWER_SAVING_CREATE_SCHEDULE,
-                network_id,
-                None,
+            .request(
+                routes::POWER_SAVING_CREATE_SCHEDULE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({
                     "name": name,
@@ -204,14 +212,18 @@ impl PowerSavingApi {
             ));
         }
 
+        let url = routes::POWER_SAVING_UPDATE_SCHEDULE.resolve(
+            self.transport.api_host(),
+            network_id,
+            schedule_id,
+            None,
+        )?;
         // Deliberately no `schedule_id` in this fixed operation string — see the module docs.
         crate::links::warn_uncharacterised_write("update power saving schedule for network");
         self.transport
-            .nested(
-                &routes::POWER_SAVING_UPDATE_SCHEDULE,
-                network_id,
-                schedule_id,
-                None,
+            .request(
+                routes::POWER_SAVING_UPDATE_SCHEDULE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(body)),
             )
@@ -228,14 +240,18 @@ impl PowerSavingApi {
         network_id: &str,
         schedule_id: &str,
     ) -> Result<Envelope, Error> {
+        let url = routes::POWER_SAVING_DELETE_SCHEDULE.resolve(
+            self.transport.api_host(),
+            network_id,
+            schedule_id,
+            None,
+        )?;
         // Deliberately no `schedule_id` in this fixed operation string — see the module docs.
         crate::links::warn_uncharacterised_write("delete power saving schedule for network");
         self.transport
-            .nested(
-                &routes::POWER_SAVING_DELETE_SCHEDULE,
-                network_id,
-                schedule_id,
-                None,
+            .request(
+                routes::POWER_SAVING_DELETE_SCHEDULE.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )

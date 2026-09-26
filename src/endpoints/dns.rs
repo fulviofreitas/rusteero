@@ -342,8 +342,13 @@ impl DnsApi {
     /// Ported from `eero-api src/eero/api/dns.py:183-220` (`DnsAPI._put_settings`): every DNS
     /// write funnels through here, so the reboot warning lives in exactly one place. Logs the
     /// identical operation string Python does (`dns.py:206`, em dash) via
-    /// [`warn_uncharacterised_write`] immediately before the request, per this crate's own
-    /// conventions.
+    /// [`warn_uncharacterised_write`] as the *first* statement in the method — **before** the
+    /// authentication check and before the URL is resolved, unlike every other write in this
+    /// crate (which warn only after resolution/validation has succeeded, right before the
+    /// request). This is Python's own quirk for this one method, not this port's general rule
+    /// (`dns.py:206` precedes `dns.py:207-208`'s `get_auth_token()` call) — preserved verbatim
+    /// rather than "fixed" to match its siblings, per this crate's discipline of reproducing
+    /// observed Python behaviour rather than silently diverging from it.
     async fn put_settings(
         &self,
         network_id: &str,

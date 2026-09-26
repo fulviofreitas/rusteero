@@ -53,6 +53,8 @@ async fn get_blacklist_prefers_parents_device_blacklist_link() -> anyhow::Result
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001/blacklist"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
@@ -81,6 +83,7 @@ async fn add_to_blacklist_sends_a_form_encoded_mac_not_json() -> anyhow::Result<
         .and(session_cookie())
         .and(header("content-type", "application/x-www-form-urlencoded"))
         .and(body_string("mac=aa%3Abb%3Acc%3A00%3A00%3A01"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
@@ -97,6 +100,8 @@ async fn add_to_blacklist_prefers_parents_device_blacklist_link() -> anyhow::Res
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
         .and(path("/2.4/networks/network-0001/blacklist"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
@@ -124,6 +129,7 @@ async fn remove_from_blacklist_hits_the_right_path() -> anyhow::Result<()> {
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/blacklist/aabbcc000001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
@@ -131,6 +137,31 @@ async fn remove_from_blacklist_hits_the_right_path() -> anyhow::Result<()> {
 
     let api = blacklist_api(&mock);
     api.remove_from_blacklist("network-0001", "aabbcc000001", None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn remove_from_blacklist_prefers_parents_device_blacklist_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/blacklist/aabbcc000001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.4/networks/network-0001/blacklist/aabbcc000001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"device_blacklist": "/2.4/networks/network-0001/blacklist"}});
+    let api = blacklist_api(&mock);
+    api.remove_from_blacklist("network-0001", "aabbcc000001", Some(&parent))
         .await?;
     Ok(())
 }

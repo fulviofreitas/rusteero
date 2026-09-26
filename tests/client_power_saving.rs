@@ -62,6 +62,53 @@ async fn set_power_saving_rejects_no_fields() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `Client::get_power_saving_schedules` passes the cached network as `parent=`
+/// (`_network_parent_kwargs`, `client.py:2832-2837`), exactly like every other `+net` wrapper —
+/// but `PowerSavingApi::get_schedules`'s route deliberately has `link: None`
+/// (`routes::power_saving::POWER_SAVING_GET_SCHEDULES`'s own doc comment), so the parent is
+/// structurally inert at the domain layer: even a cached network publishing an (arbitrary,
+/// unrelated) `resources` link must never change the resolved path away from the bare-id
+/// template.
+#[tokio::test]
+async fn get_power_saving_schedules_passes_the_cached_network_as_an_inert_parent()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let network_with_link = json!({
+        "meta": {"code": 200},
+        "data": {
+            "url": "/2.2/networks/network-0001",
+            "resources": {"schedules": "/2.3/networks/network-0001/power_saving/schedules"},
+        },
+    });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/power_saving/schedules"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/power_saving/schedules"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .get_power_saving_schedules(Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_power_saving_schedules_requires_a_network_id() -> anyhow::Result<()> {
     let mock = MockEero::start().await;

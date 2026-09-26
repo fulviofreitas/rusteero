@@ -55,6 +55,7 @@ async fn set_dhcp_custom_only_given_keys() -> anyhow::Result<()> {
         .and(body_json(
             json!({ "dhcp": { "custom": { "start_ip": "192.0.2.10" } } }),
         ))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -87,6 +88,7 @@ async fn set_dhcp_custom_v2_only_given_keys() -> anyhow::Result<()> {
         .and(body_json(
             json!({ "dhcp": { "custom_v2": { "supernet": "10.0.0.0/8" } } }),
         ))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -186,6 +188,7 @@ async fn set_dhcp_prefers_parent_link() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -211,6 +214,7 @@ async fn set_connection_mode_bridge_sends_json() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
         .and(body_json(json!({ "connection": { "mode": "BRIDGE" } })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -234,6 +238,7 @@ async fn set_connection_mode_nat_sends_json() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
         .and(body_json(json!({ "connection": { "mode": "NAT" } })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -260,6 +265,36 @@ async fn set_connection_mode_rejects_invalid_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn set_connection_mode_prefers_parent_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let parent = json!({"resources": {"settings": "/2.3/networks/network-0001/settings"}});
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dhcp_api(&mock);
+    let env = api
+        .set_connection_mode("network-0001", "BRIDGE", Some(&parent))
+        .await?;
+
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
 // ===================== set_nat_port_randomization =====================
 
 #[tokio::test]
@@ -271,6 +306,7 @@ async fn set_nat_port_randomization_true_sends_json() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
         .and(body_json(json!({ "nat_port_randomization": true })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -294,6 +330,7 @@ async fn set_nat_port_randomization_false_sends_json() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
         .and(body_json(json!({ "nat_port_randomization": false })))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -302,6 +339,36 @@ async fn set_nat_port_randomization_false_sends_json() -> anyhow::Result<()> {
     let api = dhcp_api(&mock);
     let env = api
         .set_nat_port_randomization("network-0001", false, None)
+        .await?;
+
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_nat_port_randomization_prefers_parent_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let parent = json!({"resources": {"settings": "/2.3/networks/network-0001/settings"}});
+    let response = json!({ "meta": { "code": 200 }, "data": {} });
+
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = dhcp_api(&mock);
+    let env = api
+        .set_nat_port_randomization("network-0001", true, Some(&parent))
         .await?;
 
     assert_eq!(env.into_value(), response);

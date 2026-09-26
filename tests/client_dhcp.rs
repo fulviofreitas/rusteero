@@ -103,6 +103,93 @@ async fn set_nat_port_randomization_invalidates_the_network_bucket() -> anyhow::
 }
 
 #[tokio::test]
+async fn set_dhcp_forwards_the_cached_network_as_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_dhcp(Some("automatic"), None, None, Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_connection_mode_forwards_the_cached_network_as_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_connection_mode("NAT", Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_nat_port_randomization_forwards_the_cached_network_as_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("dns_network_with_settings_link.json")),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_nat_port_randomization(true, Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_pppoe_is_not_network_scoped() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("POST"))

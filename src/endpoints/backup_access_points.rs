@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::envelope::Envelope;
 use crate::error::Error;
+use crate::links::warn_uncharacterised_write;
 use crate::routes;
 use crate::transport::{RequestBody, Transport};
 
@@ -116,12 +117,16 @@ impl BackupAccessPointsApi {
         if let Some(uuid) = uuid {
             body.insert("uuid".to_owned(), Value::String(uuid.to_owned()));
         }
-        crate::links::warn_uncharacterised_write("add backup access point for network");
+        let url = routes::BACKUP_ACCESS_POINTS_ADD.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
+        warn_uncharacterised_write("add backup access point for network");
         self.transport
-            .resource(
-                &routes::BACKUP_ACCESS_POINTS_ADD,
-                network_id,
-                None,
+            .request(
+                routes::BACKUP_ACCESS_POINTS_ADD.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(body)),
             )
@@ -171,13 +176,17 @@ impl BackupAccessPointsApi {
                 Value::String(last_updated_at.to_owned()),
             );
         }
-        crate::links::warn_uncharacterised_write("update backup access point for network");
+        let url = routes::BACKUP_ACCESS_POINTS_UPDATE.resolve(
+            self.transport.api_host(),
+            network_id,
+            backup_network_id,
+            None,
+        )?;
+        warn_uncharacterised_write("update backup access point for network");
         self.transport
-            .nested(
-                &routes::BACKUP_ACCESS_POINTS_UPDATE,
-                network_id,
-                backup_network_id,
-                None,
+            .request(
+                routes::BACKUP_ACCESS_POINTS_UPDATE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(body)),
             )
@@ -198,13 +207,17 @@ impl BackupAccessPointsApi {
         network_id: &str,
         backup_network_id: &str,
     ) -> Result<Envelope, Error> {
-        crate::links::warn_uncharacterised_write("delete backup access point for network");
+        let url = routes::BACKUP_ACCESS_POINTS_DELETE.resolve(
+            self.transport.api_host(),
+            network_id,
+            backup_network_id,
+            None,
+        )?;
+        warn_uncharacterised_write("delete backup access point for network");
         self.transport
-            .nested(
-                &routes::BACKUP_ACCESS_POINTS_DELETE,
-                network_id,
-                backup_network_id,
-                None,
+            .request(
+                routes::BACKUP_ACCESS_POINTS_DELETE.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )
@@ -222,12 +235,16 @@ impl BackupAccessPointsApi {
     ///
     /// See [`Self::list`].
     pub async fn rearrange(&self, network_id: &str, order: &[&str]) -> Result<Envelope, Error> {
-        crate::links::warn_uncharacterised_write("rearrange backup access points for network");
+        let url = routes::BACKUP_ACCESS_POINTS_REARRANGE.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
+        warn_uncharacterised_write("rearrange backup access points for network");
         self.transport
-            .resource(
-                &routes::BACKUP_ACCESS_POINTS_REARRANGE,
-                network_id,
-                None,
+            .request(
+                routes::BACKUP_ACCESS_POINTS_REARRANGE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "rearranged_ids": order })),
             )
@@ -266,12 +283,18 @@ impl BackupAccessPointsApi {
     ///
     /// See [`Self::list`].
     pub async fn start_ssid_discovery(&self, network_id: &str) -> Result<Envelope, Error> {
-        crate::links::warn_uncharacterised_write("start SSID discovery for network");
+        let url = routes::BACKUP_ACCESS_POINTS_START_SSID_DISCOVERY.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
+        warn_uncharacterised_write("start SSID discovery for network");
         self.transport
-            .resource(
-                &routes::BACKUP_ACCESS_POINTS_START_SSID_DISCOVERY,
-                network_id,
-                None,
+            .request(
+                routes::BACKUP_ACCESS_POINTS_START_SSID_DISCOVERY
+                    .method
+                    .clone(),
+                url,
                 &[],
                 RequestBody::EmptyJsonString,
             )
@@ -289,12 +312,18 @@ impl BackupAccessPointsApi {
     ///
     /// See [`Self::list`].
     pub async fn connectivity_check(&self, network_id: &str) -> Result<Envelope, Error> {
-        crate::links::warn_uncharacterised_write("start backup connectivity check for network");
+        let url = routes::BACKUP_ACCESS_POINTS_CONNECTIVITY_CHECK.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
+        warn_uncharacterised_write("start backup connectivity check for network");
         self.transport
-            .resource(
-                &routes::BACKUP_ACCESS_POINTS_CONNECTIVITY_CHECK,
-                network_id,
-                None,
+            .request(
+                routes::BACKUP_ACCESS_POINTS_CONNECTIVITY_CHECK
+                    .method
+                    .clone(),
+                url,
                 &[],
                 RequestBody::EmptyJsonString,
             )

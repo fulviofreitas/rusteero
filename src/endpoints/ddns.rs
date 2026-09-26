@@ -48,12 +48,13 @@ impl DdnsApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url =
+            routes::ddns::DDNS_ENABLE.resolve(self.transport.api_host(), network_id, parent)?;
         links::warn_uncharacterised_write("enable DDNS for network");
         self.transport
-            .resource(
-                &routes::ddns::DDNS_ENABLE,
-                network_id,
-                parent,
+            .request(
+                routes::ddns::DDNS_ENABLE.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )
@@ -77,12 +78,13 @@ impl DdnsApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url =
+            routes::ddns::DDNS_DISABLE.resolve(self.transport.api_host(), network_id, parent)?;
         links::warn_uncharacterised_write("disable DDNS for network");
         self.transport
-            .resource(
-                &routes::ddns::DDNS_DISABLE,
-                network_id,
-                parent,
+            .request(
+                routes::ddns::DDNS_DISABLE.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )

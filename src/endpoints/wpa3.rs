@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::links::warn_uncharacterised_write;
+use crate::params::{py_list, py_quote};
 use crate::routes;
 use crate::transport::{RequestBody, Transport};
 
@@ -105,12 +106,16 @@ impl Wpa3Api {
             ));
         }
 
+        let url = routes::wpa3::SET_WPA3_PER_BAND.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("set per-band WPA3 mode for network");
         self.transport
-            .resource(
-                &routes::wpa3::SET_WPA3_PER_BAND,
-                network_id,
-                parent,
+            .request(
+                routes::wpa3::SET_WPA3_PER_BAND.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(payload)),
             )
@@ -129,7 +134,11 @@ fn validate_mode<'a>(value: &'a str, field: &str) -> Result<&'a str, Error> {
     if !WPA3_MODES.contains(&value) {
         return Err(Error::validation(
             field,
-            format!("must be one of {WPA3_MODES:?}, got {value:?}"),
+            format!(
+                "must be one of {}, got {}",
+                py_list(WPA3_MODES),
+                py_quote(value)
+            ),
         ));
     }
     Ok(value)

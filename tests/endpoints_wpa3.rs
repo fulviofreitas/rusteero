@@ -50,6 +50,8 @@ async fn get_wpa3_per_band_prefers_the_parents_published_link() -> anyhow::Resul
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001/wpa3_per_band"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("wpa3_per_band.json")))
         .expect(1)
         .mount(&mock.server)
@@ -70,6 +72,8 @@ async fn set_wpa3_per_band_sends_only_the_given_band() -> anyhow::Result<()> {
         Mock::given(method("PUT"))
             .and(path("/2.2/networks/network-0001/wpa3_per_band"))
             .and(body_json(json!({ "band_2_4_ghz": mode })))
+            .and(session_cookie())
+            .and(user_token_header())
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
             .expect(1)
             .mount(&mock.server)
@@ -93,6 +97,8 @@ async fn set_wpa3_per_band_sends_both_bands() -> anyhow::Result<()> {
             "band_2_4_ghz": "WPA2_WPA3",
             "band_5_ghz": "WPA3",
         })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -148,6 +154,8 @@ async fn set_wpa3_per_band_prefers_the_parents_published_link() -> anyhow::Resul
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/wpa3_per_band"))
         .and(body_json(json!({ "band_2_4_ghz": "WPA3" })))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)

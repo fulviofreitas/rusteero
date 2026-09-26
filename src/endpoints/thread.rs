@@ -82,12 +82,13 @@ impl ThreadApi {
         enabled: bool,
         _parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url =
+            routes::thread::PUT_THREAD.resolve(self.transport.api_host(), network_id, None)?;
         warn_uncharacterised_write("set thread enabled for network");
         self.transport
-            .resource(
-                &routes::thread::PUT_THREAD,
-                network_id,
-                None,
+            .request(
+                routes::thread::PUT_THREAD.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "enabled": enabled })),
             )
@@ -132,12 +133,13 @@ impl ThreadApi {
             ));
         }
 
+        let url =
+            routes::thread::PUT_THREAD.resolve(self.transport.api_host(), network_id, None)?;
         warn_uncharacterised_write("update thread config for network");
         self.transport
-            .resource(
-                &routes::thread::PUT_THREAD,
-                network_id,
-                None,
+            .request(
+                routes::thread::PUT_THREAD.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(Value::Object(payload)),
             )
@@ -163,12 +165,13 @@ impl ThreadApi {
         network_id: &str,
         _parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url =
+            routes::thread::POST_THREAD.resolve(self.transport.api_host(), network_id, None)?;
         warn_uncharacterised_write("regenerate thread credentials for network");
         self.transport
-            .resource(
-                &routes::thread::POST_THREAD,
-                network_id,
-                None,
+            .request(
+                routes::thread::POST_THREAD.method.clone(),
+                url,
                 &[],
                 RequestBody::EmptyJsonString,
             )

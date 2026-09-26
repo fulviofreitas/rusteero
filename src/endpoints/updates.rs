@@ -74,12 +74,16 @@ impl UpdatesApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::updates::UPDATES_APPLY_UPDATE.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         warn_uncharacterised_write("apply update for network — reboots every node");
         self.transport
-            .resource(
-                &routes::updates::UPDATES_APPLY_UPDATE,
-                network_id,
-                parent,
+            .request(
+                routes::updates::UPDATES_APPLY_UPDATE.method.clone(),
+                url,
                 &[],
                 RequestBody::EmptyJsonString,
             )

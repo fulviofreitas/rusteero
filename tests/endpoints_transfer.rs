@@ -67,6 +67,7 @@ async fn get_transfer_stats_prefers_the_parents_transfer_link() -> anyhow::Resul
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/custom-transfer"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -97,6 +98,7 @@ async fn get_transfer_stats_with_device_id_hits_the_device_level_path() -> anyho
             "/2.2/networks/network-0001/devices/device-0002/transfer",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -130,6 +132,7 @@ async fn get_transfer_stats_with_empty_device_id_hits_the_network_level_path() -
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/transfer"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)

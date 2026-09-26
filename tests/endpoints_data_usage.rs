@@ -62,6 +62,8 @@ async fn get_data_usage_omits_timezone_when_not_supplied() -> anyhow::Result<()>
         .and(query_param("start", "s"))
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -110,6 +112,8 @@ async fn get_data_usage_never_sends_a_request_body() -> anyhow::Result<()> {
         .await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -130,6 +134,8 @@ async fn get_breakdown_url_and_required_params() -> anyhow::Result<()> {
         .and(path("/2.2/networks/network-0001/data_usage/breakdown"))
         .and(query_param("start", "s"))
         .and(query_param("end", "e"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -147,6 +153,8 @@ async fn get_breakdown_cadence_included_when_supplied() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage/breakdown"))
         .and(query_param("cadence", "hourly"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -176,6 +184,8 @@ async fn get_devices_usage_profile_id_included_when_supplied() -> anyhow::Result
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage/devices"))
         .and(query_param("profile_id", "profile-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -200,6 +210,8 @@ async fn get_devices_usage_profile_id_omitted_when_none() -> anyhow::Result<()> 
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage/devices"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -220,6 +232,8 @@ async fn get_unprofiled_devices_url_and_required_params() -> anyhow::Result<()> 
         ))
         .and(query_param("start", "s"))
         .and(query_param("end", "e"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -243,6 +257,8 @@ async fn get_device_usage_url_and_params() -> anyhow::Result<()> {
         .and(query_param("start", "s"))
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -324,6 +340,8 @@ async fn get_eeros_summary_url_and_params() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage/eeros/summary"))
         .and(query_param("cadence", "daily"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -343,6 +361,8 @@ async fn get_eero_usage_url_and_params() -> anyhow::Result<()> {
             "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
         ))
         .and(query_param("cadence", "hourly"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -362,6 +382,8 @@ async fn get_profile_usage_url_and_params() -> anyhow::Result<()> {
             "/2.2/networks/network-0001/data_usage/profiles/profile-0001",
         ))
         .and(query_param("cadence", "daily"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -389,6 +411,8 @@ async fn get_unprofiled_summary_url_and_params() -> anyhow::Result<()> {
             "/2.2/networks/network-0001/data_usage/unprofiled/summary",
         ))
         .and(query_param("cadence", "daily"))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
         .mount(&mock.server)
@@ -410,6 +434,8 @@ async fn get_report_settings_hits_the_flat_path_with_no_query_params() -> anyhow
         .and(path(
             "/2.2/networks/network-0001/data_usage/report_settings",
         ))
+        .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
         .expect(1)
         .mount(&mock.server)
@@ -440,6 +466,163 @@ async fn set_report_settings_sends_a_json_body() -> anyhow::Result<()> {
 
     let api = data_usage_api(&mock);
     api.set_report_settings("network-0001", "daily", "monday", None)
+        .await?;
+    Ok(())
+}
+
+// ===================== parent self-url resolution (shared table test) =====================
+
+/// Registers, on `mock`, a `.expect(0)` trap on every `bare` path and a `.expect(1)` credentialed
+/// success mock on every corresponding `resolved` path — the shared setup for the two
+/// self-url-preference tests below.
+async fn expect_self_url_wins(mock: &MockEero, bare_paths: &[&str], resolved_paths: &[&str]) {
+    let ok = json!({"meta": {"code": 200}, "data": {}});
+    for bare in bare_paths {
+        Mock::given(method("GET"))
+            .and(path(*bare))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock.server)
+            .await;
+    }
+    for resolved in resolved_paths {
+        Mock::given(method("GET"))
+            .and(path(*resolved))
+            .and(session_cookie())
+            .and(user_token_header())
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok.clone()))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+}
+
+/// Shared test (part 1/2, split to stay under `clippy::too_many_lines`) for every
+/// `DataUsageApi` method's `network_id_or_self_url` behaviour (`data_usage.py:97-153`'s
+/// `_get_usage`, ported doc comment on `DataUsageApi::network_id_or_self_url`): a `parent`
+/// carrying its own `url` field wins over the bare-`network_id` template. Every bare-id path is
+/// registered with `.expect(0)` so a regression that ignores `parent` fails loudly instead of
+/// silently matching the wrong mock, and every self-url-resolved path (on a distinct network id
+/// and API version, `/2.4/networks/other-network`) is registered with `.expect(1)`.
+#[tokio::test]
+async fn network_and_device_level_methods_prefer_parents_self_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let parent = json!({"url": "/2.4/networks/other-network"});
+
+    expect_self_url_wins(
+        &mock,
+        &[
+            "/2.2/networks/network-0001/data_usage",
+            "/2.2/networks/network-0001/data_usage/breakdown",
+            "/2.2/networks/network-0001/data_usage/devices",
+            "/2.2/networks/network-0001/data_usage/devices/dev-0001",
+            "/2.2/networks/network-0001/data_usage/eeros/summary",
+            "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
+        ],
+        &[
+            "/2.4/networks/other-network/data_usage",
+            "/2.4/networks/other-network/data_usage/breakdown",
+            "/2.4/networks/other-network/data_usage/devices",
+            "/2.4/networks/other-network/data_usage/devices/dev-0001",
+            "/2.4/networks/other-network/data_usage/eeros/summary",
+            "/2.4/networks/other-network/data_usage/eeros/eero-0001",
+        ],
+    )
+    .await;
+
+    let api = data_usage_api(&mock);
+    api.get_data_usage("network-0001", "s", "e", "daily", None, Some(&parent))
+        .await?;
+    api.get_breakdown("network-0001", "s", "e", None, None, Some(&parent))
+        .await?;
+    api.get_devices_usage("network-0001", "s", "e", None, None, None, Some(&parent))
+        .await?;
+    api.get_device_usage(
+        "network-0001",
+        "dev-0001",
+        "s",
+        "e",
+        "daily",
+        None,
+        Some(&parent),
+    )
+    .await?;
+    api.get_eeros_summary("network-0001", "s", "e", "daily", None, Some(&parent))
+        .await?;
+    api.get_eero_usage(
+        "network-0001",
+        "eero-0001",
+        "s",
+        "e",
+        "daily",
+        None,
+        Some(&parent),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Shared test (part 2/2) — see
+/// [`network_and_device_level_methods_prefer_parents_self_url`] for the full rationale.
+#[tokio::test]
+async fn profile_and_report_level_methods_prefer_parents_self_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let parent = json!({"url": "/2.4/networks/other-network"});
+    let ok = json!({"meta": {"code": 200}, "data": {}});
+
+    expect_self_url_wins(
+        &mock,
+        &[
+            "/2.2/networks/network-0001/data_usage/profiles/profile-0001",
+            "/2.2/networks/network-0001/data_usage/unprofiled/devices",
+            "/2.2/networks/network-0001/data_usage/unprofiled/summary",
+            "/2.2/networks/network-0001/data_usage/report_settings",
+        ],
+        &[
+            "/2.4/networks/other-network/data_usage/profiles/profile-0001",
+            "/2.4/networks/other-network/data_usage/unprofiled/devices",
+            "/2.4/networks/other-network/data_usage/unprofiled/summary",
+            "/2.4/networks/other-network/data_usage/report_settings",
+        ],
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/data_usage/report_settings",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.4/networks/other-network/data_usage/report_settings",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    api.get_profile_usage(
+        "network-0001",
+        "profile-0001",
+        "s",
+        "e",
+        "daily",
+        None,
+        Some(&parent),
+    )
+    .await?;
+    api.get_unprofiled_devices("network-0001", "s", "e", None, None, Some(&parent))
+        .await?;
+    api.get_unprofiled_summary("network-0001", "s", "e", "daily", None, Some(&parent))
+        .await?;
+    api.get_report_settings("network-0001", Some(&parent))
+        .await?;
+    api.set_report_settings("network-0001", "daily", "monday", Some(&parent))
         .await?;
     Ok(())
 }

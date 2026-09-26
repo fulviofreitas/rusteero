@@ -60,6 +60,7 @@ async fn get_app_events_sends_the_supplied_query_params() -> anyhow::Result<()> 
         .and(session_cookie())
         .and(query_param("page_size", "10"))
         .and(query_param("timestamp", "2026-01-01T00:00:00Z"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -80,6 +81,7 @@ async fn get_app_events_prefers_a_parent_supplied_self_url_over_the_template() -
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/app_events"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -100,6 +102,7 @@ async fn get_app_events_falls_back_to_the_bare_id_template_with_no_parent() -> a
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/app_events"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -121,12 +124,41 @@ async fn get_network_scan_hits_the_network_scan_path() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/network_scan"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let env = api(&mock).get_network_scan("network-0001", None).await?;
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_network_scan_prefers_a_parent_supplied_self_url_over_the_template()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": { "scan": [] } });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/network_scan"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/network_scan"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"url": "/2.3/networks/network-0001"});
+    let env = api(&mock)
+        .get_network_scan("network-0001", Some(&parent))
+        .await?;
     assert_eq!(env.into_value(), body);
     Ok(())
 }
@@ -142,6 +174,7 @@ async fn get_channel_utilization_with_required_params_only() -> anyhow::Result<(
         .and(session_cookie())
         .and(query_param("start", "2026-01-01T00:00:00Z"))
         .and(query_param("end", "2026-01-02T00:00:00Z"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -175,6 +208,7 @@ async fn get_channel_utilization_sends_every_optional_param() -> anyhow::Result<
         .and(query_param("band", "band_5GHz_low"))
         .and(query_param("granularity", "60"))
         .and(query_param("gap_data_placeholder", "-1"))
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -209,6 +243,7 @@ async fn get_channel_utilization_accepts_every_valid_band() -> anyhow::Result<()
             .and(path("/2.2/networks/network-0001/channel_utilization"))
             .and(session_cookie())
             .and(query_param("band", *band))
+            .and(user_token_header())
             .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
             .expect(1)
             .mount(&mock.server)
@@ -341,6 +376,7 @@ async fn get_channel_utilization_prefers_a_parent_supplied_self_url_over_the_tem
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/channel_utilization"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)

@@ -228,6 +228,58 @@ async fn clear_network_password_invalidates_the_network_bucket() -> anyhow::Resu
     Ok(())
 }
 
+// ===================== set_guest_network =====================
+
+/// `Client::set_guest_network` (`client.py:1127-1158`) passes the cached network envelope as
+/// `parent=` (`+net`, `client.md`'s networks row): once `network[nid]` is populated with an
+/// envelope publishing its own `guestnetwork` link, the write goes to that link's path, not the
+/// bare-id template, and on success invalidates `network[nid]`.
+#[tokio::test]
+async fn set_guest_network_passes_the_cached_network_as_parent_and_invalidates_it()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let network_with_link = json!({
+        "meta": {"code": 200},
+        "data": {
+            "url": "/2.2/networks/network-0001",
+            "resources": {"guestnetwork": "/2.3/networks/network-0001/guestnetwork"},
+        },
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // The bare-id template must never be hit once the cached parent publishes its own link.
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_guest_network(true, Some("Guest"), Some("network-0001"))
+        .await?;
+    // `network[nid]` was invalidated: this re-fetches, hitting the GET mock a second time.
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
 // ===================== Guest network family =====================
 
 #[tokio::test]

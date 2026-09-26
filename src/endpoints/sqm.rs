@@ -84,13 +84,14 @@ impl SqmApi {
         enabled: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url =
+            routes::sqm::SQM_PUT_SETTINGS.resolve(self.transport.api_host(), network_id, parent)?;
         warn_uncharacterised_write("set SQM for network");
         let query_value = if enabled { "true" } else { "false" };
         self.transport
-            .resource(
-                &routes::sqm::SQM_PUT_SETTINGS,
-                network_id,
-                parent,
+            .request(
+                routes::sqm::SQM_PUT_SETTINGS.method.clone(),
+                url,
                 &[("sqm", query_value.to_owned())],
                 RequestBody::None,
             )

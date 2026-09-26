@@ -55,6 +55,7 @@ async fn get_permissions_prefers_the_parents_self_url() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001/permissions"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)

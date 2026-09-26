@@ -98,12 +98,16 @@ impl ForwardsApi {
         forward_data: Value,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::forwards::FORWARDS_CREATE.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         links::warn_uncharacterised_write("create forward for network");
         self.transport
-            .resource(
-                &routes::forwards::FORWARDS_CREATE,
-                network_id,
-                parent,
+            .request(
+                routes::forwards::FORWARDS_CREATE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(forward_data),
             )
@@ -158,13 +162,17 @@ impl ForwardsApi {
     /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
     /// status-mapped [`Error`] the request produces otherwise.
     pub async fn delete_forward(&self, network_id: &str, forward: &str) -> Result<Envelope, Error> {
+        let url = routes::forwards::FORWARDS_DELETE.resolve(
+            self.transport.api_host(),
+            network_id,
+            forward,
+            None,
+        )?;
         links::warn_uncharacterised_write("delete forward for network");
         self.transport
-            .nested(
-                &routes::forwards::FORWARDS_DELETE,
-                network_id,
-                forward,
-                None,
+            .request(
+                routes::forwards::FORWARDS_DELETE.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )

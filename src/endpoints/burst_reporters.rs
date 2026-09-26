@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::envelope::Envelope;
 use crate::error::Error;
+use crate::links::warn_uncharacterised_write;
 use crate::routes;
 use crate::transport::{RequestBody, Transport};
 
@@ -62,12 +63,13 @@ impl BurstReportersApi {
         reporter_data: Value,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        crate::links::warn_uncharacterised_write("create burst reporter for network");
+        let url =
+            routes::CREATE_BURST_REPORTER.resolve(self.transport.api_host(), network_id, parent)?;
+        warn_uncharacterised_write("create burst reporter for network");
         self.transport
-            .resource(
-                &routes::CREATE_BURST_REPORTER,
-                network_id,
-                parent,
+            .request(
+                routes::CREATE_BURST_REPORTER.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(reporter_data),
             )

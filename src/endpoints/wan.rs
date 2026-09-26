@@ -78,12 +78,16 @@ impl WanApi {
         network_id: &str,
         config: Value,
     ) -> Result<Envelope, Error> {
+        let url = routes::wan::WAN_SET_MULTISTATICIP.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
         links::warn_uncharacterised_write("set multi-static-IP configuration for network");
         self.transport
-            .resource(
-                &routes::wan::WAN_SET_MULTISTATICIP,
-                network_id,
-                None,
+            .request(
+                routes::wan::WAN_SET_MULTISTATICIP.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(config),
             )
@@ -109,15 +113,19 @@ impl WanApi {
         network_id: &str,
         config: Value,
     ) -> Result<Envelope, Error> {
+        let url = routes::wan::WAN_SET_SECONDARY_WAN_CONFIG.resolve(
+            self.transport.api_host(),
+            network_id,
+            None,
+        )?;
         links::warn_uncharacterised_write(
             "set secondary WAN configuration for network -- may reboot every eero, like the \
              confirmed DNS write path",
         );
         self.transport
-            .resource(
-                &routes::wan::WAN_SET_SECONDARY_WAN_CONFIG,
-                network_id,
-                None,
+            .request(
+                routes::wan::WAN_SET_SECONDARY_WAN_CONFIG.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(config),
             )
@@ -143,16 +151,22 @@ impl WanApi {
         mac: &str,
         deny: bool,
     ) -> Result<Envelope, Error> {
+        let url = routes::wan::WAN_SET_DEVICE_SECONDARY_WAN_ACCESS.resolve(
+            self.transport.api_host(),
+            network_id,
+            mac,
+            None,
+        )?;
         links::warn_uncharacterised_write(
             "set secondary WAN access for device on network -- may reboot every eero, like the \
              confirmed DNS write path",
         );
         self.transport
-            .nested(
-                &routes::wan::WAN_SET_DEVICE_SECONDARY_WAN_ACCESS,
-                network_id,
-                mac,
-                None,
+            .request(
+                routes::wan::WAN_SET_DEVICE_SECONDARY_WAN_ACCESS
+                    .method
+                    .clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "secondary_wan_deny_access": deny })),
             )
