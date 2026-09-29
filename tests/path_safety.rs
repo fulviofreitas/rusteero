@@ -1,28 +1,42 @@
 //! Path-traversal regression suite for security review finding F1 (HIGH), plus one end-to-end
 //! test for finding F3 (LOW).
 //!
-//! F1: an empty, `"."`, or `".."` path parameter must never reach the wire — `Url::path_segments_mut`
-//! silently *drops* a segment equal to `""`, `"."`, or `".."` instead of encoding it
-//! (`src/routes.rs`'s module docs, "Path traversal" section), which would otherwise retarget an
-//! item-scoped destructive request onto its parent collection (`DELETE .../blacklist/{id}` with
-//! `id = ".."` renders `DELETE .../blacklist`, unblocking every device on the network instead of
-//! one). `src/routes.rs::validate_segment` and `src/transport.rs::Transport::render_url` share
-//! one rule (`crate::routes::validate_segment`) so this cannot regress in only one of the two
-//! renderers without failing here.
+//! F1: an empty, `"."`, or `".."` path parameter must never reach the wire. At v8.0.4 every
+//! identifier substituted into a resolved URL is validated by
+//! [`rusteero::links::validate_identifier`] (a strict `^[A-Za-z0-9][A-Za-z0-9._:-]*$` whitelist,
+//! plus an explicit `".."` rejection) before it is ever joined onto a request URL — either
+//! directly (`child_url`, used by `BlacklistApi::remove_from_blacklist`), or via
+//! [`rusteero::params::resolve_nested_url`] (used by every `Nested`-routed delete/update below),
+//! whose own explicit empty-child check runs first (`field: "child"`) before it too falls back to
+//! `child_url` for a non-empty-but-still-invalid value (`field: "id"`). See `src/routes/mod.rs`'s
+//! module docs ("Path traversal") for the full mechanism; the pre-v8.0.4 `Route`/`validate_segment`
+//! model this file used to pin directly is gone.
 //!
 //! Every destructive route below is exercised the same way, proving the point the module docs
-//! make explicitly: checking only the returned error is not enough, because the bug was that a
-//! request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."` case therefore mounts
-//! a catch-all `wiremock::matchers::any()` mock with `.expect(0)` — if `render_url`/`Route::render`
-//! ever regress to the pre-fix behaviour, the mock server's own drop-time verification fails the
-//! test, not just the returned `Result`. A positive case (an ordinary id) and a slash-bearing id
-//! (proving percent-encoding still contains it in one path segment) are included per route too.
+//! make explicitly: checking only the returned error is not enough, because the bug this finding
+//! describes was that a request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."`
+//! case therefore mounts a catch-all `wiremock::matchers::any()` mock with `.expect(0)` — if
+//! identifier validation ever regresses to the pre-fix behaviour, the mock server's own drop-time
+//! verification fails the test, not just the returned `Result`.
+//!
+//! A slash-bearing id (e.g. `"../../secrets"`) is also covered per route below, but its expected
+//! outcome is the opposite of the pre-v8.0.4 suite this file replaces: `validate_identifier`'s
+//! whitelist has no allowance for `/` at all, so a slash-bearing value is rejected outright (zero
+//! requests sent) rather than percent-encoded into a single opaque segment. This is a deliberate,
+//! *stricter* behaviour change, faithfully ported from `eero-api`'s own `_IDENTIFIER_RE`
+//! (`git -C eero-api show v8.0.4:src/eero/api/links.py`) — not a regression. The `field` name on
+//! the returned `Error::Validation` is not pinned (it depends on which of `resolve_nested_url`/
+//! `child_url` first rejects the value); only the variant and the zero-requests guarantee are.
+//!
+//! A positive case (an ordinary id) is included per route too, so this suite cannot pass by
+//! rejecting everything.
 //!
 //! F3: `Client::ensure_network_id`'s auto-discovery path and `Client::derive_preferred_network_id`
 //! both extract a network id out of a `/networks` response body via the shared
-//! `extract_network_id` helper (`src/client.rs`), which now applies the same
-//! `crate::routes::validate_segment` rule before handing a candidate id back — see
-//! `auto_discovered_network_id_rejects_a_hostile_id_field` below.
+//! `extract_network_id` helper (`src/client/mod.rs`), which applies `crate::routes::validate_segment`
+//! before handing a candidate id back — see `auto_discovered_network_id_rejects_a_hostile_id_field`
+//! below. Unrelated to the `Resource`/`Nested` route model: `extract_network_id` reads a candidate
+//! id straight out of an untrusted response body, never through `links::validate_identifier`.
 
 mod common;
 
@@ -53,16 +67,14 @@ async fn expect_no_requests_at_all(mock: &MockEero) {
         .await;
 }
 
-/// Asserts `err` is `Error::Validation` naming `field` exactly — the placeholder name from the
-/// route template, not some other field — so a future change that swaps in a differently-named
-/// validation error at the wrong call site still fails this assertion.
-fn assert_validation_error_for_field(err: &Error, field: &str) {
-    match err {
-        Error::Validation { field: actual, .. } => {
-            assert_eq!(actual, field, "unexpected field name on Error::Validation");
-        }
-        other => panic!("expected Error::Validation {{ field: {field:?}, .. }}, got {other:?}"),
-    }
+/// Asserts `err` is `Error::Validation` — fail-closed, not some other error variant a regression
+/// could otherwise disguise itself as. The `field` name itself is deliberately not pinned; see
+/// this file's module docs.
+fn assert_is_validation_error(err: &Error) {
+    assert!(
+        matches!(err, Error::Validation { .. }),
+        "expected Error::Validation, got {err:?}"
+    );
 }
 
 // ============================= remove_from_blacklist =============================
@@ -74,10 +86,10 @@ async fn remove_from_blacklist_empty_id_is_rejected_before_any_request() -> anyh
 
     let api = BlacklistApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .remove_from_blacklist("network-0001", "")
+        .remove_from_blacklist("network-0001", "", None)
         .await
         .expect_err("an empty id must not collapse DELETE .../blacklist/{id} onto the collection");
-    assert_validation_error_for_field(&err, "mac_or_device_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -89,18 +101,16 @@ async fn remove_from_blacklist_single_dot_id_is_rejected_before_any_request() ->
 
     let api = BlacklistApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .remove_from_blacklist("network-0001", ".")
+        .remove_from_blacklist("network-0001", ".", None)
         .await
         .expect_err("a \".\" id must not collapse DELETE .../blacklist/{id} onto the collection");
-    assert_validation_error_for_field(&err, "mac_or_device_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
 /// The concrete reproduction from the security finding: before the fix, this DELETE landed on
 /// `DELETE /2.2/networks/network-0001/blacklist` — the whole blacklist, unblocking every device
-/// on the network — instead of erroring. Captured with `--nocapture` against the pre-fix
-/// renderer (see this crate's final task report for the verbatim wrong URL); this must now be
-/// rejected with zero requests sent.
+/// on the network — instead of erroring. This must be rejected with zero requests sent.
 #[tokio::test]
 async fn remove_from_blacklist_dot_dot_id_is_rejected_before_any_request() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
@@ -108,10 +118,10 @@ async fn remove_from_blacklist_dot_dot_id_is_rejected_before_any_request() -> an
 
     let api = BlacklistApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .remove_from_blacklist("network-0001", "..")
+        .remove_from_blacklist("network-0001", "..", None)
         .await
         .expect_err("a \"..\" id must not collapse DELETE .../blacklist/{id} onto the collection");
-    assert_validation_error_for_field(&err, "mac_or_device_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -127,29 +137,26 @@ async fn remove_from_blacklist_normal_id_still_works() -> anyhow::Result<()> {
         .await;
 
     let api = BlacklistApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    api.remove_from_blacklist("network-0001", "aabbcc000001")
+    api.remove_from_blacklist("network-0001", "aabbcc000001", None)
         .await?;
     Ok(())
 }
 
-/// A slash-bearing id must still be percent-encoded into exactly one path segment, never split
-/// into two — the pre-existing guard this fix must not weaken.
+/// A slash-bearing id has no allowance in `validate_identifier`'s whitelist at all — it must be
+/// rejected outright (zero requests sent), not percent-encoded into a single opaque segment as
+/// the pre-v8.0.4 model would have done. See this file's module docs.
 #[tokio::test]
-async fn remove_from_blacklist_slash_bearing_id_stays_in_one_segment() -> anyhow::Result<()> {
+async fn remove_from_blacklist_slash_bearing_id_is_rejected_before_any_request()
+-> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("DELETE"))
-        .and(path(
-            "/2.2/networks/network-0001/blacklist/..%2F..%2Fsecrets",
-        ))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
+    expect_no_requests_at_all(&mock).await;
 
     let api = BlacklistApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    api.remove_from_blacklist("network-0001", "../../secrets")
-        .await?;
+    let err = api
+        .remove_from_blacklist("network-0001", "../../secrets", None)
+        .await
+        .expect_err("a slash-bearing id is not a valid single-segment identifier");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -165,7 +172,7 @@ async fn delete_profile_empty_id_is_rejected_before_any_request() -> anyhow::Res
         .delete_profile("network-0001", "")
         .await
         .expect_err("an empty id must not collapse DELETE .../profiles/{id} onto the collection");
-    assert_validation_error_for_field(&err, "profile_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -179,7 +186,7 @@ async fn delete_profile_single_dot_id_is_rejected_before_any_request() -> anyhow
         .delete_profile("network-0001", ".")
         .await
         .expect_err("a \".\" id must not collapse DELETE .../profiles/{id} onto the collection");
-    assert_validation_error_for_field(&err, "profile_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -193,7 +200,7 @@ async fn delete_profile_dot_dot_id_is_rejected_before_any_request() -> anyhow::R
         .delete_profile("network-0001", "..")
         .await
         .expect_err("a \"..\" id must delete one profile, never every profile on the network");
-    assert_validation_error_for_field(&err, "profile_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -214,20 +221,16 @@ async fn delete_profile_normal_id_still_works() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn delete_profile_slash_bearing_id_stays_in_one_segment() -> anyhow::Result<()> {
+async fn delete_profile_slash_bearing_id_is_rejected_before_any_request() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("DELETE"))
-        .and(path(
-            "/2.2/networks/network-0001/profiles/..%2F..%2Fsecrets",
-        ))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
+    expect_no_requests_at_all(&mock).await;
 
     let api = ProfilesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    api.delete_profile("network-0001", "../../secrets").await?;
+    let err = api
+        .delete_profile("network-0001", "../../secrets")
+        .await
+        .expect_err("a slash-bearing id is not a valid single-segment identifier");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -239,10 +242,13 @@ async fn delete_reservation_empty_id_is_rejected_before_any_request() -> anyhow:
     expect_no_requests_at_all(&mock).await;
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    let err = api.delete_reservation("network-0001", "").await.expect_err(
-        "an empty id must not collapse DELETE .../reservations/{id} onto the collection",
-    );
-    assert_validation_error_for_field(&err, "reservation_id");
+    let err = api
+        .delete_reservation("network-0001", "", None)
+        .await
+        .expect_err(
+            "an empty id must not collapse DELETE .../reservations/{id} onto the collection",
+        );
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -253,12 +259,12 @@ async fn delete_reservation_single_dot_id_is_rejected_before_any_request() -> an
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .delete_reservation("network-0001", ".")
+        .delete_reservation("network-0001", ".", None)
         .await
         .expect_err(
             "a \".\" id must not collapse DELETE .../reservations/{id} onto the collection",
         );
-    assert_validation_error_for_field(&err, "reservation_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -269,12 +275,12 @@ async fn delete_reservation_dot_dot_id_is_rejected_before_any_request() -> anyho
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .delete_reservation("network-0001", "..")
+        .delete_reservation("network-0001", "..", None)
         .await
         .expect_err(
             "a \"..\" id must delete one reservation, never every reservation on the network",
         );
-    assert_validation_error_for_field(&err, "reservation_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -292,27 +298,23 @@ async fn delete_reservation_normal_id_still_works() -> anyhow::Result<()> {
         .await;
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    api.delete_reservation("network-0001", "reservation-0001")
+    api.delete_reservation("network-0001", "reservation-0001", None)
         .await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn delete_reservation_slash_bearing_id_stays_in_one_segment() -> anyhow::Result<()> {
+async fn delete_reservation_slash_bearing_id_is_rejected_before_any_request() -> anyhow::Result<()>
+{
     let mock = MockEero::start().await;
-    Mock::given(method("DELETE"))
-        .and(path(
-            "/2.2/networks/network-0001/reservations/..%2F..%2Fsecrets",
-        ))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
+    expect_no_requests_at_all(&mock).await;
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    api.delete_reservation("network-0001", "../../secrets")
-        .await?;
+    let err = api
+        .delete_reservation("network-0001", "../../secrets", None)
+        .await
+        .expect_err("a slash-bearing id is not a valid single-segment identifier");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -328,7 +330,7 @@ async fn delete_forward_empty_id_is_rejected_before_any_request() -> anyhow::Res
         .delete_forward("network-0001", "")
         .await
         .expect_err("an empty id must not collapse DELETE .../forwards/{id} onto the collection");
-    assert_validation_error_for_field(&err, "forward_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -342,7 +344,7 @@ async fn delete_forward_single_dot_id_is_rejected_before_any_request() -> anyhow
         .delete_forward("network-0001", ".")
         .await
         .expect_err("a \".\" id must not collapse DELETE .../forwards/{id} onto the collection");
-    assert_validation_error_for_field(&err, "forward_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -356,7 +358,7 @@ async fn delete_forward_dot_dot_id_is_rejected_before_any_request() -> anyhow::R
         .delete_forward("network-0001", "..")
         .await
         .expect_err("a \"..\" id must delete one forward, never every forward on the network");
-    assert_validation_error_for_field(&err, "forward_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -377,20 +379,16 @@ async fn delete_forward_normal_id_still_works() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn delete_forward_slash_bearing_id_stays_in_one_segment() -> anyhow::Result<()> {
+async fn delete_forward_slash_bearing_id_is_rejected_before_any_request() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("DELETE"))
-        .and(path(
-            "/2.2/networks/network-0001/forwards/..%2F..%2Fsecrets",
-        ))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
+    expect_no_requests_at_all(&mock).await;
 
     let api = ForwardsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    api.delete_forward("network-0001", "../../secrets").await?;
+    let err = api
+        .delete_forward("network-0001", "../../secrets")
+        .await
+        .expect_err("a slash-bearing id is not a valid single-segment identifier");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -399,7 +397,10 @@ async fn delete_forward_slash_bearing_id_stays_in_one_segment() -> anyhow::Resul
 // `update_reservation` is a `PUT` carrying the caller's body — the finding's scariest variant,
 // since a "delete everything" mistake is at least visibly destructive, but `PUT
 // .../reservations` with `id = ".."` would silently apply the caller's single-reservation body
-// to the *collection* endpoint instead.
+// to the *collection* endpoint instead. `update_reservation(reservation, data, network, parent)`:
+// every case below passes `network = Some("network-0001")` and `parent = None` so the bare-id
+// dispatch branch (`resolve_reservation_url`) is the one under test, exactly like every other
+// case in this file.
 
 #[tokio::test]
 async fn update_reservation_empty_id_is_rejected_before_any_request() -> anyhow::Result<()> {
@@ -408,12 +409,12 @@ async fn update_reservation_empty_id_is_rejected_before_any_request() -> anyhow:
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .update_reservation("network-0001", "", json!({"ip": "10.0.0.5"}))
+        .update_reservation("", json!({"ip": "10.0.0.5"}), Some("network-0001"), None)
         .await
         .expect_err(
             "an empty id must not turn a single-reservation PUT into a collection-level one",
         );
-    assert_validation_error_for_field(&err, "reservation_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -424,12 +425,12 @@ async fn update_reservation_single_dot_id_is_rejected_before_any_request() -> an
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .update_reservation("network-0001", ".", json!({"ip": "10.0.0.5"}))
+        .update_reservation(".", json!({"ip": "10.0.0.5"}), Some("network-0001"), None)
         .await
         .expect_err(
             "a \".\" id must not turn a single-reservation PUT into a collection-level one",
         );
-    assert_validation_error_for_field(&err, "reservation_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -440,13 +441,13 @@ async fn update_reservation_dot_dot_id_is_rejected_before_any_request() -> anyho
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let err = api
-        .update_reservation("network-0001", "..", json!({"ip": "10.0.0.5"}))
+        .update_reservation("..", json!({"ip": "10.0.0.5"}), Some("network-0001"), None)
         .await
         .expect_err(
             "a \"..\" id must not silently PUT the caller's body onto the reservations \
              collection endpoint",
         );
-    assert_validation_error_for_field(&err, "reservation_id");
+    assert_is_validation_error(&err);
     Ok(())
 }
 
@@ -465,30 +466,32 @@ async fn update_reservation_normal_id_still_works() -> anyhow::Result<()> {
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     api.update_reservation(
-        "network-0001",
         "reservation-0001",
         json!({"ip": "10.0.0.5"}),
+        Some("network-0001"),
+        None,
     )
     .await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn update_reservation_slash_bearing_id_stays_in_one_segment() -> anyhow::Result<()> {
+async fn update_reservation_slash_bearing_id_is_rejected_before_any_request() -> anyhow::Result<()>
+{
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .and(path(
-            "/2.2/networks/network-0001/reservations/..%2F..%2Fsecrets",
-        ))
-        .and(session_cookie())
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
+    expect_no_requests_at_all(&mock).await;
 
     let api = ReservationsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    api.update_reservation("network-0001", "../../secrets", json!({"ip": "10.0.0.5"}))
-        .await?;
+    let err = api
+        .update_reservation(
+            "../../secrets",
+            json!({"ip": "10.0.0.5"}),
+            Some("network-0001"),
+            None,
+        )
+        .await
+        .expect_err("a slash-bearing id is not a valid single-segment identifier");
+    assert_is_validation_error(&err);
     Ok(())
 }
 

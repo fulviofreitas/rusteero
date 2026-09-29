@@ -44,10 +44,7 @@ use crate::error::Error;
 /// ```
 pub fn id_from_url(id_or_url: &str) -> Result<String, Error> {
     if id_or_url.is_empty() {
-        return Err(Error::Validation {
-            field: "id_or_url".to_string(),
-            message: "must be a non-empty string".to_string(),
-        });
+        return Err(Error::validation("id_or_url", "must be a non-empty string"));
     }
     // Python: `id_or_url.rstrip("/")` strips every trailing slash, not just one.
     let stripped = id_or_url.trim_end_matches('/');
@@ -60,10 +57,10 @@ pub fn id_from_url(id_or_url: &str) -> Result<String, Error> {
         // yields one (empty) segment. Rejecting this outright, rather than returning `Ok("")`
         // as Python does, is the fix for the empty-identifier finding — see this function's
         // doc comment.
-        return Err(Error::Validation {
-            field: "id_or_url".to_string(),
-            message: "resolves to an empty path segment".to_string(),
-        });
+        return Err(Error::validation(
+            "id_or_url",
+            "resolves to an empty path segment",
+        ));
     }
     Ok(segment.to_string())
 }
@@ -121,7 +118,7 @@ mod tests {
     fn empty_string_raises_validation_error() {
         let err = id_from_url("").unwrap_err();
         match err {
-            Error::Validation { field, message } => {
+            Error::Validation { field, message, .. } => {
                 assert_eq!(field, "id_or_url");
                 assert_eq!(message, "must be a non-empty string");
             }
@@ -139,7 +136,7 @@ mod tests {
     fn single_slash_raises_validation_error_for_empty_segment() {
         let err = id_from_url("/").unwrap_err();
         match err {
-            Error::Validation { field, message } => {
+            Error::Validation { field, message, .. } => {
                 assert_eq!(field, "id_or_url");
                 assert_eq!(message, "resolves to an empty path segment");
             }
@@ -151,7 +148,7 @@ mod tests {
     fn all_slashes_raises_validation_error_for_empty_segment() {
         let err = id_from_url("///").unwrap_err();
         match err {
-            Error::Validation { field, message } => {
+            Error::Validation { field, message, .. } => {
                 assert_eq!(field, "id_or_url");
                 assert_eq!(message, "resolves to an empty path segment");
             }

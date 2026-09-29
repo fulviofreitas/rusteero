@@ -1,144 +1,298 @@
 # PARITY — rusteero vs eero-api
 
-Per-method checklist against `fulviofreitas/eero-api` at commit `e7bcfd9` (2026-09-10). Completion criterion: every row is **ported**, **dropped** (with reason), or **changed** (with reason), and every ported row has a wiremock test pinning verb, path and body.
+Per-method checklist against `fulviofreitas/eero-api` at tag `v8.0.4` (commit `ac7358f`, 2026-09-24). Completion criterion: every row is **ported**, **dropped** (with reason), or **changed** (with reason), and every ported row has a wiremock test pinning verb, path and body.
 
 Status values: `planned` → `ported` (with test) · `changed` · `renamed` · `identical` · `dropped`.
 
-**Summary:** 127 rows — changed: 9, dropped: 7, identical: 2, ported: 107, renamed: 2. **All five implementation phases are complete.** Every row is ported, changed with a reason, dropped with a reason, identical or renamed; no row remains planned. Remaining work is phase 6: docs, live validation against a real account, and release.
+**What changed since the previous baseline (`e7bcfd9`, 2026-09-10, effectively v6.2.0).** The session transport is new: the token travels as the `X-User-Token` header (plus a per-request legacy `s=` cookie while `send_legacy_cookie` is on), the login/verify/logout handshake is form-encoded (`login=`, `code=`, a field literally named `Cookie`), `refresh_session` is a single coalesced `POST login/refresh` authenticated by the current token (no refresh token, no `account/refresh` fallback, the server-issued token is ignored), the credential record is the one-field schema-2 `{"session_id", "schema_version": 2}` with legacy `user_token` migrated on read, and there is no client-side session expiry at all. The error catalogue is closed (`errors.py` → `errors.rs`: `ErrorGroup`, the `*_ERRORS` sets, `classify_error_code`), so every API failure maps to one of `NotFound` / `AccessDenied` / `PremiumRequired` / `FeatureUnavailable` / `ClientBlocked` / `RateLimit` / `Validation` / `Authentication` / `Api`. URL resolution is link-based: every domain method that targets a network or eero sub-resource accepts `parent: Option<&Value>` and prefers the published `data.resources.<link>` (or the parent's own `url`) over the literal template, and every id parameter is id-or-url polymorphic (`links.rs`, `params.rs`). Fourteen domain modules are new (`account`, `backup_access_points`, `ddns`, `dhcp`, `dns_policies`, `entitlements`, `events`, `members`, `notifications`, `permissions`, `power_saving`, `subnets`, `wan`, `wpa3`) and the dead surface is gone upstream (`activity`, `settings`, `password`, `set_device_priority`, `set_ipv6_dns`, `run_insights`, `run_ouicheck`, `SecurityAPI.set_thread`, `get_burst_reporters`, the four `sqm` writers, the four old `backup` methods, the profile schedule/content-filter writers) — see the "removed upstream" rows below.
+
+Path column legend: `**2.3**` marks an endpoint pinned to API version 2.3; `link:<name>` after a path means the route prefers the parent's published `data.resources.<name>` link when a `parent` is supplied; `link:self` means it prefers the parent's own `data.url`. Bodies in parentheses: `(form …)` is `application/x-www-form-urlencoded`, `("")` is the two-character JSON-string body, otherwise JSON.
+
+**Summary:** 267 rows — changed: 22, dropped: 20, identical: 3, ported: 218, renamed: 4. **No row is `planned`.** Every row is ported, changed with a reason, dropped with a reason, identical or renamed. 16 of the 20 `dropped` rows are upstream removals (methods that no longer exist at v8.0.4, listed for the benefit of readers of the `e7bcfd9` baseline); the other four are `EeroAPI.__aenter__/__aexit__`, `EeroClient.login/verify`, the Python-logging adapter and the unused `const.py` enums.
 
 | Module | Python | Rust | Verb | Path | Status | Test | Note |
 |---|---|---|---|---|---|---|---|
-| auth (AuthAPI) | `is_authenticated` | `is_authenticated` | — | `local` | ported | `auth::tests` | local only: token set and now <= expiry |
-| auth (AuthAPI) | `login` | `LoginFlow::start` | POST | `2.2/login` | ported | `tests/auth.rs` | separable from Client |
-| auth (AuthAPI) | `verify` | `PendingLogin::verify` | POST | `2.2/login/verify` | ported | `tests/auth.rs` | **provisional** — both Set-Cookie branches implemented and tested; needs live confirmation (plan 7.2, D-16) |
-| auth (AuthAPI) | `resend_verification_code` | `PendingLogin::resend` | POST | `2.2/login/resend` | ported | `tests/auth.rs` |  |
-| auth (AuthAPI) | `logout` | `logout` | POST | `2.2/logout` | changed | `tests/auth.rs` | always clears local session and store, on every outcome; Python skips cleanup on 429/network error (auth.py:239-277) despite its own comment at :269 |
-| auth (AuthAPI) | `refresh_session` | `refresh_session` | POST | `2.2/login/refresh → 2.2/account/refresh` | changed | `tests/transport.rs` | retry uses the REFRESHED token; Python re-passes the stale one and clobbers the fresh cookie (base.py:296-298), so its refresh cannot succeed. Route order and 404-fallthrough are as Python |
-| auth (AuthAPI) | `ensure_authenticated` | `ensure_authenticated` | — | `local` | ported | `auth::tests` | local check; Python's refresh branch is unreachable, same observable behaviour |
-| auth (AuthAPI) | `get_auth_token` | `Client::session` | — | `local` | renamed | — | returns Session (SecretString), not a bare string |
-| auth (AuthAPI) | `clear_auth_data` | `clear_auth_data` | — | `local` | ported | `tests/auth.rs` | clears store too; honours StorageFailures |
-| auth (AuthAPI) | `set_session_token` | `set_session_token / Session::from_token` | — | `local` | ported | `tests/auth.rs` | preserves an existing refresh token, as Python does |
-| auth (AuthAPI) | `clear_session_token` | `clear_session_token` | — | `local` | ported | `tests/auth.rs` | leaves the refresh token in place, unlike clear_auth_data |
-| EeroAPI | `EeroAPI(session, cookie_file, use_keyring)` | `EeroApi::new(transport)` | — | `—` | changed | — | storage moves to Client::builder().store() |
-| EeroAPI | `__aenter__/__aexit__` | `(none)` | — | `—` | dropped | — | no context manager in Rust |
-| EeroAPI | `is_authenticated / login / verify / logout` | `same on Client` | — | `—` | identical | — |  |
-| EeroClient (client-only logic) | `EeroClient(session, cookie_file, use_keyring, cache_timeout)` | `Client::builder()` | — | `—` | renamed | — | builder |
-| EeroClient (client-only logic) | `clear_cache` | `clear_cache` | — | `local` | changed | — | also clears timestamps |
-| EeroClient (client-only logic) | `_ensure_network_id` | `resolve_network_id (private)` | — | `local` | ported | `tests/client.rs` |  |
-| EeroClient (client-only logic) | `set_preferred_network / preferred_network_id` | `same` | — | `local` | identical | — |  |
-| EeroClient (client-only logic) | `get_account` | `get_account` | GET | `2.2/account` | ported | `tests/client.rs` | cached |
-| EeroClient (client-only logic) | `get_networks (+ /account fallback, preferred side-effect)` | `get_networks` | GET | `2.2/networks` | ported | `tests/client.rs` | cached |
-| EeroClient (client-only logic) | `get_device_priority` | `(none)` | — | `—` | dropped | — | server no-op, eero-api #111 |
-| EeroClient (client-only logic) | `set_device_priority` | `(none)` | — | `—` | dropped | — | server no-op, eero-api #111 |
-| EeroClient (client-only logic) | `get_activity* (5)` | `(none)` | — | `—` | dropped | — | endpoints 404, eero-api #107 |
-| EeroClient (client-only logic) | `local {meta:{code:400}} for empty setters (4)` | `Err(Error::Validation)` | — | `—` | changed | — | Result already expresses it |
-| ac_compat | `get_ac_compat` | `get_ac_compat` | GET | `2.2/networks/{nid}/ac_compat` | ported | `tests/endpoints_*` |  |
-| backup | `get_backup_network` | `get_backup_network` | GET | `2.2/networks/{nid}/backup` | ported | `tests/endpoints_*` |  |
-| backup | `get_backup_status` | `get_backup_status` | GET | `2.2/networks/{nid}/backup/status` | ported | `tests/endpoints_*` |  |
-| backup | `set_backup_network` | `set_backup_network` | PUT | `2.2/networks/{nid}/backup` | ported | `tests/endpoints_*` |  |
-| backup | `configure_backup_network` | `configure_backup_network` | PUT | `2.2/networks/{nid}/backup` | ported | `tests/endpoints_*` | empty → Validation |
-| blacklist | `get_blacklist` | `get_blacklist` | GET | `2.2/networks/{nid}/blacklist` | ported | `tests/endpoints_*` |  |
-| blacklist | `add_to_blacklist` | `add_to_blacklist` | POST | `2.2/networks/{nid}/blacklist` | ported | `tests/endpoints_*` |  |
-| blacklist | `remove_from_blacklist` | `remove_from_blacklist` | DELETE | `2.2/networks/{nid}/blacklist/{mac_or_id}` | ported | `tests/endpoints_*` |  |
-| burst_reporters | `get_burst_reporters` | `get_burst_reporters` | GET | `2.2/networks/{nid}/burst_reporters` | ported | `tests/endpoints_*` |  |
-| burst_reporters | `create_burst_reporter` | `create_burst_reporter` | POST | `2.2/networks/{nid}/burst_reporters` | ported | `tests/endpoints_*` |  |
-| data_usage | `get_data_usage` | `get_data_usage` | GET+body | `2.2/networks/{nid}/data_usage[/{resource}]` | ported | `tests/endpoints_*` | JSON body on GET |
-| devices | `get_devices` | `get_devices` | GET | `2.2/networks/{nid}/devices` | ported | `tests/endpoints_*` |  |
-| devices | `get_device` | `get_device` | GET | `2.2/networks/{nid}/devices/{did}` | ported | `tests/endpoints_*` |  |
-| devices | `set_device_nickname` | `set_device_nickname` | PUT | `**2.3**/networks/{nid}/devices/{did}` | ported | `tests/endpoints_*` |  |
-| devices | `pause_device` | `pause_device` | PUT | `**2.3**/networks/{nid}/devices/{did}` | ported | `tests/endpoints_*` |  |
-| devices | `block_device` | `block_device` | GET+POST / DELETE | `2.2/networks/{nid}/blacklist[/{did}]` | ported | `tests/endpoints_*` | two round-trips on block |
-| diagnostics | `get_diagnostics` | `get_diagnostics` | GET | `2.2/networks/{nid}/diagnostics` | ported | `tests/endpoints_*` |  |
-| diagnostics | `run_diagnostics` | `run_diagnostics` | POST | `2.2/networks/{nid}/diagnostics` | ported | `tests/endpoints_*` |  |
-| dns | `get_dns_settings` | `get_dns_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| dns | `set_dns_caching` | `set_dns_caching` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| dns | `set_custom_dns` | `set_custom_dns` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | ≤2 servers |
-| dns | `clear_custom_dns` | `clear_custom_dns` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
-| dns | `set_dns_mode` | `set_dns_mode` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | invalid → Validation |
-| dns | `set_ipv6_dns` | `set_ipv6_dns` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| eeros | `get_eeros` | `get_eeros` | GET | `2.2/networks/{nid}/eeros` | ported | `tests/endpoints_*` |  |
-| eeros | `get_eero` | `get_eero` | GET | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
-| eeros | `reboot_eero` | `reboot_eero` | POST | `2.2/eeros/{eid}/reboot` | ported | `tests/endpoints_*` |  |
-| eeros | `get_led_status` | `get_led_status` | GET | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
-| eeros | `set_led` | `set_led` | PUT | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
-| eeros | `set_led_brightness` | `set_led_brightness` | PUT | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` | clamp 0–100 |
-| eeros | `get_nightlight` | `get_nightlight` | GET | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` |  |
-| eeros | `set_nightlight` | `set_nightlight` | PUT | `2.2/eeros/{eid}` | ported | `tests/endpoints_*` | empty → Validation |
-| eeros | `set_nightlight_brightness` | `set_nightlight_brightness` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
-| eeros | `set_nightlight_schedule` | `set_nightlight_schedule` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
-| forwards | `get_forwards` | `get_forwards` | GET | `2.2/networks/{nid}/forwards` | ported | `tests/endpoints_*` |  |
-| forwards | `create_forward` | `create_forward` | POST | `2.2/networks/{nid}/forwards` | ported | `tests/endpoints_*` |  |
-| forwards | `delete_forward` | `delete_forward` | DELETE | `2.2/networks/{nid}/forwards/{fid}` | ported | `tests/endpoints_*` |  |
-| insights | `get_insights` | `get_insights` | GET | `2.2/networks/{nid}/insights?start&end&cadence&insight_type` | ported | `tests/endpoints_*` |  |
-| insights | `run_insights` | `run_insights` | POST | `2.2/networks/{nid}/insights` | ported | `tests/endpoints_*` |  |
-| networks | `get_networks` | `get_networks` | GET | `2.2/networks` | ported | `tests/endpoints_*` |  |
-| networks | `get_network` | `get_network` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| networks | `set_guest_network` | `set_guest_network` | PUT | `2.2/networks/{nid}/guestnetwork` | ported | `tests/endpoints_*` |  |
-| networks | `run_speed_test` | `run_speed_test` | POST | `2.2/networks/{nid}/speedtest` | ported | `tests/endpoints_*` |  |
-| networks | `reboot_network` | `reboot_network` | POST | `2.2/networks/{nid}/reboot` | ported | `tests/endpoints_*` |  |
-| networks | `get_premium_status` | `get_premium_status` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| networks | `set_network_name` | `set_network_name` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| ouicheck | `get_ouicheck` | `get_ouicheck` | GET | `2.2/networks/{nid}/ouicheck` | ported | `tests/endpoints_*` |  |
-| ouicheck | `run_ouicheck` | `run_ouicheck` | POST | `2.2/networks/{nid}/ouicheck` | ported | `tests/endpoints_*` |  |
-| password | `get_password` | `get_password` | GET | `2.2/networks/{nid}/password` | ported | `tests/endpoints_*` | never logged |
-| profiles | `get_profiles` | `get_profiles` | GET | `2.2/networks/{nid}/profiles` | ported | `tests/endpoints_*` |  |
-| profiles | `get_profile` | `get_profile` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `pause_profile` | `pause_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `get_profile_devices` | `get_profile_devices` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `set_profile_devices` | `set_profile_devices` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `update_profile_content_filter` | `update_profile_content_filter` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` | key whitelist |
-| profiles | `update_profile_block_list` | `update_profile_block_list` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `get_blocked_applications` | `get_blocked_applications` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `set_blocked_applications` | `set_blocked_applications` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `create_profile` | `create_profile` | POST | `2.2/networks/{nid}/profiles` | ported | `tests/endpoints_*` |  |
-| profiles | `rename_profile` | `rename_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| profiles | `delete_profile` | `delete_profile` | DELETE | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| reservations | `get_reservations` | `get_reservations` | GET | `2.2/networks/{nid}/reservations` | ported | `tests/endpoints_*` |  |
-| reservations | `create_reservation` | `create_reservation` | POST | `2.2/networks/{nid}/reservations` | ported | `tests/endpoints_*` |  |
-| reservations | `update_reservation` | `update_reservation` | PUT | `2.2/networks/{nid}/reservations/{rid}` | ported | `tests/endpoints_*` |  |
-| reservations | `delete_reservation` | `delete_reservation` | DELETE | `2.2/networks/{nid}/reservations/{rid}` | ported | `tests/endpoints_*` |  |
-| routing | `get_routing` | `get_routing` | GET | `2.2/networks/{nid}/routing` | ported | `tests/endpoints_*` |  |
-| schedule | `get_profile_schedule` | `get_profile_schedule` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| schedule | `set_profile_schedule` | `set_profile_schedule` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_*` |  |
-| schedule | `clear_profile_schedule` | `clear_profile_schedule` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
-| schedule | `enable_bedtime` | `enable_bedtime` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
-| schedule | `set_weekday_bedtime` | `set_weekday_bedtime` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
-| schedule | `set_weekend_bedtime` | `set_weekend_bedtime` | PUT | `delegates` | ported | `tests/endpoints_*` |  |
-| security | `get_security_settings` | `get_security_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| security | `set_wpa3` | `set_wpa3` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| security | `set_band_steering` | `set_band_steering` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| security | `set_upnp` | `set_upnp` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| security | `set_ipv6` | `set_ipv6` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| security | `set_thread` | `set_thread` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| security | `configure_security` | `configure_security` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | empty → Validation |
-| settings | `get_settings` | `get_settings` | GET | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` |  |
-| sqm | `get_sqm_settings` | `get_sqm_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_*` |  |
-| sqm | `set_sqm_enabled` | `set_sqm_enabled` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | flat bool |
-| sqm | `set_sqm_bandwidth` | `set_sqm_bandwidth` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | shape unverified upstream (sqm.py TODOs at :128,:173,:197) |
-| sqm | `configure_sqm` | `configure_sqm` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | shape unverified upstream (sqm.py TODOs at :128,:173,:197) |
-| sqm | `set_sqm_auto` | `set_sqm_auto` | PUT | `2.2/networks/{nid}/settings` | ported | `tests/endpoints_*` | shape unverified upstream (sqm.py TODOs at :128,:173,:197) |
-| support | `get_support` | `get_support` | GET | `2.2/networks/{nid}/support` | ported | `tests/endpoints_*` |  |
-| support | `request_support` | `request_support` | POST | `2.2/networks/{nid}/support` | ported | `tests/endpoints_*` |  |
-| thread | `get_thread` | `get_thread` | GET | `2.2/networks/{nid}/thread` | ported | `tests/endpoints_*` |  |
-| transfer | `get_transfer_stats` | `get_transfer_stats` | GET | `2.2/networks/{nid}/transfer | …/devices/{did}/transfer` | ported | `tests/endpoints_*` |  |
-| updates | `get_updates` | `get_updates` | GET | `2.2/networks/{nid}/updates` | ported | `tests/endpoints_*` |  |
-| activity (dropped module) | `get_activity, get_activity_clients, get_activity_for_device, get_activity_history, get_activity_categories` | `(none)` | GET | `2.2/networks/{nid}/activity*` | dropped | — | 404 on 2.2 and 2.3 upstream (eero-api #107) |
-| misc | `id_from_url` | `id_from_url` | — | `local` | ported | `tests/endpoints_*` |  |
-| misc | `redact_sensitive` | `redact::redact_sensitive` | — | `local` | ported | `tests/endpoints_*` | Value only |
-| misc | `get_secure_logger / SecureLoggerAdapter` | `(none)` | — | `—` | dropped | — | Python-logging specific; tracing + SecretString |
-| misc | `const.py enums (EeroDeviceType, …)` | `(none)` | — | `—` | dropped | — | unused in Python |
+| auth (AuthAPI) | `AuthAPI(session, cookie_file, use_keyring, *, send_legacy_cookie, accept_language, get_retries)` | `TransportBuilder` (`.send_legacy_cookie()`, `.accept_language()`, `.get_retries()`, `.store()`) | — | `—` | renamed | `tests/transport.rs`, `tests/client_core.rs` | builder; storage selection moves to `.store()` / `create_storage` |
+| auth (AuthAPI) | `is_authenticated` | `AuthApi::is_authenticated` | — | `local` | ported | `auth::tests`, `tests/auth.rs` | token presence only — no client-side expiry at v8.0.4 |
+| auth (AuthAPI) | `login` | `LoginFlow::start` | POST | `2.2/login` (form `login=`) | changed | `tests/auth.rs` | errors with `Error::Authentication("Login failed: No user token received")` instead of returning `False` on a missing `data.user_token`; every other API failure is re-wrapped as `Authentication { "Login failed: …" }` exactly as `auth.py:203-218` |
+| auth (AuthAPI) | `verify` | `PendingLogin::verify` | POST | `2.2/login/verify` (form `code=`) | changed | `tests/auth.rs` | type-state: consumes the pending login and returns a `Session` instead of `bool`; response discarded and the login token becomes the session token as Python does; the provisional `Set-Cookie` hedge of 1.0.0 is removed |
+| auth (AuthAPI) | `resend_verification_code` | `PendingLogin::resend` | POST | `2.2/login/resend` (JSON `{}`) | changed | `tests/auth.rs` | returns the raw `Envelope` and propagates every error; Python discards the body and returns `False` on a generic `EeroAPIException` |
+| auth (AuthAPI) | `logout` | `AuthApi::logout` / `Client::logout` | POST | `2.2/logout` (form `Cookie=s=<token>`) | ported | `tests/auth.rs`, `tests/client_core.rs` | returns `bool`: `Ok(false)` with no request when unauthenticated; every network/API failure swallowed at WARN; memory + every store cleared regardless; `Ok(true)`. Only a `StorageFailures::Fatal` clear failure is `Err` |
+| auth (AuthAPI) | `refresh_session` | `AuthApi::refresh_session` (→ `Transport::refresh_session`) | POST | `2.2/login/refresh` (`""`) | changed | `tests/transport.rs` | single route, current token authenticates, server-issued token ignored, single-flight coalescing with the 30 s waiter cap, `VERIFICATION`/`SESSION_REFRESH` retention groups — all as Python. Divergence: the 401-triggered retry re-reads the session *after* the refresh instead of re-sending the pre-refresh token (`base.py:625-658`) |
+| auth (AuthAPI) | `ensure_authenticated` | `AuthApi::ensure_authenticated` | — | `local` | changed | `auth::tests` | returns `Result<(), Error>` (`Err(Authentication)`) instead of `bool`; no refresh branch, like Python |
+| auth (AuthAPI) | `get_auth_token` | `AuthApi::session` / `Client::session` | — | `local` | renamed | `tests/auth.rs` | returns `Option<Session>` (`SecretString`), never a bare string |
+| auth (AuthAPI) | `clear_auth_data` | `AuthApi::clear_auth_data` | — | `local` | ported | `tests/auth.rs` | same body as `clear_session_token` — one-field record, nothing left to distinguish |
+| auth (AuthAPI) | `set_session_token` | `AuthApi::set_session_token` / `Client::set_session_token` / `Session::from_token` | — | `local` | ported | `tests/auth.rs`, `tests/client_core.rs` | validates non-empty printable ASCII (the value becomes `X-User-Token`); no fabricated expiry; `Error::Storage` only under `StorageFailures::Fatal` |
+| auth (AuthAPI) | `clear_session_token` | `AuthApi::clear_session_token` / `Client::clear_session_token` | — | `local` | ported | `tests/auth.rs`, `tests/client_core.rs` | `clear_session_token == clear_auth_data` at v8.0.4 (`_destroy_stored_credentials`) |
+| auth (AuthAPI) | `(none)` | `Session::from_env` | — | `local` | changed | `auth::session::tests` | Rust-only addition: token from an environment variable, same shape validation as `set_session_token` |
+| EeroAPI | `EeroAPI(session, cookie_file, use_keyring, *, send_legacy_cookie, accept_language, get_retries)` | `EeroApi::new(transport)` | — | `—` | changed | `tests/api_aggregator.rs` | options and storage live on `TransportBuilder` / `Client::builder()` |
+| EeroAPI | `__aenter__/__aexit__` | `(none)` | — | `—` | dropped | — | no context manager in Rust; `Transport` owns the reqwest client (core.md §2) |
+| EeroAPI | `is_authenticated / logout` | `same on EeroApi` | — | `—` | identical | `tests/api_aggregator.rs` | `logout` returns `bool` |
+| EeroAPI | `login / verify` | `LoginFlow::start` / `PendingLogin::verify` | — | `—` | renamed | `tests/auth.rs` | deliberately not mirrored on `EeroApi` (api.rs module docs): the handshake is a type-state pair that can only hand back a verified `Session` |
+| EeroAPI | `.<domain> attributes (37)` | `EeroApi::<domain>()` accessors (37) | — | `—` | ported | `tests/api_aggregator.rs` | one accessor per Python domain attribute; `.auth` → `EeroApi::auth()` |
+| EeroClient (client-only logic) | `EeroClient(session, cookie_file, use_keyring, cache_timeout, *, send_legacy_cookie, accept_language, get_retries)` | `Client::builder()` | — | `—` | renamed | `tests/client_core.rs` | `.cache_ttl()`, `.store()`, `.session()`, `.storage_failures()`, plus the three transport options |
+| EeroClient (client-only logic) | `is_authenticated` | `Client::is_authenticated` | — | `local` | identical | `tests/client_core.rs` |  |
+| EeroClient (client-only logic) | `login / verify (+ clear_cache after verify)` | `(none on Client)` | — | `—` | dropped | — | handshake lives in `LoginFlow`/`PendingLogin`; a freshly built `Client` has an empty cache, so a post-verify `clear_cache` has nothing to do (client.md §7 Q1, `client/mod.rs` docs) |
+| EeroClient (client-only logic) | `logout` | `Client::logout` | POST | `2.2/logout` | changed | `tests/client_core.rs` | clears the cache unconditionally, not only `if result:` — the session is gone on every outcome (security finding F1) |
+| EeroClient (client-only logic) | `set_session_token / clear_session_token` | `Client::set_session_token` / `Client::clear_session_token` | — | `local` | ported | `tests/client_core.rs` | cache cleared after the auth call succeeds, Python's ordering |
+| EeroClient (client-only logic) | `clear_cache` | `Client::clear_cache` | — | `local` | changed | `cache::tests`, `tests/client_core.rs` | also drops timestamps |
+| EeroClient (client-only logic) | `_is_cache_valid / _update_cache / _get_from_cache` | `Cache::get / Cache::put` | — | `local` | ported | `cache::tests` | TTL + falsy-value read guard; clone-on-read replaces Python's deep copy |
+| EeroClient (client-only logic) | `_ensure_network_id` | `Client::ensure_network_id` (private) | — | `local` | ported | `tests/client_core.rs` | explicit empty string treated like `None`; auto-discovery reads the cached `get_networks` (gotcha G2 reproduced) |
+| EeroClient (client-only logic) | `set_preferred_network / preferred_network_id` | `same` | — | `local` | identical | `tests/client_core.rs` | in-memory only |
+| EeroClient (client-only logic) | `_network_parent_kwargs / _eero_parent_kwargs / _device_parent_kwargs / _find_by_id_or_url` | `Client::network_parent / eero_parent / device_parent / find_by_id_or_url` (private) | — | `local` | ported | `client::tests`, `tests/client_eeros.rs`, `tests/client_networks.rs` | `parent` forwarded only where `client.py` forwards it (client.md §4 `notes` column) |
+| EeroClient (client-only logic) | `_invalidate_network_cache / _invalidate_eeros_cache / _invalidate_device_cache / _invalidate_profile_cache / _invalidate_profiles_list_cache / _invalidate_all_profile_caches` | `Client::invalidate_network_cache / invalidate_eeros_cache / invalidate_device_cache / invalidate_profile_cache / invalidate_profiles_list_cache` (private) + `Cache::invalidate_bucket` | — | `local` | ported | `client::tests`, `tests/client_*.rs` | each wrapper invalidates exactly the bucket client.md §4 lists |
+| EeroClient (client-only logic) | `get_account` | `Client::get_account` (→ `NetworksApi::get_account`) | GET | `2.2/account` | changed | `tests/client_account.rs`, `tests/client_networks.rs` | cached; goes through `Transport::resource`, so it gets the one-shot refresh-and-retry Python's bare `auth.get` lacks (gotcha G12) |
+| EeroClient (client-only logic) | `get_networks (+ /account fallback, preferred side-effect)` | `Client::get_networks` | GET | `2.2/networks` (+ `2.2/account`) | changed | `tests/client_networks.rs` | synthesised `{meta, data.networks}` envelope reproduced (G1); the fallback's own failure is propagated as `Err` instead of swallowed at DEBUG (G6) |
+| EeroClient (client-only logic) | `get_device_priority` | `Client::get_device_priority` | GET | `2.2/networks/{nid}/devices/{mac}` | ported | `tests/client_devices.rs` | same domain call as `get_device`, never touches the cache, `auto_discover=False` — quirk reproduced |
+| EeroClient (client-only logic) | `get_eero(refresh_cache)` | `Client::get_eero` | GET | `2.2/eeros/{eid}` | ported | `tests/client_eeros.rs` | accepts but ignores `refresh_cache` like Python — always a live call, never cached |
+| EeroClient (client-only logic) | `get_devices(thread=, proxied_node=)` cache bypass | `Client::get_devices` | GET | `2.2/networks/{nid}/devices` | ported | `tests/client_devices.rs` | filtered calls bypass the `devices` bucket (client.md §3.6) |
+| EeroClient (client-only logic) | `port_action / nightlight_override / led_cycle` network-id handling | `Client::port_action` / `Client::nightlight_override` / `Client::led_cycle` | — | `local` | ported | `tests/client_eeros.rs` | `network_id` resolved only to invalidate `eeros[{nid}]`, never forwarded (domain method has no such parameter); `led_cycle` takes no `network_id` at all |
+| EeroClient (client-only logic) | `get_profile_devices / set_profile_devices` (`auto_discover=True`) | `Client::get_profile_devices` / `Client::set_profile_devices` | — | `local` | ported | `tests/client_profiles.rs` | the two post-`get_diagnostics` wrappers that still auto-discover (gotcha G5) |
+| ac_compat | `get_ac_compat` | `ACCompatApi::get_ac_compat` / `Client::get_ac_compat` | GET | `2.2/networks/{nid}/ac_compat link:ac_compat` | ported | `tests/endpoints_ac_compat.rs`, `tests/client_ac_compat.rs` |  |
+| account | `set_name` | `AccountApi::set_name` / `Client::set_account_name` | PUT | `2.2/account/name` (form `name=`) | ported | `tests/endpoints_account.rs`, `tests/client_account.rs` | resets the `Account` cache entry |
+| account | `set_email` | `AccountApi::set_email` / `Client::set_account_email` | PUT | `2.2/account/email` (form `email=`) | ported | `tests/endpoints_account.rs`, `tests/client_account.rs` | starts a change; does not invalidate |
+| account | `verify_email` | `AccountApi::verify_email` / `Client::verify_account_email` | POST | `2.2/account/email/verify` (form `code=`) | ported | `tests/endpoints_account.rs`, `tests/client_account.rs` | resets `Account` |
+| account | `set_phone` | `AccountApi::set_phone` / `Client::set_account_phone` | PUT | `2.2/account/phone` (form `phone=`) | ported | `tests/endpoints_account.rs`, `tests/client_account.rs` | does not invalidate |
+| account | `verify_phone` | `AccountApi::verify_phone` / `Client::verify_account_phone` | POST | `2.2/account/phone/verify` (form `code=`) | ported | `tests/endpoints_account.rs`, `tests/client_account.rs` | resets `Account` |
+| account | `set_consents` | `AccountApi::set_consents` / `Client::set_account_consents` | PUT | `2.2/account/consents` | ported | `tests/endpoints_account.rs`, `tests/client_account.rs` | resets `Account` |
+| account | `get_sms_countries` | `AccountApi::get_sms_countries` / `Client::get_sms_countries` | GET | `2.2/countries/sms` | ported | `tests/endpoints_account.rs`, `tests/client_account.rs` |  |
+| backup | `get_backup_internet` | `BackupApi::get_backup_internet` / `Client::get_backup_internet` | GET | `2.2/networks/{nid}/backupinternet` | ported | `tests/endpoints_backup.rs`, `tests/client_backup.rs` |  |
+| backup | `set_backup_internet` | `BackupApi::set_backup_internet` / `Client::set_backup_internet` | PUT | `2.2/networks/{nid}/backupinternet` | ported | `tests/endpoints_backup.rs`, `tests/client_backup.rs` | `{"backup_internet_enabled": bool}` |
+| backup | `get_cellular_backup_usage` | `BackupApi::get_cellular_backup_usage` / `Client::get_cellular_backup_usage` | GET | `2.2/networks/{nid}/cellular_backup_usage` | ported | `tests/endpoints_backup.rs`, `tests/client_backup.rs` |  |
+| backup | `get_cellular_backup_events` | `BackupApi::get_cellular_backup_events` / `Client::get_cellular_backup_events` | GET | `2.2/networks/{nid}/cellular_backup_events` | ported | `tests/endpoints_backup.rs`, `tests/client_backup.rs` |  |
+| backup_access_points | `list` | `BackupAccessPointsApi::list` / `Client::list_backup_access_points` | GET | `2.2/networks/{nid}/backup_access_points link:backup_access_points` | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` |  |
+| backup_access_points | `add` | `BackupAccessPointsApi::add` / `Client::add_backup_access_point` | POST | `2.2/networks/{nid}/backup_access_points` | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` | `ssid`, `password`, optional `uuid` |
+| backup_access_points | `update` | `BackupAccessPointsApi::update` / `Client::update_backup_access_point` | PUT | `2.2/networks/{nid}/backup_access_points/{bid}` | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` | `UpdateBackupAccessPointOptions` |
+| backup_access_points | `delete_backup_access_point` | `BackupAccessPointsApi::delete_backup_access_point` / `Client::delete_backup_access_point` | DELETE | `2.2/networks/{nid}/backup_access_points/{bid}` | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` |  |
+| backup_access_points | `rearrange` | `BackupAccessPointsApi::rearrange` / `Client::rearrange_backup_access_points` | POST | `2.2/networks/{nid}/backup_access_points/rearrange` | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` | `{"rearranged_ids": […]}` |
+| backup_access_points | `discover_ssids` | `BackupAccessPointsApi::discover_ssids` / `Client::discover_backup_ssids` | GET | `2.2/networks/{nid}/backup_access_points/ssid_discovery` | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` |  |
+| backup_access_points | `start_ssid_discovery` | `BackupAccessPointsApi::start_ssid_discovery` / `Client::start_backup_ssid_discovery` | POST | `2.2/networks/{nid}/backup_access_points/ssid_discovery` (`""`) | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` |  |
+| backup_access_points | `connectivity_check` | `BackupAccessPointsApi::connectivity_check` / `Client::backup_connectivity_check` | POST | `2.2/networks/{nid}/backup_access_points/connectivity_check` (`""`) | ported | `tests/endpoints_backup_access_points.rs`, `tests/client_backup_access_points.rs` |  |
+| blacklist | `get_blacklist` | `BlacklistApi::get_blacklist` / `Client::get_blacklist` | GET | `2.2/networks/{nid}/blacklist link:device_blacklist` | ported | `tests/endpoints_blacklist.rs`, `tests/client_blacklist.rs` |  |
+| blacklist | `add_to_blacklist` | `BlacklistApi::add_to_blacklist` | POST | `2.2/networks/{nid}/blacklist link:device_blacklist` (form `mac=`) | ported | `tests/endpoints_blacklist.rs` | domain-only, as in Python (`EeroClient` reaches it via `block_device`); the pre-v8 `Client`-level `add_to_blacklist`/`remove_from_blacklist` wrappers had no Python precedent and are gone |
+| blacklist | `remove_from_blacklist` | `BlacklistApi::remove_from_blacklist` | DELETE | `2.2/networks/{nid}/blacklist/{mac_or_id} link:device_blacklist` | ported | `tests/endpoints_blacklist.rs` | domain-only, as in Python (via `unblock_device`) |
+| burst_reporters | `create_burst_reporter` | `BurstReportersApi::create_burst_reporter` | POST | `2.2/networks/{nid}/burst_reporters link:burst_reporters` | ported | `tests/endpoints_burst_reporters.rs` | no `EeroClient` wrapper in Python either — `src/client/burst_reporters.rs` is deliberately empty |
+| data_usage | `get_data_usage` | `DataUsageApi::get_data_usage` / `Client::get_data_usage` | GET | `2.2/networks/{nid}/data_usage link:self ?start&end&cadence[&timezone]` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` | never cached |
+| data_usage | `get_breakdown` | `DataUsageApi::get_breakdown` / `Client::get_data_usage_breakdown` | GET | `2.2/networks/{nid}/data_usage/breakdown link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_devices_usage` | `DataUsageApi::get_devices_usage` / `Client::get_devices_data_usage` | GET | `2.2/networks/{nid}/data_usage/devices link:self [?profile_id]` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_device_usage` | `DataUsageApi::get_device_usage` / `Client::get_device_data_usage` | GET | `2.2/networks/{nid}/data_usage/devices/{mac} link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_eeros_summary` | `DataUsageApi::get_eeros_summary` / `Client::get_eeros_data_usage_summary` | GET | `2.2/networks/{nid}/data_usage/eeros/summary link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_eero_usage` | `DataUsageApi::get_eero_usage` / `Client::get_eero_data_usage` | GET | `2.2/networks/{nid}/data_usage/eeros/{eid} link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_profile_usage` | `DataUsageApi::get_profile_usage` / `Client::get_profile_data_usage` | GET | `2.2/networks/{nid}/data_usage/profiles/{pid} link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_unprofiled_devices` | `DataUsageApi::get_unprofiled_devices` / `Client::get_unprofiled_devices_data_usage` | GET | `2.2/networks/{nid}/data_usage/unprofiled/devices link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_unprofiled_summary` | `DataUsageApi::get_unprofiled_summary` / `Client::get_unprofiled_data_usage_summary` | GET | `2.2/networks/{nid}/data_usage/unprofiled/summary link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `get_report_settings` | `DataUsageApi::get_report_settings` / `Client::get_data_usage_report_settings` | GET | `2.2/networks/{nid}/data_usage/report_settings link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` |  |
+| data_usage | `set_report_settings` | `DataUsageApi::set_report_settings` / `Client::set_data_usage_report_settings` | PUT | `2.2/networks/{nid}/data_usage/report_settings link:self` | ported | `tests/endpoints_data_usage.rs`, `tests/client_data_usage.rs` | the only write in the group; invalidates `Net{nid}` |
+| ddns | `enable` | `DdnsApi::enable` / `Client::enable_ddns` | PUT | `2.2/networks/{nid}/ddns/enable link:ddns_enable` | ported | `tests/endpoints_ddns.rs`, `tests/client_ddns.rs` | no body |
+| ddns | `disable` | `DdnsApi::disable` / `Client::disable_ddns` | PUT | `2.2/networks/{nid}/ddns/disable link:ddns_disable` | ported | `tests/endpoints_ddns.rs`, `tests/client_ddns.rs` | no body |
+| devices | `get_devices` | `DevicesApi::get_devices` / `Client::get_devices` | GET | `2.2/networks/{nid}/devices link:devices [?thread&proxied_node]` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` |  |
+| devices | `get_device` | `DevicesApi::get_device` / `Client::get_device` | GET | `2.2/networks/{nid}/devices/{mac}` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` |  |
+| devices | `set_device_nickname` | `DevicesApi::set_device_nickname` / `Client::set_device_nickname` | PUT | `**2.3**/networks/{nid}/devices/{mac}` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` | 2.2 silently drops it (eero-api #102) |
+| devices | `pause_device` | `DevicesApi::pause_device` / `Client::pause_device` | PUT | `**2.3**/networks/{nid}/devices/{mac}` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` |  |
+| devices | `update_device_via_link` | `DevicesApi::update_device_via_link` / `Client::update_device_via_link` | PUT | `2.2/networks/{nid}/devices/{mac} link:self` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` | `nickname`/`paused`/`profile`; empty → `Validation`; unverified write, warned |
+| devices | `set_device_type` | `DevicesApi::set_device_type` / `Client::set_device_type` | PUT | `2.2/networks/{nid}/devices/{mac}` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` | `{"device_type": …}`, live-verified upstream |
+| devices | `get_device_labels` | `DevicesApi::get_device_labels` / `Client::get_device_labels` | GET | `2.2/networks/{nid}/devices/{mac}/labels` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` |  |
+| devices | `set_device_labels` | `DevicesApi::set_device_labels` / `Client::set_device_labels` | PUT | `2.2/networks/{nid}/devices/{mac}/labels ?make_label&model_label&version_label&type_label` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` | query-string write; server-side no-op as of 2026-09-20, ported for parity |
+| devices | `block_device` | `DevicesApi::block_device` / `Client::block_device` | POST | `delegates` → `add_to_blacklist` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` | pure delegate, no `GET` first; the old 3-arg `(id, blocked, network_id)` shape is gone |
+| devices | `unblock_device` | `DevicesApi::unblock_device` / `Client::unblock_device` | DELETE | `delegates` → `remove_from_blacklist` | ported | `tests/endpoints_devices.rs`, `tests/client_devices.rs` |  |
+| dhcp | `set_dhcp` | `DhcpApi::set_dhcp` / `Client::set_dhcp` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dhcp.rs`, `tests/client_dhcp.rs` | `{"dhcp": {mode, custom, custom_v2}}`; invalid mode → `Validation` |
+| dhcp | `set_connection_mode` | `DhcpApi::set_connection_mode` / `Client::set_connection_mode` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dhcp.rs`, `tests/client_dhcp.rs` | `{"connection": {"mode": …}}` |
+| dhcp | `set_nat_port_randomization` | `DhcpApi::set_nat_port_randomization` / `Client::set_nat_port_randomization` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dhcp.rs`, `tests/client_dhcp.rs` |  |
+| dhcp | `set_pppoe` | `DhcpApi::set_pppoe` / `Client::set_pppoe` | POST | `2.2/eeros/{eid}/pppoe` | ported | `tests/endpoints_dhcp.rs`, `tests/client_dhcp.rs` | addressed by eero serial/id, no `network_id` |
+| diagnostics | `get_diagnostics` | `DiagnosticsApi::get_diagnostics` / `Client::get_diagnostics` | GET | `2.2/networks/{nid}/diagnostics link:diagnostics` | ported | `tests/endpoints_diagnostics.rs`, `tests/client_diagnostics.rs` |  |
+| diagnostics | `run_diagnostics` | `DiagnosticsApi::run_diagnostics` / `Client::run_diagnostics` | POST | `2.2/networks/{nid}/diagnostics link:diagnostics` | ported | `tests/endpoints_diagnostics.rs`, `tests/client_diagnostics.rs` | JSON `{device?, symptom?}`, `{}` when neither |
+| dns | `get_dns_settings` | `DnsApi::get_dns_settings` / `Client::get_dns_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_dns.rs`, `tests/client_dns.rs` | alias of the network read |
+| dns | `set_dns_caching` | `DnsApi::set_dns_caching` / `Client::set_dns_caching` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dns.rs`, `tests/client_dns.rs` | `{"dns": {"caching": bool}}` |
+| dns | `set_custom_dns` | `DnsApi::set_custom_dns` / `Client::set_custom_dns` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dns.rs`, `tests/client_dns.rs` | split by family, ≤2 per family → `Validation` (v7 rule); both Python helpers' differing empty-entry messages reproduced |
+| dns | `set_custom_dns_ipv4` | `DnsApi::set_custom_dns_ipv4` / `Client::set_custom_dns_ipv4` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dns.rs`, `tests/client_dns.rs` |  |
+| dns | `set_custom_dns_ipv6` | `DnsApi::set_custom_dns_ipv6` / `Client::set_custom_dns_ipv6` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dns.rs`, `tests/client_dns.rs` |  |
+| dns | `clear_custom_dns` | `DnsApi::clear_custom_dns` / `Client::clear_custom_dns` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dns.rs`, `tests/client_dns.rs` | `family` = ipv4 / ipv6 / both; other → `Validation` |
+| dns | `set_dns_mode` | `DnsApi::set_dns_mode` / `Client::set_dns_mode` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_dns.rs`, `tests/client_dns.rs` | `automatic` / `custom`; presets → `Validation` as Python since v7; `custom` with no servers re-enables stored ones |
+| dns_policies | `get_advanced_content_filter` | `DnsPoliciesApi::get_advanced_content_filter` / `Client::get_advanced_content_filter` | GET | `2.2/networks/{nid}/dns_policies/advanced_content_filter link:advanced_content_filter` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` |  |
+| dns_policies | `allow_domain` | `DnsPoliciesApi::allow_domain` / `Client::allow_domain` | PUT | `2.2/networks/{nid}/dns_policies/network/allowed link:dns_policies_network_allowed` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` | removal via `is_delete` |
+| dns_policies | `allow_cnames` | `DnsPoliciesApi::allow_cnames` / `Client::allow_cnames` | PUT | `2.2/networks/{nid}/dns_policies/network/allowed/cnames link:dns_policies_network_allowed_cnames` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` |  |
+| dns_policies | `block_domain` | `DnsPoliciesApi::block_domain` / `Client::block_domain` | PUT | `2.2/networks/{nid}/dns_policies/network/blocked link:dns_policies_network_blocked` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` |  |
+| dns_policies | `allow_domain_for_profiles` | `DnsPoliciesApi::allow_domain_for_profiles` / `Client::allow_domain_for_profiles` | PUT | `2.2/networks/{nid}/dns_policies/profiles/allowed link:dns_policies_profiles_allowed` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` | invalidates the profile list, not `Net{nid}` |
+| dns_policies | `allow_cnames_for_profiles` | `DnsPoliciesApi::allow_cnames_for_profiles` / `Client::allow_cnames_for_profiles` | PUT | `2.2/networks/{nid}/dns_policies/profiles/allowed/cnames link:dns_policies_profiles_allowed_cnames` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` |  |
+| dns_policies | `block_domain_for_profiles` | `DnsPoliciesApi::block_domain_for_profiles` / `Client::block_domain_for_profiles` | PUT | `2.2/networks/{nid}/dns_policies/profiles/blocked link:dns_policies_profiles_blocked` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` |  |
+| dns_policies | `get_profile_applications` | `DnsPoliciesApi::get_profile_applications` / `Client::get_dns_policy_applications` | GET | `2.2/networks/{nid}/dns_policies/profiles/{pid}/applications` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` | wrapper name differs in Python too |
+| dns_policies | `set_profile_blocked_applications` | `DnsPoliciesApi::set_profile_blocked_applications` / `Client::set_profile_blocked_applications` | PUT | `2.2/networks/{nid}/dns_policies/profiles/{pid}/applications/blocked` | ported | `tests/endpoints_dns_policies.rs`, `tests/client_dns_policies.rs` | replaces the removed `set_blocked_applications` |
+| eeros | `get_eeros` | `EerosApi::get_eeros` / `Client::get_eeros` | GET | `2.2/networks/{nid}/eeros link:eeros` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` |  |
+| eeros | `get_eero` | `EerosApi::get_eero` / `Client::get_eero` | GET | `2.2/eeros/{eid} link:self` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | wrapper accepts but ignores `refresh_cache` like Python |
+| eeros | `reboot_eero` | `EerosApi::reboot_eero` / `Client::reboot_eero` | POST | `2.2/eeros/{eid}/reboot link:reboot` (`""`) | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` |  |
+| eeros | `get_led_status` | `EerosApi::get_led_status` / `Client::get_led_status` | GET | `2.2/eeros/{eid} link:self` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | alias of `get_eero` |
+| eeros | `set_led` | `EerosApi::set_led` / `Client::set_led` | PUT | `2.2/eeros/{eid}/led link:led_action` (form `led_on=`) | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | wire format changed upstream in v8.0.0 (the old JSON PUT changed nothing) |
+| eeros | `set_led_brightness` | `EerosApi::set_led_brightness` / `Client::set_led_brightness` | PUT | `2.2/eeros/{eid}/led link:led_action` (form `led_brightness=`) | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | 0–100 → `Validation` |
+| eeros | `set_location` | `EerosApi::set_location` / `Client::set_location` | PUT | `2.2/eeros/{eid} link:self` (form `location=`) | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | unverified upstream, warned |
+| eeros | `get_nightlight` | `EerosApi::get_nightlight` / `Client::get_nightlight` | GET | `{data.nightlight.url}` (discovery `GET 2.2/eeros/{eid}` without parent) | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | no nightlight URL → `Error::FeatureUnavailable` |
+| eeros | `set_nightlight` | `EerosApi::set_nightlight` / `Client::set_nightlight` | PUT | `{data.nightlight.url}` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | `enabled` / `brightness_percentage` / `schedule`; empty → `Validation` (as Python) |
+| eeros | `set_nightlight_brightness` | `EerosApi::set_nightlight_brightness` / `Client::set_nightlight_brightness` | PUT | `delegates` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` |  |
+| eeros | `set_nightlight_schedule` | `EerosApi::set_nightlight_schedule` / `Client::set_nightlight_schedule` | PUT | `delegates` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | one opaque schedule object |
+| eeros | `get_connections` | `EerosApi::get_connections` / `Client::get_connections` | GET | `2.2/eeros/{eid}/connections link:connections` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` |  |
+| eeros | `node_action` | `EerosApi::node_action` / `Client::node_action` | POST | `2.2/eeros/{eid}/action link:action` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | `{"action": …}`; unknown action → `Validation` |
+| eeros | `port_action` | `EerosApi::port_action` / `Client::port_action` | POST | `2.2/eeros/{eid}/ports/{n}/action` | changed | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | `interface_number` is `u32`, narrower than Python's `str` (phase-G fix list item 24) |
+| eeros | `led_cycle` | `EerosApi::led_cycle` / `Client::led_cycle` | POST | `2.2/eeros/{serial}/led_cycle` (form `colors`, `duration`, `time_per_color`) | changed | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | `duration` / `time_per_color` are `u32`, narrower than Python's `str`; no `network_id` |
+| eeros | `nightlight_override` | `EerosApi::nightlight_override` / `Client::nightlight_override` | POST | `2.2/eeros/{eid}/nightlight/override` (form `brightness_percentage=`) | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` |  |
+| eeros | `get_eero_support` | `EerosApi::get_eero_support` / `Client::get_eero_support` | GET | `2.2/eeros/{serial}/support` | ported | `tests/endpoints_eeros.rs`, `tests/client_eeros.rs` | addressed by serial; 404 on some nodes |
+| entitlements | `get_features` | `EntitlementsApi::get_features` / `Client::get_entitlement_features` | GET | `2.2/entitlements/networks/{nid}/features` | ported | `tests/endpoints_entitlements.rs`, `tests/client_entitlements.rs` |  |
+| entitlements | `get_upsell_features` | `EntitlementsApi::get_upsell_features` / `Client::get_upsell_features` | GET | `2.2/entitlements/networks/{nid}/upsell_features` | ported | `tests/endpoints_entitlements.rs`, `tests/client_entitlements.rs` |  |
+| entitlements | `get_model_capabilities` | `EntitlementsApi::get_model_capabilities` / `Client::get_model_capabilities` | GET | `2.2/eero_models/capabilities ?networkId` | ported | `tests/endpoints_entitlements.rs`, `tests/client_entitlements.rs` |  |
+| entitlements | `get_premium_customer` | `EntitlementsApi::get_premium_customer` / `Client::get_premium_customer` | GET | `2.2/premium/customer` | ported | `tests/endpoints_entitlements.rs`, `tests/client_entitlements.rs` | account-scoped |
+| events | `get_app_events` | `EventsApi::get_app_events` / `Client::get_app_events` | GET | `2.2/networks/{nid}/app_events link:self [?page_size&timestamp]` | ported | `tests/endpoints_events.rs`, `tests/client_events.rs` |  |
+| events | `get_network_scan` | `EventsApi::get_network_scan` / `Client::get_network_scan` | GET | `2.2/networks/{nid}/network_scan link:self` | ported | `tests/endpoints_events.rs`, `tests/client_events.rs` |  |
+| events | `get_channel_utilization` | `EventsApi::get_channel_utilization` / `Client::get_channel_utilization` | GET | `2.2/networks/{nid}/channel_utilization link:self ?start&end[&busy_threshold&eero_id&band&granularity&gap_data_placeholder]` | ported | `tests/endpoints_events.rs`, `tests/client_events.rs` | `GetChannelUtilizationOptions`; zero `busy_threshold`/`granularity` → `Validation` |
+| forwards | `get_forwards` | `ForwardsApi::get_forwards` / `Client::get_forwards` | GET | `2.2/networks/{nid}/forwards link:forwards` | ported | `tests/endpoints_forwards.rs`, `tests/client_forwards.rs` |  |
+| forwards | `create_forward` | `ForwardsApi::create_forward` / `Client::create_forward` | POST | `2.2/networks/{nid}/forwards link:forwards` | ported | `tests/endpoints_forwards.rs`, `tests/client_forwards.rs` |  |
+| forwards | `update_forward` | `ForwardsApi::update_forward` / `Client::update_forward` | PUT | `2.2/networks/{nid}/forwards/{fid}` | ported | `tests/endpoints_forwards.rs`, `tests/client_forwards.rs` | `forward` may be a bare id (then `network` required), path, URL or envelope; unverified, warned |
+| forwards | `delete_forward` | `ForwardsApi::delete_forward` / `Client::delete_forward` | DELETE | `2.2/networks/{nid}/forwards/{fid}` | ported | `tests/endpoints_forwards.rs`, `tests/client_forwards.rs` |  |
+| insights | `get_insights` | `InsightsApi::get_insights` / `Client::get_insights` | GET | `2.2/networks/{nid}/insights ?start&end&cadence&insight_type` | changed | `tests/endpoints_insights.rs`, `tests/client_insights.rs` | `cadence` is a required argument — Python SDK-defaults it to `"daily"` (`insights.py:79`); kept from the pre-v8 port (g3 brief open question 3). `"weekly"` no longer accepted, as upstream |
+| insights | `get_devices_insights` | `InsightsApi::get_devices_insights` / `Client::get_devices_insights` | GET | `2.2/networks/{nid}/insights/devices link:insights_devices` | ported | `tests/endpoints_insights.rs`, `tests/client_insights.rs` |  |
+| insights | `get_device_insights` | `InsightsApi::get_device_insights` / `Client::get_device_insights` | GET | `2.2/networks/{nid}/insights/devices/{mac}` | ported | `tests/endpoints_insights.rs`, `tests/client_insights.rs` |  |
+| insights | `get_profiles_insights` | `InsightsApi::get_profiles_insights` / `Client::get_profiles_insights` | GET | `2.2/networks/{nid}/insights/profiles link:insights_profiles` | ported | `tests/endpoints_insights.rs`, `tests/client_insights.rs` |  |
+| insights | `get_profile_insights` | `InsightsApi::get_profile_insights` / `Client::get_profile_insights` | GET | `2.2/networks/{nid}/insights/profiles/{pid}` | ported | `tests/endpoints_insights.rs`, `tests/client_insights.rs` |  |
+| insights | `get_profile_devices_insights` | `InsightsApi::get_profile_devices_insights` / `Client::get_profile_devices_insights` | GET | `2.2/networks/{nid}/insights/profiles/{pid}/devices` | ported | `tests/endpoints_insights.rs`, `tests/client_insights.rs` |  |
+| members | `get_members` | `MembersApi::get_members` / `Client::get_members` | GET | `2.2/networks/{nid}/members link:members` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` |  |
+| members | `get_invites` | `MembersApi::get_invites` / `Client::get_invites` | GET | `2.2/networks/{nid}/invites` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` | 403 on some accounts |
+| members | `create_invite` | `MembersApi::create_invite` / `Client::create_invite` | POST | `2.2/networks/{nid}/invites` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` | `{"invite_role": …}`; unknown role → `Validation` |
+| members | `update_invite` | `MembersApi::update_invite` / `Client::update_invite` | PUT | `2.2/networks/{nid}/invites/{iid}` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` | `{"invite_nickname": …}` |
+| members | `delete_invite` | `MembersApi::delete_invite` / `Client::delete_invite` | DELETE | `2.2/networks/{nid}/invites/{iid}` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` |  |
+| members | `respond_to_invite` | `MembersApi::respond_to_invite` / `Client::respond_to_invite` | POST | `2.2/networks/{nid}/invites/response` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` | `invite_id` or `invite_code`, neither → `Validation` |
+| members | `cancel_pending_admin` | `MembersApi::cancel_pending_admin` / `Client::cancel_pending_admin` | POST | `2.2/networks/{nid}/invites/cancel_pending_admin` (`""`) | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` |  |
+| members | `promote_member` | `MembersApi::promote_member` / `Client::promote_member` | POST | `2.2/networks/{nid}/member_promotion` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` | `{"member_id": …}` |
+| members | `remove_admin` | `MembersApi::remove_admin` / `Client::remove_admin` | DELETE | `2.2/networks/{nid}/admins/{uid}` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` |  |
+| members | `query_invite` | `MembersApi::query_invite` / `Client::query_invite` | POST | `2.2/inviteQuery` | ported | `tests/endpoints_members.rs`, `tests/client_members.rs` | `{"invite_code": …}`; no `network_id` |
+| networks | `get_networks` | `NetworksApi::get_networks` | GET | `2.2/networks` | ported | `tests/endpoints_networks.rs` | the `/account` fallback is `Client`-level — see the `EeroClient` rows |
+| networks | `get_network` | `NetworksApi::get_network` / `Client::get_network` | GET | `2.2/networks/{nid} link:self` | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` | populates `Net{nid}` |
+| networks | `get_premium_status` | `NetworksApi::get_premium_status` / `Client::get_premium_status` | GET | `2.2/networks/{nid} link:self` | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` | alias of the network read |
+| networks | `reboot_network` | `NetworksApi::reboot_network` | POST | `2.2/networks/{nid}/reboot link:reboot` (`""`) | ported | `tests/endpoints_networks.rs` | domain-only at v8.0.4 (Migration.md v7.x → v8.0.0 "Writes now use the forms the API declares"); no `Client` wrapper, as in Python |
+| networks | `run_speed_test` | `NetworksApi::run_speed_test` / `Client::run_speed_test` | POST | `2.2/networks/{nid}/speedtest link:speedtest` (`""`) | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` |  |
+| networks | `get_speed_tests` | `NetworksApi::get_speed_tests` / `Client::get_speed_tests` | GET | `2.2/networks/{nid}/speedtest link:speedtest [?limit&start_time&end_time]` | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` |  |
+| networks | `set_network_name` | `NetworksApi::set_network_name` / `Client::set_network_name` | PUT | `2.2/networks/{nid}/settings link:settings` (form `name=`) | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` |  |
+| networks | `set_network_password` | `NetworksApi::set_network_password` / `Client::set_network_password` | PUT | `2.2/networks/{nid}/password link:password` (form `password=`) | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` | value never logged |
+| networks | `clear_network_password` | `NetworksApi::clear_network_password` / `Client::clear_network_password` | DELETE | `2.2/networks/{nid}/password link:password` | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` |  |
+| networks | `get_guest_network` | `NetworksApi::get_guest_network` / `Client::get_guest_network` | GET | `2.2/networks/{nid}/guestnetwork link:guestnetwork` | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` |  |
+| networks | `set_guest_network` | `NetworksApi::set_guest_network` / `Client::set_guest_network` | PUT | `2.2/networks/{nid}/guestnetwork link:guestnetwork` (form `enabled=[&name=]`) | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` | `password=` is gone upstream — use the two password methods |
+| networks | `set_guest_password` | `NetworksApi::set_guest_password` / `Client::set_guest_password` | PUT | `2.2/networks/{nid}/guestnetwork/password link:password` (form `password=`) | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` | the *guest network's* own `password` link |
+| networks | `clear_guest_password` | `NetworksApi::clear_guest_password` / `Client::clear_guest_password` | DELETE | `2.2/networks/{nid}/guestnetwork/password link:password` | ported | `tests/endpoints_networks.rs`, `tests/client_networks.rs` |  |
+| notifications | `get_settings` | `NotificationsApi::get_settings` / `Client::get_notification_settings` | GET | `2.2/networks/{nid}/notifications link:self` | ported | `tests/endpoints_notifications.rs`, `tests/client_notifications.rs` |  |
+| notifications | `set_settings` | `NotificationsApi::set_settings` / `Client::set_notification_settings` | PUT | `2.2/networks/{nid}/notifications link:self` | ported | `tests/endpoints_notifications.rs`, `tests/client_notifications.rs` |  |
+| notifications | `has_unread` | `NotificationsApi::has_unread` / `Client::has_unread_notifications` | GET | `2.2/networks/{nid}/notifications/has_unread link:self` | ported | `tests/endpoints_notifications.rs`, `tests/client_notifications.rs` |  |
+| notifications | `mark_read` | `NotificationsApi::mark_read` / `Client::mark_notifications_read` | POST | `2.2/networks/{nid}/notifications/mark_read link:self` (`""`) | ported | `tests/endpoints_notifications.rs`, `tests/client_notifications.rs` |  |
+| notifications | `get_history` | `NotificationsApi::get_history` / `Client::get_notification_history` | GET | `2.2/networks/{nid}/notifications_history link:self [?timestamp]` | ported | `tests/endpoints_notifications.rs`, `tests/client_notifications.rs` |  |
+| notifications | `set_push_settings` | `NotificationsApi::set_push_settings` / `Client::set_push_settings` | PUT | `2.2/account/push_settings` | ported | `tests/endpoints_notifications.rs`, `tests/client_notifications.rs` | account-scoped |
+| ouicheck | `get_ouicheck` | `OUICheckApi::get_ouicheck` / `Client::get_ouicheck` | GET | `2.2/networks/{nid}/ouicheck link:self ?serial&version` | ported | `tests/endpoints_ouicheck.rs`, `tests/client_ouicheck.rs` | empty `serial`/`version` → `Validation` |
+| permissions | `get_permissions` | `PermissionsApi::get_permissions` / `Client::get_permissions` | GET | `2.2/networks/{nid}/permissions link:self` | ported | `tests/endpoints_permissions.rs`, `tests/client_permissions.rs` |  |
+| power_saving | `set_power_saving` | `PowerSavingApi::set_power_saving` / `Client::set_power_saving` | PUT | `2.2/networks/{nid}/power_saving link:power_saving` | ported | `tests/endpoints_power_saving.rs`, `tests/client_power_saving.rs` | `enable` / `power_saving_schedule_enabled`; empty → `Validation` |
+| power_saving | `get_schedules` | `PowerSavingApi::get_schedules` / `Client::get_power_saving_schedules` | GET | `2.2/networks/{nid}/power_saving/schedules` | ported | `tests/endpoints_power_saving.rs`, `tests/client_power_saving.rs` |  |
+| power_saving | `create_schedule` | `PowerSavingApi::create_schedule` / `Client::create_power_saving_schedule` | POST | `2.2/networks/{nid}/power_saving/schedules` | ported | `tests/endpoints_power_saving.rs`, `tests/client_power_saving.rs` |  |
+| power_saving | `update_schedule` | `PowerSavingApi::update_schedule` / `Client::update_power_saving_schedule` | PUT | `2.2/networks/{nid}/power_saving/schedules/{sid}` | ported | `tests/endpoints_power_saving.rs`, `tests/client_power_saving.rs` | `UpdatePowerSavingScheduleOptions`; empty → `Validation` |
+| power_saving | `delete_schedule` | `PowerSavingApi::delete_schedule` / `Client::delete_power_saving_schedule` | DELETE | `2.2/networks/{nid}/power_saving/schedules/{sid}` | ported | `tests/endpoints_power_saving.rs`, `tests/client_power_saving.rs` |  |
+| profiles | `get_profiles` | `ProfilesApi::get_profiles` / `Client::get_profiles` | GET | `2.2/networks/{nid}/profiles link:profiles` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` |  |
+| profiles | `get_profile` | `ProfilesApi::get_profile` / `Client::get_profile` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` |  |
+| profiles | `pause_profile` | `ProfilesApi::pause_profile` / `Client::pause_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` |  |
+| profiles | `get_profile_devices` | `ProfilesApi::get_profile_devices` / `Client::get_profile_devices` | GET | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` | alias of `get_profile` |
+| profiles | `set_profile_devices` | `ProfilesApi::set_profile_devices` / `Client::set_profile_devices` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` | `{"devices": [{"url": …}]}`; Python's double `warn_uncharacterised_write` reproduced; invalidates only the single profile entry |
+| profiles | `create_profile` | `ProfilesApi::create_profile` / `Client::create_profile` | POST | `2.2/networks/{nid}/profiles link:profiles` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` | `name`, optional `devices` / `paused` |
+| profiles | `rename_profile` | `ProfilesApi::rename_profile` / `Client::rename_profile` | PUT | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` |  |
+| profiles | `delete_profile` | `ProfilesApi::delete_profile` / `Client::delete_profile` | DELETE | `2.2/networks/{nid}/profiles/{pid}` | ported | `tests/endpoints_profiles.rs`, `tests/client_profiles.rs` |  |
+| reservations | `get_reservations` | `ReservationsApi::get_reservations` / `Client::get_reservations` | GET | `2.2/networks/{nid}/reservations link:reservations` | ported | `tests/endpoints_reservations.rs`, `tests/client_reservations.rs` |  |
+| reservations | `create_reservation` | `ReservationsApi::create_reservation` / `Client::create_reservation` | POST | `2.2/networks/{nid}/reservations link:reservations` | ported | `tests/endpoints_reservations.rs`, `tests/client_reservations.rs` |  |
+| reservations | `update_reservation` | `ReservationsApi::update_reservation` / `Client::update_reservation` | PUT | `2.2/networks/{nid}/reservations/{rid}` | ported | `tests/endpoints_reservations.rs`, `tests/client_reservations.rs` | `reservation` may be a bare id (then `network` required), path, URL or envelope; unverified, warned |
+| reservations | `delete_reservation` | `ReservationsApi::delete_reservation` / `Client::delete_reservation` | DELETE | `2.2/networks/{nid}/reservations/{rid} [?delete_forwards]` | ported | `tests/endpoints_reservations.rs`, `tests/client_reservations.rs` |  |
+| routing | `get_routing` | `RoutingApi::get_routing` / `Client::get_routing` | GET | `2.2/networks/{nid}/routing link:routing` | ported | `tests/endpoints_routing.rs`, `tests/client_routing.rs` | the published link is served on 2.3; the template default stays 2.2 |
+| schedule | `get_schedules` | `ScheduleApi::get_schedules` / `Client::get_schedules` | GET | `2.2/networks/{nid}/profiles/{pid}/schedules link:schedules` | ported | `tests/endpoints_schedule.rs`, `tests/client_schedule.rs` | never cached |
+| schedule | `create_schedule` | `ScheduleApi::create_schedule` / `Client::create_schedule` | POST | `2.2/networks/{nid}/profiles/{pid}/schedules link:schedules` | ported | `tests/endpoints_schedule.rs`, `tests/client_schedule.rs` | `name`, `days`, `start`, `end`, `enabled`; nothing invalidated (as Python) |
+| schedule | `update_schedule` | `ScheduleApi::update_schedule` / `Client::update_schedule` | PUT | `2.2/{schedule path or url}` | ported | `tests/endpoints_schedule.rs`, `tests/client_schedule.rs` | `schedule` is the pause's own path/URL/envelope, no `network_id`; `UpdateScheduleOptions`; empty → `Validation` |
+| schedule | `delete_schedule` | `ScheduleApi::delete_schedule` / `Client::delete_schedule` | DELETE | `2.2/{schedule path or url}` | ported | `tests/endpoints_schedule.rs`, `tests/client_schedule.rs` |  |
+| schedule | `clear_profile_schedule` | `ScheduleApi::clear_profile_schedule` / `Client::clear_profile_schedule` | GET + DELETE×N | `delegates` | ported | `tests/endpoints_schedule.rs`, `tests/client_schedule.rs` | returns `Vec<Envelope>` (Python `List[Dict]`); a failed delete aborts and propagates |
+| schedule | `enable_bedtime` | `ScheduleApi::enable_bedtime` / `Client::enable_bedtime` | POST | `delegates` → `create_schedule` | ported | `tests/endpoints_schedule.rs`, `tests/client_schedule.rs` | one pause per call |
+| schedule | `set_weekday_bedtime` | `ScheduleApi::set_weekday_bedtime` | POST | `delegates` → `enable_bedtime` | ported | `tests/endpoints_schedule.rs` | domain-only at v8.0.4 (no `EeroClient` wrapper in Python) |
+| schedule | `set_weekend_bedtime` | `ScheduleApi::set_weekend_bedtime` | POST | `delegates` → `enable_bedtime` | ported | `tests/endpoints_schedule.rs` | domain-only at v8.0.4 |
+| security | `get_security_settings` | `SecurityApi::get_security_settings` / `Client::get_security_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` | alias of the network read |
+| security | `set_wpa3` | `SecurityApi::set_wpa3` / `Client::set_wpa3` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` |  |
+| security | `set_band_steering` | `SecurityApi::set_band_steering` / `Client::set_band_steering` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` |  |
+| security | `set_upnp` | `SecurityApi::set_upnp` / `Client::set_upnp` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` |  |
+| security | `set_ipv6` | `SecurityApi::set_ipv6` / `Client::set_ipv6` | PUT | `2.2/networks/{nid}/settings link:settings` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` | `{"ipv6_upstream": bool}` |
+| security | `configure_security` | `SecurityApi::configure_security` / `Client::configure_security` | PUT | `2.2/networks/{nid}/settings link:settings` | changed | `tests/endpoints_security.rs`, `tests/client_security.rs` | an empty call returns `Error::Validation { field: "settings" }` instead of Python's locally fabricated `{"meta": {"code": 400}}` (`security.py:356-358`); `thread=` is gone, as upstream |
+| security | `set_mlo_mode` | `SecurityApi::set_mlo_mode` / `Client::set_mlo_mode` | PUT | `2.2/networks/{nid}/mlo_mode link:mlo_mode` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` | unknown mode → `Validation`; may reboot the mesh |
+| security | `get_fast_transition` | `SecurityApi::get_fast_transition` / `Client::get_fast_transition` | GET | `2.2/networks/{nid}/fast_transition link:fast_transition` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` |  |
+| security | `set_fast_transition` | `SecurityApi::set_fast_transition` / `Client::set_fast_transition` | PUT | `2.2/networks/{nid}/fast_transition link:fast_transition` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` |  |
+| security | `set_passpoint_enabled` | `SecurityApi::set_passpoint_enabled` / `Client::set_passpoint_enabled` | PUT | `2.2/networks/{nid}/passpoint/enabled link:passpoint` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` |  |
+| security | `set_proxied_nodes` | `SecurityApi::set_proxied_nodes` / `Client::set_proxied_nodes` | PUT | `2.2/networks/{nid}/proxied_nodes link:proxied_nodes` | ported | `tests/endpoints_security.rs`, `tests/client_security.rs` |  |
+| sqm | `get_sqm_settings` | `SqmApi::get_sqm_settings` / `Client::get_sqm_settings` | GET | `2.2/networks/{nid}` | ported | `tests/endpoints_sqm.rs`, `tests/client_sqm.rs` | alias of the network read |
+| sqm | `set_sqm` | `SqmApi::set_sqm` / `Client::set_sqm` | PUT | `2.2/networks/{nid}/settings link:settings ?sqm=true/false` | ported | `tests/endpoints_sqm.rs`, `tests/client_sqm.rs` | no body, value in the query; replaces the four removed writers |
+| subnets | `get_config` | `SubnetsApi::get_config` / `Client::get_subnets_config` | GET | `2.2/networks/{nid}/subnets_config link:subnets_config` | ported | `tests/endpoints_subnets.rs`, `tests/client_subnets.rs` |  |
+| subnets | `set_config` | `SubnetsApi::set_config` / `Client::set_subnets_config` | PUT | `2.2/networks/{nid}/subnets_config` | ported | `tests/endpoints_subnets.rs`, `tests/client_subnets.rs` | may reboot the mesh |
+| subnets | `delete_subnet` | `SubnetsApi::delete_subnet` / `Client::delete_subnet` | DELETE | `2.2/networks/{nid}/subnets_config/{subnet_type}` | ported | `tests/endpoints_subnets.rs`, `tests/client_subnets.rs` |  |
+| subnets | `set_content_filters` | `SubnetsApi::set_content_filters` / `Client::set_subnet_content_filters` | PUT | `2.2/networks/{nid}/subnets_config/dns_policies/content_filters` | ported | `tests/endpoints_subnets.rs`, `tests/client_subnets.rs` | invalidates nothing, as Python |
+| subnets | `get_content_filters` | `SubnetsApi::get_content_filters` / `Client::get_subnet_content_filters` | GET | `2.2/networks/{nid}/subnets_config/{sid}/dns_policies/content_filters` | ported | `tests/endpoints_subnets.rs`, `tests/client_subnets.rs` |  |
+| support | `get_support` | `SupportApi::get_support` / `Client::get_support` | GET | `2.2/networks/{nid}/support link:support` | ported | `tests/endpoints_support.rs`, `tests/client_support.rs` |  |
+| support | `request_support` | `SupportApi::request_support` | POST | `2.2/networks/{nid}/support link:support` | ported | `tests/endpoints_support.rs` | domain-only at v8.0.4 (no `EeroClient` wrapper in Python) |
+| thread | `get_thread` | `ThreadApi::get_thread` / `Client::get_thread` | GET | `2.2/networks/{nid}/thread link:thread` | ported | `tests/endpoints_thread.rs`, `tests/client_thread.rs` |  |
+| thread | `set_thread_enabled` | `ThreadApi::set_thread_enabled` / `Client::set_thread_enabled` | PUT | `2.2/networks/{nid}/thread` | ported | `tests/endpoints_thread.rs`, `tests/client_thread.rs` | `{"enabled": bool}`, literal path (no link); unverified upstream |
+| thread | `update_thread` | `ThreadApi::update_thread` / `Client::update_thread` | PUT | `2.2/networks/{nid}/thread` | ported | `tests/endpoints_thread.rs`, `tests/client_thread.rs` | `thread_enable` / `enable_credential_syncing`; empty → `Validation` |
+| thread | `regenerate_thread_credentials` | `ThreadApi::regenerate_thread_credentials` / `Client::regenerate_thread_credentials` | POST | `2.2/networks/{nid}/thread` (`""`) | ported | `tests/endpoints_thread.rs`, `tests/client_thread.rs` |  |
+| transfer | `get_transfer_stats` | `TransferApi::get_transfer_stats` / `Client::get_transfer_stats` | GET | `2.2/networks/{nid}/transfer link:transfer` \| `2.2/networks/{nid}/devices/{mac}/transfer` | ported | `tests/endpoints_transfer.rs`, `tests/client_transfer.rs` | link preferred only for the network-level read |
+| updates | `get_updates` | `UpdatesApi::get_updates` / `Client::get_updates` | GET | `2.2/networks/{nid}/updates link:updates` | ported | `tests/endpoints_updates.rs`, `tests/client_updates.rs` |  |
+| updates | `apply_update` | `UpdatesApi::apply_update` / `Client::apply_update` | POST | `2.2/networks/{nid}/updates link:updates` (`""`) | ported | `tests/endpoints_updates.rs`, `tests/client_updates.rs` | reboots every node |
+| wan | `get_multistaticip` | `WanApi::get_multistaticip` / `Client::get_multistaticip` | GET | `**2.3**/networks/{nid}/multistaticip link:multistaticip` | ported | `tests/endpoints_wan.rs`, `tests/client_wan.rs` | 404 `error.network.multistaticip_not_found` without the feature |
+| wan | `set_multistaticip` | `WanApi::set_multistaticip` / `Client::set_multistaticip` | PUT | `**2.3**/networks/{nid}/multistaticip` | ported | `tests/endpoints_wan.rs`, `tests/client_wan.rs` | may reboot the mesh |
+| wan | `set_secondary_wan_config` | `WanApi::set_secondary_wan_config` / `Client::set_secondary_wan_config` | PUT | `**2.3**/networks/{nid}/devices/secondary_wan_config` | ported | `tests/endpoints_wan.rs`, `tests/client_wan.rs` |  |
+| wan | `set_device_secondary_wan_access` | `WanApi::set_device_secondary_wan_access` / `Client::set_device_secondary_wan_access` | PUT | `**2.3**/networks/{nid}/devices/{mac}` | ported | `tests/endpoints_wan.rs`, `tests/client_wan.rs` | `{"secondary_wan_deny_access": bool}`; invalidates the device cache |
+| wpa3 | `get_wpa3_per_band` | `Wpa3Api::get_wpa3_per_band` / `Client::get_wpa3_per_band` | GET | `2.2/networks/{nid}/wpa3_per_band link:wpa3_per_band` | ported | `tests/endpoints_wpa3.rs`, `tests/client_wpa3.rs` |  |
+| wpa3 | `set_wpa3_per_band` | `Wpa3Api::set_wpa3_per_band` / `Client::set_wpa3_per_band` | PUT | `2.2/networks/{nid}/wpa3_per_band link:wpa3_per_band` | ported | `tests/endpoints_wpa3.rs`, `tests/client_wpa3.rs` | `band_2_4_ghz` / `band_5_ghz`; unknown mode or empty → `Validation` |
+| removed upstream (v8.0.0) | `DevicesAPI.set_device_priority / EeroClient.set_device_priority` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0" removed table: server no-op (eero-api #111); replacement `set_sqm(true)` |
+| removed upstream (v8.0.0) | `ActivityAPI / get_activity* (5)` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": always 404 (eero-api #107); replacements `get_insights` / `get_data_usage` |
+| removed upstream (v8.0.0) | `DnsAPI.set_ipv6_dns` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": toggled `ipv6_upstream`, never DNS servers; use `set_ipv6` / `set_custom_dns_ipv6` |
+| removed upstream (v8.0.0) | `InsightsAPI.run_insights` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": the API has no such operation |
+| removed upstream (v8.0.0) | `OUICheckAPI.run_ouicheck` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": the API has no such operation |
+| removed upstream (v8.0.0) | `SecurityAPI.set_thread / configure_security(thread=)` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": the settings write ignores a `thread` field; use the `thread` module |
+| removed upstream (v8.0.0) | `SettingsAPI.get_settings / EeroClient.get_settings` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": same fields live on `get_network()` (the GET also 404s live, see below) |
+| removed upstream (v8.0.0) | `PasswordAPI.get_password / EeroClient.get_password` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": same fields live on `get_network()` |
+| removed upstream (v8.0.0) | `BurstReportersAPI.get_burst_reporters / EeroClient.get_burst_reporters` | `(none)` | — | `—` | dropped | — | Migration.md "v7.x → v8.0.0": endpoint 404s; the resource is POST-only |
+| removed upstream (v8.0.0) | `SqmAPI.set_sqm_enabled / configure_sqm / set_sqm_bandwidth / set_sqm_auto` | `(none)` | — | `—` | dropped | — | Migration.md "Writes now use the forms the API declares": bandwidth/mode fields the API never declared; replaced by `set_sqm(enabled)` |
+| removed upstream (v8.0.0) | `BackupAPI.get_backup_network / get_backup_status / set_backup_network / configure_backup_network` | `(none)` | — | `—` | dropped | — | Migration.md "Writes now use the forms the API declares": `phone_number` field the API never declared; replaced by the four `backup` rows above |
+| removed upstream (v8.0.0) | `ScheduleAPI.get_profile_schedule / set_profile_schedule` | `(none)` | — | `—` | dropped | — | Migration.md "Writes now use the forms the API declares": wrote a `schedule` array that is not a profile field; replaced by the `schedule` sub-resource family |
+| removed upstream (v8.0.0) | `ProfilesAPI.update_profile_content_filter / update_profile_block_list / get_blocked_applications / set_blocked_applications` | `(none)` | — | `—` | dropped | — | Migration.md "Writes now use the forms the API declares": silent no-ops (fields a profile does not have); replaced by `dns_policies` |
+| removed upstream (v8.0.0) | `EeroClient.reboot_network` | `(none on Client)` | — | `—` | dropped | — | Migration.md "Writes now use the forms the API declares": domain API only; `NetworksApi::reboot_network` remains reachable via `client.api().networks()` |
+| removed upstream (v8.0.0) | `EeroClient.set_weekday_bedtime / set_weekend_bedtime` | `(none on Client)` | — | `—` | dropped | — | Migration.md "Writes now use the forms the API declares": `enable_bedtime` creates one pause per call; the domain-level helpers remain (rows above) |
+| removed upstream (v8.0.0) | `EeroClient.block_device(id, blocked, network_id)` (3-arg) | `(none)` | — | `—` | dropped | — | Migration.md "Writes now use the forms the API declares": split into `block_device(id)` + `unblock_device(id)` (rows above) |
+| misc | `base.py id_from_url` | `util::id_from_url` | — | `local` | ported | `util::tests`, `tests/security_paths.rs` | rejects dot segments and empty tails |
+| misc | `links.py validate_identifier / join_api_path / resolve_link / self_url / resource_url / child_url / sub_resource_url` | `links::` same names | — | `local` | ported | `links::tests`, `tests/path_safety.rs`, `tests/security_paths.rs` | host-bound (`&Url`), version from `routes::ApiVersion`; id-or-url polymorphism and link preference |
+| misc | `_params.py validate_cadence / resolve_network_url / resolve_nested_url` | `params::` same names | — | `local` | ported | `params::tests`, `tests/path_safety.rs` | nested-family check rejects a foreign URL |
+| misc | `_writes.py warn_uncharacterised_write` | `links::warn_uncharacterised_write` | — | `local` | ported | — | `tracing::warn!` with Python's exact operation strings |
+| misc | `_writes.py as_envelope` | `parent: Option<&Value>` parameters | — | `local` | changed | — | no wrapper type: a parent is passed as the raw envelope `Value`, validated at link-resolution time |
+| misc | `errors.py ErrorGroup / *_ERRORS / classify_error_code / message_for_error_code / exception_for_error` | `errors::{ErrorGroup, *_ERRORS, classify_error_code, message_for_error_code, error_for_response}` | — | `local` | ported | `errors::tests`, `tests/transport.rs` | closed catalogue; status-independent groups map regardless of HTTP status |
+| misc | `exceptions.py (12 exception classes)` | `error::Error` variants (`Authentication`, `RateLimit`, `Network`, `Api`, `Timeout`, `AccessDenied`, `ClientBlocked`, `NotFound`, `PremiumRequired`, `FeatureUnavailable`, `Validation`) + `MissingNetworkId` / `Storage` / `Json` | — | `local` | changed | `error::tests`, `tests/transport.rs` | one `thiserror` enum instead of a class hierarchy; `is_auth_error()`, `error_code()`, `envelope()`, `status()` accessors carry what the subclasses did |
+| misc | `base.py BaseAPI / AuthenticatedAPI._request (+ get_retries, X-User-Token, legacy cookie, size cap, redirects refused, refresh hook)` | `Transport::request / resource / nested` | — | `local` | ported | `tests/transport.rs`, `tests/client_core.rs` | `Policy::none()` redirects; `MAX_RESPONSE_BYTES`; GET-only retry; one-shot refresh on 401 `error.session.refresh` |
+| misc | `base.py RequestEncoding` | `transport::RequestBody` | — | `local` | ported | `tests/transport.rs` | `None` / `Json` / `Form` / `EmptyJsonString` |
+| misc | `logging.py redact_sensitive` | `redact::redact_sensitive` | — | `local` | ported | `redact::tests` | `Value` only |
+| misc | `logging.py get_secure_logger / SecureLoggerAdapter / add_sensitive_pattern` | `(none)` | — | `—` | dropped | — | Python-logging specific (core.md §7); `tracing` + `SecretString` cover it |
+| misc | `const.py EeroDeviceType / EeroNetworkStatus / EeroDeviceStatus` | `(none)` | — | `—` | dropped | — | unused by the SDK itself (core.md §1) |
+| misc | `const.py` (hosts, versions, endpoints, limits, header names) | `consts.rs` + `routes::ApiVersion` | — | `local` | ported | `routes::tests`, `tests/transport.rs` | every wire endpoint is a `Resource`/`Nested` constant in `src/routes/` |
 
-## Live validation (2026-09-14)
+## Credential storage (`api/auth_storage.py`)
+
+| Python | Rust | Status | Test | Note |
+|---|---|---|---|---|
+| `AuthCredentials` (`session_id`, `schema_version = 2`) | `Session` + `StoredSession` | ported | `auth::session::tests`, `tests/storage.rs` | same JSON keys; legacy `user_token` accepted on read, `refresh_token` / `session_expiry` dropped silently, so the record stays shareable with the Python library |
+| `CredentialStorage` (ABC) | `CredentialStore` trait | ported | `storage::*` | sync on purpose; async callers use the `spawn_blocking` adapters |
+| `_parse_stored_record` + `_log_migration_readback` | `Session::from_json` + `storage::migrate_and_verify` | ported | `tests/storage.rs`, `storage::file::tests`, `storage::keyring::tests` | legacy record re-saved and read back on load, match/mismatch logged, never fails the load |
+| `MemoryStorage` | `MemoryStore` | changed | `storage::memory::tests` | `load()` returns an owned clone, not the live stored object (`auth_storage.py:359`) |
+| `FileStorage` | `FileStore` | changed | `tests/storage.rs`, `storage::file::tests` | create-exclusive at `0600` + atomic rename, unique temp name, orphan cleanup — equivalent to v8.0.4's `mkstemp` path. Python's symlink-at-destination refusal is deliberately omitted: the final step is `rename(2)`, which replaces a symlink rather than following it (core.md §5) |
+| `KeyringStorage` | `KeyringStore` | changed | `storage::keyring::tests` | same service `eero-api` / account `auth-tokens`, shared with the Python library on purpose. Returns `StorageError` instead of swallowing every exception at DEBUG (`auth_storage.py:142-145,152-155,165-166`) |
+| `ChainedStorage` | `ChainedStore` | changed | `tests/storage.rs`, `storage::chained::tests` | promote-to-primary with read-back and save-then-verify as Python; the migration write is best-effort (a failed promotion never fails the `load`, unlike `auth_storage.py:291`); the save fallback actually fires because `KeyringStore::save` can return `Err`; `clear()` attempts both and reports `Err` if either fails |
+| `create_storage(use_keyring, cookie_file)` | `create_storage(&StorageConfig)` | ported | `storage::tests`, `tests/storage.rs` | same four-way matrix; degrades to file-then-memory without the `keyring` feature |
+| swallowed storage exceptions | `StorageFailures {Warn, Fatal}` | changed | `tests/storage.rs`, `auth::tests` | Rust-only addition: every Python backend swallows its own errors; `Warn` is the default, `Fatal` surfaces them as `Error::Storage` on `TransportBuilder` / `Client::builder()` |
+
+## Live validation (2026-09-14, pre-v8 port)
 
 A read-only sweep against a real account (4 eeros, 135 devices, 10 profiles) with an
-`eeroctl`-issued session token. Every path below was additionally re-probed with raw `curl` to
-separate "this port builds the wrong URL" from "the endpoint is gone or gated" — the two agree in
-every case, so **no route constant is wrong**. Reproduce with
-`cargo test --test live -- --ignored --exact live_read_only_endpoint_sweep`.
-
-**18 of 25 read-only endpoints answered `200`**: account, networks, network, eeros, devices,
-profiles, dns_settings, security_settings, sqm_settings, blacklist, reservations, forwards,
-routing, thread, updates, ac_compat, support, diagnostics, premium_status.
+`eeroctl`-issued session token, run against the `e7bcfd9`-baseline port. Every path was
+additionally re-probed with raw `curl`, and the two agreed in every case, so no route constant was
+wrong. The observations below survive the v8.0.4 rework because the paths they concern are
+unchanged; the sweep has **not** yet been re-run against the v8.0.4 port
+(`cargo test --test live -- --ignored --exact live_read_only_endpoint_sweep`).
 
 Confirmed by observation, not just by reading Python:
 
@@ -148,33 +302,14 @@ Confirmed by observation, not just by reading Python:
 - **`GET /networks` returned an empty list on this account**, so the `/account` fallback is what
   actually resolved the network id. That fallback is load-bearing in the real world, not a
   vestigial branch — worth knowing before anyone "simplifies" it away.
-- The account's stored `cookies.json` has `"refresh_token": null`, matching §1.3's finding that a
-  refresh token is never issued at login.
 
-Seven endpoints did not answer. These are observations from **one** account on one day, so a 404
-here may mean "feature not enabled for this account" rather than "removed upstream"; they are
-recorded, not acted on, and no row below was changed to `dropped` on this evidence alone.
+Endpoints that did not answer on that day, from one account, recorded and not acted on:
 
 | Endpoint | Live result | Note |
 |---|---|---|
-| `GET networks/{nid}/settings` | 404 | `get_settings`. The PUT to the same path is how every settings writer works, so the resource is not simply absent — the GET appears unsupported. |
-| `GET networks/{nid}/password` | 404 | `get_password`. |
-| `GET networks/{nid}/transfer` | **403** | `get_transfer_stats`. Forbidden rather than missing — looks permission- or tier-gated. |
-| `GET networks/{nid}/backup` | 404 | `get_backup_network`; this account has no backup internet configured. |
-| `GET networks/{nid}/backup/status` | 404 | `get_backup_status`. |
-| `GET networks/{nid}/ouicheck` | 404 | `get_ouicheck`. |
-| `GET networks/{nid}/burst_reporters` | 404 | `get_burst_reporters`. |
-
-
-## Credential storage (phase 2, `api/auth_storage.py`)
-
-| Python | Rust | Status | Test | Note |
-|---|---|---|---|---|
-| `AuthCredentials` | `Session` + `StoredSession` | ported | `auth::session::tests`, `tests/storage.rs` | same JSON keys, naive 19-char ISO 8601 expiry, legacy `user_token` accepted on read (D-5) |
-| `CredentialStorage` (ABC) | `CredentialStore` trait | ported | `storage::*` | sync on purpose; async callers use the `spawn_blocking` adapters |
-| `MemoryStorage` | `MemoryStore` | ported | `storage::memory::tests` | |
-| `FileStorage` | `FileStore` | changed | `tests/storage.rs`, `storage::file::tests` | 0600 applied atomically at open; Python chmods after write (`auth_storage.py:215-224`), leaving a world-readable window. Unique temp name per write, temp removed on every error path, `clear()` also removes an orphaned temp |
-| `KeyringStorage` | `KeyringStore` | changed | `storage::keyring::tests` | same service `eero-api` / account `auth-tokens` (D-5). Returns `StorageError` instead of swallowing every exception at DEBUG (`auth_storage.py:142-145,152-155`) |
-| `ChainedStorage` | `ChainedStore` | changed | `tests/storage.rs`, `storage::chained::tests` | save fallback actually fires, because `KeyringStore::save` can return `Err`; Python's never can. A failed primary save clears the stale primary. `clear()` attempts both and reports `Err` if either fails, so a partial erase is never reported as success |
-| `create_storage(use_keyring, cookie_file)` | `create_storage(&StorageConfig)` | ported | `storage::tests`, `tests/storage.rs` | same four-way matrix; degrades to file-then-memory without the `keyring` feature |
-| swallowed storage exceptions | `StorageFailures {Warn, Fatal}` | changed | `tests/storage.rs`, `auth::tests` | D-13. Warn is the default. On `TransportBuilder` for now; `Client::builder()` forwards to it in phase 4 |
+| `GET networks/{nid}/settings` | 404 | the old `get_settings`; removed upstream in v8.0.0 (row above) — the PUT to the same path is how every settings writer works |
+| `GET networks/{nid}/password` | 404 | the old `get_password`; removed upstream in v8.0.0 |
+| `GET networks/{nid}/transfer` | **403** | `get_transfer_stats`. Forbidden rather than missing — looks permission- or tier-gated |
+| `GET networks/{nid}/backup` | 404 | the old `get_backup_network` path; v8.0.4 reads `backupinternet` instead |
+| `GET networks/{nid}/ouicheck` | 404 | `get_ouicheck` without `serial`/`version` — v8.0.4 requires both |
+| `GET networks/{nid}/burst_reporters` | 404 | the old `get_burst_reporters`; removed upstream (POST-only resource) |

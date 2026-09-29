@@ -1,0 +1,25 @@
+    Checking rusteero v1.0.0 (/workspace/projects/rusteero)
+warning: unused import: `json`
+  --> src/endpoints/wpa3.rs:10:30
+   |
+10 | use serde_json::{Map, Value, json};
+   |                              ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ouicheck::*`
+   --> src/routes/mod.rs:531:9
+    |
+531 | pub use ouicheck::*;
+    |         ^^^^^^^^^^^
+
+warning: function `put_network_settings` is never used
+   --> src/endpoints/networks.rs:457:21
+    |
+457 | pub(crate) async fn put_network_settings(
+    |                     ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rusteero` (lib) generated 3 warnings (run `cargo fix --lib -p rusteero` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.38s

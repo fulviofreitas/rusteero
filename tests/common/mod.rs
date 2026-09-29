@@ -136,6 +136,21 @@ pub fn session_cookie_for(token: &str) -> HeaderExactMatcher {
     header("cookie", format!("s={token}"))
 }
 
+/// Matches a request's `X-User-Token` header against exactly [`TEST_TOKEN`] — the *primary*
+/// credential at `v8.0.4` (see `src/transport.rs`'s credential-placement docs). Pair with
+/// [`session_cookie`] to assert both the primary header and the legacy cookie are present.
+#[must_use]
+pub fn user_token_header() -> HeaderExactMatcher {
+    user_token_header_for(TEST_TOKEN)
+}
+
+/// Matches a request's `X-User-Token` header against exactly `token`. See [`session_cookie_for`]
+/// for the sibling legacy-cookie matcher.
+#[must_use]
+pub fn user_token_header_for(token: &str) -> HeaderExactMatcher {
+    header("x-user-token", token)
+}
+
 /// Reads a fixture file's contents as a `String`.
 ///
 /// `name` is a bare file name (e.g. `"devices.json"`), resolved against this crate's

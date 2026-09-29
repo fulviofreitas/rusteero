@@ -19,9 +19,9 @@ use super::CredentialStore;
 /// A [`CredentialStore`] backed by a single JSON file on disk.
 ///
 /// Mirrors `FileStorage` (`auth_storage.py:169-237`): the file holds exactly the JSON object
-/// `Session::to_json`/[`Session::from_json`] produce/consume (`session_id`, `refresh_token`,
-/// `session_expiry`, plus the legacy `user_token` read alias) — the same shape a Python
-/// `eero-api` install reads and writes, per decision D-5. There is deliberately no default
+/// `Session::to_json`/[`Session::from_json`] produce/consume (`session_id`, `schema_version`,
+/// plus the legacy `user_token` read alias) — the same shape a Python `eero-api` install reads
+/// and writes at `v8.0.4`, per decision D-5. There is deliberately no default
 /// path: like `FileStorage.__init__`, which always requires an explicit `file_path`, choosing
 /// *where* the file lives is left entirely to the caller (in `eero-api`'s ecosystem, that
 /// choice belongs to the CLI layer, not this library).
@@ -42,6 +42,19 @@ use super::CredentialStore;
 /// permissions/ACL the OS applies, and this crate does not attempt to further restrict them.
 /// Callers on Windows should not rely on the stored file being owner-only — treat the containing
 /// directory's own ACLs as the real access boundary there.
+///
+/// # Security: writing through a symlink at the final path (v8.0.4 parity note)
+///
+/// Python's `FileStorage.save()` refuses to write when the *final* path is a symlink
+/// (`os.path.islink` check before opening the temp file, `auth_storage.py:299-301`) — a defence
+/// against a symlink planted at the cookie-file path being used to redirect a credential write
+/// onto an attacker-chosen target. This port does not reproduce that check as a separate
+/// precondition, and does not need to: the final step of [`FileStore::save`] is [`fs::rename`],
+/// not an in-place open of `path`. POSIX `rename(2)` (and its Windows equivalent) *replaces*
+/// whatever is at the destination — including a symlink — rather than following it, so the write
+/// always lands at `path` itself, never at whatever a symlink there might point to. This is
+/// verified by `save_replaces_a_symlink_at_the_destination_rather_than_following_it` below rather
+/// than merely asserted in this comment.
 ///
 /// # Security: no orphaned plaintext credential (phase-2 storage review, finding S3)
 ///
@@ -85,17 +98,37 @@ impl CredentialStore for FileStore {
             // expected "never logged in" state, not an error.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Session::empty()),
             Err(err) => Err(StorageError::Io(err)),
-            Ok(contents) => Session::from_json(&contents),
+            Ok(contents) => {
+                // Security fix (phase-security-review, finding 8): a credential file with any
+                // group/other permission bit set (e.g. one this crate did not itself create —
+                // hand-placed, copied in from a backup, or written by an older/foreign tool) is
+                // readable by more than its owner. Never fails the read — this is a diagnostic,
+                // not an enforced precondition — but it must not go unnoticed either.
+                warn_if_permissions_are_loose(&self.path);
+                let (session, migrated) = Session::from_json_migrating(&contents)?;
+                if migrated {
+                    // Best-effort: never fails this read, see `migrate_and_verify`'s own docs.
+                    super::migrate_and_verify(self, &session, "file");
+                }
+                Ok(session)
+            }
         }
     }
 
     fn save(&self, session: &Session) -> Result<(), StorageError> {
         // Mirrors `os.makedirs(cookie_dir, exist_ok=True)` (`auth_storage.py:215-217`); an empty
         // parent (a bare file name with no directory component) has nothing to create.
+        //
+        // Security fix (phase-security-review, finding 8): every directory this call creates is
+        // created with owner-only (`0700`) permissions from the moment it is created, on Unix —
+        // matching the atomic 0600-on-create discipline `create_private_file` already applies to
+        // the file itself, rather than relying on the process umask (which a caller could have
+        // widened, e.g. `umask 022`, leaving a group/other-readable directory the credential file
+        // then inherits its own looser default permissions from on some platforms/filesystems).
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
-            fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
         let json = session.to_json()?;
         write_private_atomically(&self.path, json.as_bytes())
@@ -253,12 +286,67 @@ fn create_private_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+/// Creates `parent` and every missing ancestor directory with owner-only (`0700`) permissions,
+/// set at creation time rather than via a separate `chmod` afterwards — the same atomic-mode
+/// discipline [`create_private_file`] applies to the credential file itself (security finding 8).
+///
+/// [`std::fs::DirBuilder::mode`] applies to every directory this call actually creates, not just
+/// the deepest one; an already-existing ancestor is left with whatever permissions it already
+/// has (matching `create_dir_all`'s own "existing directories are not modified" contract).
+#[cfg(unix)]
+fn create_private_dir_all(parent: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+}
+
+/// Non-Unix fallback: creates `parent` and every missing ancestor with the platform's default
+/// permissions. See [`FileStore`]'s own doc comment for what this means for callers on Windows.
+#[cfg(not(unix))]
+fn create_private_dir_all(parent: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(parent)
+}
+
+/// Returns `true` if `path`'s permission bits grant any access to group or other (i.e. anything
+/// beyond owner-only `0600`/`0700`), `false` if `path` cannot be inspected at all (never treated
+/// as loose — there is nothing this crate can usefully warn about for a file it cannot stat).
+///
+/// Unix-only: there is no portable notion of "group/other" permission bits to inspect elsewhere;
+/// see [`FileStore`]'s own doc comment for what that means for callers on Windows.
+#[cfg(unix)]
+fn has_loose_permissions(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o077 != 0)
+}
+
+/// Logs a fixed `WARN` (never fails, never blocks the read) if [`has_loose_permissions`] reports
+/// `path` is readable/writable by group or other — e.g. a credential file this crate did not
+/// itself create, copied in from elsewhere, or left over from an older non-atomic
+/// implementation. Security finding 8: this crate's own [`create_private_file`]/
+/// [`create_private_dir_all`] never produce such a file, but nothing prevents one from appearing
+/// at `path` by some other means, and a loosely-permissioned plaintext credential file should
+/// never go unnoticed merely because it still parses.
+#[cfg(unix)]
+fn warn_if_permissions_are_loose(path: &Path) {
+    if has_loose_permissions(path) {
+        tracing::warn!(
+            path = %path.display(),
+            "credential file has group/other-accessible permissions; expected owner-only (0600)"
+        );
+    }
+}
+
+/// Non-Unix no-op: there is no portable permission-bit check to perform. See
+/// [`has_loose_permissions`]'s own doc comment.
+#[cfg(not(unix))]
+fn warn_if_permissions_are_loose(_path: &Path) {}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-
-    use secrecy::ExposeSecret;
 
     use super::{CredentialStore, FileStore};
     use crate::auth::Session;
@@ -280,35 +368,100 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_through_eero_api_cookies_json_shape() {
-        // The exact on-disk shape `FileStorage.save()` writes (`auth_storage.py:220-221`): key
-        // order `session_id`, `refresh_token`, `session_expiry`, with Python's default
-        // `json.dump` separators (a space after `:`/`,`). This differs byte-for-byte from this
-        // port's compact `serde_json` output, but both are valid JSON over the same D-5 wire
-        // contract, so a file a Python install wrote must still load cleanly here.
+    fn round_trip_through_v8_0_4_cookies_json_shape() {
+        // The exact on-disk shape `FileStorage.save()` writes at v8.0.4 (`auth_storage.py:50-56`):
+        // key order `session_id`, `schema_version`, with Python's default `json.dump` separators
+        // (a space after `:`/`,`). This differs byte-for-byte from this port's compact
+        // `serde_json` output, but both are valid JSON over the same D-5 wire contract, so a file
+        // a Python install wrote must still load cleanly here.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cookies.json");
-        let python_written = r#"{"session_id": "session_valid_id", "refresh_token": "rt_refresh_token", "session_expiry": "2026-10-10T14:32:07"}"#;
+        let python_written = r#"{"session_id": "session_valid_id", "schema_version": 2}"#;
         fs_write(&path, python_written);
 
         let store = FileStore::new(&path);
         let session = store.load().expect("load succeeds");
 
         assert_eq!(session.expose_token(), "session_valid_id");
-        assert_eq!(
-            session
-                .refresh_token()
-                .expect("refresh token present")
-                .expose_secret(),
-            "rt_refresh_token"
-        );
-        assert!(session.expiry().is_some());
 
         // Re-saving through this port must remain a valid credential file: reloading it here
-        // must still recover every field.
+        // must still recover the token.
         store.save(&session).expect("save succeeds");
         let reloaded = store.load().expect("load succeeds");
         assert_eq!(reloaded.expose_token(), "session_valid_id");
+    }
+
+    // ===================== legacy migration (no schema_version) =====================
+
+    #[test]
+    fn load_migrates_a_legacy_record_and_the_migration_read_back_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        // A pre-v8.0.4 record: no `schema_version`, carries now-dropped legacy fields.
+        fs_write(
+            &path,
+            r#"{"session_id":"legacy-token","refresh_token":"rt-1","session_expiry":"2099-01-01T00:00:00"}"#,
+        );
+        let store = FileStore::new(&path);
+
+        let session = store
+            .load()
+            .expect("load succeeds, legacy record tolerated");
+        assert_eq!(session.expose_token(), "legacy-token");
+
+        // The migration re-save must have overwritten the file with the current schema shape.
+        let on_disk = fs::read_to_string(&path).expect("file still exists");
+        assert!(on_disk.contains("\"schema_version\":2"));
+        assert!(!on_disk.contains("refresh_token"));
+        assert!(!on_disk.contains("session_expiry"));
+
+        // And a second load must not report a migration a second time.
+        let reloaded = store.load().expect("second load succeeds");
+        assert_eq!(reloaded.expose_token(), "legacy-token");
+    }
+
+    #[test]
+    fn load_of_a_current_schema_record_is_not_treated_as_a_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        fs_write(&path, r#"{"session_id":"tok","schema_version":2}"#);
+        let store = FileStore::new(&path);
+
+        let before = fs::read_to_string(&path).expect("file exists");
+        let session = store.load().expect("load succeeds");
+        assert_eq!(session.expose_token(), "tok");
+        let after = fs::read_to_string(&path).expect("file still exists");
+        assert_eq!(
+            before, after,
+            "a current-schema record must not be rewritten"
+        );
+    }
+
+    // ===================== symlink-at-destination (v8.0.4 parity note) =====================
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_a_symlink_at_the_destination_rather_than_following_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_target = dir.path().join("attacker-owned-target.json");
+        fs_write(&real_target, "should never be written to");
+        let cookie_path = dir.path().join("cookies.json");
+        std::os::unix::fs::symlink(&real_target, &cookie_path).expect("symlink created");
+
+        let store = FileStore::new(&cookie_path);
+        store
+            .save(&Session::from_token("tok"))
+            .expect("save succeeds even though the destination is a symlink");
+
+        // The symlink itself was replaced by a regular file; the target it used to point to was
+        // never touched.
+        assert!(
+            !cookie_path.is_symlink(),
+            "save must replace the symlink, not write through it"
+        );
+        let target_contents =
+            fs::read_to_string(&real_target).expect("the original target file still exists");
+        assert_eq!(target_contents, "should never be written to");
     }
 
     // ===================== 0600 permissions (Unix) =====================
@@ -376,6 +529,67 @@ mod tests {
             .expect("save succeeds");
 
         assert!(path.exists());
+    }
+
+    // ===================== Parent directory / loose-permission warning (finding 8) =====================
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_every_missing_parent_directory_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("dirs").join("cookies.json");
+        let store = FileStore::new(&path);
+
+        store
+            .save(&Session::from_token("tok"))
+            .expect("save succeeds");
+
+        for created in [dir.path().join("nested"), dir.path().join("nested/dirs")] {
+            let mode = fs::metadata(&created)
+                .expect("directory exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "expected {created:?} to be owner-only, got {mode:o}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_loose_permissions_is_false_for_a_freshly_saved_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        let store = FileStore::new(&path);
+        store
+            .save(&Session::from_token("tok"))
+            .expect("save succeeds");
+
+        assert!(!super::has_loose_permissions(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn has_loose_permissions_is_true_for_a_world_readable_file_and_load_still_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        fs_write(&path, r#"{"session_id":"tok","schema_version":2}"#);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod succeeds");
+
+        assert!(super::has_loose_permissions(&path));
+
+        let store = FileStore::new(&path);
+        let session = store.load().expect(
+            "a loosely-permissioned file must still load — this is a warning, not a failure",
+        );
+        assert_eq!(session.expose_token(), "tok");
     }
 
     // ===================== Missing file / empty session =====================

@@ -1,15 +1,11 @@
-//! P2 storage suite: the credential-store backends (`FileStore`, `ChainedStore`,
-//! `create_storage`'s four-way matrix) plus the storage-adjacent half of `Transport`
-//! (`StorageFailures`, `set_session`/`refresh_session` persistence), all exercised from outside
-//! the crate the way a real consumer would.
+//! Storage suite: the credential-store backends (`FileStore`, `ChainedStore`, `create_storage`'s
+//! four-way matrix), the `v8.0.4` legacy-record migration path, plus the storage-adjacent half of
+//! `Transport` (`StorageFailures`, `set_session`/`refresh_session` persistence), all exercised
+//! from outside the crate the way a real consumer would.
 //!
-//! The headline requirement this file exists to satisfy is the Phase 2 exit criterion: **"Storage
-//! format round-trips with a real eero-api cookies.json fixture."** `fixtures/cookies.json` and
-//! `fixtures/cookies_legacy.json` are not derived from this crate's own `Session`/`FileStore`
-//! code — their shape is taken from the const behaviour notes' line-cited behaviour brief
-//! for `eero-api`'s `AuthCredentials.to_dict()`/`from_dict()` (`auth_storage.py:50-80`), so a
-//! green test here is evidence this port can read what the Python library actually writes, not
-//! merely what this port itself writes.
+//! `fixtures/cookies.json`, `fixtures/cookies_legacy.json`, and `fixtures/cookies_eeroctl.json`
+//! are all **legacy** records (no `schema_version` key) — loading any of them exercises the
+//! re-save-and-read-back migration path every backend with a load path applies.
 
 mod common;
 
@@ -31,11 +27,6 @@ use rusteero::transport::{StorageFailures, Transport};
 
 /// Copies `fixture_name`'s exact, checked-in bytes from `tests/fixtures/` into a fresh
 /// `cookies.json` inside `dir`, returning the new path.
-///
-/// Every storage test in this file that needs a file on disk goes through this (or writes
-/// directly into a `tempfile::tempdir()`), per the crate's testing conventions' "Never write outside
-/// a temp dir" rule — `FileStore` would happily overwrite the checked-in fixture itself if a test
-/// pointed it there directly.
 fn copy_fixture_into(dir: &Path, fixture_name: &str) -> PathBuf {
     let path = dir.join("cookies.json");
     std::fs::write(&path, fixture(fixture_name)).expect("write into a fresh tempdir succeeds");
@@ -44,17 +35,8 @@ fn copy_fixture_into(dir: &Path, fixture_name: &str) -> PathBuf {
 
 // ===================== D-5 contract: FileStore reads a real eero-api cookies.json =====================
 
-/// Loads a fixture whose key order, key set and value *types* were taken byte-for-byte from a
-/// real `cookies.json` written by the Python `eeroctl`, with only the token and the date
-/// replaced by synthetic values of the same shape.
-///
-/// This differs from `cookies.json` in the one way that turned out to matter: a real file
-/// produced by an ordinary login has `"refresh_token": null`, because `eero-api` is never issued
-/// a refresh token at login (port plan §1.3). The hand-written fixture carries a refresh token,
-/// so the null case — the *common* one in practice — was only covered incidentally. Verified
-/// against a genuine file on 2026-09-14.
 #[test]
-fn filestore_loads_a_real_eeroctl_cookies_file_with_a_null_refresh_token() -> anyhow::Result<()> {
+fn filestore_loads_a_real_eeroctl_cookies_file() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = copy_fixture_into(dir.path(), "cookies_eeroctl.json");
     let store = FileStore::new(&path);
@@ -62,19 +44,13 @@ fn filestore_loads_a_real_eeroctl_cookies_file_with_a_null_refresh_token() -> an
     let session = store.load()?;
 
     assert_eq!(session.token().expose_secret().len(), 35);
-    assert!(
-        session.refresh_token().is_none(),
-        "a real post-login cookies.json has no refresh token; the port must not invent one"
-    );
-    assert!(
-        session.is_valid(),
-        "the fixture's expiry is in the future, so the session must load as valid"
-    );
+    assert!(session.is_valid());
     Ok(())
 }
 
 #[test]
-fn filestore_loads_the_real_eero_api_cookies_json_fixture() -> anyhow::Result<()> {
+fn filestore_loads_the_legacy_eero_api_cookies_json_fixture_and_migrates_it() -> anyhow::Result<()>
+{
     let dir = tempfile::tempdir()?;
     let path = copy_fixture_into(dir.path(), "cookies.json");
     let store = FileStore::new(&path);
@@ -82,21 +58,13 @@ fn filestore_loads_the_real_eero_api_cookies_json_fixture() -> anyhow::Result<()
     let session = store.load()?;
 
     assert_eq!(session.token().expose_secret(), "session_valid_id_7f3a9c2e");
-    assert_eq!(
-        session
-            .refresh_token()
-            .expect("fixtures/cookies.json carries a refresh_token")
-            .expose_secret(),
-        "rt_refresh_token_4b8d1f56"
-    );
-    assert!(
-        session.expiry().is_some(),
-        "fixtures/cookies.json carries a future session_expiry"
-    );
-    assert!(
-        session.is_valid(),
-        "a far-future expiry with a non-empty token must be a valid session"
-    );
+    assert!(session.is_valid());
+
+    // The migration must have re-saved the file in the current (v8.0.4) schema shape.
+    let on_disk = std::fs::read_to_string(&path)?;
+    assert!(on_disk.contains("\"schema_version\":2"));
+    assert!(!on_disk.contains("refresh_token"));
+    assert!(!on_disk.contains("session_expiry"));
     Ok(())
 }
 
@@ -112,21 +80,15 @@ fn filestore_loads_the_legacy_user_token_fixture() -> anyhow::Result<()> {
         session.token().expose_secret(),
         "legacy_user_token_c1a2b3d4"
     );
-    assert!(
-        session.refresh_token().is_none(),
-        "the legacy fixture never carried a refresh token"
-    );
     assert!(session.is_valid());
     Ok(())
 }
 
 #[test]
-fn filestore_save_then_reload_preserves_every_field() -> anyhow::Result<()> {
+fn filestore_save_then_reload_round_trips_the_token() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = FileStore::new(dir.path().join("cookies.json"));
-    let original = Session::from_json(
-        r#"{"session_id":"round-trip-token","refresh_token":"round-trip-refresh","session_expiry":"2099-06-15T09:30:00"}"#,
-    )?;
+    let original = Session::from_token("round-trip-token");
 
     store.save(&original)?;
     let reloaded = store.load()?;
@@ -135,59 +97,30 @@ fn filestore_save_then_reload_preserves_every_field() -> anyhow::Result<()> {
         reloaded.token().expose_secret(),
         original.token().expose_secret()
     );
-    assert_eq!(
-        reloaded.refresh_token().map(ExposeSecret::expose_secret),
-        original.refresh_token().map(ExposeSecret::expose_secret)
-    );
-    assert_eq!(reloaded.expiry(), original.expiry());
     Ok(())
 }
 
-// ===================== D-5 contract: expiry format regression guard =====================
-
-/// Checks `s` matches `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$` exactly — no regex dependency
-/// needed for a fixed, known-length shape. Written independently of `src/auth/session.rs`'s own
-/// unit test of the same shape (rather than imported), so this integration test does not rely on
-/// the library's own test helper to prove the same guarantee it is itself supposed to catch a
-/// regression in.
-fn is_naive_local_iso8601(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    s.len() == 19
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[10] == b'T'
-        && bytes[13] == b':'
-        && bytes[16] == b':'
-        && s[0..4].bytes().all(|b| b.is_ascii_digit())
-        && s[5..7].bytes().all(|b| b.is_ascii_digit())
-        && s[8..10].bytes().all(|b| b.is_ascii_digit())
-        && s[11..13].bytes().all(|b| b.is_ascii_digit())
-        && s[14..16].bytes().all(|b| b.is_ascii_digit())
-        && s[17..19].bytes().all(|b| b.is_ascii_digit())
-}
-
+/// A legacy fixture carrying an expiry far in the past is now unconditionally valid — `v8.0.4`
+/// has no client-side expiry concept at all, so the (dropped) `session_expiry` field can no
+/// longer make a token look expired.
 #[test]
-fn filestore_save_writes_expiry_as_naive_nineteen_char_iso8601() -> anyhow::Result<()> {
+fn a_legacy_expired_session_expiry_field_no_longer_matters() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("cookies.json");
+    std::fs::write(
+        &path,
+        r#"{"session_id": "session_expired_id", "refresh_token": "rt_expired_refresh", "session_expiry": "2000-01-01T00:00:00"}"#,
+    )?;
     let store = FileStore::new(&path);
 
-    store.save(&Session::from_token("tok"))?;
-
-    let raw = std::fs::read_to_string(&path)?;
-    let value: serde_json::Value = serde_json::from_str(&raw)?;
-    let expiry = value["session_expiry"]
-        .as_str()
-        .expect("session_expiry is a string");
-
-    assert_eq!(expiry.len(), 19, "expected exactly 19 characters: {expiry}");
+    let session = store.load()?;
     assert!(
-        is_naive_local_iso8601(expiry),
-        "expiry {expiry} does not match ^\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}:\\d{{2}}$"
+        session.is_valid(),
+        "v8.0.4 has no client-side expiry concept: a non-empty token is always valid locally"
     );
-    assert!(!expiry.contains('.'), "must have no fractional seconds");
-    assert!(!expiry.contains('Z'), "must have no UTC designator");
-    assert!(!expiry.contains('+'), "must have no UTC offset");
+
+    let transport = Transport::builder().session(Some(session)).build()?;
+    assert!(transport.is_authenticated());
     Ok(())
 }
 
@@ -219,9 +152,6 @@ fn chained_store_load_prefers_primary_over_a_fallback_that_would_error_if_touche
     let primary_file = FileStore::new(&primary_path);
     primary_file.save(&Session::from_token("primary-token"))?;
 
-    // A fallback pointed at a directory, not a file: any attempt to read it as a cookie file
-    // fails with a real `io::Error` — if this test ever turns red, that is proof
-    // `ChainedStore::load` consulted the fallback despite a usable primary session.
     let fallback_dir = dir.path().join("this-is-a-directory-not-a-cookie-file");
     std::fs::create_dir(&fallback_dir)?;
 
@@ -238,7 +168,7 @@ fn chained_store_load_prefers_primary_over_a_fallback_that_would_error_if_touche
 #[test]
 fn chained_store_load_falls_back_and_migrates_into_a_real_primary_file() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let primary_path = dir.path().join("primary.json"); // does not exist yet
+    let primary_path = dir.path().join("primary.json");
     let primary_file = Arc::new(FileStore::new(&primary_path));
 
     let fallback_path = dir.path().join("fallback.json");
@@ -252,10 +182,7 @@ fn chained_store_load_falls_back_and_migrates_into_a_real_primary_file() -> anyh
     let session = chained.load()?;
     assert_eq!(session.token().expose_secret(), "fallback-token");
 
-    assert!(
-        primary_path.exists(),
-        "a usable fallback session must be migrated into primary"
-    );
+    assert!(primary_path.exists());
     let migrated = primary_file.load()?;
     assert_eq!(migrated.token().expose_secret(), "fallback-token");
     Ok(())
@@ -264,12 +191,6 @@ fn chained_store_load_falls_back_and_migrates_into_a_real_primary_file() -> anyh
 #[test]
 fn chained_store_save_falls_back_to_a_working_store_when_the_primary_directory_cannot_be_created()
 -> anyhow::Result<()> {
-    // A regular file standing where the primary's parent directory would need to be created:
-    // `fs::create_dir_all` on this path fails with a real `io::Error` — a genuine backend
-    // failure, not a test double, exercising the documented divergence from `eero-api`
-    // (the const behaviour notes §7, gotcha #7): unlike Python's `KeyringStorage.save()`,
-    // which never raises, this port's stores can surface a real error, so `ChainedStore`'s
-    // fallback branch actually activates instead of being dead code.
     let dir = tempfile::tempdir()?;
     let blocking_file = dir.path().join("not-a-directory");
     std::fs::write(&blocking_file, b"blocking")?;
@@ -284,10 +205,7 @@ fn chained_store_save_falls_back_to_a_working_store_when_the_primary_directory_c
     );
     chained.save(&Session::from_token("fallback-only-token"))?;
 
-    assert!(
-        !primary_path.exists(),
-        "the primary write must have genuinely failed, not silently succeeded"
-    );
+    assert!(!primary_path.exists());
     let saved = fallback_file.load()?;
     assert_eq!(saved.token().expose_secret(), "fallback-only-token");
     Ok(())
@@ -408,37 +326,8 @@ mod create_storage_matrix {
     }
 }
 
-// ===================== Expired session leaves a Transport unauthenticated =====================
-
-#[test]
-fn expired_session_loaded_from_a_store_leaves_a_transport_unauthenticated() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("cookies.json");
-    // Mirrors the shape of eero-api's own `expired_session_data` test fixture
-    // (the const behaviour notes, "Fixture payloads"), with a fixed past date instead of a
-    // wall-clock-relative one so this test can never become flaky.
-    std::fs::write(
-        &path,
-        r#"{"session_id": "session_expired_id", "refresh_token": "rt_expired_refresh", "session_expiry": "2000-01-01T00:00:00"}"#,
-    )?;
-    let store = FileStore::new(&path);
-
-    let session = store.load()?;
-    assert!(
-        !session.is_valid(),
-        "an expiry in the past must never be valid"
-    );
-
-    let transport = Transport::builder().session(Some(session)).build()?;
-    assert!(!transport.is_authenticated());
-    Ok(())
-}
-
 // ===================== StorageFailures policy =====================
 
-/// A [`CredentialStore`] that fails every operation — used only to exercise
-/// [`StorageFailures`]'s two policies from outside the crate. Every other test in this file
-/// drives a genuine backend instead.
 #[derive(Debug, Default)]
 struct AlwaysFailsStore;
 
@@ -475,10 +364,7 @@ fn storage_failures_warn_lets_set_session_proceed_despite_a_failing_store() -> a
         .build()?;
 
     transport.set_session(None)?;
-    assert!(
-        transport.session().is_none(),
-        "the in-memory session updates regardless of the store's outcome"
-    );
+    assert!(transport.session().is_none());
     Ok(())
 }
 
@@ -495,8 +381,6 @@ fn storage_failures_fatal_returns_error_storage_when_the_store_fails() -> anyhow
         .set_session(None)
         .expect_err("the store always fails");
     assert!(matches!(err, Error::Storage(_)));
-    // Security finding F3 (`src/transport.rs`): even under the Fatal policy, the in-memory
-    // session must still update before `set_session` returns.
     assert!(transport.session().is_none());
     Ok(())
 }
@@ -517,43 +401,57 @@ async fn transport_with_store_set_session_persists_the_new_session() -> anyhow::
 }
 
 #[tokio::test]
-async fn transport_refresh_session_persists_the_refreshed_session_into_the_store()
--> anyhow::Result<()> {
+async fn transport_refresh_session_success_never_touches_the_store() -> anyhow::Result<()> {
+    // A successful refresh never rotates the token (server-issued token discarded per SDK
+    // policy), so there is nothing new to persist — the store must be left exactly as it was.
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
         .and(path("/2.2/login/refresh"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            json!({
-                "meta": { "code": 200 },
-                "data": { "session_token": "refreshed-token", "refresh_token": "refreshed-refresh" }
-            })
-            .to_string(),
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(json!({ "meta": { "code": 200 }, "data": {} }).to_string()),
+        )
         .expect(1)
         .mount(&mock.server)
         .await;
 
     let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
-    let session = Session::from_json(
-        r#"{"session_id":"about-to-be-refreshed","refresh_token":"pre-refresh-token","session_expiry":"2099-01-01T00:00:00"}"#,
-    )?;
-    let transport = Transport::builder()
-        .base_url(mock.uri())
-        .session(Some(session))
-        .store(Some(Arc::clone(&store)))
-        .build()?;
+    let transport = mock.transport_with_store("about-to-be-refreshed", Arc::clone(&store));
 
-    // Sanity: nothing has been persisted yet — only `refresh_session`'s own persistence point
-    // (the behaviour under test) should ever populate the store.
-    assert!(!store.load()?.is_valid());
-
-    let refreshed = transport.refresh_session().await?;
     assert!(
-        refreshed,
-        "the mocked refresh response carries a non-empty session_token"
+        !store.load()?.is_valid(),
+        "sanity: seeding a Transport's session does not itself persist anything"
     );
 
-    let stored = store.load()?;
-    assert_eq!(stored.token().expose_secret(), "refreshed-token");
+    let refreshed = transport.refresh_session().await?;
+    assert!(refreshed);
+
+    assert!(
+        !store.load()?.is_valid(),
+        "a successful refresh must not write anything to the store"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_refresh_session_terminal_failure_clears_the_store() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(r#"{"meta":{"code":401,"error":"error.session.revoked"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    store.save(&Session::from_token("about-to-be-cleared"))?;
+    let transport = mock.transport_with_store("about-to-be-cleared", Arc::clone(&store));
+
+    let refreshed = transport.refresh_session().await?;
+    assert!(!refreshed);
+    assert!(!store.load()?.is_valid());
     Ok(())
 }

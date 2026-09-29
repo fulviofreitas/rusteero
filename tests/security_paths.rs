@@ -1,23 +1,35 @@
-//! Security regression tests for the path-traversal / empty-segment finding fixed in
-//! `src/routes.rs` (`validate_segment`) and `src/transport.rs` (`Transport::render_url`).
+//! Security regression tests for the path-traversal / empty-segment finding, proven at v8.0.4
+//! through real endpoint calls rather than the pre-v8.0.4 `Route`/`validate_segment` model this
+//! file used to pin directly (that model is gone — see `src/routes/mod.rs`'s module docs).
 //!
-//! `url` 2.5.8's path-segment parser strips ASCII tab/CR/LF from a segment *before*
-//! percent-encoding and dot-segment removal run, so a placeholder value that is not literally
-//! `".."` (e.g. `"..\n"`) could previously be turned into `".."` by the time it reached the
-//! encoder, collapsing a destructive verb (`DELETE`, or a `/2.3` `PUT`) onto the parent
-//! collection instead of the one item the caller named. An empty substituted value had the same
-//! effect. See `src/routes.rs`'s module docs ("Path traversal") for the full mechanism.
+//! Every identifier substituted into a resolved URL at v8.0.4 goes through
+//! [`rusteero::links::validate_identifier`] (a strict `^[A-Za-z0-9][A-Za-z0-9._:-]*$` whitelist,
+//! plus an explicit `".."` rejection) — either directly (`child_url`/`resource_url`) or, for
+//! `DevicesApi::pause_device`, after [`rusteero::util::id_from_url`] first extracts a trailing
+//! path segment from a path/URL-shaped value. This is *stricter* than the pre-v8.0.4 model (which
+//! percent-encoded almost anything into a single opaque segment and only denylisted a known-bad
+//! shape): a value such as `"a/b"` or `"a?b"` was previously accepted-and-encoded, and is now
+//! rejected outright by [`EerosApi::get_eero`]/[`BlacklistApi::remove_from_blacklist`] (ported
+//! faithfully from `eero-api`'s own `_IDENTIFIER_RE` at v8.0.4 — see
+//! `git -C eero-api show v8.0.4:src/eero/api/links.py`). `DevicesApi::pause_device` is the one
+//! exception: it normalises `mac` through `id_from_url` first, which extracts the segment after
+//! the last `/` rather than rejecting a slash outright, matching `_update_device`'s own
+//! `id_from_url(mac)` call (`devices.py:44-65`) before the same identifier check runs.
 //!
-//! Every test below proves the fix at the network boundary: a hostile value must be rejected by
-//! `Transport::render_url` (surfaced here as an `Err(Error::Validation { .. })` from the
-//! endpoint method) *before* any HTTP request is sent — a catch-all `wiremock::matchers::any()`
-//! mock with `.expect(0)` fails loudly if a hostile value ever escapes to the wire. Per
-//! the crate's testing conventions, this is covered for at least one route per shape: a DELETE-by-id
-//! (`BlacklistApi::remove_from_blacklist`), a PUT-by-id on `/2.3` (`DevicesApi::pause_device`),
-//! and a GET-by-id (`EerosApi::get_eero`) — proving the fix on the destructive verbs
-//! specifically, not just reads.
+//! Every test below proves the fix at the network boundary: a hostile value must be rejected as
+//! `Error::Validation` *before* any HTTP request is sent — a catch-all `wiremock::matchers::any()`
+//! mock with `.expect(0)` fails loudly if a hostile value ever escapes to the wire. This is
+//! covered for at least one route per shape: a DELETE-by-id (`BlacklistApi::remove_from_blacklist`),
+//! a PUT-by-id on `/2.3` (`DevicesApi::pause_device`), and a GET-by-id (`EerosApi::get_eero`) —
+//! proving the fix on the destructive verbs specifically, not just reads.
 //!
-//! A second table of already-legitimate or already-safe values is asserted to still work
+//! The exact `field` name on the returned `Error::Validation` is deliberately **not** pinned here:
+//! it depends on which of `id_from_url`/`resource_url`/`child_url` first rejects the value (`"id"`,
+//! `"id_or_url"`, or `"child"` depending on the route and the value's shape) — an implementation
+//! detail, not part of the security guarantee this suite exists to pin (fail closed, zero requests
+//! sent).
+//!
+//! A second table of legitimate, unambiguously-safe identifiers is asserted to still work
 //! *unchanged* across the same three shapes, so this fix is proven not to have introduced a
 //! false-positive rejection alongside the true-positive one.
 
@@ -36,26 +48,22 @@ use common::{MockEero, TEST_TOKEN};
 
 /// Every value this suite asserts is REJECTED before any request reaches the server.
 ///
-/// Each one either contains a byte `url` 2.5.8 strips before its dot-segment check runs
-/// (`"..\n"`, `".\t."`, `"\t.."`, `"..\t"`, `"..\r\n"`, `"\u{0}"`, `"a\u{7f}b"`), is itself a
-/// literal dot segment with no stripping involved (`".."`, `"."`), or is empty (`""`).
+/// Each one either contains a byte outside `links::validate_identifier`'s whitelist
+/// (`[A-Za-z0-9._:-]`), is itself a literal dot segment (`".."`, `"."`), or is empty (`""`).
 const HOSTILE_VALUES: &[&str] = &[
     "..\n", ".\t.", "\t..", "..\t", "..\r\n", "..", ".", "", "\u{0}", "a\u{7f}b",
 ];
 
-/// Every value this suite asserts is left unaffected by the fix: legitimate identifier shapes,
-/// plus values that are already safely opaque once percent-encoded and never reach the `url`
-/// crate's dot-segment logic at all.
-const SAFE_VALUES: &[&str] = &[
-    "device-0001",
-    "aa:bb:cc:00:00:01",
-    "a/b",
-    "%2e%2e",
-    "..%2f..",
-    "．．", // fullwidth dots (U+FF0E) — not ASCII '.', never trips dot-segment removal
-    "a?b",
-    "a#b",
-];
+/// Every value this suite asserts is left unaffected by the fix: legitimate identifier shapes —
+/// alphanumeric, optionally with `.`/`_`/`:`/`-` — that were valid before this fix and remain
+/// valid under `links::validate_identifier`'s stricter whitelist.
+///
+/// Unlike the pre-v8.0.4 suite this file replaces, this list deliberately excludes values that
+/// were merely "safe because percent-encoded" under the old, more permissive `Route`/
+/// `validate_segment` model (slashes, `%`, `?`, `#`, non-ASCII look-alike dots): those are no
+/// longer valid single-segment identifiers at v8.0.4 and are correctly rejected now — ported
+/// faithfully from `eero-api`'s own identifier regex, not a regression.
+const SAFE_VALUES: &[&str] = &["device-0001", "aa:bb:cc:00:00:01", "abc123", "a.b_c-d:e"];
 
 /// Mounts a catch-all mock on `mock` that must never be hit, matching the "no request may be
 /// sent for a rejected value" half of every test below.
@@ -67,15 +75,14 @@ async fn deny_all_requests(mock: &MockEero) {
         .await;
 }
 
-/// Asserts `err` is `Error::Validation` for exactly `field`, and not some other error variant a
-/// regression could otherwise disguise itself as.
-fn assert_validation_error_for_field(err: &Error, field: &str) {
-    match err {
-        Error::Validation { field: got, .. } => {
-            assert_eq!(got, field, "wrong field name in rejection for {err:?}");
-        }
-        other => panic!("expected Error::Validation for field {field:?}, got {other:?}"),
-    }
+/// Asserts `err` is `Error::Validation` — fail-closed, not some other error variant a regression
+/// could otherwise disguise itself as. See this file's module docs for why the `field` name
+/// itself is deliberately not pinned.
+fn assert_is_validation_error(err: &Error) {
+    assert!(
+        matches!(err, Error::Validation { .. }),
+        "expected Error::Validation, got {err:?}"
+    );
 }
 
 // ===================== DELETE-by-id: BlacklistApi::remove_from_blacklist =====================
@@ -89,12 +96,12 @@ async fn remove_from_blacklist_rejects_every_hostile_value_before_any_request() 
 
     for value in HOSTILE_VALUES {
         let err = api
-            .remove_from_blacklist("network-0001", value)
+            .remove_from_blacklist("network-0001", value, None)
             .await
             .expect_err(&format!(
                 "{value:?} must be rejected, not sent to the server"
             ));
-        assert_validation_error_for_field(&err, "mac_or_device_id");
+        assert_is_validation_error(&err);
     }
     Ok(())
 }
@@ -110,7 +117,7 @@ async fn remove_from_blacklist_still_accepts_every_safe_value() -> anyhow::Resul
     let api = BlacklistApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
 
     for value in SAFE_VALUES {
-        api.remove_from_blacklist("network-0001", value)
+        api.remove_from_blacklist("network-0001", value, None)
             .await
             .unwrap_or_else(|err| panic!("{value:?} must still be accepted, got {err:?}"));
     }
@@ -132,7 +139,7 @@ async fn pause_device_rejects_every_hostile_value_before_any_request() -> anyhow
             .expect_err(&format!(
                 "{value:?} must be rejected, not sent to the server"
             ));
-        assert_validation_error_for_field(&err, "device_id");
+        assert_is_validation_error(&err);
     }
     Ok(())
 }
@@ -164,10 +171,10 @@ async fn get_eero_rejects_every_hostile_value_before_any_request() -> anyhow::Re
     let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
 
     for value in HOSTILE_VALUES {
-        let err = api.get_eero(value).await.expect_err(&format!(
+        let err = api.get_eero(value, None).await.expect_err(&format!(
             "{value:?} must be rejected, not sent to the server"
         ));
-        assert_validation_error_for_field(&err, "eero_id");
+        assert_is_validation_error(&err);
     }
     Ok(())
 }
@@ -183,7 +190,7 @@ async fn get_eero_still_accepts_every_safe_value() -> anyhow::Result<()> {
     let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
 
     for value in SAFE_VALUES {
-        api.get_eero(value)
+        api.get_eero(value, None)
             .await
             .unwrap_or_else(|err| panic!("{value:?} must still be accepted, got {err:?}"));
     }

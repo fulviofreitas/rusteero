@@ -1,14 +1,17 @@
 # 🦀 rusteero Wiki
 
-Welcome! Everything you need to use `rusteero`, the Rust client for the Eero mesh Wi-Fi cloud API.
+Welcome! Everything you need to use `rusteero`, the async Rust client for the Eero mesh Wi-Fi
+cloud API — a port of the Python [`eero-api`](https://github.com/fulviofreitas/eero-api)
+library at **v8.0.4**.
 
 ## 📚 Guides
 
 | Page | What you'll learn |
 |------|-------------------|
-| **[📖 Rust API](Rust-API)** | Full API reference & examples |
-| **[⚙️ Configuration](Configuration)** | Auth storage & builder options |
-| **[🔧 Troubleshooting](Troubleshooting)** | Common issues & fixes |
+| **[📖 Rust API](Rust-API)** | The `Client` → `EeroApi` → `Transport` layers, builder options, every domain accessor, caching, network targeting, errors |
+| **[⚙️ Configuration](Configuration)** | `Session` sources, credential stores and the schema-2 record, transport options, logging |
+| **[🔧 Troubleshooting](Troubleshooting)** | 401s, premium gating, local validation errors, writes that return 200 and change nothing, keyring on headless Linux |
+| **[🔀 Migration](Migration)** | Upgrading from rusteero 1.0.0 to 2.0.0 |
 
 ---
 
@@ -66,6 +69,25 @@ async fn main() -> Result<(), rusteero::Error> {
 
 ---
 
+## 🧭 How it is put together
+
+```
+Client            cache + network-id resolution + parent envelopes   (eero-api: EeroClient)
+  └─ EeroApi      37 domain accessors over one shared transport      (eero-api: EeroAPI)
+       └─ Transport   headers, credential placement, status → Error, refresh-and-replay
+```
+
+* Every endpoint returns `Result<Envelope, Error>` over the untouched `{"meta": …, "data": …}`
+  wire payload.
+* Method names are the Python names verbatim, in `snake_case`, so a method can be searched for by
+  name across both libraries.
+* Every resource argument accepts a bare id, an API path or an absolute API-host URL; every
+  domain method takes a `parent` envelope so the request follows the link the API published.
+* Errors are classified against the API's closed catalogue of `meta.error` strings; every error
+  carries `error_code()` and `envelope()`.
+
+---
+
 ## 🔗 Links
 
 | Resource | URL |
@@ -95,21 +117,21 @@ no licence and was consulted as a reference only.
 **What's new** (relative to `eero-api`):
 
 *   Native async Rust on `tokio` + `reqwest` (rustls), no Python runtime
-*   Same raw `{meta, data}` JSON contract, plus an `Envelope` helper and opt-in typed models
-*   Interactive email/SMS code flow separated from the client (`LoginFlow` → `Session`), so
-    headless and CI consumers can inject a pre-obtained session token
-*   Pluggable `CredentialStore` trait: system keyring (optional feature), file, memory, or your own
-*   Credential storage format is wire-compatible with `eero-api`, so a session created by
+*   Same raw `{meta, data}` JSON contract, plus an `Envelope` helper (`meta()`, `data()`,
+    `data_as::<T>()`, `into_value()`)
+*   Interactive email/SMS code flow separated from the client (`LoginFlow` → `PendingLogin` →
+    `Session`), so headless and CI consumers can inject a pre-obtained session token
+*   Pluggable `CredentialStore` trait: system keyring (optional feature), file, memory, chained,
+    or your own; the persisted record is byte-compatible with `eero-api`, so a session created by
     `eeroctl` works unchanged
-*   Session tokens are `SecretString`s and never appear in logs
-*   Keyring failures fall back to file storage (the Python fallback never fired)
+*   Session tokens are `SecretString`s and never appear in `Debug` output, logs or error messages
+*   Storage failures surface as a typed `StorageError` with a `Warn`/`Fatal` policy, instead of
+    being swallowed
+*   `ChainedStore` genuinely falls back when the primary backend fails to save
 *   Rate-limit errors carry `Retry-After` when the server sends it
-*   Every wire endpoint is a single `Route` constant, so upstream API drift is a one-line fix
-*   Removed-upstream endpoints (`activity/*`, device priority) are not carried over
-*   Response bodies embedded in errors are redacted before truncation, so a malformed reply
-    cannot leak a session token or a Wi-Fi password into a log line
-*   Path segments are validated before a URL is built, so an id carrying a stray newline
-    cannot escape its segment and send a write at the wrong resource
+*   Every wire endpoint is a route constant, so upstream API drift is a one-line fix
+*   Path segments and link values are validated before a URL is built, and the credential is
+    withheld from any request that would leave the configured API host
 
 ---
 

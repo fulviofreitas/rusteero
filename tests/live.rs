@@ -12,16 +12,18 @@
 //! ```
 //!
 //! `RUSTEERO_SESSION_TOKEN` is a session token already obtained out of band (e.g. from a prior
-//! interactive login) — this file's tests only ever perform read-only calls with it, except for
-//! [`live_verify_sets_a_fresh_session_cookie_open_question_d16`], which is explicitly about
-//! performing a *fresh* login and is gated on its own additional environment variables (see that
-//! test's doc comment).
+//! interactive login) — this file's tests only ever perform read-only calls with it.
+//!
+//! The former D-16 diagnostic (`login/verify`'s `Set-Cookie` behaviour) is gone: `v8.0.4` has no
+//! `Set-Cookie` reader anywhere in `base.py`/`auth.py`, and the login token is unconditionally the
+//! session token (see `crate::auth::flow::PendingLogin::verify`'s docs), so there is no longer an
+//! open question for a live capture to settle.
 
 use rusteero::auth::AuthApi;
 use rusteero::auth::Session;
 use rusteero::auth::flow::LoginFlow;
 use rusteero::routes::ACCOUNT;
-use rusteero::transport::Transport;
+use rusteero::transport::{RequestBody, Transport};
 
 /// Returns `Some(token)` only when both `RUSTEERO_LIVE=1` and a non-empty `RUSTEERO_SESSION_TOKEN`
 /// are set in the environment.
@@ -107,7 +109,7 @@ async fn live_get_account_smoke() {
 
     let envelope = auth
         .transport()
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect("GET /account should succeed with a valid session token");
     assert_eq!(envelope.meta().code, Some(200));
@@ -137,6 +139,9 @@ async fn live_get_account_smoke() {
 /// expectation.
 #[tokio::test]
 #[ignore = "hits the real Eero cloud API; see this file's module docs for how to run it"]
+// A long, flat list of `probe!` calls is the whole point of a sweep — splitting it into helper
+// functions would only hide which endpoints are covered, not reduce real complexity.
+#[allow(clippy::too_many_lines)]
 async fn live_read_only_endpoint_sweep() {
     let Some(token) = live_credentials() else {
         eprintln!(
@@ -201,14 +206,16 @@ async fn live_read_only_endpoint_sweep() {
     let n = Some(nid.as_str());
     probe!("account", client.get_account(false));
     probe!("network", client.get_network(n, false));
+    // Fetched once more here (in addition to the `probe!` below) purely to source a real eero's
+    // serial/version for the `ouicheck` probe further down — an extra read against a diagnostic,
+    // human-run-only suite, never part of `cargo test`.
+    let eeros_for_ouicheck = client.get_eeros(n, false).await;
     probe!("eeros", client.get_eeros(n, false));
-    probe!("devices", client.get_devices(n, false));
+    probe!("devices", client.get_devices(n, false, None, None));
     probe!("profiles", client.get_profiles(n, false));
-    probe!("settings", client.get_settings(n));
     probe!("dns_settings", client.get_dns_settings(n));
     probe!("security_settings", client.get_security_settings(n));
     probe!("sqm_settings", client.get_sqm_settings(n));
-    probe!("password", client.get_password(n));
     probe!("blacklist", client.get_blacklist(n));
     probe!("reservations", client.get_reservations(n));
     probe!("forwards", client.get_forwards(n));
@@ -219,11 +226,64 @@ async fn live_read_only_endpoint_sweep() {
     probe!("support", client.get_support(n));
     probe!("diagnostics", client.get_diagnostics(n));
     probe!("transfer_stats", client.get_transfer_stats(n, None));
-    probe!("burst_reporters", client.get_burst_reporters(n));
-    probe!("backup_network", client.get_backup_network(n));
-    probe!("backup_status", client.get_backup_status(n));
-    probe!("ouicheck", client.get_ouicheck(n));
+    probe!("backup_internet", client.get_backup_internet(n));
+    probe!("cellular_backup_usage", client.get_cellular_backup_usage(n));
+    probe!(
+        "cellular_backup_events",
+        client.get_cellular_backup_events(n)
+    );
     probe!("premium_status", client.get_premium_status(n));
+
+    // `get_ouicheck` needs a real eero's serial + firmware version; take them from the first
+    // entry `get_eeros` (probed above) returned, and skip this probe entirely (never fail the
+    // sweep) if that data is unavailable for any reason — an empty network, a prior probe
+    // failure, or a live account whose eero objects simply don't carry a version-shaped field.
+    match eeros_for_ouicheck {
+        Ok(eeros) => {
+            let first = eeros.data().get(0);
+            let serial = first.and_then(|e| e.get("serial")).and_then(|v| v.as_str());
+            let version = first
+                .and_then(|e| e.get("os_version").or_else(|| e.get("version")))
+                .and_then(|v| v.as_str());
+            match (serial, version) {
+                (Some(serial), Some(version)) => {
+                    probe!("ouicheck", client.get_ouicheck(serial, version, n));
+                }
+                _ => println!(
+                    "  {:<22} skipped (no eero serial/version field available)",
+                    "ouicheck"
+                ),
+            }
+        }
+        Err(_) => println!(
+            "  {:<22} skipped (get_eeros itself failed above)",
+            "ouicheck"
+        ),
+    }
+
+    // ==================== new-since-v8.0.0 domain families ====================
+    // Each of these is genuinely new surface (entitlements, permissions, notifications,
+    // members, events, power-saving, wpa3, dns-policies, subnets, backup access points,
+    // multistaticip) — probed read-only, same fail-soft treatment as everything above: a
+    // 403/404/premium-required error is reported, not fatal, exactly like the pre-existing
+    // probes.
+    probe!("entitlement_features", client.get_entitlement_features(n));
+    probe!("permissions", client.get_permissions(n));
+    probe!("notification_settings", client.get_notification_settings(n));
+    probe!("members", client.get_members(n));
+    probe!("app_events", client.get_app_events(None, None, n));
+    probe!(
+        "power_saving_schedules",
+        client.get_power_saving_schedules(n)
+    );
+    probe!("wpa3_per_band", client.get_wpa3_per_band(n));
+    probe!(
+        "dns_policies_advanced_filter",
+        client.get_advanced_content_filter(n)
+    );
+    probe!("subnets_config", client.get_subnets_config(n));
+    probe!("backup_access_points", client.list_backup_access_points(n));
+    probe!("multistaticip", client.get_multistaticip(n));
 
     println!(
         "\nlive sweep: {ok} endpoints returned an envelope, {} errored",
@@ -274,7 +334,7 @@ struct ErrorKind<'a>(&'a rusteero::Error);
 impl std::fmt::Display for ErrorKind<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self.0 {
-            rusteero::Error::Authentication(_) => "Authentication",
+            rusteero::Error::Authentication { .. } => "Authentication",
             rusteero::Error::RateLimit { .. } => "RateLimit",
             rusteero::Error::Network(_) => "Network",
             rusteero::Error::Api { .. } => "Api",
@@ -290,100 +350,4 @@ impl std::fmt::Display for ErrorKind<'_> {
         };
         f.write_str(name)
     }
-}
-
-// ===================== the verify-Set-Cookie open question (rust-port-plan.md §7.2, D-16) =====================
-
-/// Diagnostic-only test to settle the one open question this port still has: does a real
-/// `login/verify` response ever carry a fresh `Set-Cookie: s=...` header?
-///
-/// `eero-api` cannot answer this either way — it never reads `Set-Cookie` explicitly (it relies
-/// on aiohttp's implicit cookie jar) — and `rusteero` has no implicit jar to observe it
-/// silently, so [`PendingLogin::verify`](rusteero::auth::flow::PendingLogin::verify) falls back
-/// to the login token whenever no fresh cookie is present, which is indistinguishable from
-/// "there never was one" from outside the crate. This test therefore does **not** go through
-/// `rusteero`'s own `LoginFlow`/`PendingLogin` at all: it makes the login and verify calls with a
-/// bare `reqwest::Client` instead, purely so it can inspect the raw `Set-Cookie` response header
-/// this crate's own transport deliberately never logs (crate security rule: never log headers,
-/// cookies, or bodies).
-///
-/// # Running this test
-///
-/// Requires `RUSTEERO_LIVE=1`, `RUSTEERO_SESSION_TOKEN` (the blanket gate every test in this
-/// file shares), plus `RUSTEERO_LOGIN_IDENTIFIER` and a **freshly requested** `RUSTEERO_LOGIN_CODE`
-/// (one-time codes are single-use and short-lived, so this cannot be automated in CI — a human
-/// must request a code via [`live_login_start_returns_a_pending_login`] or the mobile/web app
-/// immediately before running this test with the code it received).
-///
-/// This test **mutates the live account's active session** (a real login/verify rotates it):
-/// update `RUSTEERO_SESSION_TOKEN` afterward if other live tests depend on the old one.
-///
-/// There is no hard assertion either way; the answer is printed for a human to copy into
-/// `rust-port-plan.md` §7.2 to close out decision D-16.
-#[tokio::test]
-#[ignore = "hits the real Eero cloud API and rotates the account's session; see this test's doc comment"]
-async fn live_verify_sets_a_fresh_session_cookie_open_question_d16() {
-    let Some(_gate) = live_credentials() else {
-        eprintln!(
-            "skipping live_verify_sets_a_fresh_session_cookie_open_question_d16: set \
-             RUSTEERO_LIVE=1 and RUSTEERO_SESSION_TOKEN to run live tests"
-        );
-        return;
-    };
-    let (Ok(identifier), Ok(code)) = (
-        std::env::var("RUSTEERO_LOGIN_IDENTIFIER"),
-        std::env::var("RUSTEERO_LOGIN_CODE"),
-    ) else {
-        eprintln!(
-            "skipping live_verify_sets_a_fresh_session_cookie_open_question_d16: set \
-             RUSTEERO_LOGIN_IDENTIFIER and RUSTEERO_LOGIN_CODE (a freshly requested one-time \
-             code) to run this test"
-        );
-        return;
-    };
-
-    // No `.cookie_store(true)` (the crate's `cookies` cargo feature is not enabled — this crate
-    // never wants an implicit jar, see `src/transport.rs`'s module docs), so `client` never
-    // stores or forwards the `Set-Cookie` this test needs to inspect directly.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("client builds");
-
-    let login_response = client
-        .post("https://api-user.e2ro.com/2.2/login")
-        .json(&serde_json::json!({ "login": identifier }))
-        .send()
-        .await
-        .expect("login request should succeed");
-    let login_body: serde_json::Value =
-        login_response.json().await.expect("login response is JSON");
-    let login_token = login_body["data"]["user_token"]
-        .as_str()
-        .expect("login response carries a non-empty data.user_token")
-        .to_owned();
-
-    let verify_response = client
-        .post("https://api-user.e2ro.com/2.2/login/verify")
-        .header("cookie", format!("s={login_token}"))
-        .json(&serde_json::json!({ "code": code }))
-        .send()
-        .await
-        .expect("verify request should succeed with a freshly requested code");
-
-    let fresh_cookie_present = verify_response
-        .headers()
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .any(|raw| raw.trim_start().starts_with("s="));
-
-    println!(
-        "D-16: login/verify {} send a fresh `s` Set-Cookie header",
-        if fresh_cookie_present {
-            "DID"
-        } else {
-            "did NOT"
-        }
-    );
 }

@@ -9,7 +9,8 @@ mod common;
 
 use reqwest::Method;
 use rusteero::error::Error;
-use rusteero::routes::{ACCOUNT, ApiVersion, Route};
+use rusteero::routes::{ACCOUNT, ApiVersion, Nested};
+use rusteero::transport::RequestBody;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -31,7 +32,7 @@ async fn transport_with_token_reaches_the_mock_server_on_v2_2() {
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let env = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect("mock server responds 200 with a valid envelope");
 
@@ -45,13 +46,14 @@ async fn transport_with_token_reaches_the_mock_server_on_v2_2() {
 async fn base_url_override_points_both_api_versions_at_the_mock_server() {
     let mock = MockEero::start().await;
 
-    // No `Route` for a device PUT exists yet (phase 3 owns `src/endpoints/`); assembled ad hoc
-    // here exactly as `routes.rs`'s own doc comment says a `Route` may be, purely to prove the
-    // harness's base-URL wiring, not to test device semantics.
-    let device_put = Route {
+    // A `Nested` for a device PUT, assembled ad hoc exactly as `routes/mod.rs`'s own doc comment
+    // permits, purely to prove the harness's base-URL wiring, not to test device semantics.
+    let device_put = Nested {
         method: Method::PUT,
         version: ApiVersion::V2_3,
-        path: "networks/{network_id}/devices/{device_id}",
+        prefix: "devices",
+        suffix: "",
+        link: None,
     };
 
     Mock::given(method("PUT"))
@@ -64,10 +66,13 @@ async fn base_url_override_points_both_api_versions_at_the_mock_server() {
 
     let transport = mock.transport_with_token(TEST_TOKEN);
     let env = transport
-        .send(
+        .nested(
             &device_put,
-            &[("network_id", "network-0001"), ("device_id", "aa:bb")],
-            Some(json!({ "nickname": "renamed" })),
+            "network-0001",
+            "aa:bb",
+            None,
+            &[],
+            RequestBody::Json(json!({ "nickname": "renamed" })),
         )
         .await
         .expect("mock server accepts the v2.3 PUT");
@@ -87,10 +92,12 @@ async fn transport_anonymous_has_no_session_and_never_calls_the_network() {
     let transport = mock.transport_anonymous();
 
     let err = transport
-        .send(&ACCOUNT, &[], None)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await
         .expect_err("no session configured means the precondition fires before any request");
-    assert!(matches!(err, Error::Authentication(ref msg) if msg == "Not authenticated"));
+    assert!(
+        matches!(err, Error::Authentication { message: ref msg, .. } if msg == "Not authenticated")
+    );
 }
 
 // ===================== login_flow: hits the mock's /login route =====================

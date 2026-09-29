@@ -1,32 +1,33 @@
-//! Backup Network API: `eero-api`'s `BackupAPI` (an Eero Plus/Eero Secure feature).
+//! Backup Internet API: `eero-api`'s `BackupAPI`, rewritten for v8.0.4.
 //!
-//! Ported from `eero-api src/eero/api/backup.py`: `BackupAPI.get_backup_network` and
-//! `BackupAPI.get_backup_status` — **two distinct wire endpoints** (`.../backup` and
-//! `.../backup/status`), never aliases of one another — plus the two mutation methods,
-//! `BackupAPI.set_backup_network` and `BackupAPI.configure_backup_network`.
+//! Ported from `eero-api src/eero/api/backup.py` (v8.0.4). `get_backup_network`/
+//! `get_backup_status`/`set_backup_network`/`configure_backup_network` (the pre-v8.0.0 shape
+//! this file used to port) were removed upstream and are **not** reproduced here — see
+//! `.claude/tasks/briefs/v8/g7-backup-members.md` §2 for the removal and its replacement.
 //!
-//! Every method here funnels through `Transport::send`, which already implements the "not
+//! Every method here funnels through `Transport::resource`, which already implements the "not
 //! authenticated" precondition Python repeats at the top of each method (`get_auth_token()` /
 //! `EeroAuthenticationException("Not authenticated")`) and every status-to-error mapping a
 //! response can produce — so, unlike the Python source, no method below duplicates that guard.
 
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::envelope::Envelope;
 use crate::error::Error;
+use crate::links::warn_uncharacterised_write;
 use crate::routes;
-use crate::transport::Transport;
+use crate::transport::{RequestBody, Transport};
 
-/// `eero-api`'s `BackupAPI` (`src/eero/api/backup.py`).
+/// `eero-api`'s `BackupAPI` (`src/eero/api/backup.py`), rewritten for v8.0.4.
 ///
-/// Backup network features require an active Eero Plus/Eero Secure subscription — they let a
-/// mobile phone stand in as a backup internet connection when the primary connection fails.
+/// Backup-internet features require an active Eero Plus/Eero Secure subscription — they let a
+/// cellular connection stand in as a backup internet connection when the primary connection
+/// fails.
 ///
 /// Build one with `BackupApi::new`, wrapping a `Transport` already shared with the rest of the
-/// (not-yet-built) `EeroApi` aggregator — `BackupApi` never constructs or owns a `Transport`
-/// itself.
+/// `EeroApi` aggregator — `BackupApi` never constructs or owns a `Transport` itself.
 #[derive(Debug)]
 pub struct BackupApi {
     transport: Arc<Transport>,
@@ -44,122 +45,112 @@ impl BackupApi {
         Self { transport }
     }
 
-    /// `GET /2.2/networks/{network_id}/backup` — backup-network (Eero Plus) configuration.
+    /// `GET /2.2/networks/{network_id}/backupinternet` — cellular-backup-internet configuration.
     ///
-    /// Ported from `BackupAPI.get_backup_network` (`backup.py:37-55`). Returns the raw
-    /// `{"meta": …, "data": {...}}` envelope; this method never inspects or reshapes it.
+    /// Ported from `BackupAPI.get_backup_internet` (`backup.py:41-64`). `parent` is accepted for
+    /// signature parity with the Python method but never consulted: `get_backup_internet`'s
+    /// resource is built directly via `resource_url`, never a published `resources` link (module
+    /// docstring, `backup.py:22-27`) — the same reason `routes::GET_BACKUP_INTERNET::link` is
+    /// `None`. Returns the raw `{"meta": …, "data": {...}}` envelope; this method never inspects
+    /// or reshapes it.
     ///
     /// # Errors
     ///
     /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
     /// before any request is sent, or whatever other status-mapped error the request produces —
-    /// see `Transport::send`.
-    pub async fn get_backup_network(&self, network_id: &str) -> Result<Envelope, Error> {
+    /// see `Transport::resource`.
+    pub async fn get_backup_internet(
+        &self,
+        network_id: &str,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
         self.transport
-            .send(
-                &routes::GET_BACKUP_NETWORK,
-                &[("network_id", network_id)],
-                None,
+            .resource(
+                &routes::GET_BACKUP_INTERNET,
+                network_id,
+                parent,
+                &[],
+                RequestBody::None,
             )
             .await
     }
 
-    /// `GET /2.2/networks/{network_id}/backup/status` — current backup-network status.
+    /// `PUT /2.2/networks/{network_id}/backupinternet` — enable or disable cellular-backup
+    /// internet.
     ///
-    /// A distinct wire endpoint from `get_backup_network` above (`.../backup/status`, not
-    /// `.../backup`) — the two share no `Route` and are never aliases of one another. Ported
-    /// from `BackupAPI.get_backup_status` (`backup.py:57-78`). Returns the raw
-    /// `{"meta": …, "data": {...}}` envelope.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
-    /// before any request is sent, or whatever other status-mapped error the request produces —
-    /// see `Transport::send`.
-    pub async fn get_backup_status(&self, network_id: &str) -> Result<Envelope, Error> {
-        self.transport
-            .send(
-                &routes::GET_BACKUP_STATUS,
-                &[("network_id", network_id)],
-                None,
-            )
-            .await
-    }
-
-    /// `PUT /2.2/networks/{network_id}/backup` — enable or disable the backup network.
-    ///
-    /// Ported from `BackupAPI.set_backup_network` (`backup.py:80-112`). Sends
-    /// `routes::SET_BACKUP_NETWORK` with body `{"enabled": enabled}` (`backup.py:111`) — the
-    /// exact `networks/{network_id}/backup` resource `get_backup_network` reads.
+    /// Ported from `BackupAPI.set_backup_internet` (`backup.py:66-103`). Sends
+    /// `{"backup_internet_enabled": enabled}` (`backup.py:103`) — note this key, not `enabled`,
+    /// and there is no `phone_number` field on this resource at all (`Deprecations.md:84`).
+    /// `parent` is accepted but never consulted — see [`Self::get_backup_internet`].
     ///
     /// # Errors
     ///
     /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
     /// before any request is sent, or whatever other status-mapped error the request produces —
-    /// see `Transport::send`.
-    pub async fn set_backup_network(
+    /// see `Transport::resource`.
+    pub async fn set_backup_internet(
         &self,
         network_id: &str,
         enabled: bool,
+        parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url =
+            routes::SET_BACKUP_INTERNET.resolve(self.transport.api_host(), network_id, parent)?;
+        warn_uncharacterised_write("set backup internet for network");
         self.transport
-            .send(
-                &routes::SET_BACKUP_NETWORK,
-                &[("network_id", network_id)],
-                Some(json!({ "enabled": enabled })),
+            .request(
+                routes::SET_BACKUP_INTERNET.method.clone(),
+                url,
+                &[],
+                RequestBody::Json(json!({ "backup_internet_enabled": enabled })),
             )
             .await
     }
 
-    /// `PUT /2.2/networks/{network_id}/backup` — configure backup network settings.
+    /// `GET /2.2/networks/{network_id}/cellular_backup_usage` — cellular-backup data usage.
     ///
-    /// Ported from `BackupAPI.configure_backup_network` (`backup.py:114-156`). Sends
-    /// `routes::CONFIGURE_BACKUP_NETWORK` (alias of `routes::SET_BACKUP_NETWORK`, the same
-    /// `networks/{network_id}/backup` resource `set_backup_network` above PUTs) with a body
-    /// built from only the arguments actually supplied: `{"enabled": ...}` is included only when
-    /// `enabled` is `Some` (`backup.py:140-141`), `{"phone_number": ...}` only when
-    /// `phone_number` is `Some` (`backup.py:143-144`). Neither key is ever sent as `null` for an
-    /// omitted argument — the omitted argument's key is absent from the body entirely.
+    /// Ported from `BackupAPI.get_cellular_backup_usage` (`backup.py:105-128`). `parent` is
+    /// accepted but never consulted — see [`Self::get_backup_internet`].
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation` if both `enabled` and `phone_number` are `None`, before any
-    /// request is sent. This is a deliberate divergence from Python, which never contacts the
-    /// server in that case either but instead fabricates a local
-    /// `{"meta": {"code": 400}, "data": {}}` response (`backup.py:146-148`) — a response that
-    /// never actually came from the wire. Inventing a fake envelope here would violate this
-    /// crate's raw-payload contract more than simply refusing before any request is built (port
-    /// plan §3.3). Returns `Error::Authentication("Not authenticated")` if no valid session is
-    /// configured, or whatever other status-mapped error the request produces otherwise — see
-    /// `Transport::send`.
-    pub async fn configure_backup_network(
+    /// See [`Self::get_backup_internet`].
+    pub async fn get_cellular_backup_usage(
         &self,
         network_id: &str,
-        enabled: Option<bool>,
-        phone_number: Option<&str>,
+        parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let mut payload = Map::new();
-        if let Some(enabled) = enabled {
-            payload.insert("enabled".to_owned(), Value::Bool(enabled));
-        }
-        if let Some(phone_number) = phone_number {
-            payload.insert(
-                "phone_number".to_owned(),
-                Value::String(phone_number.to_owned()),
-            );
-        }
-        if payload.is_empty() {
-            return Err(Error::Validation {
-                field: "enabled, phone_number".to_owned(),
-                message: "at least one of `enabled` or `phone_number` must be provided".to_owned(),
-            });
-        }
-
         self.transport
-            .send(
-                &routes::CONFIGURE_BACKUP_NETWORK,
-                &[("network_id", network_id)],
-                Some(Value::Object(payload)),
+            .resource(
+                &routes::GET_CELLULAR_BACKUP_USAGE,
+                network_id,
+                parent,
+                &[],
+                RequestBody::None,
+            )
+            .await
+    }
+
+    /// `GET /2.2/networks/{network_id}/cellular_backup_events` — cellular-backup event log.
+    ///
+    /// Ported from `BackupAPI.get_cellular_backup_events` (`backup.py:130-153`). `parent` is
+    /// accepted but never consulted — see [`Self::get_backup_internet`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::get_backup_internet`].
+    pub async fn get_cellular_backup_events(
+        &self,
+        network_id: &str,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        self.transport
+            .resource(
+                &routes::GET_CELLULAR_BACKUP_EVENTS,
+                network_id,
+                parent,
+                &[],
+                RequestBody::None,
             )
             .await
     }

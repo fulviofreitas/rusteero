@@ -30,6 +30,11 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
+  # The suite is ~85 integration-test binaries per feature set. Full debuginfo made the
+  # two test builds plus the coverage build exhaust ubuntu-latest's disk; line tables keep
+  # panic locations readable at a fraction of the size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   # ============================================================================
@@ -89,6 +94,17 @@ jobs:
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v7
+      # ubuntu-latest ships ~14 GB free; two feature-set test builds plus the coverage build
+      # need more. Drop the preinstalled SDKs this job never uses (the runner image, not the
+      # repository).
+      - name: 🧹 Free runner disk space
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
       - name: 🦀 Setup Rust
         uses: dtolnay/rust-toolchain@stable
       - name: 💾 Cache cargo

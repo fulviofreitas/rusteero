@@ -1,16 +1,10 @@
 //! Support API: `eero-api`'s `SupportAPI`.
 //!
-//! Ported from `eero-api src/eero/api/support.py`: `SupportAPI.get_support` and
+//! Ported from `eero-api src/eero/api/support.py` (v8.0.4): `SupportAPI.get_support` and
 //! `SupportAPI.request_support`.
 //!
-//! Every method here funnels through [`crate::transport::Transport::send`], which already
-//! implements the "not authenticated" precondition Python repeats at the top of each method
-//! (`get_auth_token()` / `EeroAuthenticationException("Not authenticated")`) and every
-//! status-to-error mapping a response can produce — so, unlike the Python source, no method
-//! below duplicates that guard.
-//!
-//! A support request can carry account details; nothing in this module logs a response body
-//! (see the crate's security guidelines).
+//! A support request can carry account details; nothing in this module logs a response body (see
+//! the crate's security guidelines).
 
 use std::sync::Arc;
 
@@ -18,8 +12,9 @@ use serde_json::Value;
 
 use crate::envelope::Envelope;
 use crate::error::Error;
+use crate::links::warn_uncharacterised_write;
 use crate::routes;
-use crate::transport::Transport;
+use crate::transport::{RequestBody, Transport};
 
 /// `eero-api`'s `SupportAPI` (`src/eero/api/support.py`).
 ///
@@ -39,35 +34,62 @@ impl SupportApi {
 
     /// Gets support information for a network — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/support.py:33-54` (`SupportAPI.get_support`). Sends
-    /// `GET` [`crate::routes::GET_SUPPORT`] with `network_id` substituted into the path.
-    pub async fn get_support(&self, network_id: &str) -> Result<Envelope, Error> {
+    /// Ported from `eero-api src/eero/api/support.py:35-60` (`SupportAPI.get_support`). Sends
+    /// `GET` [`crate::routes::support::GET_SUPPORT_V8`], preferring `parent`'s own published
+    /// `support` link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `network_id`/`parent` cannot be resolved to a URL.
+    /// Otherwise, [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces.
+    pub async fn get_support(
+        &self,
+        network_id: &str,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
         self.transport
-            .send(&routes::GET_SUPPORT, &[("network_id", network_id)], None)
+            .resource(
+                &routes::support::GET_SUPPORT_V8,
+                network_id,
+                parent,
+                &[],
+                RequestBody::None,
+            )
             .await
     }
 
     /// Files a support request for a network — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/support.py:56-81` (`SupportAPI.request_support`).
-    /// Sends `POST` [`crate::routes::REQUEST_SUPPORT`] with `request_data` attached as the
-    /// request's JSON body exactly as given. Neither Python nor this port validates or reshapes
-    /// `request_data` in any way; it is a pure passthrough.
+    /// Ported from `eero-api src/eero/api/support.py:65-101` (`SupportAPI.request_support`).
+    /// Sends `POST` [`crate::routes::support::REQUEST_SUPPORT_V8`] with `request_data` attached as
+    /// the request's JSON body exactly as given (Python's one write in this group that keeps JSON
+    /// encoding, `support.py:101`), preferring `parent`'s own published `support` link. Neither
+    /// Python nor this port validates or reshapes `request_data` in any way; it is a pure
+    /// passthrough. Unverified against a live account: logs one `WARNING` via
+    /// [`warn_uncharacterised_write`] before issuing the request (`support.py:99`).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Authentication`] if no valid session is configured, or whatever
-    /// status-mapped [`Error`] the request produces otherwise (see [`Transport::send`]).
+    /// See [`SupportApi::get_support`].
     pub async fn request_support(
         &self,
         network_id: &str,
         request_data: Value,
+        parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::support::REQUEST_SUPPORT_V8.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
+        warn_uncharacterised_write("request support for network");
         self.transport
-            .send(
-                &routes::REQUEST_SUPPORT,
-                &[("network_id", network_id)],
-                Some(request_data),
+            .request(
+                routes::support::REQUEST_SUPPORT_V8.method.clone(),
+                url,
+                &[],
+                RequestBody::Json(request_data),
             )
             .await
     }

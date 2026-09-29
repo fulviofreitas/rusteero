@@ -1,20 +1,16 @@
 //! Transfer API: `eero-api`'s `TransferAPI`, in full — its only method is a `GET`.
 //!
-//! Ported from `eero-api src/eero/api/transfer.py`. There is no phase-5 mutation method for
-//! this module (`TransferAPI` has exactly one method).
-//!
-//! [`TransferApi::get_transfer_stats`] funnels through [`crate::transport::Transport::send`],
-//! which already implements the "not authenticated" precondition Python repeats at the top of
-//! each method (`get_auth_token()` / `EeroAuthenticationException("Not authenticated")`) and
-//! every status-to-error mapping a response can produce — so, unlike the Python source, this
-//! method does not duplicate that guard.
+//! Ported from `eero-api src/eero/api/transfer.py` (v8.0.4). `TransferAPI` has exactly one
+//! method.
 
 use std::sync::Arc;
+
+use serde_json::Value;
 
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::routes;
-use crate::transport::Transport;
+use crate::transport::{RequestBody, Transport};
 
 /// `eero-api`'s `TransferAPI` (`src/eero/api/transfer.py`).
 ///
@@ -35,41 +31,59 @@ impl TransferApi {
     /// Gets transfer statistics for a network, or for a single device on that network — returns
     /// the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/transfer.py:33-62` (`TransferAPI.get_transfer_stats`).
+    /// Ported from `eero-api src/eero/api/transfer.py:36-79` (`TransferAPI.get_transfer_stats`).
     /// Python selects the request path at call time based on whether `device_id` was supplied;
-    /// this method does the same by selecting between two distinct `Route` constants rather than
-    /// templating one path over the other:
+    /// this method does the same by selecting between a [`crate::routes::Resource`] and a
+    /// [`crate::routes::Nested`] route:
     ///
-    /// - `device_id.is_none()`: sends `GET` [`crate::routes::GET_TRANSFER_STATS`]
-    ///   (`networks/{network_id}/transfer`).
-    /// - `device_id.is_some()`: sends `GET` [`crate::routes::GET_DEVICE_TRANSFER_STATS`]
-    ///   (`networks/{network_id}/devices/{device_id}/transfer`).
+    /// - `device_id.is_none()`: sends `GET` [`crate::routes::transfer::GET_TRANSFER_STATS_V8`]
+    ///   (`networks/{id}/transfer`), preferring `parent`'s own published `transfer` link.
+    /// - `device_id.is_some()`: sends `GET`
+    ///   [`crate::routes::transfer::GET_DEVICE_TRANSFER_STATS_V8`]
+    ///   (`networks/{network}/devices/{device}/transfer`), a **literal** path — `parent` is
+    ///   ignored on this branch, exactly like Python (`transfer.py:75`, no `parent=` argument at
+    ///   all on the `device_id` branch). `resolve_nested_url`'s anti-double-format guard
+    ///   ([`crate::params::resolve_nested_url`]/`_require_nested_family`) protects a `device_id`
+    ///   containing a stray `{`/`}` from corrupting the rendered template — the exact regression
+    ///   `test_get_transfer_stats_device_id_with_brace_does_not_break_template` pins.
     ///
-    /// Divergence from `eero-api`: Python's `if device_id:` also falls back to the network-level
-    /// path for an *empty* `device_id` string, not just `None`. This method takes `Some("")` as a
-    /// (degenerate) device id and renders the device-level path — real Eero device ids are never
-    /// empty, so this is a documented edge case, not a behavioural change for any real caller.
+    /// Matches Python's `if device_id:` exactly (`transfer.py:71`): a truthy check, not an
+    /// `is None` check. `Some("")` is therefore treated identically to `None` — the network-level
+    /// path is used, `parent` is honoured, and the (never actually reachable) device-level branch
+    /// is not taken for an empty device id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `network_id`/`device_id`/`parent` cannot be resolved to a
+    /// URL. Otherwise, [`Error::Authentication`] if no valid session is configured, or whatever
+    /// status-mapped [`Error`] the request produces.
     pub async fn get_transfer_stats(
         &self,
         network_id: &str,
         device_id: Option<&str>,
+        parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        match device_id {
+        match device_id.filter(|id| !id.is_empty()) {
             Some(device_id) => {
                 self.transport
-                    .send(
-                        &routes::GET_DEVICE_TRANSFER_STATS,
-                        &[("network_id", network_id), ("device_id", device_id)],
+                    .nested(
+                        &routes::transfer::GET_DEVICE_TRANSFER_STATS_V8,
+                        network_id,
+                        device_id,
                         None,
+                        &[],
+                        RequestBody::None,
                     )
                     .await
             }
             None => {
                 self.transport
-                    .send(
-                        &routes::GET_TRANSFER_STATS,
-                        &[("network_id", network_id)],
-                        None,
+                    .resource(
+                        &routes::transfer::GET_TRANSFER_STATS_V8,
+                        network_id,
+                        parent,
+                        &[],
+                        RequestBody::None,
                     )
                     .await
             }

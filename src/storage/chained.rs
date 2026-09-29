@@ -189,6 +189,18 @@ impl CredentialStore for ChainedStore {
     /// caller like `logout`/`refresh`) had already superseded it in `fallback`. The chain must
     /// never serve a credential a later write superseded.
     ///
+    /// # Security fix (phase-security-review, finding 6)
+    ///
+    /// After a *successful* `primary.save()`, this also best-effort clears `fallback` — the
+    /// mirror image of the S2 fix above. Without this, a fallback copy left behind by an earlier
+    /// failed `primary.save()` (or simply primed directly, e.g. by a test, or by a prior process
+    /// that only ever reached `fallback`) would keep sitting on disk/in the keyring indefinitely
+    /// after a later, successful `primary` write superseded it — decision D-5 documents
+    /// `ChainedStore` as the shipped configuration's only durable store, so a stray fallback copy
+    /// is a stale, fully-valid plaintext (or keyring) credential with no way for a caller to know
+    /// it is still there. This clear is best-effort and its own failure is discarded (logged at
+    /// `DEBUG`) — it must never turn an otherwise-successful save into a reported failure.
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError`] only if **both** `primary` and `fallback` fail to save;
@@ -197,7 +209,16 @@ impl CredentialStore for ChainedStore {
     /// but fallback succeeded" error to report — the session did end up durably stored).
     fn save(&self, session: &Session) -> Result<(), StorageError> {
         match self.primary.save(session) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Err(err) = self.fallback.clear() {
+                    tracing::debug!(
+                        error = %err,
+                        "chained store: best-effort fallback clear after a successful primary \
+                         save failed; a superseded credential may still be at rest in fallback"
+                    );
+                }
+                Ok(())
+            }
             Err(primary_err) => {
                 // Best-effort: invalidate whatever `primary` was still holding so a later
                 // `load()` (which unconditionally prefers `primary`) can never resurrect a
@@ -345,6 +366,29 @@ mod tests {
         }
     }
 
+    /// A [`CredentialStore`] test double that delegates `load`/`save` to a real [`MemoryStore`]
+    /// but always fails to `clear` — isolates finding 6's own best-effort discipline (a failed
+    /// fallback `clear()` after a successful primary `save()` must never fail the save itself)
+    /// from [`AlwaysFailsStore`], which has no internal state of its own to observe surviving.
+    #[derive(Debug)]
+    struct ClearFailsDelegatingStore {
+        inner: Arc<MemoryStore>,
+    }
+
+    impl CredentialStore for ClearFailsDelegatingStore {
+        fn load(&self) -> Result<Session, StorageError> {
+            self.inner.load()
+        }
+
+        fn save(&self, session: &Session) -> Result<(), StorageError> {
+            self.inner.save(session)
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            Err(AlwaysFailsStore::error())
+        }
+    }
+
     fn store(session: Option<&str>) -> Arc<MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         if let Some(token) = session {
@@ -451,7 +495,53 @@ mod tests {
         );
         assert!(
             !fallback.load().expect("load never fails").is_valid(),
-            "fallback must not be touched when primary succeeds"
+            "fallback stays empty when primary succeeds and fallback started empty"
+        );
+    }
+
+    // ===================== save: finding 6 =====================
+
+    #[test]
+    fn save_clears_a_previously_primed_fallback_once_primary_succeeds() {
+        let primary = store(None);
+        let fallback = store(Some("stale-fallback-token"));
+
+        let chained = ChainedStore::new(Arc::clone(&primary) as _, Arc::clone(&fallback) as _);
+        chained
+            .save(&Session::from_token("new-token"))
+            .expect("primary save succeeds");
+
+        assert_eq!(
+            primary.load().expect("load never fails").expose_token(),
+            "new-token",
+            "primary must hold the newly saved session"
+        );
+        assert!(
+            !fallback.load().expect("load never fails").is_valid(),
+            "a superseded fallback copy must be cleared once primary succeeds (finding 6)"
+        );
+    }
+
+    #[test]
+    fn save_still_succeeds_when_the_fallback_clear_itself_fails() {
+        let inner_fallback = Arc::new(MemoryStore::new());
+        inner_fallback
+            .save(&Session::from_token("stale-fallback-token"))
+            .expect("seed save never fails");
+
+        let primary = store(None);
+        let fallback: Arc<dyn CredentialStore> = Arc::new(ClearFailsDelegatingStore {
+            inner: Arc::clone(&inner_fallback),
+        });
+
+        let chained = ChainedStore::new(Arc::clone(&primary) as _, fallback);
+        chained
+            .save(&Session::from_token("new-token"))
+            .expect("a failed best-effort fallback clear must never fail the save itself");
+
+        assert_eq!(
+            primary.load().expect("load never fails").expose_token(),
+            "new-token"
         );
     }
 

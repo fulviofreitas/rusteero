@@ -42,6 +42,40 @@ use std::sync::Arc;
 
 use crate::auth::Session;
 
+/// Best-effort re-save-and-read-back migration for a legacy (pre-`schema_version`) record a
+/// backend's `load()` just parsed.
+///
+/// Ported from `_log_migration_readback` (`auth_storage.py:71-92`): a backend with a load path
+/// (`FileStore`, `KeyringStore`) that discovers it just parsed a legacy record re-persists the
+/// migrated (current-schema) shape and reads it back, logging `debug!` on a match or `warn!` on a
+/// mismatch — but **never fails the read**: `session` (the in-memory value already parsed) is
+/// always what the caller gets back, regardless of whether the migration write or its read-back
+/// succeeded. Neither log line ever includes the credential value itself.
+pub(crate) fn migrate_and_verify<S: CredentialStore + ?Sized>(
+    store: &S,
+    session: &Session,
+    backend: &str,
+) {
+    if store.save(session).is_err() {
+        tracing::warn!(
+            "Migration read-back did not match for {backend} storage; in-memory credentials \
+             are still returned to the caller"
+        );
+        return;
+    }
+    match store.load() {
+        Ok(reloaded) if reloaded.expose_token() == session.expose_token() => {
+            tracing::debug!("Migration read-back verified for {backend} storage");
+        }
+        _ => {
+            tracing::warn!(
+                "Migration read-back did not match for {backend} storage; in-memory credentials \
+                 are still returned to the caller"
+            );
+        }
+    }
+}
+
 /// A pluggable backend for persisting a [`Session`] across process restarts.
 ///
 /// Mirrors the `CredentialStorage` abstract base class (`auth_storage.py:94-118`), which
@@ -160,6 +194,13 @@ pub(crate) async fn load_async(store: Arc<dyn CredentialStore>) -> Result<Sessio
 /// # Errors
 ///
 /// See [`load_async`].
+// No call site within this crate's own library code as of this phase: `Transport::set_session`
+// persists synchronously from within a caller-provided blocking context (`AuthApi::clear_local_
+// and_store`'s own `spawn_blocking`), and `Transport::refresh_session` no longer needs a separate
+// async persistence step at all (a successful refresh never rotates the token). Kept `pub(crate)`
+// and exercised directly by this module's own tests, since a future async call site (a domain
+// module wanting to persist without blocking its own task) is a reasonable addition later.
+#[allow(dead_code)]
 pub(crate) async fn save_async(
     store: Arc<dyn CredentialStore>,
     session: Session,

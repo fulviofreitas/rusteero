@@ -1,0 +1,17 @@
+{
+  "meta": { "code": 200 },
+  "data": {
+    "dns": {
+      "mode": "custom",
+      "custom": { "ips": ["1.1.1.1", "1.0.0.1"] },
+      "parent": { "ips": ["192.168.1.254"] },
+      "caching": false
+    },
+    "ipv6": {
+      "name_servers": {
+        "mode": "custom",
+        "custom": ["2606:4700:4700:0:0:0:0:1111"]
+      }
+    }
+  }
+}
