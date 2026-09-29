@@ -260,11 +260,15 @@ mod tests {
     // behind on a host that does have a genuinely working backend — see its own test's doc
     // comment for how.
 
+    // Every test below uses its OWN account name. Unit tests run on parallel threads, and on
+    // macOS / Windows CI runners the backend is real: a `save` test writing to an entry another
+    // test is concurrently `load`ing made `load_never_panics_and_never_fabricates_a_valid_session`
+    // observe a live token (CI run 36505627414). Distinct accounts remove the shared state.
     #[test]
     fn load_never_panics_and_never_fabricates_a_valid_session() {
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
-            "rusteero-test-account-no-backend",
+            "rusteero-test-account-no-backend-load_never_panics_and_never_fabricates_a_valid_session",
         );
         match store.load() {
             // Reachable on macOS/Windows CI runners (infallible native backend, never-used
@@ -287,7 +291,7 @@ mod tests {
     fn load_without_a_dbus_session_bus_fails_cleanly_with_no_credential_in_the_message() {
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
-            "rusteero-test-account-no-backend",
+            "rusteero-test-account-no-backend-load_without_a_dbus_session_bus_fails_cleanly_with_no_credential_in_the_message",
         );
         match store.load() {
             Err(StorageError::Backend { backend, message }) => {
@@ -317,7 +321,7 @@ mod tests {
     fn save_never_leaves_a_credential_behind_on_any_platform() {
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
-            "rusteero-test-account-no-backend",
+            "rusteero-test-account-no-backend-save_never_leaves_a_credential_behind_on_any_platform",
         );
         // Constructed before the save so it is armed regardless of which branch below runs,
         // and so an assertion failure inside this test still triggers the cleanup.
@@ -346,7 +350,7 @@ mod tests {
     fn save_without_a_dbus_session_bus_fails_cleanly_with_no_credential_in_the_message() {
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
-            "rusteero-test-account-no-backend",
+            "rusteero-test-account-no-backend-save_without_a_dbus_session_bus_fails_cleanly_with_no_credential_in_the_message",
         );
         let session = Session::from_token("should-never-appear-in-any-error-message");
         match store.save(&session) {
@@ -370,7 +374,7 @@ mod tests {
         // on macOS/Windows CI runners, where the entry genuinely does not exist yet.
         let store = KeyringStore::with_entry(
             "rusteero-test-service-no-backend",
-            "rusteero-test-account-no-backend",
+            "rusteero-test-account-no-backend-clear_without_a_working_backend_fails_cleanly_or_is_a_no_op",
         );
         match store.clear() {
             Ok(()) => {}
