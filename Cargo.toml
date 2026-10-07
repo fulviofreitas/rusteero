@@ -11,8 +11,7 @@ documentation = "https://docs.rs/rusteero"
 readme = "README.md"
 keywords = ["eero", "mesh", "wifi", "router", "api-client"]
 categories = ["api-bindings", "network-programming"]
-# Not published yet — decision D-15: no publish of any kind until live validation.
-publish = false
+publish = true
 exclude = ["/.github", "/wiki", "/PARITY.md", "/CHANGELOG.md", "/commitlint.config.js", "/.releaserc.json"]
 
 [features]
