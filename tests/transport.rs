@@ -367,7 +367,7 @@ async fn redirect_with_no_location_header_is_refused_with_the_fixed_message() ->
     Ok(())
 }
 
-/// Security finding 1: `TransportBuilder::http_builder` (the escape hatch that replaces the
+/// `TransportBuilder::http_builder` (the escape hatch that replaces the
 /// removed `TransportBuilder::http`) must force `Policy::none()` onto the resulting
 /// `reqwest::Client` even when the caller-supplied `reqwest::ClientBuilder` explicitly set a
 /// *permissive* redirect policy of its own (`Policy::limited(10)`, not merely the default) —

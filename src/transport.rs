@@ -10,7 +10,7 @@
 //! # The v8.0.4 request API
 //!
 //! [`Transport::request`]/[`Transport::resource`]/[`Transport::nested`] are the request-building
-//! entry points; see `.claude/tasks/briefs/v8/transport-api.md` for a worked example of each.
+//! entry points.
 //! Every endpoint module builds on `resource`/`nested` (or, for the login handshake and session
 //! refresh, `request`/`request_with_token` directly against a fixed-path [`Resource`]).
 //!
@@ -21,7 +21,7 @@
 //! comparisons with no `.await` inside — an async lock would only add executor overhead for no
 //! benefit here. No lock guard is ever held across an `.await` point anywhere in this module.
 //!
-//! # The refresh-retry divergence (task brief gotcha G1)
+//! # The refresh-retry divergence
 //!
 //! `eero-api`'s 401-triggered refresh retry re-sends the retried request with the *original,
 //! pre-refresh* token (`api/base.py:625-658`), which matters little at `v8.0.4` since a
@@ -103,7 +103,7 @@ pub struct Transport {
     refresh_slot: tokio::sync::Mutex<Weak<watch::Sender<Option<bool>>>>,
 }
 
-/// How a [`Transport`] treats a failed write to its configured credential store (decision D-13).
+/// How a [`Transport`] treats a failed write to its configured credential store.
 ///
 /// Set via [`TransportBuilder::storage_failures`]; honoured at every credential-store call site
 /// in this module ([`Transport::set_session`], and the credential-clearing branch of
@@ -660,7 +660,7 @@ impl Transport {
             "eero transport request"
         );
 
-        // Security finding F4 (superseded): `TransportBuilder::build` now forces
+        // Security (superseded): `TransportBuilder::build` now forces
         // `Policy::none()` onto every `reqwest::Client` it constructs — including one built from
         // a caller-supplied `reqwest::ClientBuilder` via `TransportBuilder::http_builder` — so a
         // `3xx` response can no longer be followed *inside* `request.send()` above in the first
@@ -677,7 +677,7 @@ impl Transport {
         }
 
         if status.is_redirection() {
-            // Security finding F5: the message must never carry the full request URL (which can
+            // Security: the message must never carry the full request URL (which can
             // embed a session token in its query string) or the full `Location` value (which can
             // carry an attacker-chosen query string of its own) — only the status, the request
             // *path*, and, when present, the `Location` header's *host* are safe to render here.
@@ -953,7 +953,7 @@ impl TransportBuilder {
     /// Supplies a `reqwest::ClientBuilder` to customize the underlying HTTP client, instead of
     /// letting `build` construct one from scratch with this crate's defaults.
     ///
-    /// # Security (finding F4)
+    /// # Security
     ///
     /// Regardless of what redirect policy `builder` carries — or omits — `build` calls
     /// `.redirect(reqwest::redirect::Policy::none())` on it **last**, immediately before
@@ -969,8 +969,9 @@ impl TransportBuilder {
     /// are **ignored** — `builder` is used exactly as given, aside from the forced redirect
     /// policy above. Configure timeouts on `builder` itself, or leave both unset entirely (e.g.
     /// `reqwest::ClientBuilder::new()` with nothing else called) for a test that pairs
-    /// `tokio::time::pause()` with a real HTTP round trip — see `.claude/rules/testing.md`'s
-    /// gotcha for why the crate's own timeouts and a paused clock do not mix.
+    /// `tokio::time::pause()` with a real HTTP round trip: the crate's own timeouts and a paused
+    /// clock do not mix, since paused time auto-advances to the next pending timer whenever the
+    /// runtime is momentarily idle, which happens mid-request.
     #[must_use]
     pub fn http_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
         self.http_builder = Some(builder);
@@ -987,8 +988,8 @@ impl TransportBuilder {
     }
 
     /// Sets the `User-Agent` header sent on every request. `None` (the default) sends
-    /// [`consts::DEFAULT_USER_AGENT`] — decision D-7 is superseded at `v8.0.4`, where this header
-    /// is genuinely sent.
+    /// [`consts::DEFAULT_USER_AGENT`], which is genuinely sent by the Python library at `v8.0.4`
+    /// too.
     #[must_use]
     pub fn user_agent(mut self, user_agent: Option<String>) -> Self {
         self.user_agent = user_agent;
@@ -1039,7 +1040,7 @@ impl TransportBuilder {
         self
     }
 
-    /// Sets this transport's policy for a failed credential-store operation (decision D-13).
+    /// Sets this transport's policy for a failed credential-store operation.
     #[must_use]
     pub fn storage_failures(mut self, storage_failures: StorageFailures) -> Self {
         self.storage_failures = storage_failures;
@@ -1071,7 +1072,7 @@ impl TransportBuilder {
     /// outside the printable-ASCII range (or a CR/LF). Returns `Error::Network` if constructing
     /// the underlying `reqwest::Client` fails.
     ///
-    /// # Security (finding F4)
+    /// # Security
     ///
     /// `.redirect(reqwest::redirect::Policy::none())` is applied last, immediately before
     /// `.build()`, regardless of whether the client comes from this crate's own defaults or from

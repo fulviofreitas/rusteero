@@ -1,7 +1,7 @@
 //! Data Usage API: `eero-api`'s `DataUsageAPI`.
 //!
-//! Ported from `eero-api src/eero/api/data_usage.py` at `v8.0.4`
-//! (`.claude/tasks/briefs/v8/g3-devices.md`). The whole module was rewritten in `05a2b07`
+//! Ported from `eero-api src/eero/api/data_usage.py` at `v8.0.4`.
+//! The whole module was rewritten in `05a2b07`
 //! (v8.0.0): the pre-8.0.0 shape this crate previously shipped — one `get_data_usage(payload:
 //! Value, resource: Option<&str>)` method that attached an arbitrary JSON body to a `GET`
 //! request — is gone entirely, replaced by eleven distinct, **query-params-only** methods, one
@@ -444,8 +444,7 @@ impl DataUsageApi {
     /// Validates `child` (a bare id) **before** `cadence` — mirroring Python's own evaluation
     /// order at every one of this method's three call sites (`data_usage.py:317,405,450`), where
     /// `_validate_child_id(...)` is embedded directly in the f-string argument expression handed
-    /// to `_get_usage`, so it raises before `_get_usage`'s own `cadence` check ever runs
-    /// (phase-G fix list item 15).
+    /// to `_get_usage`, so it raises before `_get_usage`'s own `cadence` check ever runs.
     async fn get_child_usage(
         &self,
         route: &Resource,

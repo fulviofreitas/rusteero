@@ -16,8 +16,7 @@
 //! ([`SecurityApi::set_mlo_mode`]) carry the "-- may reboot every eero, like the confirmed DNS
 //! write path" suffix; writes to a narrower dedicated sub-resource
 //! ([`SecurityApi::set_fast_transition`], [`SecurityApi::set_passpoint_enabled`],
-//! [`SecurityApi::set_proxied_nodes`]) carry a shorter warning with no reboot claim (g5 brief §3
-//! note 4).
+//! [`SecurityApi::set_proxied_nodes`]) carry a shorter warning with no reboot claim.
 
 use std::sync::Arc;
 
@@ -198,7 +197,7 @@ impl SecurityApi {
     /// — a response that never actually came from the wire. `SecurityApi::configure_security`
     /// diverged from that shape before v8.0.4 already (raising rather than fabricating),
     /// consistent with [`DnsApi::set_dns_mode`](crate::endpoints::dns::DnsApi::set_dns_mode)'s own
-    /// documented divergence; this port keeps it (g5 brief §3 note 7, §6 open question 3).
+    /// documented divergence; this port keeps it.
     /// Otherwise see [`SecurityApi::get_security_settings`].
     #[allow(clippy::too_many_arguments)]
     pub async fn configure_security(

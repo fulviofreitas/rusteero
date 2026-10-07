@@ -227,7 +227,7 @@ async fn update_device_via_link_invalidates_every_cached_profile_only_when_profi
 }
 
 /// `Client::update_device_via_link` calling `self.cache.invalidate_bucket(Bucket::Profiles,
-/// ..)` (`client.py:832-867`'s `profile is not None` branch, §2.6 of `client.md`) drops **every**
+/// ..)` (`client.py:832-867`'s `profile is not None` branch) drops **every**
 /// cached profile entry for the network — not just the `profiles` list bucket a plain
 /// `invalidate_profile_cache` would leave alone. A single-profile entry cached via `get_profile`
 /// beforehand must be gone afterward too.

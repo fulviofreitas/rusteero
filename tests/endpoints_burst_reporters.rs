@@ -3,7 +3,7 @@
 //! conventions.
 //!
 //! `get_burst_reporters` was removed upstream in v8.0.0 (the endpoint 404s; the resource is
-//! POST-only) and has no test here — see `.claude/tasks/briefs/v8/g7-backup-members.md` §2.
+//! POST-only) and has no test here.
 //!
 //! `BurstReportersApi` has no committed fixture file, so every response body here is a small,
 //! obviously-synthetic value built inline with `serde_json::json!`, in the shape `eero-api`'s

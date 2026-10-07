@@ -2,8 +2,8 @@
 //!
 //! Ported from `eero-api src/eero/api/backup.py` (v8.0.4). `get_backup_network`/
 //! `get_backup_status`/`set_backup_network`/`configure_backup_network` (the pre-v8.0.0 shape
-//! this file used to port) were removed upstream and are **not** reproduced here — see
-//! `.claude/tasks/briefs/v8/g7-backup-members.md` §2 for the removal and its replacement.
+//! this file used to port) were removed upstream and are **not** reproduced here — replaced by
+//! the `backup_access_points` module.
 //!
 //! Every method here funnels through `Transport::resource`, which already implements the "not
 //! authenticated" precondition Python repeats at the top of each method (`get_auth_token()` /

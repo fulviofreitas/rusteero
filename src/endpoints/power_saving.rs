@@ -21,8 +21,8 @@ use crate::transport::{RequestBody, Transport};
 
 /// Every optional keyword argument [`PowerSavingApi::update_schedule`] accepts.
 ///
-/// More than four optional keyword arguments, per this port's conventions
-/// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2). Ported from `PowerSavingAPI.update_schedule`'s
+/// More than four optional keyword arguments, per this crate's convention of grouping them into
+/// one options struct. Ported from `PowerSavingAPI.update_schedule`'s
 /// own five independent keyword-only fields (`power_saving.py:181-191`).
 #[derive(Debug, Default, Clone)]
 pub struct UpdatePowerSavingScheduleOptions<'a> {

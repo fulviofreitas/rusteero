@@ -34,7 +34,7 @@ impl Client {
     ///
     /// Ported from `run_diagnostics()` (`eero-api src/eero/client.py:1253-1273`). `auto_discover
     /// = false` — see [`Client::get_diagnostics`]. Invalidates nothing: `diagnostics` has no
-    /// cache bucket at all (behaviour brief §2.1). Passes the cached network envelope (if any) as
+    /// cache bucket at all. Passes the cached network envelope (if any) as
     /// `parent=`. `device`/`symptom` are new since v8.0.0 — omitted keys are never sent, matching
     /// [`crate::endpoints::DiagnosticsApi::run_diagnostics`]. **Unverified body shape against a
     /// live network.**

@@ -296,7 +296,7 @@ async fn get_device_usage_id_with_brace_does_not_break_template() -> anyhow::Res
 
 /// Ported from `data_usage.py:317`: `_validate_child_id(device_mac)` is embedded in the
 /// f-string argument passed to `_get_usage`, so it is evaluated -- and can raise -- before
-/// `_get_usage`'s own `cadence` check ever runs (phase-G fix list item 15). An invalid child id
+/// `_get_usage`'s own `cadence` check ever runs. An invalid child id
 /// alongside an invalid cadence must surface the `id` error, not the `cadence` one.
 #[tokio::test]
 async fn get_device_usage_validates_child_id_before_cadence() -> anyhow::Result<()> {

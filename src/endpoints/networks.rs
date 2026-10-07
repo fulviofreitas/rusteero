@@ -9,7 +9,7 @@
 //! `Client.get_account` (`eero-api src/eero/client.py:392-406`) is also ported here rather than
 //! on `Client`: `client.py:403-404` calls `self._api.auth.get("/account", ...)` directly — the
 //! same bare, uncached network call as every other method in this file — and `rusteero::Client`
-//! gives its own cache layer on top (port plan §1.6), so the raw call belongs next to
+//! gives its own cache layer on top, so the raw call belongs next to
 //! `networks`/`account`'s other raw `GET`s, not duplicated there. Unchanged at v8.0.4.
 //!
 //! Every method here funnels through [`crate::transport::Transport::request`]/`resource`, which

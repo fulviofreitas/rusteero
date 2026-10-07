@@ -22,7 +22,8 @@
 //! | — (added) | [`Error::Storage`], [`Error::Json`] |
 //!
 //! `AccessDenied`/`ClientBlocked`/`NotFound` are separate variants rather than folded into
-//! [`Error::Api`] (decision D-8): their Python counterparts are `EeroAPIException` *subclasses*
+//! [`Error::Api`], kept as separate variants to mirror the Python class hierarchy: their Python
+//! counterparts are `EeroAPIException` *subclasses*
 //! purely for `isinstance` ergonomics, but keeping the distinct shapes here means a caller can
 //! match on the specific failure without inspecting `error_code` strings.
 
@@ -901,7 +902,7 @@ mod tests {
         assert!(matches!(err, Error::Json(_)));
     }
 
-    // ===================== Debug redaction (security finding 4) =====================
+    // ===================== Debug redaction =====================
 
     #[test]
     fn api_debug_never_prints_the_envelope_password_or_the_url_query() {

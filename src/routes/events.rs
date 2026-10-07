@@ -3,8 +3,7 @@
 //! Ported from `eero-api src/eero/api/events.py` (v8.0.4). All three routes below resolve
 //! against the *network's own* URL (`_params.resolve_network_url`, which prefers a parent
 //! envelope's `url` field — `self_url` — over the bare-id template) with a literal suffix
-//! appended, **not** a named `resources` link
-//! (`.claude/tasks/briefs/v8/g7-backup-members.md`, "Helper primitives" section). [`Resource::link`]
+//! appended, **not** a named `resources` link. [`Resource::link`]
 //! is therefore `None` on every constant here: [`crate::endpoints::events::EventsApi`] does not
 //! call [`Resource::resolve`] for these three routes at all — it resolves the network part with
 //! [`crate::params::resolve_network_url`] (self-url preferring) and appends the suffix captured

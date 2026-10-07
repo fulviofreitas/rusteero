@@ -23,12 +23,12 @@ async fn client(mock: &MockEero) -> Client {
 
 #[tokio::test]
 async fn dns_setter_invalidates_the_network_bucket() -> anyhow::Result<()> {
-    // NOT a Rust-only divergence (correcting a stale comment here, phase-G fix list item 29):
+    // NOT a Rust-only divergence (correcting a stale comment here):
     // at v8.0.4, every one of Python's DNS/SQM/security setters calls
     // `self._invalidate_network_cache(network_id)` itself (`client.py:2094-2264` and friends) —
-    // `rust-port-plan.md` §3.8 "improvement (a)" describes a gap against an *older* Python
-    // baseline that v8.0.4 already closed on its own side. This test still pins the behaviour;
-    // it is simply parity with `client.py`, not a Rust-only fix.
+    // this crate once documented an "improvement" here describing a gap against an *older*
+    // Python baseline that v8.0.4 already closed on its own side. This test still pins the
+    // behaviour; it is simply parity with `client.py`, not a Rust-only fix.
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
@@ -148,7 +148,7 @@ async fn mount_dns_setter_invalidation_mocks(mock: &MockEero) -> anyhow::Result<
 }
 
 /// Every DNS setter invalidates `network[{nid}]`, matching `client.py`'s own
-/// `_invalidate_network_cache` call on each (`client.py:2094-2264`; phase-G fix list item 29).
+/// `_invalidate_network_cache` call on each (`client.py:2094-2264`).
 #[tokio::test]
 async fn set_custom_dns_invalidates_the_network_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;

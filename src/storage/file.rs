@@ -1,10 +1,8 @@
 //! Filesystem credential store.
 //!
-//! Ported from `FileStorage` (`eero-api`'s `src/eero/api/auth_storage.py:169-237`). See
-//! the const behaviour notes §5 for the full behaviour brief this module
-//! implements, and `security-review.md`'s rule for this repo for the one deliberate improvement
-//! over the Python original (atomic, mode-on-create file permissions instead of a
-//! write-then-`chmod` sequence).
+//! Ported from `FileStorage` (`eero-api`'s `src/eero/api/auth_storage.py:169-237`), with one
+//! deliberate improvement over the Python original (atomic, mode-on-create file permissions
+//! instead of a write-then-`chmod` sequence).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -21,7 +19,7 @@ use super::CredentialStore;
 /// Mirrors `FileStorage` (`auth_storage.py:169-237`): the file holds exactly the JSON object
 /// `Session::to_json`/[`Session::from_json`] produce/consume (`session_id`, `schema_version`,
 /// plus the legacy `user_token` read alias) — the same shape a Python `eero-api` install reads
-/// and writes at `v8.0.4`, per decision D-5. There is deliberately no default
+/// and writes at `v8.0.4`, shared by design. There is deliberately no default
 /// path: like `FileStorage.__init__`, which always requires an explicit `file_path`, choosing
 /// *where* the file lives is left entirely to the caller (in `eero-api`'s ecosystem, that
 /// choice belongs to the CLI layer, not this library).
@@ -56,7 +54,7 @@ use super::CredentialStore;
 /// verified by `save_replaces_a_symlink_at_the_destination_rather_than_following_it` below rather
 /// than merely asserted in this comment.
 ///
-/// # Security: no orphaned plaintext credential (phase-2 storage review, finding S3)
+/// # Security: no orphaned plaintext credential
 ///
 /// The temporary file above is given a name that is unique for the lifetime of this process
 /// (see `unique_temp_path`), and every error path in the create/write/sync/rename sequence
@@ -73,9 +71,9 @@ impl FileStore {
     /// Creates a store backed by `path`, which need not exist yet.
     ///
     /// Unlike `FileStorage.__init__` (`auth_storage.py:172-178`), which eagerly expands `~` and
-    /// absolutizes the path at construction time, `path` is stored exactly as given — this port
-    /// has no path-expansion dependency available (decision: no new dependencies, per the phase
-    /// brief) and resolving `~`/relative paths is left to the caller, consistent with there
+    /// absolutizes the path at construction time, `path` is stored exactly as given — this crate
+    /// deliberately takes no new dependency for path expansion, and resolving `~`/relative paths
+    /// is left to the caller, consistent with there
     /// being no default path anywhere in this crate.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -99,7 +97,7 @@ impl CredentialStore for FileStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Session::empty()),
             Err(err) => Err(StorageError::Io(err)),
             Ok(contents) => {
-                // Security fix (phase-security-review, finding 8): a credential file with any
+                // Security fix: a credential file with any
                 // group/other permission bit set (e.g. one this crate did not itself create —
                 // hand-placed, copied in from a backup, or written by an older/foreign tool) is
                 // readable by more than its owner. Never fails the read — this is a diagnostic,
@@ -119,7 +117,7 @@ impl CredentialStore for FileStore {
         // Mirrors `os.makedirs(cookie_dir, exist_ok=True)` (`auth_storage.py:215-217`); an empty
         // parent (a bare file name with no directory component) has nothing to create.
         //
-        // Security fix (phase-security-review, finding 8): every directory this call creates is
+        // Security fix: every directory this call creates is
         // created with owner-only (`0700`) permissions from the moment it is created, on Unix —
         // matching the atomic 0600-on-create discipline `create_private_file` already applies to
         // the file itself, rather than relying on the process umask (which a caller could have
@@ -143,7 +141,7 @@ impl CredentialStore for FileStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(StorageError::Io(err)),
         };
-        // Security fix (phase-2 storage review, finding S3(a)): also remove any temporary file
+        // Security fix: also remove any temporary file
         // `write_private_atomically` may have left behind after a crash between creating it and
         // renaming it into place — otherwise a full plaintext credential can survive at a
         // predictable path even after `clear()` reports success. Best-effort: a missing (or
@@ -160,7 +158,7 @@ impl CredentialStore for FileStore {
 /// [`fs::rename`] is guaranteed to be on the same filesystem and therefore atomic), then renames
 /// it over `path`.
 ///
-/// # Security (phase-2 storage review, finding S3(b))
+/// # Security
 ///
 /// If any step of the create/write/sync/rename sequence fails, the temporary file is removed
 /// before the error is returned (see [`write_to_temp_and_rename`]) — no error path here can
@@ -208,7 +206,7 @@ fn temp_file_prefix(path: &Path) -> String {
 /// stages content in, by mixing the current process id and a monotonically increasing
 /// in-process counter into `path`'s file name, ahead of a fixed `.tmp` suffix.
 ///
-/// # Security (phase-2 storage review, finding S3(c))
+/// # Security
 ///
 /// The previous implementation used a single fixed `<name>.tmp` sibling for every save, cleaned
 /// up with an unconditional `fs::remove_file` at the start of each write. Two processes (or two
@@ -288,7 +286,7 @@ fn create_private_file(path: &Path) -> std::io::Result<File> {
 
 /// Creates `parent` and every missing ancestor directory with owner-only (`0700`) permissions,
 /// set at creation time rather than via a separate `chmod` afterwards — the same atomic-mode
-/// discipline [`create_private_file`] applies to the credential file itself (security finding 8).
+/// discipline [`create_private_file`] applies to the credential file itself.
 ///
 /// [`std::fs::DirBuilder::mode`] applies to every directory this call actually creates, not just
 /// the deepest one; an already-existing ancestor is left with whatever permissions it already
@@ -324,7 +322,7 @@ fn has_loose_permissions(path: &Path) -> bool {
 /// Logs a fixed `WARN` (never fails, never blocks the read) if [`has_loose_permissions`] reports
 /// `path` is readable/writable by group or other — e.g. a credential file this crate did not
 /// itself create, copied in from elsewhere, or left over from an older non-atomic
-/// implementation. Security finding 8: this crate's own [`create_private_file`]/
+/// implementation. This crate's own [`create_private_file`]/
 /// [`create_private_dir_all`] never produce such a file, but nothing prevents one from appearing
 /// at `path` by some other means, and a loosely-permissioned plaintext credential file should
 /// never go unnoticed merely because it still parses.
@@ -372,7 +370,7 @@ mod tests {
         // The exact on-disk shape `FileStorage.save()` writes at v8.0.4 (`auth_storage.py:50-56`):
         // key order `session_id`, `schema_version`, with Python's default `json.dump` separators
         // (a space after `:`/`,`). This differs byte-for-byte from this port's compact
-        // `serde_json` output, but both are valid JSON over the same D-5 wire contract, so a file
+        // `serde_json` output, but both are valid JSON over the same shared wire contract, so a file
         // a Python install wrote must still load cleanly here.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cookies.json");
@@ -531,7 +529,7 @@ mod tests {
         assert!(path.exists());
     }
 
-    // ===================== Parent directory / loose-permission warning (finding 8) =====================
+    // ===================== Parent directory / loose-permission warning =====================
 
     #[cfg(unix)]
     #[test]
@@ -660,7 +658,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    // ===================== clear(): finding S3 =====================
+    // ===================== clear(): orphaned temp file cleanup =====================
 
     #[test]
     fn clear_removes_a_stale_temporary_file_left_by_a_crashed_write() {

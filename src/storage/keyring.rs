@@ -1,9 +1,8 @@
 //! OS keyring credential store.
 //!
-//! Ported from `KeyringStorage` (`eero-api`'s `src/eero/api/auth_storage.py:121-166`). See
-//! the const behaviour notes §4 for the full behaviour brief this module
-//! implements, and the port plan's decision D-5 for why the service/account pair below must
-//! stay byte-for-byte identical to the Python constants.
+//! Ported from `KeyringStorage` (`eero-api`'s `src/eero/api/auth_storage.py:121-166`). The
+//! service/account pair below stays byte-for-byte identical to the Python constants on purpose,
+//! so the keyring entry is shared with the Python library.
 //!
 //! Behind `feature = "keyring"` (default-on): see `src/storage/mod.rs`.
 
@@ -15,7 +14,7 @@ use super::CredentialStore;
 /// The keyring *service* name, shared byte-for-byte with `eero-api`'s
 /// `KeyringStorage.SERVICE_NAME` (`auth_storage.py:124`).
 ///
-/// Deliberately identical across both libraries (decision D-5): a session stored by the Python
+/// Deliberately identical across both libraries, shared by design: a session stored by the Python
 /// `eero-api` CLI/library lives in the same OS credential-store entry rusteero reads and
 /// writes, so a user who already authenticated with one can use the other without a second
 /// one-time-code login. Changing this string silently breaks that interoperability without
@@ -55,7 +54,7 @@ pub struct KeyringStore {
 impl KeyringStore {
     /// Creates a store using the shared `eero-api` entry ([`SERVICE_NAME`] / [`ACCOUNT_NAME`]).
     ///
-    /// This is the constructor that reproduces decision D-5's cross-library interoperability
+    /// This is the constructor that reproduces the shared cross-library interoperability
     /// contract; use [`KeyringStore::with_entry`] only when isolation from that shared entry is
     /// actually wanted.
     #[must_use]
@@ -105,7 +104,7 @@ impl CredentialStore for KeyringStore {
     /// `AuthCredentials()` (`auth_storage.py:142-145`), so a genuine backend failure (no Secret
     /// Service running, permission denied, etc.) is indistinguishable from "nothing was ever
     /// stored". This is also the root cause of the `ChainedStorage` fallback never triggering in
-    /// practice in Python (see the behaviour brief §7): `KeyringStorage.save()` never raises
+    /// practice in Python: `KeyringStorage.save()` never raises
     /// either, so `ChainedStorage.save()`'s `except` around the primary store can never fire.
     /// rusteero instead returns [`StorageError::Backend`] for a genuine backend failure, so
     /// `ChainedStore`'s primary/fallback logic (built on top of this trait) can actually observe
@@ -183,7 +182,7 @@ mod tests {
     use crate::auth::Session;
     use crate::error::StorageError;
 
-    // ===================== D-5: the shared eero-api entry =====================
+    // ===================== the shared eero-api entry =====================
 
     #[test]
     fn service_and_account_match_the_shared_eero_api_entry() {
@@ -228,7 +227,7 @@ mod tests {
 
     // ===================== behaviour without a *reachable* keyring backend =====================
     //
-    // Corrected justification (phase-2 storage review, finding S5): the previous comment here
+    // Corrected justification: the previous comment here
     // claimed "CI runners are headless Linux with no D-Bus session bus at all" as a blanket
     // justification for expecting every one of these tests to fail fast with a typed error.
     // That is false for 2 of the 3 runners in `ci.yml`'s matrix (`ubuntu-latest`, `macos-latest`,
@@ -308,7 +307,7 @@ mod tests {
     /// on drop — including when a later assertion panics. Exists so tests that call
     /// [`CredentialStore::save`] against this entry can never leave a real credential behind on
     /// a host with a genuinely working native backend (macOS Keychain, Windows Credential
-    /// Manager), per finding S5's requirement that a test must never leave a credential behind.
+    /// Manager) — a test must never leave a credential behind.
     struct ClearEntryOnDrop<'a>(&'a KeyringStore);
 
     impl Drop for ClearEntryOnDrop<'_> {

@@ -1,7 +1,7 @@
 //! `Client` methods for the `EerosAPI` domain (`eero-api src/eero/client.py`, eeros section).
 //!
-//! See `.claude/tasks/briefs/v8/g2-eeros.md` §3 for the full "facade name/shape divergences"
-//! list this file reproduces: which methods pass `_eero_parent_kwargs`/`_network_parent_kwargs`,
+//! This file reproduces the facade name/shape divergences from Python: which methods pass
+//! `_eero_parent_kwargs`/`_network_parent_kwargs`,
 //! which invalidate `eeros[{nid}_eeros]`, and the two "resolves `network_id` only for cache
 //! invalidation, never forwards it to the domain call" quirks ([`Client::port_action`],
 //! [`Client::nightlight_override`]).

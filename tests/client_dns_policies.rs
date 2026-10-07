@@ -45,7 +45,7 @@ async fn get_advanced_content_filter_reaches_the_literal_path() -> anyhow::Resul
 }
 
 /// `allow_domain_for_profiles` invalidates `profiles[{nid}_profiles]`, not `network[{nid}]` —
-/// the invalidation-target/parent-source mismatch `client.md` §4 flags explicitly.
+/// a deliberate invalidation-target/parent-source mismatch.
 #[tokio::test]
 async fn allow_domain_for_profiles_invalidates_the_profiles_list_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;

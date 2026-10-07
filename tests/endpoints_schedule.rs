@@ -282,7 +282,7 @@ async fn delete_schedule_deletes_its_own_url() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ===================== security finding 2: schedule-family validation =====================
+// ===================== schedule-family validation =====================
 
 #[tokio::test]
 async fn delete_schedule_rejects_a_bare_identifier_that_is_not_a_schedule_path()

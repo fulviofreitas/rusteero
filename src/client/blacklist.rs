@@ -8,9 +8,8 @@
 //! [`Client::block_device`]/`Client::unblock_device`] (`crate::client::devices`), which invoke
 //! the exact same underlying [`crate::endpoints::blacklist::BlacklistApi::add_to_blacklist`]/
 //! [`crate::endpoints::blacklist::BlacklistApi::remove_from_blacklist`] domain methods and
-//! already invalidate the `devices` cache bucket. Per
-//! `.claude/tasks/briefs/v8/client.md` §5, these two `Client` methods are removed; the domain
-//! methods themselves remain reachable via `client.api().blacklist()`, matching how
+//! already invalidate the `devices` cache bucket. These two `Client` methods are removed; the
+//! domain methods themselves remain reachable via `client.api().blacklist()`, matching how
 //! `EeroClient` exposes domain-API-only access for methods it never wraps.
 
 use super::Client;

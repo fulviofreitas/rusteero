@@ -44,8 +44,8 @@ const WEEKEND: &[&str] = &["saturday", "sunday"];
 
 /// Every optional keyword argument [`ScheduleApi::update_schedule`] accepts.
 ///
-/// More than four optional keyword arguments, per this port's conventions
-/// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2). Ported from `ScheduleAPI.update_schedule`'s
+/// More than four optional keyword arguments, per this crate's convention of grouping them into
+/// one options struct. Ported from `ScheduleAPI.update_schedule`'s
 /// own five independent keyword-only fields (`schedule.py:194-202`).
 #[derive(Debug, Default, Clone)]
 pub struct UpdateScheduleOptions<'a> {
@@ -78,15 +78,15 @@ impl ScheduleApi {
     ///
     /// Ported from `_resolve_schedule_url` (`schedule.py:48-74`), which takes one argument that
     /// is *either* a cached pause envelope *or* an id/path/URL string — decomposed here into two
-    /// Rust parameters per this port's id-or-url-plus-parent convention
-    /// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2). The two are mutually exclusive, not a
+    /// Rust parameters per this port's id-or-url-plus-parent convention.
+    /// The two are mutually exclusive, not a
     /// preference-with-fallback: when `parent` is `Some`, `id_or_url` is ignored entirely and
     /// [`links::self_url`] must resolve something, exactly like Python's `Mapping` branch (a
     /// `parent` envelope with no `url` field is a validation error, not a silent fallback to
     /// `id_or_url`); when `parent` is `None`, `id_or_url` is resolved via `route`'s `"{id}"`
     /// template, exactly like Python's `str` branch.
     ///
-    /// # Security (finding 2)
+    /// # Security
     ///
     /// Whichever branch resolves a URL, the result is required to actually name a scheduled
     /// pause — `networks/{id}/profiles/{id}/schedules/{id}` — via

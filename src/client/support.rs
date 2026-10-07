@@ -31,7 +31,7 @@ impl Client {
     // (`api/burst_reporters.py:56`) or `OUICheckAPI.run_ouicheck` (`api/ouicheck.py:56`) on
     // `EeroClient`, confirmed absent by grepping the committed `client.py` for each name.
     //
-    // **`request_support` removed** (phase-G fix list item 6): an earlier phase of this port
+    // **`request_support` removed**: an earlier version of this crate
     // added a `Client::request_support` wrapper anyway, with no Python precedent to cite — removed
     // to match `client.py` exactly. [`crate::endpoints::support::SupportApi::request_support`]
     // itself is unaffected and still callable directly through [`crate::api::EeroApi`].

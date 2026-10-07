@@ -77,7 +77,7 @@ async fn get_eeros_prefers_a_parent_supplied_eeros_link() -> anyhow::Result<()> 
 
 // ===================== get_eero =====================
 
-// The dedicated `/2.2/` regression test the task brief calls out explicitly: unlike
+// A dedicated `/2.2/` regression test: unlike
 // `DevicesApi`'s nickname/pause PUTs, `EerosApi` never switches to the `/2.3` base for this
 // resource by template, and `get_eero` is never nested under `networks/`.
 #[tokio::test]

@@ -96,8 +96,8 @@ impl AuthApi {
     /// # Errors
     ///
     /// The only way this returns `Err` past the initial "not authenticated" case is a credential-
-    /// store failure while clearing, under [`crate::transport::StorageFailures::Fatal`] (decision
-    /// D-13, security finding T2): a caller who explicitly opted into "storage failures are
+    /// store failure while clearing, under [`crate::transport::StorageFailures::Fatal`]:
+    /// a caller who explicitly opted into "storage failures are
     /// fatal" can still learn the at-rest copy was not cleared. Under the default
     /// [`crate::transport::StorageFailures::Warn`], a storage failure here is logged at `WARN`
     /// and this still returns `Ok(true)`. The in-memory session is always cleared regardless of
@@ -238,7 +238,7 @@ impl AuthApi {
         match tokio::task::spawn_blocking(move || transport.set_session(None)).await {
             Ok(result) => result,
             Err(join_err) => {
-                // Security finding T3: `JoinError`'s `Display`/`Debug` can carry a panicking
+                // `JoinError`'s `Display`/`Debug` can carry a panicking
                 // task's payload verbatim. `CredentialStore` is a public, pluggable trait, so a
                 // third-party backend that panics on a value derived from the session it was
                 // asked to persist could leak that text through this join error. Only
@@ -412,9 +412,9 @@ mod tests {
         assert_eq!(persisted.token().expose_secret(), "stale-token");
     }
 
-    // ===================== logout under StorageFailures::Fatal (security finding T2) =====================
+    // ===================== logout under StorageFailures::Fatal =====================
 
-    /// A [`CredentialStore`] whose `save`/`clear` always fail, for pinning security finding T2:
+    /// A [`CredentialStore`] whose `save`/`clear` always fail, for pinning the guarantee that
     /// `logout()` must surface a `Fatal`-policy storage failure instead of silently returning
     /// `Ok(true)` while the at-rest copy still holds the old session.
     #[derive(Debug)]
@@ -538,11 +538,11 @@ mod tests {
         );
     }
 
-    // ===================== clear_local_and_store JoinError handling (security finding T3) =====================
+    // ===================== clear_local_and_store JoinError handling =====================
 
     /// A [`CredentialStore`] whose `save`/`clear` panic with a distinctive, credential-shaped
-    /// payload, isolating the `JoinError` branch of `AuthApi::clear_local_and_store` (security
-    /// finding T3) from an ordinary `Err` returned by the store itself.
+    /// payload, isolating the `JoinError` branch of `AuthApi::clear_local_and_store`
+    /// from an ordinary `Err` returned by the store itself.
     #[derive(Debug)]
     struct PanickingStore;
 

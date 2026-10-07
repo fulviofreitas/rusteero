@@ -54,7 +54,7 @@ impl Client {
     /// Ported from `get_device()` (`client.py:717-747`); see [`Client::get_network`] for the
     /// shared `auto_discover = true` note. Note the parameter order: `device_id` (required)
     /// comes first, `network_id` (optional) second — matching every cached getter that takes an
-    /// item id (brief §6). This call never passes `parent=` itself — it *populates* the cache
+    /// item id. This call never passes `parent=` itself — it *populates* the cache
     /// `Client::device_parent` later reads from.
     ///
     /// # Errors
@@ -89,8 +89,7 @@ impl Client {
     /// (`client.py:2199`) — unlike `get_device`, this method returns [`Error::MissingNetworkId`]
     /// rather than probing `/networks` when no id/preferred network is set. **Do not** wire this
     /// into the `devices` cache bucket to "fix" the apparent duplication with `get_device` — the
-    /// uncached-ness is the documented v8.0.4 behaviour, not an oversight
-    /// (`.claude/tasks/briefs/v8/client.md`, devices table, `get_device_priority` row).
+    /// uncached-ness is the documented v8.0.4 behaviour, not an oversight.
     ///
     /// # Errors
     ///
@@ -285,7 +284,7 @@ impl Client {
     /// Gets a device's labels — returns the raw Eero API response.
     ///
     /// Ported from `get_device_labels` (`eero-api src/eero/client.py:881-887`). `auto_discover =
-    /// true`. Not cached (only the eight getters in the behaviour brief §1.4 are).
+    /// true`. Not cached (only the eight cached getters are).
     ///
     /// # Errors
     ///

@@ -7,7 +7,7 @@
 //! ported here either. 37 domain modules total: the 25 originally ported, minus those two
 //! removals, plus the 14 new-in-v8.0.0 modules (`account`, `backup_access_points`, `ddns`,
 //! `dhcp`, `dns_policies`, `entitlements`, `events`, `members`, `notifications`, `permissions`,
-//! `power_saving`, `subnets`, `wan`, `wpa3`) — see `.claude/tasks/briefs/v8/client.md` §1.2.
+//! `power_saving`, `subnets`, `wan`, `wpa3`).
 
 pub mod ac_compat;
 pub mod account;

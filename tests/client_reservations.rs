@@ -56,7 +56,7 @@ async fn get_reservations_prefers_the_cached_networks_published_link() -> anyhow
 
 /// A faithful no-op, for a domain with no cache bucket of its own at all: a DHCP reservation
 /// write cannot invalidate anything, because `reservations` was never one of the six buckets
-/// `Cache` knows about (behaviour brief §2.1) — this asserts it does not, in passing, touch the
+/// `Cache` knows about — this asserts it does not, in passing, touch the
 /// unrelated `network[nid]` entry either.
 #[tokio::test]
 async fn reservation_setter_does_not_invalidate_the_network_bucket() -> anyhow::Result<()> {

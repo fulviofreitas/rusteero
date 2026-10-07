@@ -10,7 +10,7 @@
 //! (`Client::ensure_network_id` — explicit id, preferred id, auto-discovery in both its `id` and
 //! `url`-tail shapes, and the `Error::MissingNetworkId` failure path); every place `Client`
 //! clears its cache (`clear_cache`, `logout`, `set_session_token`, `clear_session_token`); and
-//! that a failed `logout` still clears the cache (security review finding F1).
+//! that a failed `logout` still clears the cache.
 //!
 //! `get_devices` is used throughout purely as a convenient, already-cached vehicle to exercise
 //! these generic `Client`/`Cache` mechanics — none of the assertions here are about `DevicesApi`

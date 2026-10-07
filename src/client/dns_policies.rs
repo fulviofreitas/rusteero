@@ -1,9 +1,8 @@
 //! `Client` methods for the `DnsPoliciesAPI` domain (new in v8.0.0).
 //!
-//! Ported from `eero-api`'s `EeroClient` dns_policies-scoped wrappers
-//! (`.claude/tasks/briefs/v8/client.md` §4 "`dns_policies` (entirely new — no v6.2.0 equivalent)").
-//! Every method here passes `auto_discover = false` (`client.md`'s `net_id` column is `—` for the
-//! whole table) and, except [`Client::get_dns_policy_applications`]/
+//! Ported from `eero-api`'s `EeroClient` dns_policies-scoped wrappers (entirely new in v8.0.0 —
+//! no v6.2.0 equivalent).
+//! Every method here passes `auto_discover = false` and, except [`Client::get_dns_policy_applications`]/
 //! [`Client::set_profile_blocked_applications`] (no published link for that sub-tree — see
 //! [`crate::endpoints::dns_policies::DnsPoliciesApi::get_profile_applications`]'s docs), passes
 //! the cached network envelope as `parent=` (`+net`).
@@ -132,8 +131,8 @@ impl Client {
     ///
     /// Ported from `allow_domain_for_profiles` (`eero-api src/eero/client.py:2495-2521`). On
     /// success, invalidates `profiles[{nid}_profiles]` — **not** `network[{nid}]`, despite `+net`
-    /// parent passing (`client.md` §4 flags this invalidation-target/parent-source mismatch
-    /// explicitly).
+    /// parent passing (the invalidation target and the parent source are deliberately not the
+    /// same cache entry here).
     ///
     /// # Errors
     ///

@@ -10,7 +10,7 @@
 //! [`crate::links::resource_url`] whenever `link` is `None`, ignoring whatever `parent` a caller
 //! passes — the exact "accepted but inert" behaviour the Python source calls out. A port must
 //! resist "fixing" this into a `link`-preferring route for consistency with the rest of the
-//! crate; the asymmetry is upstream-declared, not an oversight (g5 brief §3.5).
+//! crate; the asymmetry is upstream-declared, not an oversight.
 
 use super::{ApiVersion, Resource};
 use reqwest::Method;

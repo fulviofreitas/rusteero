@@ -96,7 +96,7 @@ impl SubnetsApi {
     /// `DELETE` against [`crate::routes::subnets::SUBNETS_CONFIG_COLLECTION`]'s resolved URL with
     /// `subnet_type` appended via [`crate::links::child_url`] — **not** a
     /// [`crate::routes::Nested`] route, unlike every other two-level resource in this crate; see
-    /// that constant's own docs for why (phase-G fix list item 12: `subnet_type` must be a bare
+    /// that constant's own docs for why (`subnet_type` must be a bare
     /// single-segment identifier, and a path or absolute URL must be rejected, not resolved).
     /// Logs [`crate::links::warn_uncharacterised_write`] (`"delete subnet for network"`)
     /// immediately before issuing the request, after `subnet_type` has already been validated —

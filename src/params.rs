@@ -211,7 +211,7 @@ fn require_nested_family(
 /// `/<version>/networks/<network>/profiles/<profile>/schedules/<schedule>`, with single-segment
 /// ids and nothing after the final id.
 ///
-/// Security finding 2 (phase-security-review): `ScheduleApi::update_schedule`/
+/// Security: `ScheduleApi::update_schedule`/
 /// `ScheduleApi::delete_schedule` used to accept *any* same-host path or absolute URL as a
 /// schedule's own URL, as long as it resolved via [`crate::links::resource_url`]'s generic
 /// `{id}`-template substitution — a bare identifier such as `"networks"`, an unrelated path such
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn resolve_nested_url_child_with_query_is_rejected() {
-        // Security finding 3 moved this rejection earlier: `resource_url`'s own path branch (via
+        // This rejection moved earlier: `resource_url`'s own path branch (via
         // `links::validate_link_path`) now rejects the query string before `require_nested_family`
         // ever runs, so the error surfaces as `field: "link"` rather than `field: "child"` — still
         // `Error::Validation`, just caught one layer sooner. See `links.rs`'s own
@@ -523,7 +523,7 @@ mod tests {
         );
     }
 
-    // ===================== require_schedule_family (security finding 2) =====================
+    // ===================== require_schedule_family =====================
 
     #[test]
     fn require_schedule_family_accepts_a_genuine_schedule_path() {

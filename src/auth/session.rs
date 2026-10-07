@@ -8,7 +8,7 @@
 //!
 //! [`Session`] deliberately does **not** implement `Serialize`/`Deserialize` directly: the
 //! wire-compatible shape (`{"session_id", "schema_version"}`, shared with `eero-api`'s cookie
-//! file and keyring blob per decision D-5) is expressed by the [`StoredSession`] type instead,
+//! file and keyring blob by design) is expressed by the [`StoredSession`] type instead,
 //! which has no public constructor and is reached only through `Session::to_json` /
 //! [`Session::from_json`]. This keeps the on-disk format defined in exactly one place, so
 //! `FileStore` and `KeyringStore` (`src/storage/*`) can both build on it without duplicating the
@@ -43,8 +43,8 @@ pub struct Session {
 impl Session {
     /// Builds a session from a pre-obtained token, with no validation.
     ///
-    /// This is intentionally infallible — the one Rust-shape divergence the port brief calls out
-    /// explicitly: token *shape* validation (non-empty, printable ASCII with no CR/LF, since the
+    /// This is intentionally infallible — the one Rust-shape divergence from Python: token
+    /// *shape* validation (non-empty, printable ASCII with no CR/LF, since the
     /// token becomes the literal `X-User-Token` header value) happens only at the call sites that
     /// already return a `Result`: [`crate::transport::Transport::set_session`],
     /// [`crate::auth::AuthApi::set_session_token`], and [`Session::from_env`]. A token obtained
@@ -249,8 +249,8 @@ impl fmt::Display for Session {
 /// `_validate_header_value`'s printable-ASCII/no-CR/LF rule (`base.py:108-121`,
 /// `_HEADER_VALUE_RE = re.compile(r"^[\x20-\x7E]*$")`) since the token becomes a header value.
 /// Shared by [`Session::from_env`], [`crate::auth::AuthApi::set_session_token`], and
-/// [`crate::transport::Transport::set_session`] — the three call sites the port brief identifies
-/// as the ones with a `Result` on hand to reject a malformed token.
+/// [`crate::transport::Transport::set_session`] — the three call sites that have a `Result` on
+/// hand to reject a malformed token.
 ///
 /// # Errors
 ///
@@ -282,7 +282,7 @@ fn non_empty(s: &str) -> Option<String> {
 
 /// The on-disk / in-keyring JSON representation of a [`Session`].
 ///
-/// This is a **public wire contract** (decision D-5): its JSON shape — `session_id` plus
+/// This is a **public wire contract**: its JSON shape — `session_id` plus
 /// `schema_version` at `v8.0.4` — is shared byte-for-byte with the Python `eero-api` library's
 /// `AuthCredentials` (`eero-api` `src/eero/api/auth_storage.py:23-91`), so a cookie file or
 /// keyring entry written by either implementation can be read back by the other. Field names and
@@ -332,7 +332,7 @@ impl fmt::Debug for StoredSession {
 mod tests {
     use super::{Error, Session, StoredSession, validate_token_shape};
 
-    // ===================== Wire-format round trip (D-5, v8.0.4 shape) =====================
+    // ===================== Wire-format round trip (v8.0.4 shape) =====================
 
     #[test]
     fn round_trip_matches_v8_0_4_wire_shape() {

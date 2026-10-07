@@ -1,7 +1,7 @@
-//! Path-traversal regression suite for security review finding F1 (HIGH), plus one end-to-end
-//! test for finding F3 (LOW).
+//! Path-traversal regression suite, plus one end-to-end
+//! test for the network-id auto-discovery case.
 //!
-//! F1: an empty, `"."`, or `".."` path parameter must never reach the wire. At v8.0.4 every
+//! An empty, `"."`, or `".."` path parameter must never reach the wire. At v8.0.4 every
 //! identifier substituted into a resolved URL is validated by
 //! [`rusteero::links::validate_identifier`] (a strict `^[A-Za-z0-9][A-Za-z0-9._:-]*$` whitelist,
 //! plus an explicit `".."` rejection) before it is ever joined onto a request URL — either
@@ -13,8 +13,8 @@
 //! model this file used to pin directly is gone.
 //!
 //! Every destructive route below is exercised the same way, proving the point the module docs
-//! make explicitly: checking only the returned error is not enough, because the bug this finding
-//! describes was that a request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."`
+//! make explicitly: checking only the returned error is not enough, because the bug this guards
+//! against is that a request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."`
 //! case therefore mounts a catch-all `wiremock::matchers::any()` mock with `.expect(0)` — if
 //! identifier validation ever regresses to the pre-fix behaviour, the mock server's own drop-time
 //! verification fails the test, not just the returned `Result`.
@@ -31,7 +31,7 @@
 //! A positive case (an ordinary id) is included per route too, so this suite cannot pass by
 //! rejecting everything.
 //!
-//! F3: `Client::ensure_network_id`'s auto-discovery path and `Client::derive_preferred_network_id`
+//! `Client::ensure_network_id`'s auto-discovery path and `Client::derive_preferred_network_id`
 //! both extract a network id out of a `/networks` response body via the shared
 //! `extract_network_id` helper (`src/client/mod.rs`), which applies `crate::routes::validate_segment`
 //! before handing a candidate id back — see `auto_discovered_network_id_rejects_a_hostile_id_field`
@@ -108,7 +108,7 @@ async fn remove_from_blacklist_single_dot_id_is_rejected_before_any_request() ->
     Ok(())
 }
 
-/// The concrete reproduction from the security finding: before the fix, this DELETE landed on
+/// The concrete reproduction of the bug this suite guards against: before the fix, this DELETE landed on
 /// `DELETE /2.2/networks/network-0001/blacklist` — the whole blacklist, unblocking every device
 /// on the network — instead of erroring. This must be rejected with zero requests sent.
 #[tokio::test]
@@ -495,9 +495,9 @@ async fn update_reservation_slash_bearing_id_is_rejected_before_any_request() ->
     Ok(())
 }
 
-// ============================ F3: network-id auto-discovery ============================
+// ============================ network-id auto-discovery ============================
 
-/// Security review finding F3: a hostile or buggy `/networks` response must not hand
+/// A hostile or buggy `/networks` response must not hand
 /// `Client::ensure_network_id`'s auto-discovery path a `".."` network id that then flows into
 /// every subsequent request URL. Before the fix, `extract_network_id` accepted an `id` field of
 /// `".."` verbatim; now it is rejected, auto-discovery finds no usable network, and the call

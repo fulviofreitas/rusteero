@@ -2,9 +2,9 @@
 //! single [`Transport`].
 //!
 //! Ported from `eero-api`'s `EeroAPI` class (`src/eero/api/__init__.py:36-123`). `EeroApi` is
-//! the layer the not-yet-built `Client` facade (phase 4) sits on top of, adding a cache and
+//! the layer [`crate::client::Client`] sits on top of, adding a cache and
 //! network-id resolution; a consumer who wants neither uses `EeroApi` directly, exactly like the
-//! Python split described in the crate's architecture notes §2.
+//! Python split.
 //!
 //! # Composition, not endpoint logic
 //!
@@ -19,11 +19,11 @@
 //! (`api/__init__.py:8,53`) was never ported.
 //!
 //! `settings` and `password` (`SettingsAPI`/`PasswordAPI`) are likewise not represented here:
-//! both were removed upstream in `eero-api` v8.0.0 (`.claude/tasks/briefs/v8/client.md` §1.2).
+//! both were removed upstream in `eero-api` v8.0.0.
 //! The 14 domain modules new in v8.0.0 — `account`, `backup_access_points`, `ddns`, `dhcp`,
 //! `dns_policies`, `entitlements`, `events`, `members`, `notifications`, `permissions`,
-//! `power_saving`, `subnets`, `wan`, `wpa3` — are wired up below with their struct/constructor
-//! only; their endpoint methods land with the per-domain phase-G port.
+//! `power_saving`, `subnets`, `wan`, `wpa3` — are wired up below with their own endpoint
+//! methods.
 //!
 //! # No async context manager
 //!
@@ -37,8 +37,8 @@
 //! Python's `EeroAPI.login`/`EeroAPI.verify` (`api/__init__.py:94-114`) forward to
 //! `AuthAPI.login`/`AuthAPI.verify`, which stash an *unverified* token before it has been
 //! confirmed by a code. This port does not have (or want) that shape: the interactive login
-//! handshake lives entirely in `crate::auth::flow`'s `LoginFlow`/`PendingLogin` type-state pair
-//! (port plan §3.5), which can only ever hand back a `crate::auth::Session` once
+//! handshake lives entirely in `crate::auth::flow`'s `LoginFlow`/`PendingLogin` type-state pair,
+//! which can only ever hand back a `crate::auth::Session` once
 //! `PendingLogin::verify` succeeds — an unverified token can never reach an authenticated
 //! endpoint by construction. `EeroApi` therefore has no `login`/`verify` methods; obtain a
 //! `Session` via `LoginFlow` (or `Session::from_token`/any `crate::storage::CredentialStore`)
@@ -139,8 +139,8 @@ impl EeroApi {
     ///
     /// Takes an owned [`Transport`] rather than an `Arc<Transport>` so that this is directly
     /// reachable from a `Transport` a caller already built with no extra wrapping — the
-    /// ergonomic shape the not-yet-built `Client` facade (phase 4, which will own exactly one
-    /// `Transport`) needs. `transport` is wrapped in a single `Arc` here and a clone of that same
+    /// ergonomic shape [`crate::client::Client`] (which owns exactly one `Transport`) needs.
+    /// `transport` is wrapped in a single `Arc` here and a clone of that same
     /// `Arc` is handed to [`AuthApi`] and to every domain module below — see the module docs.
     #[must_use]
     pub fn new(transport: Transport) -> Self {

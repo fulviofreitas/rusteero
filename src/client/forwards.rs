@@ -29,7 +29,7 @@ impl Client {
     /// Creates a port forward on the network — returns the raw Eero API response.
     ///
     /// Ported from `create_forward` (`eero-api src/eero/client.py:1545-1552`). `auto_discover =
-    /// false`. Invalidates nothing: there is no `forwards` cache bucket (behaviour brief §2.1).
+    /// false`. Invalidates nothing: there is no `forwards` cache bucket.
     ///
     /// # Errors
     ///

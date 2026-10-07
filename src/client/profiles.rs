@@ -1,9 +1,9 @@
 //! `Client` methods for the `ProfilesAPI` domain at v8.0.4.
 //!
-//! Ported from `eero-api src/eero/client.py`'s profiles-scoped wrappers
-//! (`.claude/tasks/briefs/v8/client.md` §4 "profiles"). `update_profile_content_filter`,
+//! Ported from `eero-api src/eero/client.py`'s profiles-scoped wrappers.
+//! `update_profile_content_filter`,
 //! `update_profile_block_list`, `get_blocked_applications` and `set_blocked_applications` are
-//! **removed** (client.md §5): the domain methods they wrapped never persisted anything (silent
+//! **removed**: the domain methods they wrapped never persisted anything (silent
 //! no-op, live-verified) and have no v8.0.4 `client.py` equivalent — replaced by
 //! [`Client::allow_domain_for_profiles`]/[`Client::block_domain_for_profiles`]/
 //! [`Client::get_dns_policy_applications`]/[`Client::set_profile_blocked_applications`]
@@ -19,7 +19,7 @@ impl Client {
     ///
     /// Ported from `get_profiles()` (`eero-api src/eero/client.py:930-957`); see
     /// [`Client::get_network`] for the shared `auto_discover = true` note. Passes the cached
-    /// network envelope as `parent=` when fresh (`client.md` §4's `+net`), so the request prefers
+    /// network envelope as `parent=` when fresh (`+net`), so the request prefers
     /// the network's own published `profiles` link.
     ///
     /// # Errors
@@ -49,7 +49,7 @@ impl Client {
     ///
     /// Ported from `get_profile()` (`eero-api src/eero/client.py:959-988`); see
     /// [`Client::get_network`] for the shared `auto_discover = true` note. No `parent=` is passed
-    /// — `client.py` has no `_profile_parent_kwargs` helper (`client.md` §3.3): nothing in this
+    /// — `client.py` has no `_profile_parent_kwargs` helper: nothing in this
     /// client's cache is keyed in a way that could supply one.
     ///
     /// # Errors

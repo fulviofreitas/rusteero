@@ -6,7 +6,7 @@
 //! an explicit "auto" mode. This entirely replaces the pre-v7.0.0 shape this file used to have
 //! (four setters — `set_sqm_enabled`/`set_sqm_bandwidth`/`configure_sqm`/`set_sqm_auto` — each
 //! writing a JSON body the API never declared, per that source's own `TODO: Verify` comments,
-//! now confirmed dead; g5 brief §1, §2).
+//! now confirmed dead.
 
 use std::sync::Arc;
 

@@ -1,7 +1,7 @@
 //! `Client` methods for the `NotificationsAPI` domain (new in v8.0.0).
 //!
-//! Ported from `eero-api`'s `EeroClient` notifications-scoped wrappers
-//! (`.claude/tasks/briefs/v8/client.md` §4 "notifications (entirely new)"). Every method passes
+//! Ported from `eero-api`'s `EeroClient` notifications-scoped wrappers (entirely new in v8.0.0).
+//! Every method passes
 //! `auto_discover = false` and, except [`Client::set_push_settings`] (account-scoped, no
 //! `network_id` at all), passes the cached network envelope as `parent=` (`+net`).
 

@@ -169,10 +169,7 @@ impl PendingLogin {
     /// discarded entirely and the login token itself becomes the permanent session token
     /// (`auth.py:247-250`: *"The response carries the user object, not a new token -- the
     /// `session_id` set during `login()` is what's now verified"*) — no fresh `Set-Cookie` is ever
-    /// consulted (`v8.0.4` has no `Set-Cookie` reader anywhere in `base.py`/`auth.py`; the earlier
-    /// D-16 hedge this method used to apply is removed as of this phase, since it hedged against
-    /// a question the Python source itself never answers either way, and never will observably
-    /// differ from "use the login token" from outside this crate).
+    /// consulted (`v8.0.4` has no `Set-Cookie` reader anywhere in `base.py`/`auth.py`).
     ///
     /// # Errors
     ///

@@ -5,7 +5,7 @@
 #
 # Shared actions (commitlint) come from fulviofreitas/workflow-arsenal.
 # Rust-specific steps are inline for now and move to workflow-arsenal
-# composite actions once the pipeline is proven (decision D-10).
+# composite actions once the pipeline is proven.
 # ============================================================================
 
 name: 🧪 CI Pipeline
@@ -172,7 +172,7 @@ jobs:
           arguments: --all-features
 
   # ============================================================================
-  # 3️⃣ MSRV (Parallel) — rust-version in Cargo.toml (stable minus two, D-12)
+  # 3️⃣ MSRV (Parallel) — rust-version in Cargo.toml (stable minus two)
   # ============================================================================
   msrv:
     name: 🧱 MSRV

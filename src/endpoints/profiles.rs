@@ -219,7 +219,7 @@ impl ProfilesApi {
     /// object, matching Python's `devices_payload = [{"url": url} for url in device_urls]`
     /// exactly.
     ///
-    /// **Double-warn, reproduced deliberately (see the g4 brief's open question 3).** This method
+    /// **Double-warn, reproduced deliberately.** This method
     /// calls `warn_uncharacterised_write("set devices for profile")` itself
     /// (`profiles.py:241`) *and then* delegates to the same `_update_profile` helper
     /// [`ProfilesApi::pause_profile`]/[`ProfilesApi::rename_profile`] use, which logs a second,

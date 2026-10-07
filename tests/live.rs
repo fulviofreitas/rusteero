@@ -14,7 +14,7 @@
 //! `RUSTEERO_SESSION_TOKEN` is a session token already obtained out of band (e.g. from a prior
 //! interactive login) — this file's tests only ever perform read-only calls with it.
 //!
-//! The former D-16 diagnostic (`login/verify`'s `Set-Cookie` behaviour) is gone: `v8.0.4` has no
+//! The former `login/verify` `Set-Cookie` diagnostic is gone: `v8.0.4` has no
 //! `Set-Cookie` reader anywhere in `base.py`/`auth.py`, and the login token is unconditionally the
 //! session token (see `crate::auth::flow::PendingLogin::verify`'s docs), so there is no longer an
 //! open question for a live capture to settle.

@@ -37,5 +37,5 @@ async fn get_support_resolves_the_explicit_network() -> anyhow::Result<()> {
     Ok(())
 }
 
-// `request_support` has no `Client` wrapper (phase-G fix list item 6: no `client.py` precedent) —
+// `request_support` has no `Client` wrapper (no `client.py` precedent) —
 // see `tests/endpoints_support.rs` for `SupportApi::request_support` coverage directly.

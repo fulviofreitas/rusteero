@@ -51,7 +51,7 @@ pub fn validate_identifier(value: &str) -> Result<&str, Error> {
 ///
 /// Returns [`Error::validation`] with `field: "link"` if `link` is empty, contains `"://"`, or
 /// starts with `"//"` — none of which an API-published path ever does. Also rejects a query
-/// string or fragment (security finding 3): every caller of this helper joins `link` verbatim
+/// string or fragment: every caller of this helper joins `link` verbatim
 /// onto the API host via [`join_api_path`], and a query/fragment slipped through here would ride
 /// along into the resolved request URL unexamined, whether `link` came from an envelope's
 /// `resources`/`url` field ([`resolve_link`]/[`self_url`]) or from a caller-supplied
@@ -116,8 +116,8 @@ pub fn join_api_path(host: &Url, path: &str) -> Result<Url, Error> {
 /// # Errors
 ///
 /// Returns [`Error::validation`] with `field: "url"` if `url` does not parse, its scheme or
-/// hostname does not exactly match `host`'s, or it carries a query string or fragment (security
-/// finding 3: every caller of this helper appends a template-derived suffix onto the validated
+/// hostname does not exactly match `host`'s, or it carries a query string or fragment (every
+/// caller of this helper appends a template-derived suffix onto the validated
 /// URL and sends the result as a request URL, so a query/fragment slipped through here would
 /// ride along unexamined).
 fn validate_absolute_url(url: &str, host: &Url) -> Result<Url, Error> {
@@ -454,7 +454,7 @@ mod tests {
         assert!(matches!(err, Error::Validation { .. }));
     }
 
-    // ===================== security finding 3: query/fragment rejection =====================
+    // ===================== query/fragment rejection =====================
 
     #[test]
     fn resource_url_absolute_url_with_query_is_rejected() {

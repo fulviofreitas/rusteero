@@ -4,7 +4,7 @@
 //! `entitlements`-scoped wrappers in `client.py:2294-2312`. None of these pass `parent=` — the
 //! domain methods themselves accept none (see `crate::endpoints::entitlements`).
 //!
-//! **Facade-placement note** (`.claude/tasks/briefs/v8/g1-networks.md` §6): Python exposes
+//! **Facade-placement note.** Python exposes
 //! `get_premium_customer` under `EeroClient`'s "Session & Account" docs group (`wiki:96`), not
 //! alongside `EntitlementsAPI`'s other three methods (grouped under "Networks", `wiki:119-125`,
 //! and named `get_entitlement_features`/`get_upsell_features`/`get_model_capabilities` there) —

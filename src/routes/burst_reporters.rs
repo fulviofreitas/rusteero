@@ -1,7 +1,7 @@
 //! Burst-reporter routes (`BurstReportersAPI`, POST-only since v8.0.0).
 //!
 //! `BurstReportersAPI.get_burst_reporters` was removed upstream in v8.0.0 — the endpoint 404s;
-//! the resource is POST-only (`.claude/tasks/briefs/v8/g7-backup-members.md` §2). Only
+//! the resource is POST-only. Only
 //! `create_burst_reporter` remains.
 
 use super::{ApiVersion, Resource};

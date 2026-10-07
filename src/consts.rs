@@ -6,14 +6,13 @@
 //! - **`DEFAULT_HEADERS`**: `const.py`'s dict-literal form is not ported as a separate constant
 //!   — [`DEFAULT_USER_AGENT`] and [`DEFAULT_ACCEPT_LANGUAGE`] are ported individually instead,
 //!   since `v8.0.4`'s request pipeline sends each of them as its own header
-//!   (`api/base.py:124-164`). **Decision D-7 is superseded at `v8.0.4`**: earlier `rusteero`
+//!   (`api/base.py:124-164`). Earlier `rusteero`
 //!   revisions documented that the Python library built this mobile-style `User-Agent` string but
 //!   never actually sent it, and deliberately sent reqwest's own default instead. That was true
 //!   against `v6.2.0`'s `session.request(...)` call site, which never passed `headers=`. At
 //!   `v8.0.4` the request pipeline was rewritten and `build_request_headers` unconditionally sets
 //!   `User-Agent: <DEFAULT_USER_AGENT>` on every request (`api/base.py:154-155`) — the header is
-//!   now genuinely sent. Wiring this into the transport's header set is phase B's job (this phase
-//!   only ports the constant itself); until that lands, a caller can still opt in via
+//!   genuinely sent here too, by [`crate::transport`], unless overridden via
 //!   `TransportBuilder::user_agent`.
 //! - **`EeroDeviceType`, `EeroNetworkStatus`, `EeroDeviceStatus`** (`const.py`'s trailing enums)
 //!   are not ported. All three are dead code in the Python library — nothing in `src/eero/`
@@ -118,8 +117,8 @@ pub const REFRESH_ERROR_CODE: &str = "error.session.refresh";
 ///
 /// Ported from the literal `"user_token"` used throughout `auth.py`'s login/verify handshake —
 /// a *different* wire key from the one a refresh response would have carried before `v8.0.4`
-/// removed that response-body-parsing step entirely (see the module docs' `// removed by phase
-/// B` notes and [`crate::errors`] for the current, response-envelope-driven error model).
+/// removed that response-body-parsing step entirely (see [`crate::errors`] for the current,
+/// response-envelope-driven error model).
 pub const USER_TOKEN_KEY: &str = "user_token";
 
 /// Name of the header that carries the session token as the *primary* credential.
@@ -131,7 +130,7 @@ pub const USER_TOKEN_HEADER: &str = "X-User-Token";
 
 /// Default value of the `User-Agent` header sent on every request.
 ///
-/// Ported from `DEFAULT_USER_AGENT` (`const.py:68`). Decision D-7 is superseded at `v8.0.4`: this
+/// Ported from `DEFAULT_USER_AGENT` (`const.py:68`). This
 /// header is genuinely sent by the Python library at this tag, and by [`crate::transport`] here
 /// unless overridden via `TransportBuilder::user_agent`.
 pub const DEFAULT_USER_AGENT: &str = "eero/3.0 (iPhone; iOS 17.0)";

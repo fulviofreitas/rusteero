@@ -1,10 +1,8 @@
 //! Two-tier credential store: read/write through a `primary` backend, falling back to a
 //! `fallback` backend.
 //!
-//! Ported from `ChainedStorage` (`eero-api`'s `src/eero/api/auth_storage.py:264-315`). See
-//! the const behaviour notes §7 for the full line-cited behaviour brief
-//! this module implements, and the port plan §3.4 (decisions D-4, D-5) for the design
-//! rationale. The shipped Python configuration wraps a `KeyringStorage` primary around a
+//! Ported from `ChainedStorage` (`eero-api`'s `src/eero/api/auth_storage.py:264-315`).
+//! The shipped Python configuration wraps a `KeyringStorage` primary around a
 //! `FileStorage` fallback (`auth_storage.py:318-344`'s `create_storage(use_keyring=True,
 //! cookie_file=...)`), but this type is generic over any two [`CredentialStore`]
 //! implementations, exactly like the Python constructor's own untyped `primary`/`fallback`
@@ -116,7 +114,7 @@ impl CredentialStore for ChainedStore {
     ///
     /// Design decision beyond the literal Python source (there is no Python precedent for this
     /// branch, since every shipped Python backend's `load()` swallows all internal failures and
-    /// never raises, per the behaviour brief §4/§5): if `primary.load()` itself returns `Err`,
+    /// never raises): if `primary.load()` itself returns `Err`,
     /// that is treated the same as "primary has no usable session" and this falls through to
     /// `fallback`, rather than propagating the error immediately. A primary storage backend
     /// that cannot even be read from (e.g. a keyring daemon that is not running) is exactly the
@@ -125,8 +123,7 @@ impl CredentialStore for ChainedStore {
     ///
     /// Divergence from `eero-api`: Python's migration write at `auth_storage.py:291` is
     /// unguarded — a `primary.save()` failure there would propagate straight out of `load()` (a
-    /// *read* operation failing because of a failed opportunistic write-back), see the
-    /// behaviour brief's gotcha #8. This port treats the migration write as strictly
+    /// *read* operation failing because of a failed opportunistic write-back). This port treats the migration write as strictly
     /// best-effort: a failed migration is discarded (in place of Python's logging, which this
     /// crate does not perform in library code) and the session fetched from `fallback` is
     /// still returned. A read must never fail merely because its opportunistic write-back did.
@@ -164,7 +161,7 @@ impl CredentialStore for ChainedStore {
     ///         _LOGGER.error("Both primary and fallback storage failed: %s", fallback_error)
     /// ```
     ///
-    /// Divergence from `eero-api` (behaviour brief §7, gotcha #7): in the shipped Python
+    /// Divergence from `eero-api`: in the shipped Python
     /// configuration, `primary` is always a `KeyringStorage`, and `KeyringStorage.save()`
     /// (`auth_storage.py:147-155`) *never raises* — every internal failure is caught and only
     /// logged at DEBUG inside `KeyringStorage` itself. That makes the `except Exception` above
@@ -178,7 +175,7 @@ impl CredentialStore for ChainedStore {
     /// below actually activates. See this module's tests for coverage proving the fallback
     /// fires on a primary error.
     ///
-    /// # Security fix (phase-2 storage review, finding S2)
+    /// # Security fix
     ///
     /// Before writing to `fallback`, this also best-effort clears `primary` — discarding that
     /// `clear`'s own error — so a stale credential left behind by the failed `primary.save()`
@@ -189,14 +186,14 @@ impl CredentialStore for ChainedStore {
     /// caller like `logout`/`refresh`) had already superseded it in `fallback`. The chain must
     /// never serve a credential a later write superseded.
     ///
-    /// # Security fix (phase-security-review, finding 6)
+    /// # Security fix
     ///
     /// After a *successful* `primary.save()`, this also best-effort clears `fallback` — the
-    /// mirror image of the S2 fix above. Without this, a fallback copy left behind by an earlier
+    /// mirror image of the fix above. Without this, a fallback copy left behind by an earlier
     /// failed `primary.save()` (or simply primed directly, e.g. by a test, or by a prior process
     /// that only ever reached `fallback`) would keep sitting on disk/in the keyring indefinitely
-    /// after a later, successful `primary` write superseded it — decision D-5 documents
-    /// `ChainedStore` as the shipped configuration's only durable store, so a stray fallback copy
+    /// after a later, successful `primary` write superseded it — `ChainedStore` is the shipped
+    /// configuration's only durable store, so a stray fallback copy
     /// is a stale, fully-valid plaintext (or keyring) credential with no way for a caller to know
     /// it is still there. This clear is best-effort and its own failure is discarded (logged at
     /// `DEBUG`) — it must never turn an otherwise-successful save into a reported failure.
@@ -241,7 +238,7 @@ impl CredentialStore for ChainedStore {
     /// backends' `clear()` in sequence with no exception handling at all, relying on each
     /// backend's own `clear()` being swallow-all.
     ///
-    /// # Security fix (phase-2 storage review, finding S1)
+    /// # Security fix
     ///
     /// This method previously reported success as soon as *either* backend cleared
     /// successfully — the inverse of the guarantee a caller destroying a credential actually
@@ -344,8 +341,8 @@ mod tests {
     }
 
     /// A [`CredentialStore`] test double that always fails to save but otherwise delegates to
-    /// a real [`MemoryStore`] — isolates finding S2 (a failed `primary.save()` must clear
-    /// whatever `primary` was still holding) from [`SaveFailsStore`] above, which has no
+    /// a real [`MemoryStore`] — isolates the guarantee that a failed `primary.save()` must clear
+    /// whatever `primary` was still holding from [`SaveFailsStore`] above, which has no
     /// internal state of its own to observe being cleared.
     #[derive(Debug)]
     struct SaveFailsDelegatingStore {
@@ -367,7 +364,7 @@ mod tests {
     }
 
     /// A [`CredentialStore`] test double that delegates `load`/`save` to a real [`MemoryStore`]
-    /// but always fails to `clear` — isolates finding 6's own best-effort discipline (a failed
+    /// but always fails to `clear` — isolates the best-effort discipline (a failed
     /// fallback `clear()` after a successful primary `save()` must never fail the save itself)
     /// from [`AlwaysFailsStore`], which has no internal state of its own to observe surviving.
     #[derive(Debug)]
@@ -499,7 +496,7 @@ mod tests {
         );
     }
 
-    // ===================== save: finding 6 =====================
+    // ===================== save: stale fallback credential cleared on primary success =====================
 
     #[test]
     fn save_clears_a_previously_primed_fallback_once_primary_succeeds() {
@@ -518,7 +515,7 @@ mod tests {
         );
         assert!(
             !fallback.load().expect("load never fails").is_valid(),
-            "a superseded fallback copy must be cleared once primary succeeds (finding 6)"
+            "a superseded fallback copy must be cleared once primary succeeds"
         );
     }
 
@@ -573,7 +570,7 @@ mod tests {
         assert!(matches!(err, StorageError::Backend { .. }));
     }
 
-    // ===================== save: finding S2 =====================
+    // ===================== save: stale primary credential cleared on fallback =====================
 
     #[test]
     fn save_failure_on_primary_clears_the_stale_primary_credential_before_writing_fallback() {
@@ -592,7 +589,7 @@ mod tests {
             .expect("fallback save succeeds even though primary failed");
 
         // The stale primary entry must have been invalidated, not merely left in place —
-        // otherwise a later reachable primary would keep serving it forever (finding S2).
+        // otherwise a later reachable primary would keep serving it forever.
         assert!(
             !inner_primary.load().expect("load never fails").is_valid(),
             "a failed primary save must clear whatever primary was still holding"

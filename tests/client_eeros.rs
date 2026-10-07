@@ -1,7 +1,7 @@
 //! `Client` integration suite for the `eeros` domain: cache reads/invalidation, the
 //! `_eero_parent_kwargs`/`_network_parent_kwargs` forwarding this crate reproduces from
 //! `eero-api src/eero/client.py`, and the `get_eero`/`led_cycle`/`get_eero_support`/`port_action`/
-//! `nightlight_override` quirks recorded in `.claude/tasks/briefs/v8/g2-eeros.md` §3.
+//! `nightlight_override` facade name/shape divergences from Python.
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not

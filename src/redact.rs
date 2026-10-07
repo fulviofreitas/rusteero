@@ -150,8 +150,8 @@ fn redact_value(value: &Value, visible_chars: usize) -> Value {
 /// (with `visible_chars` set to `0` for a zero-visibility key, [`VISIBLE_CHARS`] otherwise)
 /// regardless of its type; a non-sensitive key whose value is itself an object recurses; a
 /// non-sensitive key whose value is an array is walked element-wise via [`redact_nested`], which
-/// recurses through arbitrarily deep object/array nesting (not just one array level — security
-/// finding 7: a value such as `[[{"token": "x"}]]` under a non-sensitive key must still have its
+/// recurses through arbitrarily deep object/array nesting (not just one array level — a value
+/// such as `[[{"token": "x"}]]` under a non-sensitive key must still have its
 /// doubly-nested `token` redacted); every other value is copied through untouched.
 fn redact_object(map: &Map<String, Value>) -> Value {
     let mut result = Map::with_capacity(map.len());
@@ -175,7 +175,7 @@ fn redact_object(map: &Map<String, Value>) -> Value {
 /// non-sensitive key, redacting any sensitive key it finds at any depth. Every other JSON type is
 /// copied through unchanged.
 ///
-/// This is what makes [`redact_object`] recurse past a single array level (security finding 7):
+/// This is what makes [`redact_object`] recurse past a single array level:
 /// an array of arrays of objects — or any deeper mix of the two — is walked all the way down,
 /// not just one level of `Value::Array` as the original single-level `.map(...)` implementation
 /// did.
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn handles_nested_list_of_lists_of_dicts() {
-        // Security finding 7: recursion through an array must not stop after one level.
+        // Recursion through an array must not stop after one level.
         let result = redact_sensitive(&json!({
             "outer": [[{"token": "abc123"}]]
         }));

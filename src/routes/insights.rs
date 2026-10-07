@@ -9,7 +9,7 @@ use super::{ApiVersion, Nested, Resource};
 use reqwest::Method;
 
 // ============================================================================================
-// v8.0.4 constants (`.claude/tasks/briefs/v8/g3-devices.md`). Every `InsightsApi` method in
+// v8.0.4 constants. Every `InsightsApi` method in
 // `src/endpoints/insights.rs` is built on one of these.
 // ============================================================================================
 

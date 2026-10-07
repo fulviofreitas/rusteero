@@ -1,9 +1,8 @@
 //! Burst Reporters API: `eero-api`'s `BurstReportersAPI`, POST-only since v8.0.0.
 //!
 //! Ported from `eero-api src/eero/api/burst_reporters.py`: `BurstReportersAPI.get_burst_reporters`
-//! was removed upstream in v8.0.0 — the endpoint 404s; the resource is POST-only
-//! (`.claude/tasks/briefs/v8/g7-backup-members.md` §2) — and is **not** reproduced here. Only
-//! `create_burst_reporter` remains.
+//! was removed upstream in v8.0.0 — the endpoint 404s; the resource is POST-only — and is
+//! **not** reproduced here. Only `create_burst_reporter` remains.
 //!
 //! `create_burst_reporter` funnels through `Transport::resource`, which already implements the
 //! "not authenticated" precondition Python repeats at the top of the method (`get_auth_token()`

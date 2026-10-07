@@ -1,8 +1,6 @@
 //! `MembersApi`: `members` endpoints (`eero-api src/eero/api/members.py`, new in v8.0.0).
 //!
-//! Ported from `eero-api src/eero/api/members.py` (v8.0.4). See
-//! `.claude/tasks/briefs/v8/g7-backup-members.md` §1 for the per-method table this file is
-//! scoped by.
+//! Ported from `eero-api src/eero/api/members.py` (v8.0.4).
 //!
 //! Every method here funnels through `Transport::resource`/`Transport::nested`, which already
 //! implement the "not authenticated" precondition Python repeats at the top of each method
@@ -128,8 +126,7 @@ impl MembersApi {
     /// Ported from `MembersAPI.update_invite` (`members.py:140-166`). Sends
     /// `{"invite_nickname": invite_nickname}` (`members.py:166`). The identifier is never logged
     /// — the warning below never interpolates `invite_id` into its fixed operation string
-    /// (`members.py:165`, `.claude/tasks/briefs/v8/g7-backup-members.md` §3's "sensitive-value
-    /// handling" note).
+    /// (`members.py:165`).
     ///
     /// # Errors
     ///
@@ -322,7 +319,7 @@ impl MembersApi {
     /// `POST /2.2/inviteQuery` — look up an invite by its code.
     ///
     /// **Not network-scoped** — the only method in this domain with no `network_id` parameter at
-    /// all (module docs, `.claude/tasks/briefs/v8/g7-backup-members.md` §3). Ported from
+    /// all. Ported from
     /// `MembersAPI.query_invite` (`members.py:326-353`). Sends `{"invite_code": invite_code}`
     /// (`members.py:352`). `invite_code` is never logged — the warning below never interpolates
     /// it into its fixed operation string (`members.py:348`).

@@ -35,9 +35,8 @@
 //!
 //! # The falsy-value rule
 //!
-//! **This is a faithful port of a real Python quirk — do not "fix" it.** See
-//! the port plan §1.5 ("Falsy cached values are never served (`if cached:`
-//! guards)."). `eero-api` guards every cached read with `if cached:` (e.g. `client.py:249-250,
+//! **This is a faithful port of a real Python quirk — do not "fix" it.**
+//! `eero-api` guards every cached read with `if cached:` (e.g. `client.py:249-250,
 //! 275-276, 352-353, 381-382, 456-457, 487-488, 599-600, 630-631`) — a Python truthiness check —
 //! so a cached value that is falsy is treated as a cache miss and silently refetched, even though
 //! a timestamp says the entry is still "fresh". Python truthiness maps onto the JSON shapes this
@@ -74,8 +73,8 @@
 //! — nothing in this crate calls `invalidate` on those keys either; that is a `client.rs`-level
 //! fact about which methods it calls, not something `Cache` enforces.
 //!
-//! Two behaviours are intentionally **safer** than `eero-api`, per the port plan
-//! §3.8's "what's new" list. Both are marked `Divergence from eero-api:` at the exact point they
+//! Two behaviours are intentionally **safer** than `eero-api`.
+//! Both are marked `Divergence from eero-api:` at the exact point they
 //! apply:
 //!
 //! - (a) see [`Cache::clear`] — clearing removes timestamps, not just values.
@@ -105,8 +104,8 @@ use crate::envelope::Envelope;
 /// buckets with no network id to scope by, so dropping either one is just
 /// `cache.invalidate(&CacheKey::Account)` / `cache.invalidate(&CacheKey::Networks)` — a whole
 /// enum variant would be a distinction without a difference. `Bucket` exists specifically for
-/// the shape phase 5 needs: "drop every device entry for network N" or "drop every profile
-/// entry for network N" in one call, without the caller enumerating which device/profile ids
+/// the shape the mutating writers need: "drop every device entry for network N" or "drop every
+/// profile entry for network N" in one call, without the caller enumerating which device/profile ids
 /// happen to be cached for that network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bucket {
@@ -287,8 +286,8 @@ struct Entry {
 
 /// An in-memory, TTL-bounded cache of [`Envelope`] values, keyed by [`CacheKey`].
 ///
-/// This is a hand-written map rather than a crate like `moka`: the port plan
-/// §3.8 rejected `moka` as overkill for eight key shapes with no eviction policy beyond TTL
+/// This is a hand-written map rather than a crate like `moka`: `moka` was rejected as overkill
+/// for eight key shapes with no eviction policy beyond TTL
 /// (Python has none either — the map is bounded by how many networks/devices/profiles exist).
 ///
 /// # Locking
@@ -414,9 +413,9 @@ impl Cache {
     ///
     /// No single `eero-api` call site clears a whole bucket at once this way — `client.py`
     /// deletes one key at a time (e.g. `_invalidate_device_cache` removes exactly
-    /// `devices[{nid}_{did}]` and `devices[{nid}_devices]`) — but phase 5's writers need "drop
-    /// every device entry for network N" / "drop every profile entry for network N" as a single
-    /// call rather than tracking which specific device/profile ids happen to be cached, so this
+    /// `devices[{nid}_{did}]` and `devices[{nid}_devices]`) — but the mutating writers in this
+    /// crate need "drop every device entry for network N" / "drop every profile entry for
+    /// network N" as a single call rather than tracking which specific device/profile ids happen to be cached, so this
     /// is exposed as a primitive alongside [`Cache::invalidate`] and [`Cache::clear`]. It is a
     /// superset of what any individual Python writer does (it also drops device/profile ids
     /// Python's own inline deletes never touch), which is strictly safer — a dropped entry is
@@ -496,8 +495,8 @@ impl fmt::Debug for Cache {
 }
 
 /// Returns `true` if `value`'s wire payload is "falsy" in the Python sense this cache
-/// reproduces. See the module-level "falsy-value rule" docs and
-/// the port plan §1.5 — **this is a deliberate port of a real Python quirk,
+/// reproduces. See the module-level "falsy-value rule" docs —
+/// **this is a deliberate port of a real Python quirk,
 /// not a bug to clean up.**
 fn is_falsy(value: &Envelope) -> bool {
     match value.as_value() {
@@ -602,9 +601,9 @@ mod tests {
 
     #[test]
     fn each_falsy_shape_is_treated_as_a_miss() {
-        // The five shapes the task brief calls out verbatim, plus JSON `false` for full parity
-        // with Python's `if cached:` truthiness (see the module-level "falsy-value rule" docs
-        // and the port plan §1.5). Every one of these must be a miss even
+        // The five falsy JSON shapes, plus JSON `false` for full parity
+        // with Python's `if cached:` truthiness (see the module-level "falsy-value rule" docs).
+        // Every one of these must be a miss even
         // though the entry is freshly written and well within the TTL.
         let falsy_shapes = [
             ("null", json!(null)),
@@ -749,7 +748,7 @@ mod tests {
 
     #[test]
     fn devices_for_different_networks_never_collide() {
-        // The exact scenario the task brief calls out: two networks' `devices` entries — both
+        // Two networks' `devices` entries — both
         // the `{nid}_devices` list key and a `{nid}_{did}` single-device key sharing the same
         // device id across networks — must never overwrite one another.
         let cache = Cache::new(Duration::from_secs(60));
@@ -847,8 +846,8 @@ mod tests {
 
     #[test]
     fn invalidate_bucket_drops_only_the_targeted_networks_entries() {
-        // The required behaviour phase 5 depends on: "drop every device entry for network N"
-        // must leave network M's device entries alone, even though both live in the same
+        // The required behaviour the mutating writers depend on: "drop every device entry for
+        // network N" must leave network M's device entries alone, even though both live in the same
         // `Devices` bucket and even share a device id.
         let cache = Cache::new(Duration::from_secs(60));
         cache.put(CacheKey::devices("net-1"), non_empty());

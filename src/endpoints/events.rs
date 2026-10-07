@@ -1,8 +1,6 @@
 //! `EventsApi`: `events` endpoints (`eero-api src/eero/api/events.py`, new in v8.0.0).
 //!
-//! Ported from `eero-api src/eero/api/events.py` (v8.0.4). See
-//! `.claude/tasks/briefs/v8/g7-backup-members.md` §1 for the per-method table this file is
-//! scoped by.
+//! Ported from `eero-api src/eero/api/events.py` (v8.0.4).
 //!
 //! Every method here resolves its URL from the network's own self-url-preferring resolution
 //! (`crate::params::resolve_network_url`) with a literal suffix appended — see
@@ -35,8 +33,8 @@ pub const CHANNEL_UTILIZATION_BANDS: &[&str] = &[
 
 /// Every optional keyword argument [`EventsApi::get_channel_utilization`] accepts.
 ///
-/// More than four optional keyword arguments, per this port's conventions
-/// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2).
+/// More than four optional keyword arguments, per this crate's convention of grouping them into
+/// one options struct.
 #[derive(Debug, Default, Clone)]
 pub struct GetChannelUtilizationOptions<'a> {
     /// Minimum "busy" threshold, as a positive integer. Validated the same way as

@@ -1,20 +1,20 @@
-//! Shared wiremock test harness (`MockEero`) used by every later phase's HTTP integration test.
+//! Shared wiremock test harness (`MockEero`) used by every HTTP integration test in this crate.
 //!
 //! This file is a *module*, not its own integration-test binary: it lives at
 //! `tests/common/mod.rs` rather than `tests/common.rs` specifically so cargo never tries to run
 //! it as a standalone test target (see the crate's testing conventions' "File Structure" section).
 //! Any file directly under `tests/` pulls it in with `mod common;`.
 //!
-//! [`MockEero`] answers one design question up front, correctly, for every one of the ~150 tests
-//! later phases will write against it: [`Transport::builder`]'s `base_url` setter derives *both*
+//! [`MockEero`] answers one design question up front, correctly, for every test written against
+//! it: [`Transport::builder`]'s `base_url` setter derives *both*
 //! the `/2.2` and `/2.3` bases from the same root (see `src/transport.rs`'s
 //! `TransportBuilder::base_url` docs), so a single `wiremock::MockServer` stands in for the real
 //! Eero cloud's two hosts — a test can assert a device PUT really went to `/2.3/...` while a GET
 //! from the same [`Transport`] went to `/2.2/...`, exactly like the real API.
 
 // Not every helper here has a caller in every test binary that pulls in this module with `mod
-// common;` — e.g. `transport_with_store` has no caller yet in this phase's own
-// `harness_smoke.rs`, but is required surface for phase 4's client+cache suite and phase 2's
+// common;` — e.g. `transport_with_store` has no caller in `harness_smoke.rs`,
+// but is required surface for the client+cache suite and the
 // storage-backed auth tests. A plain `cargo clippy` would otherwise flag whichever subset any one
 // binary doesn't happen to call as dead code.
 #![allow(dead_code)]

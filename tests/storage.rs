@@ -33,7 +33,7 @@ fn copy_fixture_into(dir: &Path, fixture_name: &str) -> PathBuf {
     path
 }
 
-// ===================== D-5 contract: FileStore reads a real eero-api cookies.json =====================
+// ===================== Shared wire contract: FileStore reads a real eero-api cookies.json =====================
 
 #[test]
 fn filestore_loads_a_real_eeroctl_cookies_file() -> anyhow::Result<()> {

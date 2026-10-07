@@ -5,7 +5,7 @@
 //! [`Client::set_power_saving`] and [`Client::get_power_saving_schedules`] forward a `parent=` —
 //! [`Client::create_power_saving_schedule`]/[`Client::update_power_saving_schedule`]/
 //! [`Client::delete_power_saving_schedule`] do not, matching the domain methods themselves,
-//! which take no `parent` parameter at all (`.claude/tasks/briefs/v8/g2-eeros.md` §3).
+//! which take no `parent` parameter at all.
 
 use super::Client;
 use crate::cache::CacheKey;

@@ -4,7 +4,7 @@
 //! `members`-scoped wrappers in `client.py`. Only [`Client::get_members`] passes a `parent`
 //! (`+net`, `client.py:2577-2579`) — every other wrapper below is called with no `parent=` at
 //! all, matching every single-resource read/write elsewhere in `client.py` that has no
-//! `_*_parent_kwargs` helper of its own (brief §3.3).
+//! `_*_parent_kwargs` helper of its own.
 
 use super::Client;
 use crate::envelope::Envelope;
@@ -46,7 +46,7 @@ impl Client {
     /// Creates an invite — returns the raw Eero API response.
     ///
     /// Ported from `create_invite()` (`client.py:2586-2590`). `auto_discover = false`.
-    /// Invalidates nothing: `members` has no cache bucket at all (behaviour brief §2.1), and
+    /// Invalidates nothing: `members` has no cache bucket at all, and
     /// `client.py`'s own method body has no `del self._cache[...]` call to reproduce.
     ///
     /// # Errors

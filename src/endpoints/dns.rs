@@ -284,7 +284,7 @@ impl DnsApi {
     /// servers already stored on the network** — `{"dns": {"mode": "custom"}, "ipv6":
     /// {"name_servers": {"mode": "custom"}}}`, no `custom` key on either (`dns.py:510-518`) —
     /// this is the exact inverse of `clear_custom_dns`, and is a live-verified server-side
-    /// property, not a client-side merge (g5 brief §3.1).
+    /// property, not a client-side merge.
     ///
     /// Named provider presets (`"cloudflare"`, `"google"`, `"opendns"`, ...) are **deliberately
     /// not offered** — removed upstream in v7.0.0. The API serves its own provider catalogue at
@@ -463,13 +463,13 @@ fn family_for_split(entry: &str, field: &str) -> Result<u8, Error> {
 /// [`MAX_DNS_SERVERS_PER_FAMILY`] entries; for an entry that, once trimmed, is empty; for an
 /// entry containing a `%` zone identifier (`dns.py:112-116`, meaningless to a cloud API — Rust's
 /// own `IpAddr::from_str` already rejects every zone-scoped literal on stable, but this explicit
-/// check keeps the same field/message shape Python raises rather than a generic parse failure,
-/// per g5 brief §6 note 7); for an entry that does not parse as a valid IP literal at all; or for
+/// check keeps the same field/message shape Python raises rather than a generic parse failure;
+/// for an entry that does not parse as a valid IP literal at all; or for
 /// an entry that parses but is the wrong address family. Leading zero octets (e.g.
-/// `"010.0.0.1"`) are rejected identically by both ecosystems' parsers — no divergence there (g5
-/// brief §6 note 5). Surrounding whitespace is stripped before every other check, matching
+/// `"010.0.0.1"`) are rejected identically by both ecosystems' parsers — no divergence there.
+/// Surrounding whitespace is stripped before every other check, matching
 /// Python's explicit `entry.strip()` (`dns.py:112-113`) — `IpAddr::from_str` has no equivalent
-/// leniency of its own (g5 brief §6 note 6).
+/// leniency of its own.
 fn validate_family_servers(
     servers: &[&str],
     family: u8,
@@ -514,8 +514,8 @@ fn validate_family_servers(
 ///
 /// IPv4-mapped IPv6 literals (e.g. `"::ffff:192.168.1.1"`) are serialised via [`format_ipv6`],
 /// matching Python's `ipaddress.IPv6Address.__str__` hex-group form (`"::ffff:c0a8:101"`) rather
-/// than `std::net::Ipv6Addr::fmt`'s dotted-quad special case for the same address family (phase-G
-/// fix list item 13) — see that function's own docs.
+/// than `std::net::Ipv6Addr::fmt`'s dotted-quad special case for the same address family — see
+/// that function's own docs.
 fn parse_one_server(entry: &str, field: &str) -> Result<(u8, String), Error> {
     let candidate = entry.trim();
     if candidate.is_empty() {

@@ -5,8 +5,7 @@
 //! contract — every endpoint method still returns `Result<Envelope, crate::error::Error>` over
 //! the untouched wire payload — but wraps it in [`Envelope`] so callers get ergonomic access to
 //! the common `meta` fields without losing anything: [`Envelope::into_value`] always returns
-//! exactly what was parsed in, and unknown `meta` keys survive in [`Meta::extra`]. See
-//! the port plan §3.3.
+//! exactly what was parsed in, and unknown `meta` keys survive in [`Meta::extra`].
 //!
 //! # Examples
 //!
@@ -180,7 +179,7 @@ fn value_kind(value: &Value) -> &'static str {
 /// Parses a `meta.code`-shaped value into a `u16`, accepting either a JSON number or a numeric
 /// string. Both shapes have been observed across `eero-api`'s test fixtures; neither Python nor
 /// this crate ever inspects `meta.code` to make a control-flow decision (status mapping is
-/// driven entirely by the HTTP status line, per the crate's architecture notes §7), so being
+/// driven entirely by the HTTP status line), so being
 /// liberal here costs nothing and avoids `Meta::code` silently going `None` on a server that
 /// happens to quote it.
 fn parse_code(value: &Value) -> Option<u16> {
@@ -198,7 +197,7 @@ fn parse_code(value: &Value) -> Option<u16> {
 /// [`Envelope::meta`] never fails — a missing or malformed `meta` simply yields every field
 /// `None` (see that method's docs). Fields are `pub` rather than hidden behind accessors so
 /// callers can pattern-match or destructure a `Meta` directly, matching the direct field access
-/// shown in the crate's technical notes §2 (`env.meta().code`).
+/// shape (`env.meta().code`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Meta {
     /// The response's status code, if `meta.code` was present and parsed as a `u16` (accepting

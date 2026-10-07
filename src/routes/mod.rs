@@ -10,7 +10,7 @@
 //! `networks/{network}/{prefix}/{child}{suffix}` shape. Both resolve against an explicit `host`
 //! `Url` (see each type's own `resolve` docs) via [`crate::links`]/[`crate::params`], so a
 //! server-side path rename or version bump is a single-line edit with one wiremock test to match,
-//! instead of a grep-and-replace across two dozen endpoint modules (port plan §7.1).
+//! instead of a grep-and-replace across two dozen endpoint modules.
 //!
 //! ## Path traversal
 //!
@@ -24,7 +24,7 @@
 //! second, narrower rule used only where a candidate identifier is *not* going through
 //! `resource_url`/`child_url` — currently [`crate::client`]'s network-id auto-discovery
 //! (`extract_network_id`), which reads a candidate id straight out of an untrusted `/networks`
-//! response body (security finding F3).
+//! response body.
 
 use crate::error::Error;
 use reqwest::Method;
@@ -217,7 +217,7 @@ impl std::error::Error for SegmentError {}
 ///
 /// Used directly by [`crate::client`]'s network-id auto-discovery (`extract_network_id`), which
 /// reads a candidate network id straight out of an untrusted `/networks` response body before any
-/// [`Resource`]/[`Nested`] resolution ever sees it (security finding F3) — every other identifier
+/// [`Resource`]/[`Nested`] resolution ever sees it — every other identifier
 /// in this crate is validated by [`crate::links::validate_identifier`] instead, at the point it is
 /// substituted into a resolved URL. Validating the *raw* value here, rather than trusting the
 /// `url` crate's own encoder to make any value safe, is deliberate: the encoder strips ASCII
@@ -257,14 +257,13 @@ pub(crate) fn validate_segment(value: &str) -> Result<(), SegmentError> {
 
 // =====================================================================================
 // Domain routes. Every wire endpoint from the Python `eero-api` package gets one
-// `Resource`/`Nested` constant per unique (verb, version, path) combination. Banners
-// below follow the module order of the port plan's endpoint catalogue (§1.7). Several
+// `Resource`/`Nested` constant per unique (verb, version, path) combination. Several
 // Python methods across different modules turn out to hit the exact same wire endpoint
 // (same verb, version and path) — those are modelled as an alias constant (`pub const
 // ALIAS: Resource = CANONICAL;`) rather than a second literal, so a server-side path
 // change is still a one-line fix.
 //
-// Deliberately NOT ported here (see the port plan §1.7 and this crate's lessons
+// Deliberately NOT ported here (see this crate's lessons
 // learned in `CLAUDE.md`):
 // - `ActivityAPI` (`activity.py`): all five methods (`get_activity`,
 //   `get_activity_clients`, `get_activity_for_device`, `get_activity_history`,
@@ -276,7 +275,7 @@ pub(crate) fn validate_segment(value: &str) -> Result<(), SegmentError> {
 //   Giving it its own route would misleadingly suggest a working endpoint.
 // =====================================================================================
 
-// One file per Python domain module (port plan §1.7); each declares its own `Resource`/
+// One file per Python domain module; each declares its own `Resource`/
 // `Nested` constants (or aliases of a constant declared in another domain file, for
 // endpoints that share a wire resource) and is re-exported flat here so every existing
 // `crate::routes::CONSTANT` path keeps resolving unchanged.
@@ -321,11 +320,8 @@ pub mod wpa3;
 
 // The 14 modules new in v8.0.0 (`account`, `backup_access_points`, `ddns`, `dhcp`,
 // `dns_policies`, `entitlements`, `events`, `members`, `notifications`, `permissions`,
-// `power_saving`, `subnets`, `wan`, `wpa3`) are currently empty — no `Resource`/`Nested`
-// constant is declared until the domain port (phase G) lands one. A glob `pub use` of an empty
-// module is legal (it re-exports nothing) but triggers `unused_imports` until the first constant
-// exists, so each is marked `#[allow(unused_imports)]` individually rather than widened to a
-// blanket module-level allow that would also hide a real future regression.
+// `power_saving`, `subnets`, `wan`, `wpa3`) each declare their own `Resource`/`Nested`
+// constants, re-exported below via `pub use`.
 pub use ac_compat::*;
 pub use account::*;
 pub use auth::*;

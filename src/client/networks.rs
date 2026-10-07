@@ -2,8 +2,8 @@
 //!
 //! **No `reboot_network` wrapper.** `v8.0.4`'s `client.py` has never wrapped
 //! `NetworksAPI.reboot_network` (`api/networks.py:151`) on `EeroClient` at all — an earlier
-//! phase of this port added one anyway, with no Python precedent to cite; removed (phase-G fix
-//! list item 6) to match `client.py` exactly. [`crate::endpoints::networks::NetworksApi::reboot_network`]
+//! version of this crate added one anyway, with no Python precedent to cite; removed to match
+//! `client.py` exactly. [`crate::endpoints::networks::NetworksApi::reboot_network`]
 //! itself is unaffected and still callable directly through [`crate::api::EeroApi`].
 
 use super::Client;
@@ -41,8 +41,8 @@ impl Client {
 
     /// Gets Eero Plus/Eero Secure subscription status — returns the raw Eero API response.
     ///
-    /// Ported from `get_premium_status()` (`client.py:515-519`, `.claude/tasks/briefs/v8/
-    /// client.md` row). `auto_discover = false` — see [`Client::get_diagnostics`]. Passes the
+    /// Ported from `get_premium_status()` (`client.py:515-519`).
+    /// `auto_discover = false` — see [`Client::get_diagnostics`]. Passes the
     /// cached network envelope as `parent=` (`+net`, `_network_parent_kwargs`).
     ///
     /// # Errors

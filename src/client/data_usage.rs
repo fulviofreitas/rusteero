@@ -1,10 +1,9 @@
 //! `Client` methods for the `DataUsageAPI` domain.
 //!
-//! None of these eleven methods is ever cached (behaviour brief §2.1: the whole family is
+//! None of these eleven methods is ever cached (the whole family is
 //! time-windowed reads, not one of the eight cached getters) and every one passes
 //! `auto_discover = false`. None of them passes `parent=` at this layer either — `EeroClient`
-//! never supplies one for this family (`.claude/tasks/briefs/v8/client.md`'s `data_usage` table
-//! has no `+net` annotation on any row); the underlying domain methods still accept `parent=`
+//! never supplies one for this family; the underlying domain methods still accept `parent=`
 //! for a caller reaching `client.api().data_usage()` directly with its own cached envelope.
 
 use super::Client;

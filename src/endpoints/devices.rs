@@ -1,7 +1,7 @@
 //! Devices API — device queries plus the nickname/pause/type/label/block mutations.
 //!
-//! Ported from `eero-api src/eero/api/devices.py` at `v8.0.4`
-//! (`.claude/tasks/briefs/v8/g3-devices.md`). `set_device_priority`/`get_device_priority` remain
+//! Ported from `eero-api src/eero/api/devices.py` at `v8.0.4`.
+//! `set_device_priority`/`get_device_priority` remain
 //! deliberately unported — see the module note below, unchanged from the pre-8.0.4 port.
 //!
 //! # Not ported: `set_device_priority`
@@ -222,8 +222,8 @@ impl DevicesApi {
     /// Ported from `DevicesAPI.update_device_via_link` (`devices.py:259-328`). New in `v8.0.4`
     /// (unverified write). Sends a JSON body of only the fields the caller supplied among
     /// `nickname`/`paused`/`profile` (`devices.py:304-315`) — `mac` is never itself added to the
-    /// payload, despite the module docstring's wording (`devices.py:96-99`'s docstring mismatch;
-    /// see this module's own port brief for the citation), targets the **default** (2.2) API
+    /// payload, despite the module docstring's wording (`devices.py:96-99`'s docstring mismatch),
+    /// targets the **default** (2.2) API
     /// version, not 2.3, and prefers `parent`'s own `self_url` exactly like
     /// [`DevicesApi::get_device`] (`resolve_device_url`).
     ///

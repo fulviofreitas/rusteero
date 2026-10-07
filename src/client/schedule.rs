@@ -1,23 +1,22 @@
 //! `Client` methods for the `ScheduleAPI` domain at v8.0.4.
 //!
-//! Ported from `eero-api src/eero/client.py`'s schedule-scoped wrappers
-//! (`.claude/tasks/briefs/v8/client.md` §4 "schedule"). `get_profile_schedule`/
-//! `set_profile_schedule` are **removed** (client.md §5): scheduled pauses are sub-resources of a
+//! Ported from `eero-api src/eero/client.py`'s schedule-scoped wrappers.
+//! `get_profile_schedule`/
+//! `set_profile_schedule` are **removed**: scheduled pauses are sub-resources of a
 //! profile at v8.0.4, not a `schedule` field on the profile object — replaced by
 //! [`Client::get_schedules`]/[`Client::create_schedule`]/[`Client::update_schedule`]/
 //! [`Client::delete_schedule`]/[`Client::clear_profile_schedule`].
 //!
 //! **Cache-invalidation divergence retired.** The pre-v8 `Client` invalidated the profile cache
-//! after every schedule write (security review finding F3), because a cached profile object used
+//! after every schedule write, because a cached profile object used
 //! to embed its own `schedule` array. At v8.0.4 a profile's `GET` response carries no `schedule`
 //! field at all (schedules are sub-resources, never folded into the cached profile entry, and
-//! never cached themselves — `.claude/tasks/briefs/v8/g4-profiles.md` §1.2's fixture notes), so
+//! never cached themselves), so
 //! that invalidation no longer has anything stale to correct. None of the methods below
-//! invalidates any cache entry, matching `client.py` exactly (`client.md` §4's "none invalidated"
-//! for every row in this table).
+//! invalidates any cache entry, matching `client.py` exactly.
 //!
-//! `set_weekday_bedtime`/`set_weekend_bedtime` have no v8.0.4 `client.py` equivalent (`client.md`
-//! §5) — reach the domain methods directly via `client.api().schedule()` if needed.
+//! `set_weekday_bedtime`/`set_weekend_bedtime` have no v8.0.4 `client.py` equivalent
+//! — reach the domain methods directly via `client.api().schedule()` if needed.
 
 use super::Client;
 use crate::endpoints::schedule::UpdateScheduleOptions;
@@ -90,7 +89,7 @@ impl Client {
     /// parameter at all — `schedule` alone resolves the pause's URL, matching Python's own
     /// signature. `parent` accepts the pause's own cached envelope (Python's `schedule: Any`
     /// accepts either a path/URL string or a mapping; this port always splits that into an
-    /// `id_or_url` plus a `parent`, per phase-G fix list item 19), placed right after `schedule`
+    /// `id_or_url` plus a `parent`), placed right after `schedule`
     /// since this method has no `network_id` to place it before. No cache invalidation.
     ///
     /// # Errors
@@ -113,7 +112,7 @@ impl Client {
     ///
     /// Ported from `delete_schedule` (`eero-api src/eero/client.py:2044-2053`). No `network_id`
     /// parameter. `parent` accepts the pause's own cached envelope, for the same reason as
-    /// [`Client::update_schedule`] (phase-G fix list item 19). No cache invalidation.
+    /// [`Client::update_schedule`]. No cache invalidation.
     ///
     /// # Errors
     ///

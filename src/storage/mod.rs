@@ -1,9 +1,7 @@
 //! Pluggable credential storage.
 //!
-//! Ported from `eero-api`'s `src/eero/api/auth_storage.py`. See
-//! the const behaviour notes §3-8 for the full behaviour brief of the
-//! `CredentialStorage` abstract base class this trait mirrors (and each concrete backend below),
-//! and the port plan §3.4 (decisions D-4, D-5, D-13) for the design rationale.
+//! Ported from `eero-api`'s `src/eero/api/auth_storage.py`, mirroring the
+//! `CredentialStorage` abstract base class (and each concrete backend below).
 //!
 //! # Backends
 //!
@@ -15,14 +13,13 @@
 //!   backend with a fallback, read-through and write-through.
 //! - `KeyringStore` (behind `feature = "keyring"`, default-on) — ported from `KeyringStorage`
 //!   (`auth_storage.py:121-166`): the OS-native credential store, sharing an entry with `eero-api`
-//!   (decision D-5).
+//!   by design.
 //!
 //! [`create_storage`] selects among all four with the same four-way matrix as
 //! `auth_storage.py:318-344`'s `create_storage()`. Async callers reach any `Arc<dyn
 //! CredentialStore>` without blocking their own worker thread via `load_async`, `save_async`,
-//! and `clear_async` — thin `tokio::task::spawn_blocking` adapters shared by `transport` (and,
-//! in a later round, `auth::mod`'s own inline `spawn_blocking` call sites, which this phase does
-//! not touch).
+//! and `clear_async` — thin `tokio::task::spawn_blocking` adapters shared by `transport` (`auth::mod`
+//! has its own inline `spawn_blocking` call sites for the same purpose).
 
 pub mod chained;
 pub mod file;
@@ -82,11 +79,11 @@ pub(crate) fn migrate_and_verify<S: CredentialStore + ?Sized>(
 /// declares three `async` abstract methods (`load`, `save`, `clear`) with no default bodies.
 ///
 /// This trait is deliberately **synchronous**, not `async`, even though every method it
-/// mirrors is `async def` in Python (port plan §3.4): every native OS keyring API
+/// mirrors is `async def` in Python: every native OS keyring API
 /// (`keyring` crate, `feature = "keyring"`) is a blocking call, so an async trait here would
 /// only move the blocking work around, not remove it, while forcing `async-trait` boxing on
-/// every implementation for no benefit. Async callers (the not-yet-ported `transport`/`Client`
-/// layer) are expected to invoke these methods via `tokio::task::spawn_blocking`.
+/// every implementation for no benefit. Async callers (`transport`/`Client`) are expected to
+/// invoke these methods via `tokio::task::spawn_blocking`.
 ///
 /// Implementations must be `Send + Sync` (usable from any task/thread) and `Debug` (so a
 /// `Client` holding one behind an `Arc<dyn CredentialStore>` can still derive/implement
@@ -103,8 +100,8 @@ pub trait CredentialStore: Send + Sync + std::fmt::Debug {
     ///
     /// Returns [`StorageError`] only when the backend itself is unusable (e.g. an I/O failure
     /// reading a file, or a keyring backend reporting an error) — never merely because nothing
-    /// has been saved yet. See decision D-13 for how a `Client` builder is expected to treat a
-    /// failure here (warn by default, fatal opt-in).
+    /// has been saved yet. A `Client` builder treats a failure here as warn-by-default,
+    /// fatal-opt-in (see [`crate::transport::StorageFailures`]).
     fn load(&self) -> Result<Session, StorageError>;
 
     /// Persists `session`, overwriting whatever was previously stored.
@@ -141,7 +138,7 @@ pub trait CredentialStore: Send + Sync + std::fmt::Debug {
 /// down), never that it returned an ordinary `Err`. This is surfaced as a
 /// [`StorageError::Backend`] rather than propagating the panic into the caller's own task.
 ///
-/// # Security (phase-2 storage review, finding S4)
+/// # Security
 ///
 /// The message deliberately records only [`tokio::task::JoinError::id`],
 /// [`tokio::task::JoinError::is_panic`] and [`tokio::task::JoinError::is_cancelled`] — **never**
@@ -175,11 +172,9 @@ fn join_error_to_storage_error(join_err: &tokio::task::JoinError) -> StorageErro
 /// Propagates the store's own [`StorageError`] unchanged. If the blocking task itself panics,
 /// the panic is converted to a `StorageError::Backend` instead of taking down the caller's task
 /// — see [`join_error_to_storage_error`].
-// No call site yet within this crate as of this round: `transport`'s only async store call this
-// phase is a save (`Transport::persist_session`, wired to `save_async` below), and `auth::mod`'s
-// own inline `spawn_blocking` load call site is explicitly out of scope this round (see this
-// module's doc comment). Exercised directly by this module's own tests; the intended landing
-// spot is `auth::mod`'s refactor and phase 4's `Client`.
+// `transport`'s own async store call is a save (`Transport::persist_session`, wired to
+// `save_async` below); `auth::mod` has its own inline `spawn_blocking` load call site (see this
+// module's doc comment). This adapter is used by `Client::builder()`'s initial credential load.
 #[allow(dead_code)]
 pub(crate) async fn load_async(store: Arc<dyn CredentialStore>) -> Result<Session, StorageError> {
     match tokio::task::spawn_blocking(move || store.load()).await {
@@ -194,7 +189,7 @@ pub(crate) async fn load_async(store: Arc<dyn CredentialStore>) -> Result<Sessio
 /// # Errors
 ///
 /// See [`load_async`].
-// No call site within this crate's own library code as of this phase: `Transport::set_session`
+// No call site within this crate's own library code: `Transport::set_session`
 // persists synchronously from within a caller-provided blocking context (`AuthApi::clear_local_
 // and_store`'s own `spawn_blocking`), and `Transport::refresh_session` no longer needs a separate
 // async persistence step at all (a successful refresh never rotates the token). Kept `pub(crate)`
@@ -217,10 +212,9 @@ pub(crate) async fn save_async(
 /// # Errors
 ///
 /// See [`load_async`].
-// See `load_async`'s identical justification above: no call site yet within this crate this
-// round for the same reason (`auth::mod`'s `clear_local_and_store_warn_only` is the eventual
-// caller, but its refactor is out of scope this round). Exercised directly by this module's own
-// tests.
+// See `load_async`'s identical justification above: no call site within this crate's own library
+// code (`auth::mod` uses its own inline `spawn_blocking` instead). Exercised directly by this
+// module's own tests.
 #[allow(dead_code)]
 pub(crate) async fn clear_async(store: Arc<dyn CredentialStore>) -> Result<(), StorageError> {
     match tokio::task::spawn_blocking(move || store.clear()).await {
@@ -235,8 +229,8 @@ pub(crate) async fn clear_async(store: Arc<dyn CredentialStore>) -> Result<(), S
 ///
 /// Mirrors `create_storage()`'s two parameters (`auth_storage.py:318-320`,
 /// `use_keyring: bool = True, cookie_file: Optional[str] = None`) as fields rather than function
-/// arguments, so a caller can build one with struct-update syntax and so the not-yet-built
-/// `Client::builder()` (phase 4) has a single value to thread through. Unlike Python's default
+/// arguments, so a caller can build one with struct-update syntax and so
+/// `Client::builder()` has a single value to thread through. Unlike Python's default
 /// (`use_keyring=True`), [`StorageConfig::default`] is the conservative, explicit-opt-in Rust
 /// idiom: both fields default to "off" (`Default::default()` derives `false`/`None`, which
 /// [`create_storage`] maps to a bare [`MemoryStore`]) — a library should not silently reach for
@@ -334,8 +328,8 @@ mod tests {
     // ===================== create_storage matrix — feature = "keyring" =====================
     //
     // The `true`+`None` and `true`+`Some` rows deliberately never call `.save`/`.load`/`.clear`
-    // on the resulting store: `KeyringStore::new()` uses the *shared* `eero-api` entry (decision
-    // D-5, `SERVICE_NAME`/`ACCOUNT_NAME`), and this container happens to have no reachable
+    // on the resulting store: `KeyringStore::new()` uses the *shared* `eero-api` entry
+    // (`SERVICE_NAME`/`ACCOUNT_NAME`), and this container happens to have no reachable
     // keyring backend (see `keyring.rs`'s own tests), but a real backend on a developer's
     // machine would make an actual OS call against a real, shared credential entry. Constructing
     // a `KeyringStore` never touches the OS (only `load`/`save`/`clear` open an `Entry`), so
@@ -595,7 +589,7 @@ mod tests {
         );
     }
 
-    // ===================== async adapters: finding S4 =====================
+    // ===================== async adapters: JoinError never leaks a panic payload =====================
 
     /// A [`CredentialStore`] whose panic payload is a distinctive, easy-to-grep string, so the
     /// test below can assert it never reaches a [`StorageError`]'s `Display`/`Debug` output.

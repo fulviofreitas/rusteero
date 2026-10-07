@@ -2,8 +2,8 @@
 //! `wiremock` server per the crate's testing conventions.
 //!
 //! Every write here is unverified against a live account (see `src/endpoints/account.rs`); these
-//! tests pin the request shape and the `account`-bucket cache-invalidation contract from
-//! `.claude/tasks/briefs/v8/client.md` §4 ("account (`AccountAPI`...)"), not live behaviour.
+//! tests pin the request shape and the `account`-bucket cache-invalidation contract, not live
+//! behaviour.
 
 mod common;
 

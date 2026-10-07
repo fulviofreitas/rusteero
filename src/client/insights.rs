@@ -18,7 +18,7 @@ impl Client {
     /// false` — see [`Client::get_diagnostics`]. No `parent=`. Unlike Python (which
     /// SDK-defaults `cadence` to `"daily"`), `cadence` has no default here — see
     /// [`crate::endpoints::insights::InsightsApi::get_insights`]'s own docs for why this
-    /// divergence was kept rather than closed in this phase.
+    /// divergence was kept rather than closed.
     ///
     /// # Errors
     ///

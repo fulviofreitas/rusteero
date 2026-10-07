@@ -1,10 +1,8 @@
 //! `members` routes (`MembersAPI`, new in v8.0.0).
 //!
-//! Ported from `eero-api src/eero/api/members.py` (v8.0.4). See
-//! `.claude/tasks/briefs/v8/g7-backup-members.md` §1 for the per-method URL-resolution table
-//! these constants are drawn from. Every route here is at `API_VERSION_DEFAULT` ("2.2"), the
-//! same default every `resource_url`/`sub_resource_url` call in `members.py` uses
-//! (`.claude/tasks/briefs/v8/g7-backup-members.md`, "Helper primitives" section).
+//! Ported from `eero-api src/eero/api/members.py` (v8.0.4). Every route here is at
+//! `API_VERSION_DEFAULT` ("2.2"), the
+//! same default every `resource_url`/`sub_resource_url` call in `members.py` uses.
 
 use super::{ApiVersion, Nested, Resource};
 use reqwest::Method;

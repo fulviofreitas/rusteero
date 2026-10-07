@@ -37,7 +37,7 @@ async fn client(mock: &MockEero) -> Client {
 ///
 /// When `/networks` comes back empty, `Client::get_networks` forces a live `/account` fetch and,
 /// if that yields a non-empty list, synthesises a new envelope: `meta` from the ORIGINAL
-/// `/networks` response, `data.networks` from the account-derived list (brief gotcha G1). This
+/// `/networks` response, `data.networks` from the account-derived list. This
 /// also derives `preferred_network_id` as a one-shot side effect.
 #[tokio::test]
 async fn get_networks_falls_back_to_account_when_the_list_is_empty() -> anyhow::Result<()> {
@@ -231,7 +231,7 @@ async fn clear_network_password_invalidates_the_network_bucket() -> anyhow::Resu
 // ===================== set_guest_network =====================
 
 /// `Client::set_guest_network` (`client.py:1127-1158`) passes the cached network envelope as
-/// `parent=` (`+net`, `client.md`'s networks row): once `network[nid]` is populated with an
+/// `parent=` (`+net`): once `network[nid]` is populated with an
 /// envelope publishing its own `guestnetwork` link, the write goes to that link's path, not the
 /// bare-id template, and on success invalidates `network[nid]`.
 #[tokio::test]
@@ -459,9 +459,9 @@ async fn a_failed_write_does_not_invalidate_the_cache() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ===================== Security review finding F5 =====================
+// ===================== Credential-leak-through-error-body regression =====================
 
-/// **F5** (superseded by the v8.0.4 error model, still worth pinning): a value that looks like a
+/// (superseded by the v8.0.4 error model, still worth pinning): a value that looks like a
 /// credential but sits under an unrelated key (e.g. a guest Wi-Fi password echoed back verbatim
 /// in a `400`'s `error` field) can no longer reach `Error::Api.message` at all — `message` is
 /// built entirely from `errors::message_for_error_code`, never from the raw response body. This

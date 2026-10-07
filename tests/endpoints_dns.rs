@@ -2,7 +2,7 @@
 //! `wiremock` server per the crate's testing conventions.
 //!
 //! Every authenticated request test pins both `X-User-Token` (primary, v8.0.4) and the legacy
-//! `Cookie: s=...` header (secondary, on by default) — see `.claude/tasks/briefs/v8/transport-api.md`.
+//! `Cookie: s=...` header (secondary, on by default).
 //!
 //! **Judgment call (test-file split, kept from the pre-v8.0.4 suite)**:
 //! `dns_security_and_sqm_settings_all_hit_the_same_network_path` exercises `DnsApi`,
@@ -437,7 +437,7 @@ async fn set_custom_dns_ipv6_compressed_form_is_sent_on_the_wire() -> anyhow::Re
     Ok(())
 }
 
-/// Phase-G fix list item 13: an IPv4-mapped IPv6 literal must be serialised in Python's hex-group
+/// An IPv4-mapped IPv6 literal must be serialised in Python's hex-group
 /// form (`ipaddress.IPv6Address("::ffff:192.168.1.1")` -> `"::ffff:c0a8:101"`), not Rust
 /// `Ipv6Addr::Display`'s dotted-quad special case (`"::ffff:192.168.1.1"`).
 #[tokio::test]

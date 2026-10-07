@@ -126,7 +126,7 @@ mod tests {
         }
     }
 
-    // ===================== Empty-extracted-segment errors (security finding, no Python equivalent) =====================
+    // ===================== Empty-extracted-segment errors (Rust-only hardening, no Python equivalent) =====================
     //
     // Python's `id_from_url` has no guard here at all and returns `""` for every input below;
     // rejecting an empty *extracted* segment is a deliberate Rust-side hardening documented on

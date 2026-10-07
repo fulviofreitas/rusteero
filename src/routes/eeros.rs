@@ -6,8 +6,9 @@
 //! link-preferring shape (`crate::links::sub_resource_url`), so those methods do not call
 //! `Resource::resolve` at all; the constants below still record their `method`/`version`/
 //! `template` for documentation, and `src/endpoints/eeros.rs` resolves them by hand via
-//! `crate::links::self_url`/`crate::links::resource_url` directly (transport-api.md's "rarely
-//! `.request(..)`" case). Nightlight discovery (`get_nightlight`/`set_nightlight`) has no fixed
+//! `crate::links::self_url`/`crate::links::resource_url` directly (a rare case of falling back to
+//! `Transport::request` directly rather than `resource`/`nested`). Nightlight discovery
+//! (`get_nightlight`/`set_nightlight`) has no fixed
 //! route at all — its URL is read out of a parent's `data.nightlight.url` field, or discovered
 //! with a live `GET` of the eero's own URL; see that endpoint's own docs.
 //!

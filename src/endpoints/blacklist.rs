@@ -1,8 +1,8 @@
 //! Device Blacklist API: `eero-api`'s `BlacklistAPI` — list, add and remove blacklisted
 //! (blocked) devices.
 //!
-//! Ported from `eero-api src/eero/api/blacklist.py` at `v8.0.4`
-//! (`.claude/tasks/briefs/v8/g3-devices.md`): `BlacklistAPI.get_blacklist`,
+//! Ported from `eero-api src/eero/api/blacklist.py` at `v8.0.4`:
+//! `BlacklistAPI.get_blacklist`,
 //! `BlacklistAPI.add_to_blacklist`, `BlacklistAPI.remove_from_blacklist`.
 //!
 //! `DevicesAPI.block_device`/`unblock_device` (`crate::endpoints::devices::DevicesApi`) delegate

@@ -5,7 +5,7 @@
 //! write below targets the **literal** `networks/{id}/thread` path directly, never through a
 //! published link — `parent` is accepted by every write method here for signature consistency
 //! with the rest of this crate's domain modules, but is never consulted (see
-//! `src/routes/thread.rs`'s module docs, and g5 brief §3 note 5, for why this asymmetry is
+//! `src/routes/thread.rs`'s module docs for why this asymmetry is
 //! upstream-declared, not an oversight to "fix").
 
 use std::sync::Arc;
@@ -151,7 +151,7 @@ impl ThreadApi {
     /// Ported from `eero-api src/eero/api/thread.py:161-186`
     /// (`ThreadAPI.regenerate_thread_credentials`). Issues a `POST` with the literal two-byte body
     /// `""` to the literal `networks/{id}/thread` path (`RequestEncoding.EMPTY_JSON_STRING`,
-    /// mirrored here as [`RequestBody::EmptyJsonString`] — g5 brief §6 open question 9).
+    /// mirrored here as [`RequestBody::EmptyJsonString`]).
     /// Unverified upstream; the response is documented to carry a `network` key of unknown shape
     /// — this method returns it unmodified, like every other method in this crate.
     ///

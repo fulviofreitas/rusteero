@@ -6,7 +6,7 @@
 //! field (`self_url`) — a different preference rule than [`Resource`]'s `link`-based
 //! `resolve_link`. That is byte-for-byte the same rule [`crate::params::resolve_network_url`]
 //! already implements (shared with `NetworksAPI`/`SqmAPI`'s identical local reimplementations —
-//! g5 brief §6, open question 2 recommends unifying on the shared helper rather than replicating
+//! unifying on the shared helper avoids replicating
 //! the duplication), so [`crate::endpoints::security::SecurityApi::get_security_settings`] calls
 //! that helper directly plus [`crate::transport::Transport::request`], rather than going through
 //! a `Resource` constant that cannot express "prefer `self_url`" at all.

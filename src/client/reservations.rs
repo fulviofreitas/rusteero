@@ -29,8 +29,7 @@ impl Client {
     /// Creates a DHCP reservation on the network — returns the raw Eero API response.
     ///
     /// Ported from `create_reservation` (`eero-api src/eero/client.py:1503-1510`). `auto_discover
-    /// = false`. Invalidates nothing: there is no `reservations` cache bucket (behaviour brief
-    /// §2.1).
+    /// = false`. Invalidates nothing: there is no `reservations` cache bucket.
     ///
     /// # Errors
     ///
@@ -78,7 +77,7 @@ impl Client {
     /// Ported from `delete_reservation` (`eero-api src/eero/client.py:1524-1536`).
     /// `auto_discover = false`. `delete_forwards` is forwarded to the domain call unchanged —
     /// `None` means the query parameter is omitted from the request entirely, matching Python's
-    /// `kwargs` dict built only when `delete_forwards is not None` (brief §3.7). Invalidates
+    /// `kwargs` dict built only when `delete_forwards is not None`. Invalidates
     /// nothing — see [`Client::create_reservation`].
     ///
     /// # Errors

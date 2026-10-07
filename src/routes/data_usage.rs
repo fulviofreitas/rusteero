@@ -6,7 +6,7 @@ use super::{ApiVersion, Resource};
 use reqwest::Method;
 
 // ============================================================================================
-// v8.0.4 constants (`.claude/tasks/briefs/v8/g3-devices.md`). Every `DataUsageApi` method in
+// v8.0.4 constants. Every `DataUsageApi` method in
 // `src/endpoints/data_usage.rs` is built on one of these. All eleven Python methods this group
 // ports resolve their network segment via `resolve_network_url(network_id, parent)`
 // (`data_usage.py:97-153`'s shared `_get_usage`) — i.e. they prefer `parent`'s own published

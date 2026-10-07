@@ -4,7 +4,7 @@
 //! `configure_backup_network` were removed upstream in `eero-api` v8.0.0 — the `networks/{id}/
 //! backup` resource they targeted no longer exists. `get_backup_internet`/`set_backup_internet`
 //! below target a different resource (`networks/{id}/backupinternet`) with a narrower shape (no
-//! `phone_number` field); see `.claude/tasks/briefs/v8/g7-backup-members.md` §2.
+//! `phone_number` field).
 
 use super::{ApiVersion, Resource};
 use reqwest::Method;

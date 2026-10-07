@@ -1,7 +1,7 @@
 //! Insights API: `eero-api`'s `InsightsAPI`.
 //!
-//! Ported from `eero-api src/eero/api/insights.py` at `v8.0.4`
-//! (`.claude/tasks/briefs/v8/g3-devices.md`): `get_insights`, `get_devices_insights`,
+//! Ported from `eero-api src/eero/api/insights.py` at `v8.0.4`:
+//! `get_insights`, `get_devices_insights`,
 //! `get_device_insights`, `get_profiles_insights`, `get_profile_insights`,
 //! `get_profile_devices_insights`. `run_insights` (`insights.py:115-137` at `v6.2.0`) was
 //! removed entirely in `05a2b07` (v8.0.0) — **no** `Error`/endpoint replacement of any kind, and
@@ -64,8 +64,7 @@ impl InsightsApi {
     /// `insight_type` are required, matching Python; unlike Python's SDK-supplied default
     /// (`cadence: str = "daily"`, `insights.py:43`), this port keeps `cadence` a plain required
     /// argument — a deliberate divergence carried over from the pre-8.0.4 port, revisited and
-    /// kept for this phase (`.claude/tasks/briefs/v8/g3-devices.md`, open question 3): callers
-    /// wanting `"daily"` pass it explicitly. `cadence` is validated against
+    /// kept: callers wanting `"daily"` pass it explicitly. `cadence` is validated against
     /// `INSIGHTS_CADENCES` (`"hourly"`/`"daily"` — `"weekly"` is no longer accepted, see the
     /// module docs) before any request is sent. No `parent=` kwarg exists on this Python method.
     /// Query parameters are sent in Python's exact order — `start`, `end`, `cadence`,

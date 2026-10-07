@@ -1,9 +1,7 @@
 //! `BackupAccessPointsApi`: `backup_access_points` endpoints (`eero-api
 //! src/eero/api/backup_access_points.py`, new in v8.0.0).
 //!
-//! Ported from `eero-api src/eero/api/backup_access_points.py` (v8.0.4). See
-//! `.claude/tasks/briefs/v8/g7-backup-members.md` §1 for the per-method table this file is
-//! scoped by.
+//! Ported from `eero-api src/eero/api/backup_access_points.py` (v8.0.4).
 //!
 //! Every method here funnels through `Transport::resource`/`Transport::nested`, which already
 //! implement the "not authenticated" precondition Python repeats at the top of each method
@@ -23,15 +21,13 @@ use crate::transport::{RequestBody, Transport};
 
 /// Every field the update (`PUT`) write can carry — see [`BackupAccessPointsApi::update`].
 ///
-/// More than four optional keyword arguments, per this port's conventions
-/// (`.claude/tasks/briefs/v8/g7-backup-members.md` "rules" reference,
-/// `.claude/tasks/briefs/v8/phase-g-rules.md` item 2). `connectivity` is kept as an opaque
+/// More than four optional keyword arguments, per this crate's convention of grouping them into
+/// one options struct. `connectivity` is kept as an opaque
 /// [`Value`] rather than a narrower Rust type: Python declares it `Optional[Mapping[str, Any]]`
 /// (`backup_access_points.py:128`) with no further shape validation, and the wire shape of a
 /// "connectivity status" object is not established by anything read while porting this domain.
 /// `created`/`last_updated_at`, by contrast, are `Option<&'a str>` — Python types both
-/// `Optional[str]` (`backup_access_points.py:129-130`), not an opaque mapping (phase-G fix list
-/// item 25).
+/// `Optional[str]` (`backup_access_points.py:129-130`), not an opaque mapping.
 #[derive(Debug, Default, Clone)]
 pub struct UpdateBackupAccessPointOptions<'a> {
     /// New SSID for the access point.
@@ -99,7 +95,7 @@ impl BackupAccessPointsApi {
     /// `{"ssid": ssid, "password": password}`, plus `"uuid"` only when `uuid` is `Some`
     /// (`backup_access_points.py:106-109`) — the omitted key is absent from the body entirely,
     /// never sent as `null`. `password` is never logged (this crate's `Transport` never logs
-    /// request bodies at any level — see `.claude/rules/security-review.md`).
+    /// request bodies at any level).
     ///
     /// # Errors
     ///

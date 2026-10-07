@@ -2,7 +2,7 @@
 //!
 //! Ported from `eero-api src/eero/api/events.py` (v8.0.4) by way of `EeroClient`'s own
 //! `events`-scoped wrappers in `client.py`. Every wrapper here passes the cached network
-//! envelope as `parent` (`+net`, `.claude/tasks/briefs/v8/client.md` §4's `events` rows), so a
+//! envelope as `parent` (`+net`), so a
 //! fresher self-url on that cached envelope wins over the literal template — see
 //! [`crate::endpoints::events::EventsApi`]'s own docs for the resolution this enables.
 

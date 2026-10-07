@@ -19,7 +19,7 @@ use super::CredentialStore;
 /// One behaviour is intentionally *not* carried over: Python's `load()` returns the very same
 /// `AuthCredentials` object reference every time (`auth_storage.py:253`), so a caller that
 /// mutates the returned value in place mutates the store's internal state without ever calling
-/// `save()` — a latent footgun the brief calls out explicitly. Rust's ownership model makes
+/// `save()` — a latent footgun in the Python source. Rust's ownership model makes
 /// this reproduction impossible by construction: [`CredentialStore::load`] returns an owned
 /// [`Session`], so [`MemoryStore::load`] always returns a clone, and mutating it can never
 /// affect the store. This is a strict safety improvement, not a behavioural gap.
