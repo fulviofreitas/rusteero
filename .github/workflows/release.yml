@@ -2,11 +2,7 @@
 # 🚀 Automated Semantic Release
 # ============================================================================
 # Chain: CI → Release (tag + GitHub release + Cargo.toml bump) → crates.io publish
-#
-# crates.io publishing runs through the `crates-io` GitHub Environment and
-# crates.io Trusted Publishing (OIDC): no registry token is stored in this
-# repository. The first version (2.0.0) was published manually by the author;
-# every later release is published by the job below.
+# (via the `crates-io` environment and Trusted Publishing; no registry token is stored here)
 # ============================================================================
 
 name: 🚀 Release
