@@ -19,7 +19,6 @@ library at **v8.0.4**.
 
 ### Install
 
-> 📦 Published on crates.io as `rusteero`; API docs on docs.rs.
 
 ```toml
 [dependencies]

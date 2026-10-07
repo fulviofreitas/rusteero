@@ -6,7 +6,6 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge)](LICENSE)
-[![Status](https://img.shields.io/badge/status-pre--release%20%E2%80%94%20not%20published-f59e0b?style=for-the-badge)](#-status)
 
 ---
 
@@ -36,9 +35,6 @@ in place, each pinned by wiremock tests. [`PARITY.md`](PARITY.md) is the method-
 against the Python library at tag `v8.0.4`: 267 rows — 218 ported, 22 changed with a reason,
 20 dropped with a reason, 3 identical, 4 renamed; none planned.
 
-Published on crates.io as [`rusteero`](https://crates.io/crates/rusteero); API docs on
-[docs.rs](https://docs.rs/rusteero).
-
 ## 📦 Install
 
 ```toml
@@ -48,9 +44,6 @@ rusteero = "2"
 # Headless / embedded (no system keyring):
 rusteero = { version = "2", default-features = false }
 ```
-
-To track unreleased changes instead, depend on the git repository:
-`rusteero = { git = "https://github.com/fulviofreitas/rusteero" }`.
 
 ## 🚀 Quick Start
 
