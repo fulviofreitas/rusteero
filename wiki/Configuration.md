@@ -190,7 +190,7 @@ the body is read; an empty or `204` body becomes an empty `Envelope`.
 
 ```toml
 [dependencies]
-rusteero = { git = "https://github.com/fulviofreitas/rusteero", default-features = false }
+rusteero = { version = "2", default-features = false }
 ```
 
 `FileStore`, `MemoryStore`, `ChainedStore` and `create_storage` all still work; only

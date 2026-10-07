@@ -36,20 +36,21 @@ in place, each pinned by wiremock tests. [`PARITY.md`](PARITY.md) is the method-
 against the Python library at tag `v8.0.4`: 267 rows — 218 ported, 22 changed with a reason,
 20 dropped with a reason, 3 identical, 4 renamed; none planned.
 
-Nothing is published to crates.io until the library is validated against a live account and the
-author signs off.
+Published on crates.io as [`rusteero`](https://crates.io/crates/rusteero); API docs on
+[docs.rs](https://docs.rs/rusteero).
 
 ## 📦 Install
 
-Not on crates.io yet — use the git dependency:
-
 ```toml
 [dependencies]
-rusteero = { git = "https://github.com/fulviofreitas/rusteero" }
+rusteero = "2"
 
 # Headless / embedded (no system keyring):
-rusteero = { git = "https://github.com/fulviofreitas/rusteero", default-features = false }
+rusteero = { version = "2", default-features = false }
 ```
+
+To track unreleased changes instead, depend on the git repository:
+`rusteero = { git = "https://github.com/fulviofreitas/rusteero" }`.
 
 ## 🚀 Quick Start
 

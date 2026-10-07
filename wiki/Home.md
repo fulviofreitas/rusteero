@@ -19,11 +19,11 @@ library at **v8.0.4**.
 
 ### Install
 
-> 🚧 Not published to crates.io yet. Until then, depend on the git repository.
+> 📦 Published on crates.io as `rusteero`; API docs on docs.rs.
 
 ```toml
 [dependencies]
-rusteero = { git = "https://github.com/fulviofreitas/rusteero" }
+rusteero = "2"
 ```
 
 <details>
@@ -92,7 +92,7 @@ Client            cache + network-id resolution + parent envelopes   (eero-api: 
 
 | Resource | URL |
 |----------|-----|
-| 📦 crates.io | _not published yet_ |
+| 📦 crates.io | <https://crates.io/crates/rusteero> |
 | 📦 GitHub | [fulviofreitas/rusteero](https://github.com/fulviofreitas/rusteero) |
 | 🐛 Issues | [Report a bug](https://github.com/fulviofreitas/rusteero/issues) |
 | 📋 Changelog | [CHANGELOG.md](https://github.com/fulviofreitas/rusteero/blob/master/CHANGELOG.md) |
