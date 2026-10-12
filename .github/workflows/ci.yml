@@ -130,7 +130,7 @@ jobs:
           cargo llvm-cov --all-features --lcov --output-path lcov.info
       - name: 📤 Upload coverage
         if: matrix.os == 'ubuntu-latest'
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
