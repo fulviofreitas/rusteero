@@ -46,8 +46,7 @@ pub use envelope::{Envelope, Meta};
 pub use error::{Error, StorageError};
 pub use errors::{ErrorGroup, classify_error_code};
 pub use links::{
-    OriginMismatch, join_api_path, origin_mismatch, resolve_link, resource_url, rewrite_version,
-    self_url, sub_resource_url,
+    join_api_path, resolve_link, resource_url, rewrite_version, self_url, sub_resource_url,
 };
 #[cfg(feature = "keyring")]
 pub use storage::KeyringStore;
