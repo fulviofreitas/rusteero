@@ -171,8 +171,8 @@ struct Bounds {
 
 /// The request core shared by every authenticated and unauthenticated Eero cloud API call.
 ///
-/// Build one with [`Transport::builder`]. See the module docs for the locking discipline and the
-/// deliberate refresh-retry divergence from `eero-api`.
+/// Build one with [`Transport::builder`]. See the module docs for the locking discipline, the
+/// session-persistence rules and the refresh replay.
 #[derive(Debug)]
 pub struct Transport {
     http: Client,

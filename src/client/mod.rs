@@ -438,8 +438,8 @@ impl Client {
         result
     }
 
-    /// Clears the active session token (keeping any refresh token), clears this client's cache
-    /// and forgets a preferred network that auto-discovery chose.
+    /// Clears the active session token, clears this client's cache and forgets a preferred
+    /// network that auto-discovery chose.
     ///
     /// Ported from `clear_session_token()` (`client.py:536-545` at `v8.4.1`). A network chosen
     /// with [`Client::set_preferred_network`] survives; [`Client::clear_auth_data`] drops it.
