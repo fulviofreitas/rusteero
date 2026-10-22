@@ -110,6 +110,13 @@ impl AuthApi {
     /// and this still returns `Ok(true)`. The in-memory session is always cleared regardless of
     /// either outcome.
     pub async fn logout(&self) -> Result<bool, Error> {
+        self.logout_then(|| {}).await
+    }
+
+    /// As [`AuthApi::logout`], and runs `on_cleared` in the same synchronous step that clears the
+    /// in-memory session, before the credential-store clear is awaited. Not called when there was
+    /// no session to log out of.
+    pub(crate) async fn logout_then(&self, on_cleared: impl FnOnce()) -> Result<bool, Error> {
         let Some(session) = self.transport.session().filter(Session::is_valid) else {
             tracing::warn!("Attempted to logout when not authenticated");
             return Ok(false);
@@ -145,7 +152,9 @@ impl AuthApi {
 
         // The in-memory session is cleared first, then the stored record is destroyed on the
         // blocking pool (`auth.py:167-184`, `_destroy_stored_credentials`).
-        self.transport.set_session_async(None).await?;
+        self.transport
+            .set_session_async_then(None, on_cleared)
+            .await?;
         Ok(true)
     }
 
@@ -208,9 +217,20 @@ impl AuthApi {
     /// [`crate::transport::StorageFailures::Fatal`] — the in-memory session is installed
     /// regardless (see [`Transport::set_session_async`]'s docs).
     pub async fn set_session_token(&self, token: &str) -> Result<(), Error> {
+        self.set_session_token_then(token, || {}).await
+    }
+
+    /// As [`AuthApi::set_session_token`], and runs `on_installed` in the same synchronous step
+    /// that installs the session, before the credential-store write is handed to the blocking
+    /// pool. Not called when `token` is rejected.
+    pub(crate) async fn set_session_token_then(
+        &self,
+        token: &str,
+        on_installed: impl FnOnce(),
+    ) -> Result<(), Error> {
         session::validate_token_shape("token", token)?;
         self.transport
-            .set_session_async(Some(Session::from_token(token)))
+            .set_session_async_then(Some(Session::from_token(token)), on_installed)
             .await
     }
 
@@ -235,7 +255,18 @@ impl AuthApi {
     /// under [`crate::transport::StorageFailures::Fatal`] — the in-memory session is cleared
     /// regardless (see [`Transport::set_session_async`]'s docs).
     pub async fn clear_session_token(&self) -> Result<(), Error> {
-        self.transport.set_session_async(None).await
+        self.clear_session_token_then(|| {}).await
+    }
+
+    /// As [`AuthApi::clear_session_token`], and runs `on_cleared` in the same synchronous step
+    /// that clears the in-memory session, before the credential-store clear is awaited.
+    pub(crate) async fn clear_session_token_then(
+        &self,
+        on_cleared: impl FnOnce(),
+    ) -> Result<(), Error> {
+        self.transport
+            .set_session_async_then(None, on_cleared)
+            .await
     }
 
     /// Clears the current session entirely, in memory and in every configured credential-store
@@ -252,7 +283,18 @@ impl AuthApi {
     /// under [`crate::transport::StorageFailures::Fatal`] — the in-memory session is cleared
     /// regardless (see [`Transport::set_session_async`]'s docs).
     pub async fn clear_auth_data(&self) -> Result<(), Error> {
-        self.transport.set_session_async(None).await
+        self.clear_auth_data_then(|| {}).await
+    }
+
+    /// As [`AuthApi::clear_auth_data`], and runs `on_cleared` in the same synchronous step that
+    /// clears the in-memory session, before the credential-store clear is awaited.
+    pub(crate) async fn clear_auth_data_then(
+        &self,
+        on_cleared: impl FnOnce(),
+    ) -> Result<(), Error> {
+        self.transport
+            .set_session_async_then(None, on_cleared)
+            .await
     }
 
     /// Whether the most recent attempt to persist the session to the configured credential store

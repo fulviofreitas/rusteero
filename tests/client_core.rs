@@ -673,15 +673,27 @@ async fn accept_language_is_forwarded_to_the_transport() -> anyhow::Result<()> {
 
 // ===================== Session persistence through the Client =====================
 
-/// A [`CredentialStore`] test double over a [`MemoryStore`] whose `save` can be made to fail and
-/// whose `save` or `load` can be parked on a blocking-pool thread until [`GateStore::open`].
-/// Trimmed copy of the one in `tests/auth.rs`: integration-test binaries cannot share code
-/// except through `tests/common`.
+/// The longest a parked store call waits for [`GateStore::open`]. A test whose assertions fail
+/// between `wait_parked()` and `open()` would otherwise leave the blocking-pool thread parked
+/// forever, and the runtime's drop would wait for it without end.
+const PARK_LIMIT: Duration = Duration::from_secs(10);
+
+/// A [`CredentialStore`] test double over a [`MemoryStore`] whose `save`, `load` or `clear` can be
+/// parked on a blocking-pool thread until [`GateStore::open`], and whose `save` and `clear` can be
+/// made to fail. Trimmed copy of the one in `tests/auth.rs`: integration-test binaries cannot
+/// share code except through `tests/common`.
+///
+/// A parked call never outlives [`PARK_LIMIT`] (it then fails with a [`StorageError`]), and one
+/// that arrives on the thread that built the store, which is the thread driving a
+/// `#[tokio::test]` runtime, panics instead of parking: a store call that ran inline on the
+/// runtime would otherwise block the very runtime whose timeouts are meant to report it.
 #[derive(Debug)]
 struct GateStore {
     inner: MemoryStore,
     parks_saves: bool,
     parks_loads: bool,
+    parks_clears: bool,
+    test_thread: ThreadId,
     load_threads: Mutex<Vec<ThreadId>>,
     gate_open: Mutex<bool>,
     gate_changed: Condvar,
@@ -690,31 +702,33 @@ struct GateStore {
 }
 
 impl GateStore {
-    fn new(parks_saves: bool, failing: bool) -> Arc<Self> {
-        Arc::new(Self {
+    fn make(parks_saves: bool, parks_loads: bool, parks_clears: bool, failing: bool) -> Self {
+        Self {
             inner: MemoryStore::new(),
             parks_saves,
-            parks_loads: false,
+            parks_loads,
+            parks_clears,
+            test_thread: std::thread::current().id(),
             load_threads: Mutex::new(Vec::new()),
             gate_open: Mutex::new(false),
             gate_changed: Condvar::new(),
             parked: AtomicBool::new(false),
             failing: AtomicBool::new(failing),
-        })
+        }
+    }
+
+    fn new(parks_saves: bool, failing: bool) -> Arc<Self> {
+        Arc::new(Self::make(parks_saves, false, false, failing))
+    }
+
+    /// A store that parks every `clear` until opened.
+    fn parking_clears() -> Arc<Self> {
+        Arc::new(Self::make(false, false, true, false))
     }
 
     /// A store that already holds `token` and parks every `load` until opened.
     fn parking_loads(token: &str) -> Arc<Self> {
-        let store = Self {
-            inner: MemoryStore::new(),
-            parks_saves: false,
-            parks_loads: true,
-            load_threads: Mutex::new(Vec::new()),
-            gate_open: Mutex::new(false),
-            gate_changed: Condvar::new(),
-            parked: AtomicBool::new(false),
-            failing: AtomicBool::new(false),
-        };
+        let store = Self::make(false, true, false, false);
         store
             .inner
             .save(&Session::from_token(token))
@@ -722,17 +736,38 @@ impl GateStore {
         Arc::new(store)
     }
 
-    fn park(&self) {
+    /// Parks the calling blocking-pool thread until [`GateStore::open`], or fails after
+    /// [`PARK_LIMIT`].
+    fn park(&self) -> Result<(), StorageError> {
+        assert_ne!(
+            std::thread::current().id(),
+            self.test_thread,
+            "a store call ran on the runtime thread instead of the blocking pool"
+        );
         self.parked.store(true, Ordering::SeqCst);
-        let mut open = self.gate_open.lock().expect("gate lock");
-        while !*open {
-            open = self.gate_changed.wait(open).expect("gate wait");
+        let open = self.gate_open.lock().expect("gate lock");
+        let (_open, waited) = self
+            .gate_changed
+            .wait_timeout_while(open, PARK_LIMIT, |open| !*open)
+            .expect("gate wait");
+        if waited.timed_out() {
+            return Err(StorageError::Backend {
+                backend: "gate".to_owned(),
+                message: "the gate was never opened".to_owned(),
+            });
         }
+        Ok(())
     }
 
     fn open(&self) {
         *self.gate_open.lock().expect("gate lock") = true;
         self.gate_changed.notify_all();
+    }
+
+    /// Opens the gate when dropped, so a test that fails with a store call still parked releases
+    /// the blocking-pool thread instead of hanging the runtime's shutdown.
+    fn release_on_drop(self: &Arc<Self>) -> OpenOnDrop {
+        OpenOnDrop(Arc::clone(self))
     }
 
     async fn wait_parked(&self) {
@@ -742,7 +777,7 @@ impl GateStore {
             }
         })
         .await
-        .expect("a store save should have reached the parking gate");
+        .expect("a store call should have reached the parking gate");
     }
 
     fn failure(&self) -> Result<(), StorageError> {
@@ -757,6 +792,15 @@ impl GateStore {
     }
 }
 
+/// See [`GateStore::release_on_drop`].
+struct OpenOnDrop(Arc<GateStore>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
 impl CredentialStore for GateStore {
     fn load(&self) -> Result<Session, StorageError> {
         self.load_threads
@@ -764,20 +808,23 @@ impl CredentialStore for GateStore {
             .expect("load threads lock")
             .push(std::thread::current().id());
         if self.parks_loads {
-            self.park();
+            self.park()?;
         }
         self.inner.load()
     }
 
     fn save(&self, session: &Session) -> Result<(), StorageError> {
         if self.parks_saves {
-            self.park();
+            self.park()?;
         }
         self.failure()?;
         self.inner.save(session)
     }
 
     fn clear(&self) -> Result<(), StorageError> {
+        if self.parks_clears {
+            self.park()?;
+        }
         self.failure()?;
         self.inner.clear()
     }
@@ -810,10 +857,12 @@ async fn mount_devices(mock: &MockEero, times: u64) {
 }
 
 #[tokio::test]
-async fn client_set_session_token_offloads_and_clears_cache_after_persist() -> anyhow::Result<()> {
+async fn client_set_session_token_offloads_the_store_write_and_resets_the_cache_before_it()
+-> anyhow::Result<()> {
     let mock = MockEero::start().await;
     mount_devices(&mock, 2).await;
     let store = GateStore::new(true, false);
+    let _release = store.release_on_drop();
     let client = Arc::new(client_with_store(&mock, &store, StorageFailures::Warn).await);
 
     client
@@ -843,20 +892,9 @@ async fn client_set_session_token_offloads_and_clears_cache_after_persist() -> a
         "the setter waits for the parked store write"
     );
 
-    // The cache is only cleared once the auth call has succeeded, so a read made while the
-    // store write is still parked is served from it without touching the network.
-    client
-        .get_devices(Some("network-0001"), false, None, None)
-        .await?;
-    assert_eq!(
-        mock.server.received_requests().await.map(|r| r.len()),
-        Some(1)
-    );
-
-    store.open();
-    task.await??;
-
-    // Now the cache is gone: the same read goes to the network again.
+    // The cache was reset in the same step that installed the session, before the store hop, so
+    // a read made while the store write is still parked goes to the network: no task sees the new
+    // session next to the previous session's cache.
     client
         .get_devices(Some("network-0001"), false, None, None)
         .await?;
@@ -864,6 +902,198 @@ async fn client_set_session_token_offloads_and_clears_cache_after_persist() -> a
         mock.server.received_requests().await.map(|r| r.len()),
         Some(2)
     );
+
+    store.open();
+    task.await??;
+
+    // Completing the store write resets nothing a second time: the entry filled during the hop,
+    // under the new session, is still served from the cache.
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    assert_eq!(
+        mock.server.received_requests().await.map(|r| r.len()),
+        Some(2)
+    );
+    Ok(())
+}
+
+/// The caller drops the setter's future while the store write is parked (a timeout around a slow
+/// keyring, a `select!` branch, an aborted task). The new session is already installed and the
+/// store write still runs to completion, so the facade state derived from the previous session
+/// must be gone too: a reset that waited for the store would never run.
+#[tokio::test]
+async fn dropping_set_session_token_during_the_store_hop_still_resets_the_facade()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+    mount_devices_of(&mock, "network-0001", 2).await;
+    let store = GateStore::new(true, false);
+    let _release = store.release_on_drop();
+    let client = Arc::new(client_with_store(&mock, &store, StorageFailures::Warn).await);
+
+    client.get_networks(false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+
+    let task = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.set_session_token(TEST_TOKEN).await }
+    });
+    store.wait_parked().await;
+    task.abort();
+    assert!(
+        task.await.expect_err("the task was aborted").is_cancelled(),
+        "the setter's future was dropped while the store write was parked"
+    );
+
+    assert_eq!(
+        client.preferred_network_id(),
+        None,
+        "the discovered network belonged to the previous session"
+    );
+    // The cache was reset too: the same read goes back to the network, which the second
+    // expectation on the devices mock counts.
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    Ok(())
+}
+
+/// The session-clearing calls, for the tests that park the credential-store clear.
+#[derive(Debug, Clone, Copy)]
+enum Clearing {
+    ClearSessionToken,
+    ClearAuthData,
+    Logout,
+}
+
+impl Clearing {
+    const ALL: [Self; 3] = [Self::ClearSessionToken, Self::ClearAuthData, Self::Logout];
+
+    /// Mounts what the call itself needs on the wire.
+    async fn mount(self, mock: &MockEero) {
+        if matches!(self, Self::Logout) {
+            Mock::given(method("POST"))
+                .and(path("/2.2/logout"))
+                .and(user_token_header())
+                .and(session_cookie())
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&mock.server)
+                .await;
+        }
+    }
+
+    async fn run(self, client: &Client) -> Result<(), Error> {
+        match self {
+            Self::ClearSessionToken => client.clear_session_token().await,
+            Self::ClearAuthData => client.clear_auth_data().await,
+            Self::Logout => client.logout().await.map(|_| ()),
+        }
+    }
+}
+
+/// Mounts what a [`Clearing`] test needs and fills the client's cache and discovered network.
+async fn client_holding_the_previous_sessions_state(
+    mock: &MockEero,
+    clearing: Clearing,
+    store: &Arc<GateStore>,
+) -> anyhow::Result<Client> {
+    clearing.mount(mock).await;
+    mount_networks_once(mock, json!([{"id": "network-0001"}])).await;
+    mount_devices_of(mock, "network-0001", 1).await;
+    let client = client_with_store(mock, store, StorageFailures::Warn).await;
+    client.get_networks(false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+    Ok(client)
+}
+
+/// Clearing the session resets the cache and the discovered network in the same step as the
+/// in-memory session, before the parked store clear: a read made meanwhile finds neither a
+/// session nor the previous session's cached entry.
+#[tokio::test]
+async fn clearing_the_session_resets_the_facade_before_the_store_hop() -> anyhow::Result<()> {
+    for clearing in Clearing::ALL {
+        let mock = MockEero::start().await;
+        let store = GateStore::parking_clears();
+        let _release = store.release_on_drop();
+        let client =
+            Arc::new(client_holding_the_previous_sessions_state(&mock, clearing, &store).await?);
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { clearing.run(&client).await }
+        });
+        store.wait_parked().await;
+        assert!(
+            !task.is_finished(),
+            "{clearing:?} waits for the parked store clear"
+        );
+
+        assert!(!client.is_authenticated(), "{clearing:?}");
+        let err = client
+            .get_devices(Some("network-0001"), false, None, None)
+            .await
+            .expect_err("the previous session's cache must not answer for a cleared session");
+        assert!(
+            matches!(err, Error::Authentication { .. }),
+            "{clearing:?}: {err:?}"
+        );
+        assert_eq!(client.preferred_network_id(), None, "{clearing:?}");
+
+        store.open();
+        task.await??;
+    }
+    Ok(())
+}
+
+/// The caller drops the clearing call's future while the store clear is parked. The session is
+/// already gone and the store clear still runs to completion, so the cache and the discovered
+/// network must be gone as well.
+#[tokio::test]
+async fn dropping_a_clearing_call_during_the_store_hop_still_resets_the_facade()
+-> anyhow::Result<()> {
+    for clearing in Clearing::ALL {
+        let mock = MockEero::start().await;
+        let store = GateStore::parking_clears();
+        let _release = store.release_on_drop();
+        let client =
+            Arc::new(client_holding_the_previous_sessions_state(&mock, clearing, &store).await?);
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { clearing.run(&client).await }
+        });
+        store.wait_parked().await;
+        task.abort();
+        assert!(
+            task.await.expect_err("the task was aborted").is_cancelled(),
+            "{clearing:?}: the future was dropped while the store clear was parked"
+        );
+
+        assert!(!client.is_authenticated(), "{clearing:?}");
+        let err = client
+            .get_devices(Some("network-0001"), false, None, None)
+            .await
+            .expect_err("the previous session's cache must not answer for a cleared session");
+        assert!(
+            matches!(err, Error::Authentication { .. }),
+            "{clearing:?}: {err:?}"
+        );
+        assert_eq!(client.preferred_network_id(), None, "{clearing:?}");
+    }
     Ok(())
 }
 
@@ -943,6 +1173,7 @@ async fn client_without_a_store_reports_credentials_persisted() -> anyhow::Resul
 async fn client_build_initial_store_load_does_not_block_the_runtime() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let store = GateStore::parking_loads(TEST_TOKEN);
+    let _release = store.release_on_drop();
 
     // No `.session(..)`, so `build` loads the stored session; that load is parked.
     let builder = Client::builder()

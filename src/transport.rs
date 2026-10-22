@@ -403,16 +403,36 @@ impl Transport {
     /// message that never carries the panic payload; under [`StorageFailures::Warn`] it is logged
     /// at `WARN` and this returns `Ok(())`.
     pub async fn set_session_async(&self, session: Option<Session>) -> Result<(), Error> {
+        self.set_session_async_then(session, || {}).await
+    }
+
+    /// As [`Transport::set_session_async`], and runs `on_replaced` in the same synchronous step
+    /// as the in-memory change: after the new session is installed and before the credential
+    /// store is handed any work, so before the returned future first yields.
+    ///
+    /// This is how a caller keeps state derived from the previous session (the `Client`'s cache
+    /// and discovered network) from outliving it. Doing the reset after awaiting the persist
+    /// would leave a window in which another task sees the new session next to the old state,
+    /// and, if the caller drops the future during the persist, would leave the old state in place
+    /// for good. `on_replaced` is not called when the session is rejected, because nothing
+    /// changed.
+    pub(crate) async fn set_session_async_then(
+        &self,
+        session: Option<Session>,
+        on_replaced: impl FnOnce(),
+    ) -> Result<(), Error> {
         if let Some(ref s) = session {
             crate::auth::session::validate_token_shape("token", s.expose_token())?;
         }
         let Some(store) = &self.store else {
             self.replace_session(session);
+            on_replaced();
             return Ok(());
         };
         let for_store = session.clone();
         let saving = for_store.is_some();
         let ticket = self.replace_session(session);
+        on_replaced();
         let ticketed: Arc<dyn CredentialStore> = Arc::new(TicketedStore {
             store: Arc::clone(store),
             persistence: Arc::clone(&self.persistence),

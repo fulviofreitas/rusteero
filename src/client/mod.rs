@@ -385,10 +385,17 @@ impl Client {
     /// `get_network`, `get_devices`, `get_profiles`, ...) free to keep serving the previous
     /// session's data for the rest of the TTL after a failed logout (a `429`, a `5xx`, a
     /// timeout), with `is_authenticated()` already `false` and no auth check of its own gating
-    /// any of those reads. Clearing the cache unconditionally here — before either return arm —
-    /// closes that gap and matches [`EeroApi::logout`]'s own contract: the cache and the session
-    /// become stale at exactly the same moment, regardless of whether the request itself
-    /// succeeded.
+    /// any of those reads. Clearing the cache whenever the session is cleared closes that gap and
+    /// matches [`EeroApi::logout`]'s own contract: the outcome of the request does not decide
+    /// whether the session, and with it the cache, goes.
+    ///
+    /// The cache is cleared in the same synchronous step that clears the in-memory session, before
+    /// the credential-store clear is awaited. Python resets after that await; here a caller can
+    /// drop the returned future at any await point (a timeout around a slow keyring, a `select!`
+    /// branch, an aborted task), and a reset that waited for the store would then never run,
+    /// leaving a cache that keeps answering reads for a session that is already gone. The
+    /// network request that precedes the clear changes nothing, so dropping the future during it
+    /// leaves the session and the cache as they were.
     ///
     /// The discovered network follows Python: it is forgotten when the session was actually
     /// logged out (`Ok(true)`), and also on `Err`, because the in-memory session is cleared
@@ -400,10 +407,19 @@ impl Client {
     ///
     /// Propagates whatever [`EeroApi::logout`] returns. The cache is cleared regardless.
     pub async fn logout(&self) -> Result<bool, Error> {
-        let result = self.api.logout().await;
-        self.clear_cache();
-        if !matches!(result, Ok(false)) {
-            self.forget_discovered_network();
+        let mut session_cleared = false;
+        let result = self
+            .api
+            .auth()
+            .logout_then(|| {
+                self.reset_session_state();
+                session_cleared = true;
+            })
+            .await;
+        if !session_cleared {
+            // No session was cleared (`Ok(false)`): the cache still goes, the discovered network
+            // stays.
+            self.clear_cache();
         }
         result
     }
@@ -412,14 +428,18 @@ impl Client {
     /// and forgets a preferred network that auto-discovery chose.
     ///
     /// Ported from `set_session_token()` (`client.py:516-534` at `v8.4.1`): the reset runs once
-    /// the auth call has accepted the token, so a `Validation` failure — which returns before
-    /// anything changes — leaves the cache and the discovered network alone. A network chosen
-    /// with [`Client::set_preferred_network`] survives.
+    /// the token has been accepted, so a `Validation` failure — which returns before anything
+    /// changes — leaves the cache and the discovered network alone. A network chosen with
+    /// [`Client::set_preferred_network`] survives.
     ///
     /// `async` since `eero-api` 8.1.10: the credential-store write runs on the runtime's blocking
-    /// pool instead of the calling task's thread. The in-memory session changes first, the cache
-    /// is cleared once the store hop has completed, and [`Client::credentials_persisted`] reports
-    /// whether the store accepted the write.
+    /// pool instead of the calling task's thread. The in-memory session changes first, in the
+    /// first poll of the returned future, and the cache is cleared in that same synchronous step,
+    /// before the store hop. Python resets after the hop completes; here a caller can drop the
+    /// future during the hop (a timeout around a slow keyring, a `select!` branch, an aborted
+    /// task), and a reset that waited for it would then never run, leaving the previous account's
+    /// cache and discovered network in place for a client that already carries the new token.
+    /// [`Client::credentials_persisted`] reports whether the store accepted the write.
     ///
     /// # Errors
     ///
@@ -431,11 +451,10 @@ impl Client {
     /// reset in that case too: nothing cached under the previous session may be served to the
     /// new one.
     pub async fn set_session_token(&self, token: &str) -> Result<(), Error> {
-        let result = self.api.auth().set_session_token(token).await;
-        if session_changed(&result) {
-            self.reset_session_state();
-        }
-        result
+        self.api
+            .auth()
+            .set_session_token_then(token, || self.reset_session_state())
+            .await
     }
 
     /// Clears the active session token, clears this client's cache and forgets a preferred
@@ -445,7 +464,10 @@ impl Client {
     /// with [`Client::set_preferred_network`] survives; [`Client::clear_auth_data`] drops it.
     ///
     /// `async` since `eero-api` 8.1.10: the in-memory session is cleared first and the
-    /// credential-store clear then runs on the runtime's blocking pool.
+    /// credential-store clear then runs on the runtime's blocking pool. The cache is cleared in
+    /// the same synchronous step as the session, before that hop, so dropping the returned future
+    /// cannot leave a cache that answers reads for a session that is gone (see
+    /// [`Client::set_session_token`] for why this differs from Python's order).
     ///
     /// # Errors
     ///
@@ -454,11 +476,10 @@ impl Client {
     /// docs). The in-memory session is cleared regardless, so this client's cache and discovered
     /// network are reset in that case as well.
     pub async fn clear_session_token(&self) -> Result<(), Error> {
-        let result = self.api.auth().clear_session_token().await;
-        if session_changed(&result) {
-            self.reset_session_state();
-        }
-        result
+        self.api
+            .auth()
+            .clear_session_token_then(|| self.reset_session_state())
+            .await
     }
 
     /// Removes every stored credential record without contacting the API, then resets this
@@ -468,9 +489,12 @@ impl Client {
     /// Ported from `EeroClient.clear_auth_data()` (`client.py:563-578` at `v8.4.1`). Unlike
     /// [`Client::clear_session_token`] and [`Client::logout`], which keep an explicit preferred
     /// network, nothing cached or chosen is attributable to a session any more afterwards, so
-    /// everything is dropped; [`Client::is_authenticated`] is `false`. The steps run in
-    /// Python's order: the auth layer first (see [`crate::auth::AuthApi::clear_auth_data`]),
-    /// then the preferred network, then the cache.
+    /// everything is dropped; [`Client::is_authenticated`] is `false`. Python runs the auth layer
+    /// first (see [`crate::auth::AuthApi::clear_auth_data`]), then resets the preferred network,
+    /// then the cache. Here the in-memory session, the preferred network and the cache all change
+    /// in one synchronous step, before the credential-store clear is awaited, so dropping the
+    /// returned future cannot leave a cache that answers reads for a session that is gone (see
+    /// [`Client::set_session_token`] for why this differs from Python's order).
     ///
     /// # Errors
     ///
@@ -479,15 +503,18 @@ impl Client {
     /// in-memory session is already gone by then, so this resets the preferred network and the
     /// cache regardless, as [`Client::logout`] does.
     pub async fn clear_auth_data(&self) -> Result<(), Error> {
-        let result = self.api.auth().clear_auth_data().await;
-        {
-            let mut guard = self.preferred_write();
-            guard.id = None;
-            guard.explicit = false;
-            guard.session_changes = guard.session_changes.wrapping_add(1);
-        }
-        self.clear_cache();
-        result
+        self.api
+            .auth()
+            .clear_auth_data_then(|| {
+                {
+                    let mut guard = self.preferred_write();
+                    guard.id = None;
+                    guard.explicit = false;
+                    guard.session_changes = guard.session_changes.wrapping_add(1);
+                }
+                self.clear_cache();
+            })
+            .await
     }
 
     /// Whether the most recent attempt to persist the session to the configured credential store
@@ -855,16 +882,6 @@ impl Client {
     fn invalidate_profiles_list_cache(&self, network_id: &str) {
         self.cache.invalidate(&CacheKey::profiles(network_id));
     }
-}
-
-/// Whether the outcome of a session setter means the in-memory session changed.
-///
-/// `Ok` obviously does. `Error::Storage` does too: the setters install the new session in memory
-/// before they touch the credential store, so a store failure reported under
-/// [`StorageFailures::Fatal`] arrives after the change. Anything else (the token-shape
-/// `Validation` error) is raised before anything changes.
-fn session_changed<T>(result: &Result<T, Error>) -> bool {
-    matches!(result, Ok(_) | Err(Error::Storage(_)))
 }
 
 /// Extracts a JSON array of network entries from a `{meta, data}` envelope's `data` value.
