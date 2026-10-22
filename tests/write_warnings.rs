@@ -580,9 +580,11 @@ fn decode_literal(text: &str) -> String {
     panic!("unterminated string literal: {text:?}");
 }
 
-/// The index just past the item whose text starts at `from` (after its `#[cfg(test)]`): the end of
-/// its brace block or its terminating `;`, whichever comes first outside any parentheses or
-/// brackets.
+/// The index just past the item whose text starts at `from` (after its `#[cfg(test)]`), at depth 0
+/// outside any parentheses or brackets: the end of its brace block, its terminating `;`, or — for a
+/// struct field, enum variant or match arm — its `,`. A closing bracket that would leave the
+/// enclosing block (the last field or variant, written without a trailing comma) ends the item just
+/// before that bracket, which stays.
 fn item_end(code: &str, from: usize) -> usize {
     let bytes = code.as_bytes();
     let mut depth = 0_usize;
@@ -594,8 +596,9 @@ fn item_end(code: &str, from: usize) -> usize {
         }
         match bytes[at] {
             b'(' | b'[' => depth += 1,
-            b')' | b']' => depth = depth.saturating_sub(1),
-            b';' if depth == 0 => return at + 1,
+            b')' | b']' | b'}' if depth == 0 => return at,
+            b')' | b']' => depth -= 1,
+            b';' | b',' if depth == 0 => return at + 1,
             b'{' if depth == 0 => return matching_close(code, at) + 1,
             _ => {}
         }
@@ -1030,6 +1033,28 @@ fn production_code_after_a_test_only_item_is_scanned() {
         assert!(code.contains(kept), "{kept} was blanked out: {code}");
     }
     for dropped in ["test_support", "fn gone", "cfg(test)"] {
+        assert!(!code.contains(dropped), "{dropped} was kept: {code}");
+    }
+    assert_eq!(call_opens(&code, WARN_FN).len(), 1);
+
+    // A test-only field, variant or match arm ends at its comma or at the enclosing closer, so the
+    // code after the enclosing block is still scanned.
+    let code = production_code(concat!(
+        "struct S {\n",
+        "    kept_field: u8,\n",
+        "    #[cfg(test)]\n",
+        "    hits: std::sync::atomic::AtomicUsize,\n",
+        "}\n",
+        "enum E { A, #[cfg(test)] Probe }\n",
+        "fn arms(e: E) { match e { E::A => {} #[cfg(test)] E::Probe => {}, } }\n",
+        "impl S {\n",
+        "    pub async fn set_x(&self) { warn_uncharacterised_write(\"kept after\"); }\n",
+        "}\n",
+    ));
+    for kept in ["kept_field", "enum E { A,", "fn arms", "impl S", "fn set_x"] {
+        assert!(code.contains(kept), "{kept} was blanked out: {code}");
+    }
+    for dropped in ["hits", "Probe", "cfg(test)"] {
         assert!(!code.contains(dropped), "{dropped} was kept: {code}");
     }
     assert_eq!(call_opens(&code, WARN_FN).len(), 1);

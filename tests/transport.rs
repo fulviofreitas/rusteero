@@ -2057,7 +2057,8 @@ fn the_hygiene_helper_reads_the_fields_of_a_warn_event() {
 }
 
 /// Negative control for the hygiene helper: the query value in a field of a DEBUG event of this
-/// crate is caught, and the same value from another crate's target is not this crate's leak.
+/// crate is caught. (Another crate's DEBUG line carrying it is accepted; see
+/// `the_hygiene_helper_accepts_a_path_at_debug`.)
 #[test]
 #[should_panic(expected = "carries the query value")]
 fn the_hygiene_helper_reads_the_fields_of_a_debug_event() {
@@ -2073,6 +2074,8 @@ fn the_hygiene_helper_accepts_a_path_at_debug() {
     let (_guard, logs) = capture_logs();
     tracing::debug!(target: "rusteero::transport", path = "/2.2/networks", "Retrying GET");
     tracing::error!(status = 500_u16, "API error 500 on GET request");
+    // The case the exemption exists for: the HTTP stack's own DEBUG line carries the full URI.
+    tracing::debug!(target: "hyper_util::client::legacy", uri = QUERY_CANARY, "connecting");
     assert_nothing_above_debug_identifies_the_request(&logs);
 }
 
