@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use reqwest::Method;
 use reqwest::header::COOKIE;
+use rusteero::Client;
 use rusteero::auth::Session;
-use rusteero::consts::MAX_RESPONSE_BYTES;
+use rusteero::consts::{LEGACY_USER_AGENT, MAX_RESPONSE_BYTES};
 use rusteero::error::Error;
 use rusteero::routes::{ACCOUNT, ApiVersion, Nested, Resource};
 use rusteero::transport::{RequestBody, Transport};
@@ -674,6 +675,61 @@ async fn every_request_carries_accept_user_agent_and_accept_language() -> anyhow
     transport
         .resource(&ACCOUNT, "", None, &[], RequestBody::None)
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_user_agent_is_the_current_ios_client_version_literal() -> anyhow::Result<()> {
+    // Pins the literal on the wire, so a later edit of `consts::DEFAULT_USER_AGENT` cannot pass
+    // silently: the Eero cloud picks the advertised capabilities from this string.
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(header("user-agent", "eero-ios/2026.8.1 (iPhone; iOS 18.5)"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let transport = mock.transport_with_token(TEST_TOKEN);
+    transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_user_agent_is_sent_when_set_on_the_transport_or_client_builder()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(header("user-agent", "eero/3.0 (iPhone; iOS 17.0)"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .user_agent(Some(LEGACY_USER_AGENT.to_owned()))
+        .build()?;
+    transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await?;
+
+    let client = Client::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .user_agent(Some(LEGACY_USER_AGENT.to_owned()))
+        .build()
+        .await?;
+    client.get_account(true).await?;
     Ok(())
 }
 
