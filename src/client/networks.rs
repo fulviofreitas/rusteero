@@ -1,16 +1,14 @@
 //! `Client` methods for the `NetworksAPI` domain (plus the `get_premium_status` alias read).
 //!
-//! **No `reboot_network` wrapper.** `v8.0.4`'s `client.py` has never wrapped
-//! `NetworksAPI.reboot_network` (`api/networks.py:151`) on `EeroClient` at all — an earlier
-//! phase of this port added one anyway, with no Python precedent to cite; removed (phase-G fix
-//! list item 6) to match `client.py` exactly. [`crate::endpoints::networks::NetworksApi::reboot_network`]
-//! itself is unaffected and still callable directly through [`crate::api::EeroApi`].
+//! [`Client::reboot_network`] wraps `NetworksAPI.reboot_network` (`eero-api
+//! src/eero/client.py:1480-1514`), added to `EeroClient` at `v8.4.0`.
 
 use super::Client;
 use crate::cache::CacheKey;
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::params::require_non_empty_string;
+use serde_json::Value;
 
 impl Client {
     /// Gets a network's full object — returns the raw Eero API response.
@@ -183,6 +181,50 @@ impl Client {
             .await?;
         self.cache
             .invalidate(&CacheKey::network(network_id.as_str()));
+        Ok(response)
+    }
+
+    /// Reboots the entire network — returns the raw Eero API response.
+    ///
+    /// Ported from `reboot_network()` (`eero-api src/eero/client.py:1480-1514`). `auto_discover =
+    /// false`: with no `network_id` and no preferred network this fails with
+    /// [`Error::MissingNetworkId`] and never calls `get_networks`. Forwards the caller's `parent`
+    /// when supplied, otherwise the fresh cached network envelope, otherwise none (`parent` wins;
+    /// `_network_parent_kwargs_or`), so the request goes to the envelope's published `reboot` link
+    /// (default `POST /2.2/networks/{id}/reboot`) — see
+    /// [`crate::endpoints::networks::NetworksApi::reboot_network`] for the wire shape. The request
+    /// is sent exactly once and the domain envelope is returned untouched.
+    ///
+    /// On success, invalidates `network[nid]`, `eeros[{nid}_eeros]` and `devices[{nid}_devices]`.
+    /// The device invalidation drops the device **list** only (Python's `_invalidate_device_cache`
+    /// gets no device ids here), so single-device entries and every other network's entries
+    /// survive.
+    ///
+    /// **Every eero on the network restarts and all clients lose connectivity for minutes.** A
+    /// success only means the request was accepted, not that the network has settled: the reboot
+    /// lands later. Check before calling, and never wrap this in a retry loop. The write is
+    /// unverified against a live account and logs the uncharacterised-write warning.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingNetworkId`] if `network_id` is absent and no preferred network is set.
+    /// Otherwise, whatever [`Error`] the request produces. The cache is left untouched on any
+    /// `Err`.
+    pub async fn reboot_network(
+        &self,
+        network_id: Option<&str>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent_or(&network_id, parent);
+        let response = self
+            .api
+            .networks()
+            .reboot_network(&network_id, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(&network_id);
+        self.invalidate_eeros_cache(&network_id);
+        self.invalidate_device_cache(&network_id, &[]);
         Ok(response)
     }
 

@@ -4,12 +4,13 @@
 mod common;
 
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use rusteero::error::Error;
 
 /// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
 /// default 60-second cache TTL.
@@ -356,6 +357,183 @@ async fn get_fast_transition_never_invalidates_and_set_fast_transition_does() ->
     client
         .set_fast_transition(true, Some("network-0001"))
         .await?;
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+// ===================== set_ipv6_upstream =====================
+
+const SETTINGS_PATH: &str = "/2.2/networks/network-0001/settings";
+
+fn ok_envelope() -> serde_json::Value {
+    json!({"meta": {"code": 200}, "data": {}})
+}
+
+/// Mounts a `GET <path>` returning `body`, expecting exactly `times` requests.
+async fn mount_get(mock: &MockEero, path_str: &str, body: String, times: u64) {
+    Mock::given(method("GET"))
+        .and(path(path_str))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(times)
+        .mount(&mock.server)
+        .await;
+}
+
+/// Mounts `PUT <path>` expecting `times` requests with exactly `{"ipv6_upstream": enabled}`.
+async fn mount_upstream_put(mock: &MockEero, path_str: &str, enabled: bool, times: u64) {
+    Mock::given(method("PUT"))
+        .and(path(path_str))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/json"))
+        // `body_json` matches exactly, so a stray `ipv6_downstream` would never match.
+        .and(body_json(json!({ "ipv6_upstream": enabled })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(times)
+        .mount(&mock.server)
+        .await;
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_puts_only_the_upstream_flag() -> anyhow::Result<()> {
+    for enabled in [true, false] {
+        let mock = MockEero::start().await;
+        mount_upstream_put(&mock, SETTINGS_PATH, enabled, 1).await;
+
+        let client = client(&mock).await;
+        let env = client
+            .set_ipv6_upstream(enabled, Some("network-0001"), None)
+            .await?;
+        assert_eq!(env.into_value(), ok_envelope(), "enabled={enabled}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_forwards_the_cached_settings_link_and_invalidates_only_the_network()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001",
+        fixture("dns_network_with_settings_link.json"),
+        2,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/eeros",
+        fixture("eeros.json"),
+        1,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices",
+        fixture("devices.json"),
+        1,
+    )
+    .await;
+    mount_upstream_put(&mock, "/2.4/networks/network-0001/settings", true, 1).await;
+    mount_upstream_put(&mock, SETTINGS_PATH, true, 0).await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+
+    client
+        .set_ipv6_upstream(true, Some("network-0001"), None)
+        .await?;
+
+    // `network[nid]` was dropped (second GET); eeros and devices were not (still one GET each).
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_prefers_the_callers_parent_over_the_cached_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001",
+        fixture("dns_network_with_settings_link.json"),
+        1,
+    )
+    .await;
+    // A third path, distinct from both the template and the cached `/2.4` link.
+    mount_upstream_put(&mock, "/2.3/networks/network-0001/settings", false, 1).await;
+    mount_upstream_put(&mock, "/2.4/networks/network-0001/settings", false, 0).await;
+    mount_upstream_put(&mock, SETTINGS_PATH, false, 0).await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    let caller_parent = json!({
+        "meta": {"code": 200},
+        "data": {"resources": {"settings": "/2.3/networks/network-0001/settings"}},
+    });
+    client
+        .set_ipv6_upstream(false, Some("network-0001"), Some(&caller_parent))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_without_a_network_is_missing_network_id_without_discovery()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(&mock, "/2.2/networks", fixture("networks.json"), 0).await;
+    mount_upstream_put(&mock, SETTINGS_PATH, true, 0).await;
+
+    let err = client(&mock)
+        .await
+        .set_ipv6_upstream(true, None, None)
+        .await
+        .expect_err("no explicit and no preferred network");
+    assert!(matches!(err, Error::MissingNetworkId), "got {err:?}");
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_failed_write_keeps_the_network_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001",
+        fixture("network.json"),
+        1,
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path(SETTINGS_PATH))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    let err = client
+        .set_ipv6_upstream(true, Some("network-0001"), None)
+        .await
+        .expect_err("a 500 must surface");
+    assert!(matches!(err, Error::Api { status: 500, .. }), "got {err:?}");
+
+    // The GET mock allows exactly one request, so this is served from the cache.
     client.get_network(Some("network-0001"), false).await?;
     Ok(())
 }

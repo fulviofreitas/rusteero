@@ -13,6 +13,7 @@
 use super::Client;
 use crate::envelope::Envelope;
 use crate::error::Error;
+use serde_json::Value;
 
 impl Client {
     // ==================== Security ====================
@@ -111,7 +112,7 @@ impl Client {
     /// Enables or disables IPv6 (both upstream and downstream) — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `set_ipv6` (`client.py:2241-2248`). `auto_discover = false`. On success,
+    /// Ported from `set_ipv6` (`client.py:2888-2895`). `auto_discover = false`. On success,
     /// invalidates `network[nid]`.
     ///
     /// # Errors
@@ -128,6 +129,41 @@ impl Client {
             .api
             .security()
             .set_ipv6(&network_id, enabled, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(&network_id);
+        Ok(response)
+    }
+
+    /// Enables or disables IPv6 on the upstream (WAN) side only — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `set_ipv6_upstream` (`client.py:2897-2937`), new at `v8.4.0`. `auto_discover =
+    /// false`. Forwards the caller's `parent` when supplied, otherwise the fresh cached network
+    /// envelope (`_network_parent_kwargs_or`), and sends only `{"ipv6_upstream": enabled}` to the
+    /// `settings` link — it never calls [`Client::set_ipv6`], which writes both flags. This is the
+    /// upstream connectivity toggle, **not** IPv6 DNS. On success, invalidates `network[nid]` only;
+    /// the eeros and devices caches are untouched.
+    ///
+    /// **Settings-class write**: unverified against a live account, and the DNS write on the same
+    /// `settings` endpoint is confirmed to reboot every eero on the mesh, so treat this one as
+    /// capable of the same. Read the current configuration first, skip the write when it already
+    /// matches, and never retry a failed write in a loop.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_ipv6_upstream(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent_or(&network_id, parent);
+        let response = self
+            .api
+            .security()
+            .set_ipv6_upstream(&network_id, enabled, parent.as_ref())
             .await?;
         self.invalidate_network_cache(&network_id);
         Ok(response)

@@ -32,6 +32,20 @@ async fn client(mock: &MockEero) -> Client {
         .expect("a MockServer's own URI is always a valid base URL")
 }
 
+/// [`common::capture_logs`] plus an always-live second dispatcher.
+///
+/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
+/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
+/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
+/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
+/// capture then misses events nondeterministically. Keeping this anchor registered makes every
+/// rebuild consult all live dispatchers, the capture included.
+fn capture_logs() -> (common::LogGuard, common::LogCapture) {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+    common::capture_logs()
+}
+
 /// A small, obviously-synthetic success envelope every write test in this file can share.
 fn ok_envelope() -> serde_json::Value {
     json!({"meta": {"code": 200}, "data": {}})
@@ -900,5 +914,270 @@ async fn set_hide_5g_failed_write_keeps_the_network_cache() -> anyhow::Result<()
 
     let cached = client.get_network(Some("network-0001"), false).await?;
     assert_eq!(cached.as_value(), &fixture_json("network.json"));
+    Ok(())
+}
+
+// ===================== reboot_network =====================
+
+const REBOOT_PATH: &str = "/2.2/networks/network-0001/reboot";
+
+/// Mounts `POST <path>` expecting `times` requests carrying the two-byte JSON string body `""`
+/// and both credentials.
+async fn mount_reboot_post(mock: &MockEero, path_str: &str, times: u64) {
+    Mock::given(method("POST"))
+        .and(path(path_str))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/json"))
+        .and(body_string("\"\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(times)
+        .mount(&mock.server)
+        .await;
+}
+
+/// Mounts a `GET <path>` returning `body`, expecting exactly `times` requests.
+async fn mount_get(mock: &MockEero, path_str: &str, body: String, times: u64) {
+    Mock::given(method("GET"))
+        .and(path(path_str))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(times)
+        .mount(&mock.server)
+        .await;
+}
+
+#[tokio::test]
+async fn reboot_network_posts_the_empty_json_string_once() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_reboot_post(&mock, REBOOT_PATH, 1).await;
+
+    let client = client(&mock).await;
+    let env = client.reboot_network(Some("network-0001"), None).await?;
+    assert_eq!(env.into_value(), ok_envelope());
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert_eq!(requests.len(), 1, "got {requests:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_warns_once() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_reboot_post(&mock, REBOOT_PATH, 1).await;
+    let (_guard, logs) = capture_logs();
+
+    client(&mock)
+        .await
+        .reboot_network(Some("network-0001"), None)
+        .await?;
+
+    assert_eq!(logs.warnings().len(), 1, "got {:?}", logs.warnings());
+    assert_eq!(
+        logs.count(tracing::Level::WARN, "Issuing write (reboot network)"),
+        1
+    );
+    Ok(())
+}
+
+/// The cached reads `reboot_network` is expected to partially invalidate: for both networks the
+/// network, eeros and device list, plus one single-device entry on `network-0001`.
+async fn read_all_cached_reads(client: &Client) -> anyhow::Result<()> {
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    client
+        .get_device("device-0001", Some("network-0001"), false)
+        .await?;
+    client.get_network(Some("network-0002"), false).await?;
+    client.get_eeros(Some("network-0002"), false).await?;
+    client
+        .get_devices(Some("network-0002"), false, None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_invalidates_network_eeros_and_the_device_list_only() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // network-0001: network, eeros and the device list are re-fetched after the reboot (2 hits
+    // each); the single-device entry survives (1 hit). network-0002 is untouched (1 hit each).
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001",
+        fixture("network.json"),
+        2,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/eeros",
+        fixture("eeros.json"),
+        2,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices",
+        fixture("devices.json"),
+        2,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices/device-0001",
+        fixture("device.json"),
+        1,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0002",
+        fixture("network.json"),
+        1,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0002/eeros",
+        fixture("eeros.json"),
+        1,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0002/devices",
+        fixture("devices.json"),
+        1,
+    )
+    .await;
+    mount_reboot_post(&mock, REBOOT_PATH, 1).await;
+
+    let client = client(&mock).await;
+    read_all_cached_reads(&client).await?;
+    client.reboot_network(Some("network-0001"), None).await?;
+    read_all_cached_reads(&client).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_uses_the_cached_network_reboot_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001",
+        fixture("network_with_write_links.json"),
+        1,
+    )
+    .await;
+    mount_reboot_post(&mock, "/2.4/networks/network-0001/reboot", 1).await;
+    mount_reboot_post(&mock, REBOOT_PATH, 0).await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.reboot_network(Some("network-0001"), None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_prefers_the_caller_parent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001",
+        fixture("network_with_write_links.json"),
+        1,
+    )
+    .await;
+    // A third path, distinct from both the template and the cached `/2.4` link.
+    mount_reboot_post(&mock, "/2.3/networks/network-0001/reboot", 1).await;
+    mount_reboot_post(&mock, "/2.4/networks/network-0001/reboot", 0).await;
+    mount_reboot_post(&mock, REBOOT_PATH, 0).await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    let caller_parent = json!({
+        "meta": {"code": 200},
+        "data": {"resources": {"reboot": "/2.3/networks/network-0001/reboot"}},
+    });
+    client
+        .reboot_network(Some("network-0001"), Some(&caller_parent))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_without_a_network_is_missing_network_id_without_discovery()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(&mock, "/2.2/networks", fixture("networks.json"), 0).await;
+    mount_reboot_post(&mock, REBOOT_PATH, 0).await;
+
+    let err = client(&mock)
+        .await
+        .reboot_network(None, None)
+        .await
+        .expect_err("no explicit and no preferred network");
+    assert!(matches!(err, Error::MissingNetworkId), "got {err:?}");
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_failure_leaves_the_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001",
+        fixture("network.json"),
+        1,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/eeros",
+        fixture("eeros.json"),
+        1,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices",
+        fixture("devices.json"),
+        1,
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(REBOOT_PATH))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+
+    let err = client
+        .reboot_network(Some("network-0001"), None)
+        .await
+        .expect_err("a 500 must surface");
+    assert!(matches!(err, Error::Api { status: 500, .. }), "got {err:?}");
+
+    // Each GET mock allows exactly one request, so these are served from the cache.
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_eeros(Some("network-0001"), false).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
     Ok(())
 }

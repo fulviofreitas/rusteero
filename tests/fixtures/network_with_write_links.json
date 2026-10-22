@@ -1,0 +1,11 @@
+{
+  "meta": { "code": 200 },
+  "data": {
+    "id": "network-0001",
+    "url": "/2.4/networks/network-0001",
+    "resources": {
+      "reboot": "/2.4/networks/network-0001/reboot",
+      "settings": "/2.4/networks/network-0001/settings"
+    }
+  }
+}
