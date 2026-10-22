@@ -8,7 +8,10 @@
 //! [`crate::endpoints::dns_policies::DnsPoliciesApi::get_profile_applications`]'s docs), passes
 //! the cached network envelope as `parent=` (`+net`).
 
+use serde_json::Value;
+
 use super::Client;
+use crate::cache::Bucket;
 use crate::envelope::Envelope;
 use crate::error::Error;
 
@@ -275,6 +278,85 @@ impl Client {
             .set_profile_blocked_applications(&network_id, profile_id, applications)
             .await?;
         self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        Ok(response)
+    }
+
+    /// Switches ad blocking on or off for the network or profiles — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `set_network_ad_block()` (`eero-api src/eero/client.py:3142-3193` at
+    /// `v8.4.1`). `profiles` **replaces** the previous profile list; `Some(&[])` with `enabled:
+    /// true` means network-wide. Entries may be ids, paths or URLs (see
+    /// [`crate::endpoints::dns_policies::DnsPoliciesApi::set_network_ad_block`]). Pass `None` for
+    /// the network-wide switch.
+    ///
+    /// **Unverified write, premium feature** (`Error::PremiumRequired` otherwise).
+    /// `capable: true` in the network's `premium_dns` block alone does not mean the DNS-policy
+    /// subsystem is enabled. Read [`Client::get_network`] first and only write when the stored
+    /// state differs; never retry a failed write in a loop.
+    ///
+    /// `auto_discover = false`. `parent` is the network's own envelope; when `None`, the cached
+    /// network envelope is used if one is fresh (`_network_parent_kwargs_or`), and its own `url`
+    /// is the base of the endpoint. On success, invalidates `network[{nid}]`, and — when
+    /// `profiles` is `Some`, even if empty — every cached profile of the network (single
+    /// profiles and the list); other networks' profiles survive. A premium (or any other) error
+    /// leaves the cache untouched.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_network_ad_block(
+        &self,
+        enabled: bool,
+        profiles: Option<&[&str]>,
+        network_id: Option<&str>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent_or(network_id.as_str(), parent);
+        let response = self
+            .api
+            .dns_policies()
+            .set_network_ad_block(&network_id, enabled, profiles, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(network_id.as_str());
+        if profiles.is_some() {
+            self.cache
+                .invalidate_bucket(Bucket::Profiles, network_id.as_str());
+        }
+        Ok(response)
+    }
+
+    /// Switches malware blocking on or off for the network — returns the raw Eero API response.
+    ///
+    /// Ported from `set_network_block_malware()` (`eero-api src/eero/client.py:3195-3229` at
+    /// `v8.4.1`). POSTs `{"block_malware": enabled}` to the network's `dns_policies/network`
+    /// resource; the body key is validated client-side.
+    ///
+    /// **Unverified write, premium feature** (`Error::PremiumRequired` otherwise); the same
+    /// read-compare-skip discipline as [`Client::set_network_ad_block`] applies.
+    ///
+    /// `auto_discover = false`; `parent` as for [`Client::set_network_ad_block`]. On success,
+    /// invalidates `network[{nid}]` only — profile caches stay. A premium (or any other) error
+    /// leaves the cache untouched.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_network_block_malware(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent_or(network_id.as_str(), parent);
+        let response = self
+            .api
+            .dns_policies()
+            .set_network_block_malware(&network_id, enabled, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(network_id.as_str());
         Ok(response)
     }
 }
