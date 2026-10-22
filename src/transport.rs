@@ -1,16 +1,17 @@
 //! Request core: header/credential construction, status mapping, response size cap, redirect
 //! refusal, GET-only bounded retry, and the server-driven refresh-and-replay handshake.
 //!
-//! Ported from `eero-api`'s `src/eero/api/base.py` at `v8.0.4` (request pipeline) and
+//! Ported from `eero-api`'s `src/eero/api/base.py` at `v8.4.1` (request pipeline) and
 //! `src/eero/api/auth.py` (the refresh handshake). [`Transport`] is the single place that turns
 //! an HTTP status/body into either an `Envelope` or a typed `Error` — every endpoint module built
 //! on top of it is expected to be a thin wrapper that supplies a route and path/query/body values
 //! and nothing else.
 //!
-//! # The v8.0.4 request API
+//! # The request API
 //!
 //! [`Transport::request`]/[`Transport::resource`]/[`Transport::nested`] are the request-building
-//! entry points; see `.claude/tasks/briefs/v8/transport-api.md` for a worked example of each.
+//! entry points: `request` takes an already-resolved absolute [`Url`], `resource` and `nested`
+//! resolve a [`Resource`] or [`Nested`] route against [`Transport::api_host`] first.
 //! Every endpoint module builds on `resource`/`nested` (or, for the login handshake and session
 //! refresh, `request`/`request_with_token` directly against a fixed-path [`Resource`]). Each of the
 //! three has a `*_with_timeout` twin taking an optional per-call [`RequestTimeout`] that replaces
@@ -37,16 +38,15 @@
 //! [`Transport::credentials_persisted`] reports the outcome of the most recent persist that
 //! actually reached the store.
 //!
-//! # The refresh-retry divergence (task brief gotcha G1)
+//! # The refresh replay
 //!
-//! `eero-api`'s 401-triggered refresh retry re-sends the retried request with the *original,
-//! pre-refresh* token (`api/base.py:625-658`), which matters little at `v8.0.4` since a
-//! successful refresh never actually rotates the token (`refresh_session`'s own docs) — but
-//! `rusteero` still deliberately re-reads the session from shared state *after* the refresh
-//! completes rather than reusing the token captured before it, so the retry observes whatever the
-//! refresh handshake left behind (including a credential-clearing terminal failure, which turns
-//! the retry into another "Not authenticated" precondition failure rather than silently reusing a
-//! since-cleared token).
+//! A `401` carrying `error.session.refresh` triggers one refresh and one replay of the original
+//! request (`api/base.py:879-932`). As in `eero-api`, which sources the replay token from the
+//! current session through its token provider (`api/base.py:922-924`), the replay re-reads the
+//! session from shared state *after* the refresh completes rather than reusing the token captured
+//! before it. The retry therefore observes whatever the refresh handshake left behind, including
+//! a credential-clearing terminal failure, which turns the replay into another "Not
+//! authenticated" precondition failure rather than silently reusing a since-cleared token.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,14 +73,14 @@ use crate::routes::{self, ApiVersion, Nested, Resource};
 use crate::storage::{self, CredentialStore};
 
 /// The body a request carries, mirroring `eero-api`'s `RequestEncoding`
-/// (`api/base.py:54-75,324-361`).
+/// (`api/base.py:66-87,554-591`).
 ///
 /// Exactly one carrier is active per request: `Json` sets `Content-Type: application/json` and
 /// serializes `value` as the body (`reqwest::RequestBuilder::json`); `Form` sets
 /// `Content-Type: application/x-www-form-urlencoded` and url-encodes the pairs in order
 /// (`reqwest::RequestBuilder::form`); `EmptyJsonString` sends the literal two-byte body `""` with
 /// `Content-Type: application/json` set explicitly — the exact shape `login/refresh` requires
-/// (`api/base.py:483-484,501-502`); `None` sends no body and no `Content-Type` at all.
+/// (`api/base.py:709-710,727-728`); `None` sends no body and no `Content-Type` at all.
 #[derive(Debug, Clone)]
 pub enum RequestBody {
     /// No body, no `Content-Type`.
@@ -202,7 +202,7 @@ pub struct Transport {
     refresh_slot: tokio::sync::Mutex<Weak<watch::Sender<Option<bool>>>>,
 }
 
-/// How a [`Transport`] treats a failed write to its configured credential store (decision D-13).
+/// How a [`Transport`] treats a failed write to its configured credential store.
 ///
 /// Set via [`TransportBuilder::storage_failures`]; honoured at every credential-store call site
 /// in this module ([`Transport::set_session`], [`Transport::set_session_async`], and the
@@ -458,8 +458,8 @@ impl Transport {
 
     /// Whether a session is configured and has a non-empty token.
     ///
-    /// Purely a local check (`Session::is_valid`, itself a token-presence check — `v8.0.4` has no
-    /// client-side expiry, see [`Session`]'s own docs). Never makes a network call and never
+    /// Purely a local check (`Session::is_valid`, itself a token-presence check — `eero-api` has
+    /// no client-side expiry, see [`Session`]'s own docs). Never makes a network call and never
     /// attempts a refresh.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
@@ -467,7 +467,7 @@ impl Transport {
             .is_some_and(|session| session.is_valid())
     }
 
-    // ============================= v8.0.4 request API =============================
+    // ============================= request API =============================
 
     /// Sends an authenticated request built from an already-resolved `url`.
     ///
@@ -629,7 +629,7 @@ impl Transport {
     /// (`LoginFlow`/`PendingLogin`) and internally by [`Transport::refresh_session`] — none of
     /// `login`/`login/verify`/`login/resend`/`logout`/`login/refresh` should trigger (or be
     /// eligible for) the ordinary refresh replay, matching `AuthAPI` never wiring its own refresh
-    /// hook onto itself (`api/base.py:873-878`, preventing recursion on the refresh endpoint's
+    /// hook onto itself (`api/base.py:879-886`, preventing recursion on the refresh endpoint's
     /// own 401).
     ///
     /// # Errors
@@ -655,13 +655,12 @@ impl Transport {
     }
 
     /// Attempts to refresh the current session, ported from `AuthAPI._do_refresh`
-    /// (`api/auth.py:415-477`) with single-flight coalescing ported from
-    /// `AuthAPI.refresh_session` (`api/auth.py:331-413`).
+    /// (`api/auth.py:463-525`) with single-flight coalescing ported from
+    /// `AuthAPI.refresh_session` (`api/auth.py:379-461`).
     ///
-    /// Sends `POST` [`routes::LOGIN_REFRESH`] (the only refresh route at `v8.0.4` — `v6.2.0`'s
-    /// `account/refresh` fallback is gone) with body [`RequestBody::EmptyJsonString`],
-    /// authenticated by the *current* session token — there is no separate refresh token at
-    /// `v8.0.4`, the session token authenticates its own refresh. On success, the response body is
+    /// Sends `POST` [`routes::LOGIN_REFRESH`] (the only refresh route) with body
+    /// [`RequestBody::EmptyJsonString`], authenticated by the *current* session token — there is
+    /// no separate refresh token, the session token authenticates its own refresh. On success, the response body is
     /// **not** parsed for a new token at all: the server-issued token is discarded per SDK policy
     /// and the current token stays current.
     ///
@@ -1012,7 +1011,7 @@ impl Transport {
     /// [`Transport::execute_once`]).
     ///
     /// Builds `Accept: application/json`, `User-Agent`, and `X-Accept-Language` on every request
-    /// (`build_request_headers`, `base.py:124-164`); attaches the session credential via
+    /// (`build_request_headers`, `base.py:136-176`); attaches the session credential via
     /// [`Transport::apply_credentials`]; applies `body` via [`Transport::apply_body`]; refuses any
     /// `3xx` redirect immediately, before the body is streamed at all; and streams the body with
     /// the response-size cap.
@@ -1066,7 +1065,7 @@ impl Transport {
             "eero transport request"
         );
 
-        // Security finding F4 (superseded): `TransportBuilder::build` now forces
+        // `TransportBuilder::build` forces
         // `Policy::none()` onto every `reqwest::Client` it constructs — including one built from
         // a caller-supplied `reqwest::ClientBuilder` via `TransportBuilder::http_builder` — so a
         // `3xx` response can no longer be followed *inside* `request.send()` above in the first
@@ -1083,7 +1082,7 @@ impl Transport {
         }
 
         if status.is_redirection() {
-            // Security finding F5: the message must never carry the full request URL (which can
+            // The message must never carry the full request URL (which can
             // embed a session token in its query string) or the full `Location` value (which can
             // carry an attacker-chosen query string of its own) — only the status, the request
             // *path*, and, when present, the `Location` header's *host* are safe to render here.
@@ -1418,7 +1417,7 @@ fn parse_base(raw: &str) -> Result<Url, Error> {
 
 /// Validates that `value` is safe to use as an HTTP header value: printable ASCII with no CR/LF.
 ///
-/// Ported from `_validate_header_value` (`base.py:108-121`,
+/// Ported from `_validate_header_value` (`base.py:120-133`,
 /// `_HEADER_VALUE_RE = re.compile(r"^[\x20-\x7E]*$")`) — note the `*`, not `+`: an *empty* header
 /// value is valid by this rule (unlike a session token, which [`crate::auth::session::validate_token_shape`]
 /// additionally requires to be non-empty).
@@ -1479,7 +1478,7 @@ impl TransportBuilder {
     /// Supplies a `reqwest::ClientBuilder` to customize the underlying HTTP client, instead of
     /// letting `build` construct one from scratch with this crate's defaults.
     ///
-    /// # Security (finding F4)
+    /// # Security
     ///
     /// Regardless of what redirect policy `builder` carries — or omits — `build` calls
     /// `.redirect(reqwest::redirect::Policy::none())` on it **last**, immediately before
@@ -1542,7 +1541,7 @@ impl TransportBuilder {
 
     /// Whether to also attach a legacy `Cookie: s=<token>` header alongside the primary
     /// `X-User-Token` credential. Defaults to `true` (`send_legacy_cookie`'s Python default,
-    /// `base.py:241,254-257`).
+    /// `base.py:424,638`).
     #[must_use]
     pub fn send_legacy_cookie(mut self, send_legacy_cookie: bool) -> Self {
         self.send_legacy_cookie = send_legacy_cookie;
@@ -1574,7 +1573,7 @@ impl TransportBuilder {
         self
     }
 
-    /// Sets this transport's policy for a failed credential-store operation (decision D-13).
+    /// Sets this transport's policy for a failed credential-store operation.
     #[must_use]
     pub fn storage_failures(mut self, storage_failures: StorageFailures) -> Self {
         self.storage_failures = storage_failures;
@@ -1582,8 +1581,10 @@ impl TransportBuilder {
     }
 
     /// Overrides the transport's default overall (total) request timeout — the default for any
-    /// request that supplies no per-call [`RequestTimeout`]. [`Duration::ZERO`] means unbounded.
-    /// Ignored if [`TransportBuilder::http_builder`] was also called.
+    /// request that supplies no per-call [`RequestTimeout`]. Defaults to
+    /// [`consts::REQUEST_TIMEOUT`]. [`Duration::ZERO`] means **unbounded**: it switches the total
+    /// bound off rather than timing out at once, as a zero field of a per-call [`RequestTimeout`]
+    /// does. Ignored if [`TransportBuilder::http_builder`] was also called.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -1591,7 +1592,9 @@ impl TransportBuilder {
     }
 
     /// Overrides the transport's default per-read timeout — the default for any request that
-    /// supplies no per-call [`RequestTimeout`]. [`Duration::ZERO`] means unbounded. Ignored if
+    /// supplies no per-call [`RequestTimeout`]. Defaults to [`consts::READ_TIMEOUT`].
+    /// [`Duration::ZERO`] means **unbounded**: it switches the read bound off rather than timing
+    /// out at once, as a zero field of a per-call [`RequestTimeout`] does. Ignored if
     /// [`TransportBuilder::http_builder`] was also called.
     #[must_use]
     pub fn read_timeout(mut self, read_timeout: Duration) -> Self {
@@ -1610,7 +1613,7 @@ impl TransportBuilder {
     /// values reports the first. Returns `Error::Network` if constructing the underlying
     /// `reqwest::Client` fails.
     ///
-    /// # Security (finding F4)
+    /// # Security
     ///
     /// `.redirect(reqwest::redirect::Policy::none())` is applied last, immediately before
     /// `.build()`, regardless of whether the client comes from this crate's own defaults or from

@@ -1304,15 +1304,16 @@ async fn concurrent_refresh_calls_coalesce_into_a_single_request() -> anyhow::Re
 // ===================== per-call RequestTimeout =====================
 //
 // Real clock throughout: the crate's own timeouts and a paused clock do not mix with a real
-// HTTP round trip. The delays are chosen so a 150 ms default is exceeded by a 400 ms response
-// while every per-call budget below (2-3 s) is not.
+// HTTP round trip. The delays are chosen so a 100 ms default is exceeded by a 1.5 s response,
+// a gap wide enough that a starved runtime cannot let the response win the race, while every
+// per-call budget below (10 s) is not.
 
-/// Short enough that a [`SLOW`] response trips it.
-const SHORT: Duration = Duration::from_millis(150);
+/// Short enough that a [`SLOW`] response trips it, with a 15x margin.
+const SHORT: Duration = Duration::from_millis(100);
 /// How long the delayed responses below are held back.
-const SLOW: Duration = Duration::from_millis(400);
+const SLOW: Duration = Duration::from_millis(1500);
 /// A per-call budget no test response comes near.
-const GENEROUS: Duration = Duration::from_secs(3);
+const GENEROUS: Duration = Duration::from_secs(10);
 
 /// A `Transport` pointed at `mock` with a valid session and the given default bounds.
 fn transport_with_bounds(mock: &MockEero, total: Duration, read: Duration) -> Transport {
@@ -1481,7 +1482,7 @@ async fn per_call_total_and_read_replace_both_defaults() -> anyhow::Result<()> {
 #[tokio::test]
 async fn per_call_total_only_drops_the_default_read_bound() -> anyhow::Result<()> {
     // Wholesale replacement: `RequestTimeout::total(..)` leaves `read` unset, which means "no read
-    // bound", not "keep the 150 ms default read bound". A merge would time out here.
+    // bound", not "keep the 100 ms default read bound". A merge would time out here.
     let mock = MockEero::start().await;
     mount_delayed_account(&mock, SLOW, 1).await;
     let transport = transport_with_bounds(&mock, SHORT, SHORT);
@@ -1516,7 +1517,7 @@ async fn a_per_call_value_can_shorten_the_default() -> anyhow::Result<()> {
         Some(RequestTimeout::new(None, Some(Duration::from_millis(100)))),
     )
     .await
-    .expect_err("a 100 ms per-call read bound beats the 3 s default");
+    .expect_err("a 100 ms per-call read bound beats the 10 s default");
     assert!(matches!(err, Error::Timeout), "{err:?}");
 
     let err = get_account(
@@ -1524,7 +1525,7 @@ async fn a_per_call_value_can_shorten_the_default() -> anyhow::Result<()> {
         Some(RequestTimeout::total(Duration::from_millis(100))),
     )
     .await
-    .expect_err("a 100 ms per-call total bound beats the 3 s default");
+    .expect_err("a 100 ms per-call total bound beats the 10 s default");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     Ok(())
 }
@@ -1582,7 +1583,7 @@ async fn request_and_nested_entry_points_take_a_per_call_timeout_too() -> anyhow
     let err = transport
         .nested_with_timeout(&route, "net-1", "dev-1", None, &[], RequestBody::None, None)
         .await
-        .expect_err("None keeps the 150 ms default");
+        .expect_err("None keeps the 100 ms default");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     transport
         .nested_with_timeout(
@@ -1605,7 +1606,7 @@ async fn a_stalled_body_trips_the_default_read_bound() -> anyhow::Result<()> {
 
     let err = get_account(&transport, None)
         .await
-        .expect_err("a 400 ms gap between chunks exceeds the 150 ms read bound");
+        .expect_err("a 1.5 s gap between chunks exceeds the 100 ms read bound");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     Ok(())
 }
@@ -1622,17 +1623,17 @@ async fn a_per_call_value_without_a_read_bound_lets_a_stalled_body_finish() -> a
 
 #[tokio::test]
 async fn the_total_bound_covers_the_whole_body_read() -> anyhow::Result<()> {
-    // Four chunks 200 ms apart: no single wait comes near the 3 s read bound, but the body takes
-    // about 600 ms in all, so only the 400 ms total can fire.
-    let base = serve_dripped_body(DRIPPED_BODY, Duration::from_millis(200)).await;
-    let transport = transport_for(&base, Duration::from_millis(400), GENEROUS);
+    // Four chunks 400 ms apart: no single wait comes near the 10 s read bound, but the body takes
+    // about 1.2 s in all, so only the 600 ms total can fire.
+    let base = serve_dripped_body(DRIPPED_BODY, Duration::from_millis(400)).await;
+    let transport = transport_for(&base, Duration::from_millis(600), GENEROUS);
     let err = get_account(&transport, None)
         .await
         .expect_err("the total bound runs until the body is fully read");
     assert!(matches!(err, Error::Timeout), "{err:?}");
 
-    let base = serve_dripped_body(DRIPPED_BODY, Duration::from_millis(200)).await;
-    let transport = transport_for(&base, Duration::from_millis(400), GENEROUS);
+    let base = serve_dripped_body(DRIPPED_BODY, Duration::from_millis(400)).await;
+    let transport = transport_for(&base, Duration::from_millis(600), GENEROUS);
     let env = get_account(&transport, Some(RequestTimeout::total(GENEROUS))).await?;
     assert_eq!(env.data()["c"], json!(3));
     Ok(())
@@ -1640,14 +1641,14 @@ async fn the_total_bound_covers_the_whole_body_read() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn the_read_bound_restarts_for_every_chunk() -> anyhow::Result<()> {
-    // Each wait is about 250 ms, under the 600 ms read bound, although the body as a whole takes
-    // about 750 ms: the read bound is per wait, not cumulative.
-    let base = serve_dripped_body(DRIPPED_BODY, Duration::from_millis(250)).await;
+    // Each wait is about 500 ms, under the 1 s read bound, although the body as a whole takes
+    // about 1.5 s: the read bound is per wait, not cumulative.
+    let base = serve_dripped_body(DRIPPED_BODY, Duration::from_millis(500)).await;
     let transport = transport_for(&base, GENEROUS, SHORT);
 
     let env = get_account(
         &transport,
-        Some(RequestTimeout::new(None, Some(Duration::from_millis(600)))),
+        Some(RequestTimeout::new(None, Some(Duration::from_secs(1)))),
     )
     .await?;
     assert_eq!(env.data()["a"], json!(1));
@@ -1657,9 +1658,9 @@ async fn the_read_bound_restarts_for_every_chunk() -> anyhow::Result<()> {
 #[tokio::test]
 async fn per_call_timeout_gives_each_get_retry_attempt_a_full_budget() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    // Attempt 1 outlives the 600 ms per-call total; attempt 2 answers in 300 ms, which is within
-    // the per-call budget but over the 150 ms default. Succeeding after the 500 ms retry delay
-    // (about 1.4 s in all) shows the budget restarts per attempt instead of being one shared
+    // Attempt 1 outlives the 1 s per-call total; attempt 2 answers in 500 ms, which is within
+    // the per-call budget but over the 100 ms default. Succeeding after the 500 ms retry delay
+    // (about 2 s in all) shows the budget restarts per attempt instead of being one shared
     // deadline.
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
@@ -1668,7 +1669,7 @@ async fn per_call_timeout_gives_each_get_retry_attempt_a_full_budget() -> anyhow
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("account.json"))
-                .set_delay(Duration::from_millis(1000)),
+                .set_delay(Duration::from_millis(2500)),
         )
         .up_to_n_times(1)
         .expect(1)
@@ -1681,7 +1682,7 @@ async fn per_call_timeout_gives_each_get_retry_attempt_a_full_budget() -> anyhow
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("account.json"))
-                .set_delay(Duration::from_millis(300)),
+                .set_delay(Duration::from_millis(500)),
         )
         .expect(1)
         .mount(&mock.server)
@@ -1696,7 +1697,7 @@ async fn per_call_timeout_gives_each_get_retry_attempt_a_full_budget() -> anyhow
 
     let env = get_account(
         &transport,
-        Some(RequestTimeout::total(Duration::from_millis(600))),
+        Some(RequestTimeout::total(Duration::from_secs(1))),
     )
     .await?;
     assert_eq!(env.into_value(), fixture_json("account.json"));
@@ -1708,6 +1709,8 @@ async fn per_call_timeout_carries_into_the_refresh_replay() -> anyhow::Result<()
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(
             ResponseTemplate::new(401)
                 .set_body_string(r#"{"meta":{"code":401,"error":"error.session.refresh"}}"#),
@@ -1718,6 +1721,8 @@ async fn per_call_timeout_carries_into_the_refresh_replay() -> anyhow::Result<()
         .await;
     Mock::given(method("POST"))
         .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
         .and(body_string("\"\""))
         .respond_with(
             ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200},"data":{}}"#),
@@ -1732,7 +1737,7 @@ async fn per_call_timeout_carries_into_the_refresh_replay() -> anyhow::Result<()
     assert_eq!(
         env.into_value(),
         fixture_json("account.json"),
-        "the replay was slower than the 150 ms default, so the per-call value must have applied"
+        "the replay was slower than the 100 ms default, so the per-call value must have applied"
     );
     Ok(())
 }
@@ -1742,6 +1747,8 @@ async fn the_refresh_post_keeps_the_transport_default_timeout() -> anyhow::Resul
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(
             ResponseTemplate::new(401)
                 .set_body_string(r#"{"meta":{"code":401,"error":"error.session.refresh"}}"#),
@@ -1751,6 +1758,9 @@ async fn the_refresh_post_keeps_the_transport_default_timeout() -> anyhow::Resul
         .await;
     Mock::given(method("POST"))
         .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(body_string("\"\""))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"meta":{"code":200},"data":{}}"#)
@@ -1762,7 +1772,7 @@ async fn the_refresh_post_keeps_the_transport_default_timeout() -> anyhow::Resul
     let transport = transport_with_bounds(&mock, SHORT, SHORT);
 
     // The generous per-call value must not leak into the refresh POST: it times out under the
-    // 150 ms default, the timeout propagates, and the request is never replayed (the single
+    // 100 ms default, the timeout propagates, and the request is never replayed (the single
     // 401 mock above is `expect(1)`).
     let err = get_account(&transport, Some(RequestTimeout::total(GENEROUS)))
         .await
@@ -1795,7 +1805,7 @@ async fn a_per_call_value_applies_on_top_of_a_caller_supplied_http_builder() -> 
     let mock = MockEero::start().await;
     mount_delayed_account(&mock, SLOW, 4).await;
 
-    // The caller's builder carries a 150 ms total timeout of its own.
+    // The caller's builder carries a 100 ms total timeout of its own.
     let capped = Transport::builder()
         .base_url(mock.uri())
         .session(Some(Session::from_token(TEST_TOKEN)))
@@ -1863,7 +1873,7 @@ async fn mount_slow_and_fast(mock: &MockEero, slow_delay: Duration) {
 #[tokio::test]
 async fn cancelled_get_does_not_leak_its_response_into_the_next_request() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    mount_slow_and_fast(&mock, Duration::from_millis(500)).await;
+    mount_slow_and_fast(&mock, Duration::from_millis(1500)).await;
     let transport = mock.transport_with_token(TEST_TOKEN);
 
     let slow = Url::parse(&format!("{}/2.2/networks/slow", mock.uri()))?;
@@ -1885,7 +1895,7 @@ async fn cancelled_get_does_not_leak_its_response_into_the_next_request() -> any
 #[tokio::test]
 async fn timed_out_get_does_not_leak_its_response_into_the_next_request() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    mount_slow_and_fast(&mock, Duration::from_millis(800)).await;
+    mount_slow_and_fast(&mock, Duration::from_millis(2500)).await;
     let transport = transport_with_bounds(&mock, GENEROUS, GENEROUS);
 
     let slow = Url::parse(&format!("{}/2.2/networks/slow", mock.uri()))?;
@@ -2003,20 +2013,20 @@ async fn timeout_error_line_names_the_method_but_not_the_path() -> anyhow::Resul
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("{}")
-                .set_delay(Duration::from_millis(500)),
+                .set_delay(Duration::from_millis(1500)),
         )
         .mount(&mock.server)
         .await;
     let transport = Transport::builder()
         .base_url(mock.uri())
         .session(Some(Session::from_token(TEST_TOKEN)))
-        .timeout(Duration::from_millis(50))
+        .timeout(Duration::from_millis(100))
         .build()?;
 
     let (_guard, logs) = capture_logs();
     let err = send_canary(&transport, Method::GET, &mock.uri())
         .await
-        .expect_err("the response outlives the 50 ms total");
+        .expect_err("the response outlives the 100 ms total");
     assert!(matches!(err, Error::Timeout), "{err:?}");
 
     assert_eq!(logs.errors(), ["Request timed out on GET request"]);
@@ -2255,14 +2265,14 @@ async fn timeouts_and_retries_do_not_log_identifiers_above_debug() -> anyhow::Re
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("{}")
-                .set_delay(Duration::from_millis(400)),
+                .set_delay(Duration::from_millis(1500)),
         )
         .mount(&mock.server)
         .await;
     let transport = Transport::builder()
         .base_url(mock.uri())
         .session(Some(Session::from_token(TEST_TOKEN)))
-        .timeout(Duration::from_millis(40))
+        .timeout(Duration::from_millis(100))
         .get_retries(1)
         .build()?;
 
