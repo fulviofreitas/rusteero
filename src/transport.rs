@@ -411,6 +411,7 @@ impl Transport {
             return Ok(());
         };
         let for_store = session.clone();
+        let saving = for_store.is_some();
         let ticket = self.replace_session(session);
         let ticketed: Arc<dyn CredentialStore> = Arc::new(TicketedStore {
             store: Arc::clone(store),
@@ -421,6 +422,16 @@ impl Transport {
             Some(s) => storage::save_async(ticketed, s).await,
             None => storage::clear_async(ticketed).await,
         };
+        if saving
+            && outcome.is_err()
+            && self.persistence.generation.load(Ordering::SeqCst) == ticket
+        {
+            // A blocking task that was cancelled before it ran (the runtime shutting down) never
+            // reached the store, so nothing recorded the failed save; a store that did fail has
+            // already cleared the flag, which this repeats. Only the newest change may do it: an
+            // older one's outcome says nothing about the record now on disk.
+            self.persistence.last_ok.store(false, Ordering::SeqCst);
+        }
         self.apply_storage_policy(outcome)
     }
 
@@ -432,7 +443,8 @@ impl Transport {
     /// session, so an `Err` from the store makes it `false` even under [`StorageFailures::Warn`],
     /// where the failure is otherwise only a log line. A clear resets it to `true` before the
     /// store is called, so it is `true` after a clear even if that clear failed (the credential
-    /// being destroyed is no longer one that needs to survive a restart). A persist skipped
+    /// being destroyed is no longer one that needs to survive a restart). A save whose blocking
+    /// task was cancelled before it reached the store counts as failed. A persist skipped
     /// because a newer session change overtook it leaves the value untouched, as does a rejected
     /// (invalid) session.
     ///
@@ -2545,6 +2557,62 @@ mod tests {
             .set_session(Some(crate::auth::Session::from_token("tok\r\nX-Evil: 1")))
             .expect_err("a control character in the token must be rejected");
         assert!(matches!(err, Error::Validation { field, .. } if field == "token"));
+    }
+
+    // ===================== persistence outcome =====================
+
+    /// A store that accepts everything.
+    #[derive(Debug)]
+    struct AcceptingStore;
+
+    impl crate::storage::CredentialStore for AcceptingStore {
+        fn load(&self) -> Result<crate::auth::Session, crate::error::StorageError> {
+            Ok(crate::auth::Session::empty())
+        }
+        fn save(&self, _: &crate::auth::Session) -> Result<(), crate::error::StorageError> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<(), crate::error::StorageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_save_cancelled_before_it_reaches_the_store_is_not_persisted() {
+        // The runtime that owns the blocking pool is shut down while the caller, polled by a
+        // second runtime, is still to hand work to it: the persist task is cancelled without
+        // ever calling the store.
+        let pool = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("builds the blocking pool's runtime");
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("builds the runtime that polls the caller");
+        let transport = Transport::builder()
+            .store(Some(std::sync::Arc::new(AcceptingStore)))
+            .build()
+            .expect("builds");
+        assert!(transport.credentials_persisted());
+
+        let handle = pool.handle().clone();
+        pool.shutdown_background();
+        driver.block_on(async {
+            // `spawn_blocking` inside `set_session_async` goes to the pool's runtime.
+            let _enter = handle.enter();
+            transport
+                .set_session_async(Some(crate::auth::Session::from_token("tok-123")))
+                .await
+                .expect("the Warn policy swallows the failure");
+        });
+
+        assert!(
+            !transport.credentials_persisted(),
+            "a save that never reached the store did not persist"
+        );
+        assert!(
+            transport.is_authenticated(),
+            "the in-memory session is unaffected"
+        );
     }
 
     // ===================== the credential gate =====================
