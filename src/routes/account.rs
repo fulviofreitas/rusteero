@@ -1,9 +1,12 @@
 //! `account` routes (`AccountAPI`, new in v8.0.0).
 //!
-//! Ported from `eero-api src/eero/api/account.py` (v8.0.4). Every method is a fixed path (no
+//! Ported from `eero-api src/eero/api/account.py` (v8.4.1). Every method is a fixed path (no
 //! `{id}`, no `network_id` at all) — `Resource::resolve` ignores its `id_or_url` argument
 //! entirely for a template with no placeholder, so every `AccountApi` method calls
 //! `self.transport.resource(&ROUTE, "", None, ...)` with an unused, ignored `id_or_url`.
+//!
+//! `AccountApi::get_account` reads the account record from [`super::ACCOUNT`] (`GET
+//! /2.2/account`), a constant that lives with the network routes in the parent module.
 
 use super::{ApiVersion, Resource};
 use reqwest::Method;

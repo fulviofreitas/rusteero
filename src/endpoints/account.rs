@@ -1,8 +1,9 @@
 //! `AccountApi`: `account` endpoints (`eero-api src/eero/api/account.py`, new in v8.0.0).
 //!
-//! Manages the caller's own account profile: display name, email, phone, marketing consent, and
-//! the SMS country-code catalogue. Every write in this module is unverified against a live
-//! account: each logs one `WARNING` via [`warn_uncharacterised_write`] before it is issued.
+//! Reads and manages the caller's own account profile: the account record, display name, email,
+//! phone, marketing consent, and the SMS country-code catalogue. Every write in this module is
+//! unverified against a live account: each logs one `WARNING` via [`warn_uncharacterised_write`]
+//! before it is issued.
 //! Identifier values (email, phone, verification codes) are never logged, including at DEBUG —
 //! this module logs only the fact a call was made, never an argument's value.
 //!
@@ -32,6 +33,24 @@ impl AccountApi {
     #[must_use]
     pub fn new(transport: Arc<Transport>) -> Self {
         Self { transport }
+    }
+
+    /// Gets the account record — returns the raw Eero API response.
+    ///
+    /// Ported from `AccountAPI.get_account` (`account.py:52-71` at `v8.4.1`). Sends `GET`
+    /// [`crate::routes::ACCOUNT`] (`/2.2/account`) with no body and no query. A read, so no
+    /// uncharacterised-write warning is logged. A `401` whose `meta.error` is
+    /// `error.session.refresh` is refreshed once and the identical request replayed with the
+    /// re-read token, and the bounded `GET` retry applies, as for every other read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] with the message `Not authenticated`, before any
+    /// request, if no valid session is configured; otherwise see [`AccountApi::set_name`].
+    pub async fn get_account(&self) -> Result<Envelope, Error> {
+        self.transport
+            .resource(&routes::ACCOUNT, "", None, &[], RequestBody::None)
+            .await
     }
 
     /// Sets the account's display name — returns the raw Eero API response.
