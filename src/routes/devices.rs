@@ -42,13 +42,14 @@ pub const V8_GET_DEVICE: Nested = Nested {
 /// `PUT /2.3/networks/{network}/devices/{mac}` — set a device's nickname.
 ///
 /// Ported from `DevicesAPI._update_device` via `DevicesAPI.set_device_nickname`
-/// (`devices.py:44-65,201-225`). **Must** stay pinned to API version 2.3 — version 2.2 accepts
+/// (`devices.py:82-116,205-229`). **Must** stay pinned to API version 2.3 — version 2.2 accepts
 /// this exact `PUT`, returns `200 OK`, and silently drops the write (`eero-api` issue #102).
-/// `mac` **must** be normalised through [`crate::util::id_from_url`] before being passed as this
-/// route's `child` argument — see `DevicesApi::set_device_nickname`'s own docs for why a
-/// path/URL-shaped `mac` must never reach this route unnormalised (it could otherwise carry its
-/// own, different version segment and smuggle the write past the 2.3 pin). API-Reference.md:633,
-/// **verified** write.
+/// Two things keep a write off 2.2, and the endpoint applies both: `mac` is normalised through
+/// [`crate::util::id_from_url`] before being passed as this route's `child` argument (a path- or
+/// URL-shaped `mac` could otherwise carry its own version segment), and the resolved URL is then
+/// re-pinned with [`crate::links::rewrite_version`] to this route's `version`, because a network
+/// given as a path or absolute URL keeps its own version segment during resolution. See
+/// `DevicesApi::set_device_nickname`. API-Reference.md:633, **verified** write.
 pub const V8_SET_DEVICE_NICKNAME: Nested = Nested {
     method: Method::PUT,
     version: ApiVersion::V2_3,

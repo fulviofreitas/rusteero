@@ -38,7 +38,8 @@ use url::Url;
 use crate::endpoints::blacklist::BlacklistApi;
 use crate::envelope::Envelope;
 use crate::error::Error;
-use crate::routes;
+use crate::links;
+use crate::routes::{self, Nested};
 use crate::transport::{RequestBody, Transport};
 
 /// `eero-api`'s `DevicesAPI` (`devices.py`): device listing, single-device lookup, and the
@@ -140,17 +141,33 @@ impl DevicesApi {
         routes::devices::V8_GET_DEVICE.resolve(self.transport.api_host(), network_id, mac, None)
     }
 
+    /// Resolves the URL of a device write that must go out on API 2.3 — `_update_device`'s URL
+    /// steps (`devices.py:112-115`) shared by [`DevicesApi::set_device_nickname`] and
+    /// [`DevicesApi::pause_device`].
+    ///
+    /// `mac` is first reduced to its trailing path segment with [`crate::util::id_from_url`] (a
+    /// no-op for an already-bare MAC), so a path or URL form of the device cannot carry its own
+    /// version into the request. The URL is then resolved through `route`'s network template and
+    /// finally re-pinned to the route's version with [`links::rewrite_version`], because a network
+    /// given as a path or an absolute URL keeps its own version segment during resolution — a
+    /// `2.2` network path would otherwise send the write to the `2.2` endpoint, which answers
+    /// `200 OK` and silently drops it.
+    fn device_write_url(&self, route: &Nested, network_id: &str, mac: &str) -> Result<Url, Error> {
+        let normalized_mac = crate::util::id_from_url(mac)?;
+        let url = route.resolve(self.transport.api_host(), network_id, &normalized_mac, None)?;
+        Ok(links::rewrite_version(&url, route.version))
+    }
+
     /// `PUT /2.3/networks/{network_id}/devices/{mac}` — set a device's nickname.
     ///
     /// Ported from `DevicesAPI._update_device` via `DevicesAPI.set_device_nickname`
-    /// (`devices.py:44-65,201-225`), sending body `{"nickname": nickname}` (`devices.py:225`).
-    /// `mac` is normalised through [`crate::util::id_from_url`] **before** being resolved against
-    /// the 2.3 route — exactly like `_update_device` (`devices.py:82-112`'s docstring) —
-    /// specifically so a path/URL-form `mac` (which could carry its own, different version
-    /// segment) cannot smuggle a device write past the 2.3 version pin. **Must**, and does, use
-    /// `routes::devices::V8_SET_DEVICE_NICKNAME` (`ApiVersion::V2_3`), never a `/2.2` route: the
-    /// `/2.2` endpoint accepts the identical `PUT`, returns `200 OK`, and silently drops the write
-    /// (`eero-api` issue #102).
+    /// (`devices.py:82-116,205-229`), sending body `{"nickname": nickname}` (`devices.py:229`).
+    /// **Must**, and does, go out on `routes::devices::V8_SET_DEVICE_NICKNAME`'s API version 2.3,
+    /// never 2.2: the `/2.2` endpoint accepts the identical `PUT`, returns `200 OK`, and silently
+    /// drops the write (`eero-api` issue #102). `mac` is normalised through
+    /// [`crate::util::id_from_url`] before it is resolved, and the resolved URL is then re-pinned
+    /// to 2.3, so neither a path- or URL-form device nor a path- or URL-form `network_id`
+    /// carrying a `2.2` segment can route the write to 2.2.
     ///
     /// # Errors
     ///
@@ -163,13 +180,8 @@ impl DevicesApi {
         mac: &str,
         nickname: &str,
     ) -> Result<Envelope, Error> {
-        let normalized_mac = crate::util::id_from_url(mac)?;
-        let url = routes::devices::V8_SET_DEVICE_NICKNAME.resolve(
-            self.transport.api_host(),
-            network_id,
-            &normalized_mac,
-            None,
-        )?;
+        let url =
+            self.device_write_url(&routes::devices::V8_SET_DEVICE_NICKNAME, network_id, mac)?;
         self.transport
             .request(
                 Method::PUT,
@@ -184,8 +196,9 @@ impl DevicesApi {
     /// access.
     ///
     /// Ported from `DevicesAPI._update_device` via `DevicesAPI.pause_device`
-    /// (`devices.py:44-65,227-257`), sending body `{"paused": paused}` (`devices.py:257`). Same
-    /// `mac`-normalisation and 2.3 version-pin rationale as [`DevicesApi::set_device_nickname`].
+    /// (`devices.py:82-116,231-261`), sending body `{"paused": paused}` (`devices.py:261`). Same
+    /// `mac`-normalisation and post-resolution 2.3 version pin as
+    /// [`DevicesApi::set_device_nickname`].
     ///
     /// A paused device stays connected to the network but loses internet access; this is
     /// distinct from `block_device`, which removes the device from the network entirely.
@@ -199,13 +212,7 @@ impl DevicesApi {
         mac: &str,
         paused: bool,
     ) -> Result<Envelope, Error> {
-        let normalized_mac = crate::util::id_from_url(mac)?;
-        let url = routes::devices::V8_PAUSE_DEVICE.resolve(
-            self.transport.api_host(),
-            network_id,
-            &normalized_mac,
-            None,
-        )?;
+        let url = self.device_write_url(&routes::devices::V8_PAUSE_DEVICE, network_id, mac)?;
         self.transport
             .request(
                 Method::PUT,

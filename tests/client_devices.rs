@@ -7,7 +7,8 @@
 
 mod common;
 
-use wiremock::matchers::{method, path, query_param};
+use serde_json::json;
+use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
@@ -418,5 +419,37 @@ async fn get_device_priority_resolves_the_network_without_auto_discovery() -> an
         .await
         .expect_err("no network_id and no preferred network must fail without auto-discovery");
     assert!(matches!(err, Error::MissingNetworkId));
+    Ok(())
+}
+
+// ===================== version pins =====================
+
+/// A network given as a 2.2 path is re-pinned to 2.3 by the two device writes that need it.
+#[tokio::test]
+async fn device_writes_pin_v2_3_for_a_path_form_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/devices/device-0001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    for body in [json!({ "nickname": "desk" }), json!({ "paused": true })] {
+        Mock::given(method("PUT"))
+            .and(path("/2.3/networks/network-0001/devices/device-0001"))
+            .and(session_cookie())
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+
+    let client = client(&mock).await;
+    let network = Some("/2.2/networks/network-0001");
+    client
+        .set_device_nickname("device-0001", "desk", network)
+        .await?;
+    client.pause_device("device-0001", true, network).await?;
     Ok(())
 }

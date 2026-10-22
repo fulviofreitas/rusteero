@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rusteero::endpoints::devices::DevicesApi;
 use rusteero::error::Error;
-use serde_json::json;
+use serde_json::{Value, json};
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -19,6 +19,68 @@ use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_t
 
 fn devices_api(mock: &MockEero) -> DevicesApi {
     DevicesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
+}
+
+/// Every spelling of the network a device write must pin to 2.3: a bare id, API paths and
+/// absolute API-host URLs on either version, and absolute URLs whose scheme is not lower case.
+const NETWORK_FORMS: [&str; 7] = [
+    "id",
+    "path-2.2",
+    "path-2.3",
+    "url-2.2",
+    "url-2.3",
+    "upper-case-scheme-url-2.2",
+    "mixed-case-scheme-url-2.2",
+];
+
+/// Every spelling of the device: a bare id, an API path (on 2.2) and an absolute API-host URL.
+const DEVICE_FORMS: [&str; 3] = ["id", "path", "url"];
+
+/// Renders one of [`NETWORK_FORMS`] against the mock server's origin.
+fn network_form(uri: &str, form: &str) -> String {
+    let upper = uri.replacen("http", "HTTP", 1);
+    let mixed = uri.replacen("http", "hTTp", 1);
+    match form {
+        "id" => "network-0001".to_owned(),
+        "path-2.2" => "/2.2/networks/network-0001".to_owned(),
+        "path-2.3" => "/2.3/networks/network-0001".to_owned(),
+        "url-2.2" => format!("{uri}/2.2/networks/network-0001"),
+        "url-2.3" => format!("{uri}/2.3/networks/network-0001"),
+        "upper-case-scheme-url-2.2" => format!("{upper}/2.2/networks/network-0001"),
+        "mixed-case-scheme-url-2.2" => format!("{mixed}/2.2/networks/network-0001"),
+        other => panic!("unknown network form {other}"),
+    }
+}
+
+/// Renders one of [`DEVICE_FORMS`] against the mock server's origin.
+fn device_form(uri: &str, form: &str) -> String {
+    let device_path = "/2.2/networks/network-0001/devices/device-0001";
+    match form {
+        "id" => "device-0001".to_owned(),
+        "path" => device_path.to_owned(),
+        "url" => format!("{uri}{device_path}"),
+        other => panic!("unknown device form {other}"),
+    }
+}
+
+/// Mounts the pair every device-write pin test needs: the `PUT` on API 2.2 must see no request at
+/// all, and on API 2.3 it must see exactly one authenticated request carrying `body`.
+async fn mount_pinned_device_put(mock: &MockEero, body: Value) {
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/devices/device-0001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/devices/device-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(body))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
 }
 
 // ===================== get_devices =====================
@@ -262,6 +324,29 @@ async fn set_device_nickname_normalises_a_path_form_mac_and_still_targets_v2_3()
     Ok(())
 }
 
+#[tokio::test]
+async fn set_device_nickname_pins_v2_3_for_every_network_and_device_form() -> anyhow::Result<()> {
+    for network_name in NETWORK_FORMS {
+        for device_name in DEVICE_FORMS {
+            let mock = MockEero::start().await;
+            mount_pinned_device_put(&mock, json!({ "nickname": "desk" })).await;
+
+            let uri = mock.uri();
+            devices_api(&mock)
+                .set_device_nickname(
+                    &network_form(&uri, network_name),
+                    &device_form(&uri, device_name),
+                    "desk",
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("network form {network_name}, device form {device_name}: {err}")
+                });
+        }
+    }
+    Ok(())
+}
+
 // ===================== pause_device =====================
 
 #[tokio::test]
@@ -288,6 +373,29 @@ async fn pause_device_hits_v23_path_with_exact_body_never_v22() -> anyhow::Resul
     let api = devices_api(&mock);
     api.pause_device("network-0001", "device-0001", true)
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_device_pins_v2_3_for_every_network_and_device_form() -> anyhow::Result<()> {
+    for network_name in NETWORK_FORMS {
+        for device_name in DEVICE_FORMS {
+            let mock = MockEero::start().await;
+            mount_pinned_device_put(&mock, json!({ "paused": true })).await;
+
+            let uri = mock.uri();
+            devices_api(&mock)
+                .pause_device(
+                    &network_form(&uri, network_name),
+                    &device_form(&uri, device_name),
+                    true,
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("network form {network_name}, device form {device_name}: {err}")
+                });
+        }
+    }
     Ok(())
 }
 
