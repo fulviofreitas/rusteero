@@ -31,6 +31,12 @@
 //! A positive case (an ordinary id) is included per route too, so this suite cannot pass by
 //! rejecting everything.
 //!
+//! Family confinement: a *path or URL* passed in place of a bare id must name one resource of the
+//! family the method addresses, so `NetworksApi::set_network_password("/2.2/account", ..)` can no
+//! longer be retargeted onto `PUT /2.2/account/password`, and `EerosApi::reboot_eero` cannot be
+//! pointed at a network. Each rejected value below is checked against a catch-all
+//! `.expect(0)` mock; the legitimate path form still reaches the wire.
+//!
 //! F3: `Client::ensure_network_id`'s auto-discovery path and `Client::derive_preferred_network_id`
 //! both extract a network id out of a `/networks` response body via the shared
 //! `extract_network_id` helper (`src/client/mod.rs`), which applies `crate::routes::validate_segment`
@@ -45,15 +51,17 @@ use std::sync::Arc;
 use rusteero::auth::Session;
 use rusteero::client::Client;
 use rusteero::endpoints::blacklist::BlacklistApi;
+use rusteero::endpoints::eeros::EerosApi;
 use rusteero::endpoints::forwards::ForwardsApi;
+use rusteero::endpoints::networks::NetworksApi;
 use rusteero::endpoints::profiles::ProfilesApi;
 use rusteero::endpoints::reservations::ReservationsApi;
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{any, method, path};
+use wiremock::matchers::{any, body_string, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 /// Mounts a catch-all mock on `mock` that fails the test (via `wiremock`'s own drop-time
 /// verification) the moment *any* request, on any method or path, reaches the server — the
@@ -492,6 +500,200 @@ async fn update_reservation_slash_bearing_id_is_rejected_before_any_request() ->
         .await
         .expect_err("a slash-bearing id is not a valid single-segment identifier");
     assert_is_validation_error(&err);
+    Ok(())
+}
+
+// ======================== family confinement: network and eero paths ========================
+
+/// Paths and URLs that do not name exactly one network, for methods addressing one. `{mock}` stands
+/// for the mock server's own origin, so the absolute form is on the configured host.
+const NOT_A_NETWORK: &[&str] = &[
+    "/2.2/account",
+    "/2.2/eeros/9",
+    "/2.2/networks/network_123/devices",
+    "/2.2/networks/network_123/../../account",
+    "/2.2/networks/network_123?x=1",
+    "/2.2/networks/%2e%2e/account",
+    "/2.2/networks/network_123\n",
+    "{mock}/2.2/account",
+];
+
+/// Paths and URLs that do not name exactly one eero, for methods addressing one.
+const NOT_AN_EERO: &[&str] = &[
+    "/2.2/networks/123",
+    "/2.2/account",
+    "/2.2/eeros/9/../../networks/123",
+    "/2.2/eeros/9?x=1",
+    "/2.2/eeros/%2e%2e/%2e%2e/networks/1",
+    "/2.2/eeros/9\t",
+    "{mock}/2.2/networks/123",
+];
+
+/// Expands the `{mock}` placeholder of a table entry to the mock server's origin.
+fn supplied(entry: &str, mock: &MockEero) -> String {
+    entry.replace("{mock}", &mock.uri())
+}
+
+#[tokio::test]
+async fn set_network_password_rejects_a_path_that_is_not_one_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_A_NETWORK {
+        let value = supplied(entry, &mock);
+        let err = api
+            .set_network_password(&value, "password-placeholder", None)
+            .await
+            .expect_err(&format!("{value:?} must not reach PUT .../password"));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_rejects_a_path_that_is_not_one_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_A_NETWORK {
+        let value = supplied(entry, &mock);
+        let err = api
+            .reboot_network(&value, None)
+            .await
+            .expect_err(&format!("{value:?} must not reach POST .../reboot"));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_profile_rejects_a_network_path_that_is_not_one_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = ProfilesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_A_NETWORK {
+        let value = supplied(entry, &mock);
+        let err = api
+            .delete_profile(&value, "profile_1")
+            .await
+            .expect_err(&format!(
+                "{value:?} must not reach DELETE .../profiles/{{id}}"
+            ));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_eero_rejects_a_path_that_is_not_one_eero() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_AN_EERO {
+        let value = supplied(entry, &mock);
+        let err = api
+            .reboot_eero(&value, None)
+            .await
+            .expect_err(&format!("{value:?} must not reach POST .../reboot"));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wrong_family_path_reports_the_callers_argument_and_the_family() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    let err = api
+        .set_network_password("/2.2/account", "password-placeholder", None)
+        .await
+        .expect_err("/2.2/account is not a network");
+    assert!(
+        matches!(
+            &err,
+            Error::Validation { field, message, .. }
+                if field == "id_or_url"
+                    && message == "must be a path under networks/{id} on the API host"
+        ),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+/// A bare dot-segment child must be rejected rather than collapsing onto the collection, and the
+/// error names the caller's argument and the dot rule, not the family.
+#[tokio::test]
+async fn delete_profile_dot_segment_child_is_rejected_before_any_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = ProfilesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for child in [
+        "/2.2/networks/network_123/profiles/..",
+        "/2.2/networks/network_123/profiles/.",
+    ] {
+        let err = api
+            .delete_profile("network_123", child)
+            .await
+            .expect_err(&format!("{child:?} must not collapse onto the collection"));
+        assert!(
+            matches!(
+                &err,
+                Error::Validation { field, message, .. }
+                    if field == "id_or_url" && message == "must not contain dot segments"
+            ),
+            "{child:?}: unexpected error {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The legitimate path form is unaffected: it targets that eero's own reboot endpoint.
+#[tokio::test]
+async fn reboot_eero_with_a_path_in_the_family_still_reaches_the_eero_endpoint()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/eeros/e_9/reboot"))
+        .and(body_string("\"\""))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    api.reboot_eero("/2.2/eeros/e_9", None).await?;
+    Ok(())
+}
+
+/// A path or URL naming exactly one network is accepted, keeps the caller's own version segment,
+/// and drops one trailing slash.
+#[tokio::test]
+async fn reboot_network_with_a_network_path_or_url_still_reaches_the_network_endpoint()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network_123/reboot"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    api.reboot_network("/2.3/networks/network_123/", None)
+        .await?;
+    api.reboot_network(&format!("{}/2.3/networks/network_123", mock.uri()), None)
+        .await?;
     Ok(())
 }
 
