@@ -13,7 +13,7 @@ use serde_json::Value;
 impl Client {
     /// Gets a network's full object — returns the raw Eero API response.
     ///
-    /// Ported from `get_network()` (`client.py:489-513`). Resolves `network_id` with
+    /// Ported from `get_network()` (`client.py:697-722`). Resolves `network_id` with
     /// `auto_discover = true` (Python's default, since this call omits the argument), matching
     /// every other cached getter that takes a network id. This call *populates* `network[nid]`;
     /// it never passes `parent=` itself.
@@ -40,8 +40,7 @@ impl Client {
 
     /// Gets Eero Plus/Eero Secure subscription status — returns the raw Eero API response.
     ///
-    /// Ported from `get_premium_status()` (`client.py:515-519`, `.claude/tasks/briefs/v8/
-    /// client.md` row). `auto_discover = false` — see [`Client::get_diagnostics`]. Passes the
+    /// Ported from `get_premium_status()` (`client.py:724-729`). `auto_discover = false` — see [`Client::get_diagnostics`]. Passes the
     /// cached network envelope as `parent=` (`+net`, `_network_parent_kwargs`).
     ///
     /// # Errors
@@ -96,7 +95,7 @@ impl Client {
 
     /// Gets guest network configuration — returns the raw Eero API response.
     ///
-    /// Ported from `get_guest_network()` (`client.py:1120-1125`). `auto_discover = false` — see
+    /// Ported from `get_guest_network()` (`client.py:1384-1389`). `auto_discover = false` — see
     /// [`Client::get_diagnostics`]. Passes the cached network envelope as `parent=` (`+net`).
     /// Never cached (`get_guest_network` is not one of the eight cached getters).
     ///
@@ -144,7 +143,7 @@ impl Client {
 
     /// Clears the guest network's password — returns the raw Eero API response.
     ///
-    /// Ported from `clear_guest_password()` (`client.py:1173-1185`). `auto_discover = false`, no
+    /// Ported from `clear_guest_password()` (`client.py:1445-1458`). `auto_discover = false`, no
     /// `parent=` — see [`Client::set_guest_password`]. On success, invalidates `network[nid]`.
     ///
     /// # Errors
@@ -164,7 +163,7 @@ impl Client {
 
     /// Runs a speed test on the network — returns the raw Eero API response.
     ///
-    /// Ported from `run_speed_test` (`eero-api src/eero/client.py:1188-1206`). `auto_discover =
+    /// Ported from `run_speed_test` (`eero-api src/eero/client.py:1460-1478`). `auto_discover =
     /// true` — see [`Client::set_guest_network`]. Passes the cached network envelope as `parent=`
     /// (`+net`). On success, invalidates `network[nid]`.
     ///
@@ -230,7 +229,7 @@ impl Client {
 
     /// Gets past speed-test results — returns the raw Eero API response.
     ///
-    /// Ported from `get_speed_tests()` (`client.py:1208-1226`). `auto_discover = false`. Passes
+    /// Ported from `get_speed_tests()` (`client.py:1516-1532`). `auto_discover = false`. Passes
     /// the cached network envelope as `parent=` (`+net`). Never cached (time-windowed read).
     ///
     /// # Errors
@@ -347,7 +346,7 @@ impl Client {
 
     /// Clears the network's Wi-Fi password — returns the raw Eero API response.
     ///
-    /// Ported from `clear_network_password()` (`client.py:548-561`). `auto_discover = false`.
+    /// Ported from `clear_network_password()` (`client.py:799-814`). `auto_discover = false`.
     /// Passes the cached network envelope as `parent=` (`+net`). On success, invalidates
     /// `network[nid]`.
     ///

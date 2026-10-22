@@ -9,7 +9,7 @@ use crate::params::require_hour;
 impl Client {
     /// Gets firmware-update information — returns the raw Eero API response.
     ///
-    /// Ported from `get_updates()` (`client.py:1827-1831`). `auto_discover = false` — see
+    /// Ported from `get_updates()` (`client.py:2347-2352`). `auto_discover = false` — see
     /// [`Client::get_diagnostics`]. Passes the cached network envelope as `parent=` (`+net`).
     ///
     /// # Errors
@@ -26,7 +26,7 @@ impl Client {
 
     /// Applies a pending update — returns the raw Eero API response.
     ///
-    /// Ported from `apply_update()` (`client.py:1834-1849`). `auto_discover = false`. Passes the
+    /// Ported from `apply_update()` (`client.py:2354-2370`). `auto_discover = false`. Passes the
     /// cached network envelope as `parent=` (`+net`). **Reboot-class write**: applying an update
     /// reboots every node on the network. On success, invalidates `network[nid]`.
     ///
@@ -49,7 +49,7 @@ impl Client {
     /// Sets the hour of day the network applies firmware updates — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `set_preferred_update_hour()` (`client.py:2372-2402`). `hour` (`0..=23`) is
+    /// Ported from `set_preferred_update_hour()` (`client.py:2372-2403`). `hour` (`0..=23`) is
     /// validated first (`client.py:2397`), so an invalid hour never triggers network resolution
     /// and is reported even when no network can be resolved. `auto_discover = false`. **Passes no
     /// `parent=`**: the resource has no published link, so Python builds the path from the
