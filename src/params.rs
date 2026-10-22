@@ -268,44 +268,11 @@ fn require_nested_family(
     Ok(resolved)
 }
 
-/// The three-level family of a scheduled pause.
-const SCHEDULE_FAMILY: &str = "networks/{id}/profiles/{id}/schedules/{id}";
-
-/// Checks that a resolved scheduled-pause URL names the expected three-level resource family:
-/// `/<version>/networks/<network>/profiles/<profile>/schedules/<schedule>`, with single-segment
-/// ids and nothing after the final id.
-///
-/// Security finding 2 (phase-security-review): `ScheduleApi::update_schedule`/
-/// `ScheduleApi::delete_schedule` used to accept *any* same-host path or absolute URL as a
-/// schedule's own URL, as long as it resolved via [`crate::links::resource_url`]'s generic
-/// `{id}`-template substitution — a bare identifier such as `"networks"`, an unrelated path such
-/// as `"/2.2/networks/1"`, or a network's own envelope (whose `url` points at the network, not a
-/// schedule) would all resolve to *some* URL and then be sent a `PUT`/`DELETE` without ever being
-/// checked to actually be a schedule. This closes that gap the same way
-/// [`require_nested_family`] already closes it for every two-level nested resource: after
-/// resolution, the URL's path is required to match the schedule family shape below, or the call
-/// is rejected before any request is sent. The shape is checked by [`require_family_path`] on the
-/// URL with its trailing `/` removed.
-///
-/// # Errors
-///
-/// Returns [`Error::validation`] with `field: "schedule"` if `url` carries a query or fragment,
-/// or its path does not match `networks/{id}/profiles/{id}/schedules/{id}`.
-pub(crate) fn require_schedule_family(url: &Url) -> Result<Url, Error> {
-    require_family_path(
-        url.as_str().trim_end_matches('/'),
-        SCHEDULE_FAMILY,
-        "",
-        "schedule",
-    )?;
-    Ok(url.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        CADENCE_VALUES, require_hour, require_non_empty_string, require_schedule_family,
-        resolve_nested_url, resolve_network_url, validate_cadence,
+        CADENCE_VALUES, require_hour, require_non_empty_string, resolve_nested_url,
+        resolve_network_url, validate_cadence,
     };
     use crate::error::Error;
     use crate::links::resource_url;
@@ -908,78 +875,5 @@ mod tests {
             direct.as_str(),
             "http://mock.test:1234/2.2/networks/123/profiles/p1/schedules"
         );
-    }
-
-    // ===================== require_schedule_family (security finding 2) =====================
-
-    #[test]
-    fn require_schedule_family_accepts_a_genuine_schedule_path() {
-        let url =
-            Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1").unwrap();
-        assert_eq!(require_schedule_family(&url).unwrap(), url);
-    }
-
-    #[test]
-    fn require_schedule_family_rejects_a_bare_networks_collection_path() {
-        let url = Url::parse("http://mock.test:1234/2.2/networks").unwrap();
-        let err = require_schedule_family(&url).unwrap_err();
-        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
-    }
-
-    #[test]
-    fn require_schedule_family_rejects_an_unrelated_network_path() {
-        let url = Url::parse("http://mock.test:1234/2.2/networks/1").unwrap();
-        let err = require_schedule_family(&url).unwrap_err();
-        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
-    }
-
-    #[test]
-    fn require_schedule_family_rejects_a_query_or_fragment() {
-        let url = Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1?x=1")
-            .unwrap();
-        let err = require_schedule_family(&url).unwrap_err();
-        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
-
-        let url =
-            Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1#frag")
-                .unwrap();
-        let err = require_schedule_family(&url).unwrap_err();
-        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
-    }
-
-    #[test]
-    fn require_schedule_family_rejects_trailing_extra_segments() {
-        let url =
-            Url::parse("http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1/extra")
-                .unwrap();
-        let err = require_schedule_family(&url).unwrap_err();
-        assert!(matches!(err, Error::Validation { field, .. } if field == "schedule"));
-    }
-
-    #[test]
-    fn require_schedule_family_rejects_dot_segments_and_non_alphanumeric_leading_ids() {
-        for raw in [
-            "http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/s1/%2e%2e",
-            "http://mock.test:1234/2.2/networks/100/profiles/p1/schedules/_s1",
-        ] {
-            let url = Url::parse(raw).unwrap();
-            let err = require_schedule_family(&url).unwrap_err();
-            assert!(
-                matches!(&err, Error::Validation { field, .. } if field == "schedule"),
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn require_schedule_family_reports_the_family_message() {
-        let url = Url::parse("http://mock.test:1234/2.2/networks/1").unwrap();
-        let err = require_schedule_family(&url).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Validation { message, .. }
-                if message
-                    == "must be a path under networks/{id}/profiles/{id}/schedules/{id} on the API host"
-        ));
     }
 }
