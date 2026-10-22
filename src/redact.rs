@@ -145,8 +145,11 @@ fn redact_value(value: &Value, visible_chars: usize) -> Value {
         // port measures compact JSON instead of reproducing Python's repr syntax, so for a
         // container value the reported length (and, for an identifier-shaped key, the visible
         // prefix) can differ from Python: that `email` object is `46chars` here and `49chars`
-        // in Python, and `{"token": {"a": 1}}` is `7chars` here and `8chars` in Python. The whole
-        // value is replaced either way, so no part of it reaches the output.
+        // in Python, and `{"token": {"a": 1}}` is `7chars` here and `8chars` in Python. How much
+        // of the container reaches the output is what Python shows: under a credential-shaped key
+        // (`visible_chars == 0`) nothing of it; under an identifier-shaped key the first
+        // `VISIBLE_CHARS` characters of its text (`str(value)[:4]` in Python), so
+        // `{"emails": ["ab@x.io"]}` shows `["ab...`, which is part of the address.
         Value::Array(_) | Value::Object(_) => value.to_string(),
     };
 
@@ -611,6 +614,19 @@ mod tests {
             "email": {"address": "user@example.com", "verified": true}
         }));
         assert_eq!(result["email"], "{\"ad...[REDACTED:46chars]");
+    }
+
+    /// An identifier-shaped key shows the first four characters of a container's text, as
+    /// Python's `str(value)[:4]` does, which can be part of what the container holds; a
+    /// credential-shaped key shows none.
+    #[test]
+    fn a_container_shows_a_prefix_only_under_an_identifier_shaped_key() {
+        let result = redact_sensitive(&json!({
+            "emails": ["ab@x.io"],
+            "token": ["abcdefgh"],
+        }));
+        assert_eq!(result["emails"], "[\"ab...[REDACTED:11chars]");
+        assert_eq!(result["token"], "[REDACTED:12chars]");
     }
 
     // ===================== depth cap (_MAX_REDACTION_DEPTH) =====================
