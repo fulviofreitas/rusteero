@@ -697,8 +697,6 @@ async fn a_full_pause_envelope_resolves_through_its_data_url() -> anyhow::Result
 
 /// A dot segment in a caller's path is refused as a path (field `id_or_url`) rather than resolved
 /// away by the URL parser into a pause's own path.
-///
-/// Passes only once `links::resource_url` applies its caller-path rules.
 #[tokio::test]
 async fn a_schedule_path_with_a_dot_segment_is_refused_before_any_request() -> anyhow::Result<()> {
     for write in Write::ALL {
@@ -724,8 +722,6 @@ async fn a_schedule_path_with_a_dot_segment_is_refused_before_any_request() -> a
 }
 
 /// A dot segment in a published envelope url is refused too (field `link`).
-///
-/// Passes only once the plain-path rule for published links refuses dot segments.
 #[tokio::test]
 async fn a_published_envelope_url_with_a_dot_segment_is_refused() -> anyhow::Result<()> {
     for write in Write::ALL {

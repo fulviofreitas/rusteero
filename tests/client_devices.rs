@@ -8,6 +8,7 @@
 mod common;
 
 use serde_json::json;
+use tracing::Level;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -558,8 +559,6 @@ async fn set_profile_devices_sends_the_device_urls_as_given() -> anyhow::Result<
 
 /// `Client::block_device` goes through the blacklist add, which is live-verified: no
 /// uncharacterised-write warning. An explicit network id means no discovery `GET`.
-///
-/// Passes only once `BlacklistApi::add_to_blacklist` itself stops warning.
 #[tokio::test]
 async fn block_device_does_not_log_the_uncharacterised_write_warning() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
@@ -590,5 +589,10 @@ async fn block_device_does_not_log_the_uncharacterised_write_warning() -> anyhow
         "block_device must not warn, got {:?}",
         logs.warnings()
     );
+
+    // Positive control: the same capture does see the warning when one is emitted, so the
+    // negative assertion above cannot pass vacuously.
+    rusteero::links::warn_uncharacterised_write("probe");
+    assert_eq!(logs.count(Level::WARN, "not been fully characterised"), 1);
     Ok(())
 }

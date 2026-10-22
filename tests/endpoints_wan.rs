@@ -479,8 +479,8 @@ async fn wan_writes_warn_once_after_resolving_and_pinning() -> anyhow::Result<()
 // Every WAN call refuses, before any request, a network or device that could address a different
 // resource than the call is meant for. The bare-network-id and device checks are
 // `links::validate_identifier`'s; the control-character, not-exactly-one-network and
-// published-link checks pass only once `links::resource_url` and the published-link rule apply the
-// caller-path rules.
+// published-link checks are `links::resource_url`'s and the published-link rule's caller-path
+// rules.
 
 const CONTROLS: [&str; 5] = ["\n", "\t", "\r", " ", "\u{0}"];
 

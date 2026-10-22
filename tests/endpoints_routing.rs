@@ -194,8 +194,6 @@ async fn get_routing_pins_to_2_2_for_every_network_form() -> anyhow::Result<()> 
 
 /// A whitespace or control character in a caller's network path or URL is refused before any
 /// request: the URL parser would otherwise strip some of them and send a different path.
-///
-/// Passes only once `links::resource_url` itself refuses such characters in a caller's path or URL.
 #[tokio::test]
 async fn get_routing_rejects_a_control_character_in_the_network_before_any_request()
 -> anyhow::Result<()> {
@@ -223,8 +221,6 @@ async fn get_routing_rejects_a_control_character_in_the_network_before_any_reque
 }
 
 /// A published link carrying a control character is refused rather than silently pinned.
-///
-/// Passes only once the plain-path rule for published links refuses control characters.
 #[tokio::test]
 async fn get_routing_rejects_a_control_character_in_a_published_link_instead_of_pinning_it()
 -> anyhow::Result<()> {
