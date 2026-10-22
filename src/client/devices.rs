@@ -68,8 +68,10 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before any
-    /// request. Otherwise see [`Client::get_network`].
+    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before the device
+    /// request is sent. The network is resolved first, as in Python, so with no `network_id` and
+    /// no preferred network auto-discovery may still read `/networks`. Otherwise see
+    /// [`Client::get_network`].
     pub async fn get_device(
         &self,
         device_id: &str,
@@ -155,15 +157,18 @@ impl Client {
     /// entry (through its canonical key) and `devices[{nid}_devices]`. No `parent=`. The write
     /// was live-verified upstream on 2026-10-06 and logs no uncharacterised-write warning.
     ///
-    /// An empty `device_id` is rejected before the request is sent. Python's block write has no
+    /// An empty `device_id` is rejected before the write is sent. Python's block write has no
     /// check of its own: it posts `mac=`, and only afterwards fails to derive the cache key,
     /// reporting a validation error for a write the server accepted and leaving the device list
-    /// cached. Failing first reports the same error without sending anything.
+    /// cached. Failing first reports the same error without sending the write. The network is
+    /// resolved before that check, as in Python, so with no `network_id` and no preferred
+    /// network auto-discovery may still read `/networks` first.
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before any
-    /// request. Otherwise see [`Client::get_network`]. The cache is left untouched on any `Err`.
+    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before the write
+    /// is sent (auto-discovery may still read `/networks` first). Otherwise see
+    /// [`Client::get_network`]. The cache is left untouched on any `Err`.
     pub async fn block_device(
         &self,
         device_id: &str,
@@ -247,10 +252,12 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before any
-    /// request and ahead of the check below. Otherwise see [`Client::get_network`]. Also returns
-    /// [`Error::Validation`] with `field: "device"` if `nickname`, `paused` and `profile` are all
-    /// `None`, before any request is sent. The cache is left untouched on any `Err`.
+    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before the device
+    /// request is sent and ahead of the check below. Otherwise see [`Client::get_network`]. Also
+    /// returns [`Error::Validation`] with `field: "device"` if `nickname`, `paused` and `profile`
+    /// are all `None`, before the device request is sent. Both checks run after the network is
+    /// resolved, as in Python, so with no `network_id` and no preferred network auto-discovery
+    /// may still read `/networks` first. The cache is left untouched on any `Err`.
     pub async fn update_device_via_link(
         &self,
         device_id: &str,
