@@ -267,6 +267,8 @@ async fn get_account_refreshes_on_a_session_refresh_signal_replays_and_caches() 
     .await;
     Mock::given(method("POST"))
         .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
         .and(body_string("\"\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
@@ -388,6 +390,13 @@ async fn get_networks_account_fallback_failure_propagates_and_caches_nothing() -
     Ok(())
 }
 
+/// Bounds for the timeout test below, the same values the data-usage suite uses: the client-wide
+/// bound applies to every request, including the undelayed `/networks` reads, so it is not made
+/// shorter than 250 ms (each call still has to reach its mock before it expires), and the
+/// held `/account` response outlives it by a wide margin.
+const ACCOUNT_HOLD: Duration = Duration::from_millis(2000);
+const CLIENT_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[tokio::test]
 async fn get_networks_account_fallback_timeout_propagates_and_caches_nothing() -> anyhow::Result<()>
 {
@@ -397,14 +406,14 @@ async fn get_networks_account_fallback_timeout_propagates_and_caches_nothing() -
         &mock,
         ResponseTemplate::new(200)
             .set_body_json(account_body())
-            .set_delay(Duration::from_millis(500)),
+            .set_delay(ACCOUNT_HOLD),
         3,
         false,
     )
     .await;
     // A short client-level timeout, so the held `/account` response times out.
     let client = Client::builder()
-        .http_builder(reqwest::Client::builder().timeout(Duration::from_millis(100)))
+        .http_builder(reqwest::Client::builder().timeout(CLIENT_TIMEOUT))
         .base_url(mock.uri())
         .session(Some(Session::from_token(TEST_TOKEN)))
         .build()
@@ -424,6 +433,49 @@ async fn get_networks_account_fallback_timeout_propagates_and_caches_nothing() -
         .expect_err("the account read times out");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     assert_eq!(client.preferred_network_id(), None);
+    Ok(())
+}
+
+/// A `2xx` `/account` body that is not a JSON object is an error from the transport, so the
+/// fallback propagates it like any other `/account` failure: nothing is cached in either bucket,
+/// no network is selected and every call goes back to both endpoints.
+#[tokio::test]
+async fn get_networks_account_fallback_with_a_non_object_body_propagates_and_caches_nothing()
+-> anyhow::Result<()> {
+    for body in ["[]", "null", "\"text\"", "7"] {
+        let mock = MockEero::start().await;
+        mount_networks(&mock, 2).await;
+        mount_account(
+            &mock,
+            ResponseTemplate::new(200).set_body_string(body),
+            3,
+            false,
+        )
+        .await;
+        let client = client(&mock).await;
+
+        let is_rejected_body = |err: &Error| {
+            matches!(
+                err,
+                Error::Api { status: 200, message, .. }
+                    if message == "Unexpected JSON response: expected an object"
+            )
+        };
+        for attempt in 1..=2 {
+            let err = client
+                .get_networks(false)
+                .await
+                .expect_err("a non-object fallback body is an error");
+            assert!(is_rejected_body(&err), "{body} attempt {attempt}: {err:?}");
+        }
+        // Nothing was cached in the account bucket either, so this goes to the network too.
+        let err = client
+            .get_account(false)
+            .await
+            .expect_err("the account read fails");
+        assert!(is_rejected_body(&err), "{body}: {err:?}");
+        assert_eq!(client.preferred_network_id(), None, "{body}");
+    }
     Ok(())
 }
 
@@ -516,7 +568,6 @@ async fn get_networks_caches_an_empty_successful_account_fallback() -> anyhow::R
         json!({"meta": {"code": 200}, "data": {}}),
         json!({"meta": {"code": 200}, "data": null}),
         json!({"meta": {"code": 200}, "data": {"networks": "unexpected"}}),
-        json!([]),
     ];
 
     for account_body in account_bodies {
