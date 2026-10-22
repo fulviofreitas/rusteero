@@ -88,9 +88,9 @@ impl DhcpApi {
     ///
     /// Ported from `eero-api src/eero/api/dhcp.py:102-185` (`DhcpAPI.set_dhcp`). Issues a JSON
     /// `PUT` to [`crate::routes::dhcp::DHCP_SET_DHCP`] with exactly the `dhcp` sub-fields
-    /// supplied among `mode`, `custom`, and `custom_v2`. Logs
-    /// [`crate::links::warn_uncharacterised_write`] with `"set DHCP configuration for network --
-    /// may reboot every eero, like the confirmed DNS write path"` immediately before issuing the
+    /// supplied among `mode`, `custom`, and `custom_v2`. The URL is resolved first, then
+    /// [`crate::links::warn_uncharacterised_write`] logs `"set DHCP configuration for network --
+    /// may reboot every eero, like the confirmed DNS write path"` immediately before the
     /// request.
     ///
     /// `mode` is `"automatic"`, `"manual"` or `"custom"`. `"manual"` is accepted for backward
@@ -156,15 +156,16 @@ impl DhcpApi {
             ));
         }
 
+        let url =
+            routes::dhcp::DHCP_SET_DHCP.resolve(self.transport.api_host(), network_id, parent)?;
         links::warn_uncharacterised_write(
             "set DHCP configuration for network -- may reboot every eero, like the confirmed \
              DNS write path",
         );
         self.transport
-            .resource(
-                &routes::dhcp::DHCP_SET_DHCP,
-                network_id,
-                parent,
+            .request(
+                routes::dhcp::DHCP_SET_DHCP.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "dhcp": dhcp })),
             )
@@ -175,9 +176,10 @@ impl DhcpApi {
     ///
     /// Ported from `eero-api src/eero/api/dhcp.py:187-242` (`DhcpAPI.set_connection_mode`).
     /// Issues a JSON `PUT` to [`crate::routes::dhcp::DHCP_SET_CONNECTION_MODE`] with
-    /// `{"connection": {"mode": mode}}`. Logs [`crate::links::warn_uncharacterised_write`] with
-    /// `"set connection mode for network -- may reboot every eero, like the confirmed DNS write
-    /// path"` immediately before issuing the request.
+    /// `{"connection": {"mode": mode}}`. The URL is resolved first, then
+    /// [`crate::links::warn_uncharacterised_write`] logs `"set connection mode for network --
+    /// may reboot every eero, like the confirmed DNS write path"` immediately before the
+    /// request.
     ///
     /// # Errors
     ///
@@ -200,15 +202,19 @@ impl DhcpApi {
                 ),
             ));
         }
+        let url = routes::dhcp::DHCP_SET_CONNECTION_MODE.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         links::warn_uncharacterised_write(
             "set connection mode for network -- may reboot every eero, like the confirmed DNS \
              write path",
         );
         self.transport
-            .resource(
-                &routes::dhcp::DHCP_SET_CONNECTION_MODE,
-                network_id,
-                parent,
+            .request(
+                routes::dhcp::DHCP_SET_CONNECTION_MODE.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "connection": { "mode": mode } })),
             )
@@ -220,10 +226,10 @@ impl DhcpApi {
     /// Ported from `eero-api src/eero/api/dhcp.py:244-290`
     /// (`DhcpAPI.set_nat_port_randomization`). Issues a JSON `PUT` to
     /// [`crate::routes::dhcp::DHCP_SET_NAT_PORT_RANDOMIZATION`] with
-    /// `{"nat_port_randomization": enabled}`. Logs
-    /// [`crate::links::warn_uncharacterised_write`] with `"set NAT port randomization for
+    /// `{"nat_port_randomization": enabled}`. The URL is resolved first, then
+    /// [`crate::links::warn_uncharacterised_write`] logs `"set NAT port randomization for
     /// network -- may reboot every eero, like the confirmed DNS write path"` immediately before
-    /// issuing the request.
+    /// the request.
     ///
     /// # Errors
     ///
@@ -235,15 +241,19 @@ impl DhcpApi {
         enabled: bool,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::dhcp::DHCP_SET_NAT_PORT_RANDOMIZATION.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
         links::warn_uncharacterised_write(
             "set NAT port randomization for network -- may reboot every eero, like the \
              confirmed DNS write path",
         );
         self.transport
-            .resource(
-                &routes::dhcp::DHCP_SET_NAT_PORT_RANDOMIZATION,
-                network_id,
-                parent,
+            .request(
+                routes::dhcp::DHCP_SET_NAT_PORT_RANDOMIZATION.method.clone(),
+                url,
                 &[],
                 RequestBody::Json(json!({ "nat_port_randomization": enabled })),
             )

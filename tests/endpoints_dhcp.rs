@@ -10,10 +10,11 @@ use rusteero::endpoints::dhcp::{
 };
 use rusteero::error::Error;
 use serde_json::json;
+use tracing::Level;
 use wiremock::matchers::{any, body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
+use common::{MockEero, TEST_TOKEN, capture_logs, session_cookie, user_token_header};
 
 fn dhcp_api(mock: &MockEero) -> DhcpApi {
     DhcpApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
@@ -502,5 +503,130 @@ async fn set_pppoe_sends_nested_json_to_eero_pppoe_path() -> anyhow::Result<()> 
         .await?;
 
     assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+// ===================== warning order: resolve, then warn, then send =====================
+
+#[tokio::test]
+async fn set_dhcp_logs_the_warning_once_after_resolving_the_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let api = dhcp_api(&mock);
+    let (_guard, logs) = capture_logs();
+
+    // A network id that cannot be resolved is refused with no warning: nothing is issued.
+    api.set_dhcp("bad/id", Some("automatic"), None, None, None)
+        .await
+        .expect_err("an invalid network id must be refused");
+    // So is a link the parent published that is not a host-relative API path.
+    let bad_parent = json!({"resources": {"settings": "https://elsewhere.example/2.2/x"}});
+    api.set_dhcp(
+        "network-0001",
+        Some("automatic"),
+        None,
+        None,
+        Some(&bad_parent),
+    )
+    .await
+    .expect_err("a malformed published link must be refused");
+    // And so is invalid input.
+    api.set_dhcp("network-0001", Some("turbo"), None, None, None)
+        .await
+        .expect_err("an unknown mode must be refused");
+    assert!(logs.warnings().is_empty(), "got {:?}", logs.warnings());
+
+    api.set_dhcp("network-0001", Some("automatic"), None, None, None)
+        .await?;
+    assert_eq!(
+        logs.count(
+            Level::WARN,
+            "Issuing write (set DHCP configuration for network -- may reboot every eero, like \
+             the confirmed DNS write path)"
+        ),
+        1,
+        "got {:?}",
+        logs.warnings()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_connection_mode_logs_the_warning_once_after_resolving_the_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let api = dhcp_api(&mock);
+    let (_guard, logs) = capture_logs();
+
+    api.set_connection_mode("bad/id", "NAT", None)
+        .await
+        .expect_err("an invalid network id must be refused");
+    let bad_parent = json!({"resources": {"settings": "https://elsewhere.example/2.2/x"}});
+    api.set_connection_mode("network-0001", "NAT", Some(&bad_parent))
+        .await
+        .expect_err("a malformed published link must be refused");
+    api.set_connection_mode("network-0001", "nat", None)
+        .await
+        .expect_err("a lower-case mode must be refused");
+    assert!(logs.warnings().is_empty(), "got {:?}", logs.warnings());
+
+    api.set_connection_mode("network-0001", "NAT", None).await?;
+    assert_eq!(
+        logs.count(
+            Level::WARN,
+            "Issuing write (set connection mode for network -- may reboot every eero, like the \
+             confirmed DNS write path)"
+        ),
+        1,
+        "got {:?}",
+        logs.warnings()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_nat_port_randomization_logs_the_warning_once_after_resolving_the_url()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let api = dhcp_api(&mock);
+    let (_guard, logs) = capture_logs();
+
+    api.set_nat_port_randomization("bad/id", true, None)
+        .await
+        .expect_err("an invalid network id must be refused");
+    let bad_parent = json!({"resources": {"settings": "https://elsewhere.example/2.2/x"}});
+    api.set_nat_port_randomization("network-0001", true, Some(&bad_parent))
+        .await
+        .expect_err("a malformed published link must be refused");
+    assert!(logs.warnings().is_empty(), "got {:?}", logs.warnings());
+
+    api.set_nat_port_randomization("network-0001", true, None)
+        .await?;
+    assert_eq!(
+        logs.count(
+            Level::WARN,
+            "Issuing write (set NAT port randomization for network -- may reboot every eero, \
+             like the confirmed DNS write path)"
+        ),
+        1,
+        "got {:?}",
+        logs.warnings()
+    );
     Ok(())
 }
