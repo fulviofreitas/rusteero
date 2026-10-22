@@ -372,8 +372,10 @@ mod tests {
 
     use tracing::Level;
 
+    #[cfg(target_os = "linux")]
+    use super::UNCLEARED_WARNING;
     use super::{
-        ACCOUNT_NAME, BACKEND_NAME, CredentialStore, KeyringStore, SERVICE_NAME, UNCLEARED_WARNING,
+        ACCOUNT_NAME, BACKEND_NAME, CredentialStore, KeyringStore, SERVICE_NAME,
         UNPERSISTED_WARNING, check_readback,
     };
     use crate::auth::Session;

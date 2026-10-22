@@ -602,7 +602,7 @@ pub(crate) fn is_version_segment(segment: &str) -> bool {
 ///
 /// The version is the **first path segment** of a resolved URL (the configured API host is a bare
 /// origin), and only that segment is replaced: `/2.3/networks/n/2.3/support` pinned to
-/// [`ApiVersion::V2_2`] becomes `/2.2/networks/n/2.3/support`. Everything else is left exactly
+/// [`ApiVersion::V2_2`](crate::routes::ApiVersion::V2_2) becomes `/2.2/networks/n/2.3/support`. Everything else is left exactly
 /// as `url` holds it: scheme, host, port, the rest of the path with its percent-escapes, the
 /// query and the fragment.
 ///
