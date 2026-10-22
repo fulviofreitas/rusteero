@@ -1,7 +1,7 @@
 //! The closed catalogue of `meta.error` strings the Eero cloud API reports, and the single
 //! classification point that turns an HTTP status + parsed envelope into an [`Error`].
 //!
-//! Ported 1:1 from `eero-api`'s `src/eero/errors.py` at `v8.0.4`. The API reports failures as
+//! Ported 1:1 from `eero-api`'s `src/eero/errors.py` at `v8.4.1`. The API reports failures as
 //! `{"meta": {"code": <http status>, "error": <string>, ...}}`; `meta.error` is drawn from a
 //! closed set of dot-separated strings (matched case-insensitively), though some responses omit
 //! `meta.error` entirely, or carry a free-text sentence instead of one of these strings.
@@ -19,7 +19,7 @@ use crate::error::Error;
 
 /// A group of catalogue error strings that share an [`Error`] variant.
 ///
-/// Ported from `ErrorGroup` (`errors.py:34-45`).
+/// Ported from `ErrorGroup` (`errors.py:35-48`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorGroup {
@@ -52,7 +52,7 @@ pub enum ErrorGroup {
 
 /// Session errors (401): terminal, credential-clearing.
 ///
-/// Ported from `SESSION_ERRORS` (`errors.py:50-56`).
+/// Ported from `SESSION_ERRORS` (`errors.py:52-58`).
 pub const SESSION_ERRORS: &[&str] = &[
     "error.session.expired",
     "error.session.invalid",
@@ -62,13 +62,13 @@ pub const SESSION_ERRORS: &[&str] = &[
 /// Session-refresh signal (401): not terminal, triggers the transparent refresh-and-replay in
 /// the transport. Never clears credentials.
 ///
-/// Ported from `SESSION_REFRESH_ERRORS` (`errors.py:58-60`).
+/// Ported from `SESSION_REFRESH_ERRORS` (`errors.py:62`).
 pub const SESSION_REFRESH_ERRORS: &[&str] = &["error.session.refresh"];
 
 /// Verification / login-state errors (401): the token has been issued but the account is
 /// mid-verification or otherwise blocked from completing login. Never clears credentials.
 ///
-/// Ported from `VERIFICATION_ERRORS` (`errors.py:63-75`).
+/// Ported from `VERIFICATION_ERRORS` (`errors.py:67-79`).
 pub const VERIFICATION_ERRORS: &[&str] = &[
     "error.verification.required",
     "error.verification.invalid",
@@ -83,13 +83,13 @@ pub const VERIFICATION_ERRORS: &[&str] = &[
 
 /// Access denied (403): authenticated, but not permitted. Not an auth error.
 ///
-/// Ported from `ACCESS_DENIED_ERRORS` (`errors.py:77`).
+/// Ported from `ACCESS_DENIED_ERRORS` (`errors.py:82`).
 pub const ACCESS_DENIED_ERRORS: &[&str] = &["error.access.denied"];
 
 /// Not found (404). A 404 with no `meta.error` at all, or with a free-text sentence instead of
 /// one of these strings, also maps to [`Error::NotFound`] — see [`error_for_response`].
 ///
-/// Ported from `NOT_FOUND_ERRORS` (`errors.py:79-85`).
+/// Ported from `NOT_FOUND_ERRORS` (`errors.py:87-93`).
 pub const NOT_FOUND_ERRORS: &[&str] = &[
     "error.network.not.found",
     "error.eero.no_serial_found",
@@ -98,12 +98,12 @@ pub const NOT_FOUND_ERRORS: &[&str] = &[
 
 /// Rate limiting. Reported either via HTTP 429 or this string on another status.
 ///
-/// Ported from `RATE_LIMIT_ERRORS` (`errors.py:87`).
+/// Ported from `RATE_LIMIT_ERRORS` (`errors.py:96`).
 pub const RATE_LIMIT_ERRORS: &[&str] = &["error.rate.limit"];
 
 /// Client-side-shaped validation errors returned by the server (HTTP 400).
 ///
-/// Ported from `VALIDATION_ERRORS` (`errors.py:90-100`).
+/// Ported from `VALIDATION_ERRORS` (`errors.py:99-111`).
 pub const VALIDATION_ERRORS: &[&str] = &[
     "error.form.errors",
     "error.form.email.unavailable",
@@ -118,7 +118,7 @@ pub const VALIDATION_ERRORS: &[&str] = &[
 
 /// Premium/subscription gating. Maps to [`Error::PremiumRequired`] regardless of HTTP status.
 ///
-/// Ported from `PREMIUM_ERRORS` (`errors.py:102-108`).
+/// Ported from `PREMIUM_ERRORS` (`errors.py:115-120`).
 pub const PREMIUM_ERRORS: &[&str] = &[
     "error.premium.user_not_subscribed",
     "error.partner.unavailable",
@@ -127,7 +127,7 @@ pub const PREMIUM_ERRORS: &[&str] = &[
 /// Feature unavailable on this device/network. Maps to [`Error::FeatureUnavailable`] regardless
 /// of HTTP status.
 ///
-/// Ported from `FEATURE_UNAVAILABLE_ERRORS` (`errors.py:110-121`).
+/// Ported from `FEATURE_UNAVAILABLE_ERRORS` (`errors.py:124-135`).
 pub const FEATURE_UNAVAILABLE_ERRORS: &[&str] = &[
     "error.eero.offline",
     "error.network.unavailable",
@@ -142,13 +142,13 @@ pub const FEATURE_UNAVAILABLE_ERRORS: &[&str] = &[
 /// Client version rejected by the API. Maps to [`Error::ClientBlocked`] regardless of HTTP
 /// status.
 ///
-/// Ported from `CLIENT_BLOCKED_ERRORS` (`errors.py:123`).
+/// Ported from `CLIENT_BLOCKED_ERRORS` (`errors.py:139`).
 pub const CLIENT_BLOCKED_ERRORS: &[&str] = &["error.app.version.blocked"];
 
 /// Domain-specific errors that stay a generic API error; the sub-code is exposed via
 /// `error_code` for callers that want to branch on it.
 ///
-/// Ported from `DOMAIN_ERRORS` (`errors.py:126-158`).
+/// Ported from `DOMAIN_ERRORS` (`errors.py:143-179`).
 pub const DOMAIN_ERRORS: &[&str] = &[
     "error.reservation.failed",
     "error.assignment.ip.unavailable",
@@ -204,7 +204,7 @@ fn group_members() -> [(ErrorGroup, &'static [&'static str]); 11] {
 }
 
 /// Reverse lookup from a normalized (trimmed, lowercased) catalogue string to its group, built
-/// once. Ported from `_STRING_TO_GROUP` (`errors.py:169-172`).
+/// once. Ported from `_STRING_TO_GROUP` (`errors.py:200-202`).
 static STRING_TO_GROUP: LazyLock<std::collections::HashMap<&'static str, ErrorGroup>> =
     LazyLock::new(|| {
         let mut map = std::collections::HashMap::new();
@@ -219,7 +219,7 @@ static STRING_TO_GROUP: LazyLock<std::collections::HashMap<&'static str, ErrorGr
 /// The groups that select their [`Error`] variant regardless of the HTTP status
 /// code that carried them.
 ///
-/// Ported from `_STATUS_INDEPENDENT_GROUPS` (`errors.py:174-181`).
+/// Ported from `_STATUS_INDEPENDENT_GROUPS` (`errors.py:206-213`).
 fn is_status_independent(group: ErrorGroup) -> bool {
     matches!(
         group,
@@ -233,7 +233,7 @@ fn is_status_independent(group: ErrorGroup) -> bool {
 /// Returns the catalogue group for an API error code.
 ///
 /// Matching is case-insensitive and trims surrounding whitespace, matching how the transport
-/// extracts `meta.error`. Ported from `classify_error_code` (`errors.py:184-201`).
+/// extracts `meta.error`. Ported from `classify_error_code` (`errors.py:216-234`).
 ///
 /// Returns `None` when `error_code` is `None`, empty, or not present in the catalogue (for
 /// example a free-text sentence, or an error string this crate does not yet recognise).
@@ -256,7 +256,7 @@ pub fn classify_error_code(error_code: Option<&str>) -> Option<ErrorGroup> {
 /// (no `data`, no raw body text, no request URL): those stay out of error messages and are only
 /// ever available via [`Error::envelope`] or a debug log line.
 ///
-/// Ported from `message_for_error_code` (`errors.py:204-224`).
+/// Ported from `message_for_error_code` (`errors.py:237-258`).
 #[must_use]
 pub fn message_for_error_code(error_code: Option<&str>) -> String {
     match error_code {
@@ -268,7 +268,7 @@ pub fn message_for_error_code(error_code: Option<&str>) -> String {
 /// Extracts `meta.error` from a parsed response envelope.
 ///
 /// Returns the string value of `envelope["meta"]["error"]` when present, else `None`. Ported
-/// from `_error_code_from_envelope` (`api/base.py:213-229`).
+/// from `_error_code_from_envelope` (`api/base.py:396-412`).
 #[must_use]
 pub fn error_code_from_envelope(envelope: &Value) -> Option<String> {
     envelope
@@ -283,7 +283,7 @@ pub fn error_code_from_envelope(envelope: &Value) -> Option<String> {
 /// Best-effort parse of a response body as a JSON object.
 ///
 /// Returns `None` when the body is empty (or all whitespace), not valid JSON, or not a JSON
-/// object. Ported from `_parse_envelope` (`api/base.py:191-210`).
+/// object. Ported from `_parse_envelope` (`api/base.py:344-363`).
 ///
 /// `serde_json`'s own recursion limit stands in for Python's `RecursionError` guard against a
 /// pathologically nested body: either way, a body that cannot be parsed becomes `None` rather
@@ -306,9 +306,10 @@ pub fn parse_envelope(text: &str) -> Option<Value> {
 /// Classification never rejects or alters `envelope` — it is only ever attached to the returned
 /// error, verbatim. The error message is always built by [`message_for_error_code`], never from
 /// the raw response body or the request URL. Ported from `exception_for_error`
-/// (`errors.py:227-346`); precedence:
+/// (`errors.py:261-363`); precedence:
 ///
-/// 1. HTTP 401 always wins → [`Error::Authentication`], regardless of `meta.error`.
+/// 1. HTTP 401 always wins → [`Error::Authentication`] with `status: Some(401)`, regardless of
+///    `meta.error` (a 401 carrying `error.rate.limit` stays an authentication failure).
 /// 2. Otherwise, a `meta.error` string in one of the status-independent groups
 ///    (premium/feature-unavailable/client-blocked/rate-limit) always wins, regardless of the
 ///    HTTP status code.
@@ -318,6 +319,11 @@ pub fn parse_envelope(text: &str) -> Option<Value> {
 ///    validation string) → [`Error::Validation`].
 /// 4. Anything else — including every recognised "domain" string, an unrecognised string, and a
 ///    403/400 that does not match the groups above — is [`Error::Api`].
+///
+/// [`Error::Authentication`] and [`Error::RateLimit`] carry the response `status` (for a rate
+/// limit it is the actual status — `error.rate.limit` is classified on any status but `401`, so
+/// it is not necessarily `429`). `retry_after` is used only for [`Error::RateLimit`] and ignored
+/// for every other variant, none of which has such a field.
 #[must_use]
 pub fn error_for_response(
     status: u16,
@@ -333,6 +339,7 @@ pub fn error_for_response(
             message,
             envelope,
             error_code,
+            status: Some(status),
         };
     }
 
@@ -362,6 +369,7 @@ pub fn error_for_response(
                 retry_after,
                 envelope,
                 error_code,
+                status: Some(status),
             },
         };
     }
@@ -384,6 +392,7 @@ pub fn error_for_response(
             retry_after,
             envelope,
             error_code,
+            status: Some(status),
         },
         400 if group == Some(ErrorGroup::Validation) => Error::Validation {
             field: "request".to_owned(),
@@ -600,6 +609,61 @@ mod tests {
     }
 
     #[test]
+    fn a_401_carries_its_status() {
+        match error_for_response(401, None, None, None) {
+            Error::Authentication {
+                status,
+                error_code,
+                envelope,
+                ..
+            } => {
+                assert_eq!(status, Some(401));
+                assert_eq!(error_code, None);
+                assert_eq!(envelope, None);
+            }
+            other => panic!("expected Error::Authentication, got {other:?}"),
+        }
+
+        let envelope = json!({"meta": {"code": 401, "error": "error.session.expired"}});
+        let err = error_for_response(
+            401,
+            Some(envelope.clone()),
+            Some("error.session.expired".to_owned()),
+            None,
+        );
+        assert_eq!(err.status(), Some(401));
+        assert_eq!(err.envelope(), Some(&envelope));
+        assert_eq!(err.error_code(), Some("error.session.expired"));
+        assert!(err.is_auth_error());
+    }
+
+    #[test]
+    fn a_401_with_the_rate_limit_string_stays_authentication_and_carries_401() {
+        // The 401 check precedes the status-independent groups: a 401 is never downgraded to a
+        // rate limit, and `retry_after` has nowhere to go on an authentication error.
+        let err = error_for_response(
+            401,
+            Some(json!({"meta": {"code": 401, "error": "error.rate.limit"}})),
+            Some("error.rate.limit".to_owned()),
+            Some(Duration::from_secs(5)),
+        );
+        match &err {
+            Error::Authentication {
+                status,
+                message,
+                error_code,
+                ..
+            } => {
+                assert_eq!(*status, Some(401));
+                assert_eq!(message, "error.rate.limit");
+                assert_eq!(error_code.as_deref(), Some("error.rate.limit"));
+            }
+            other => panic!("expected Error::Authentication, got {other:?}"),
+        }
+        assert!(err.is_auth_error());
+    }
+
+    #[test]
     fn status_independent_groups_win_regardless_of_status() {
         let err = error_for_response(
             200,
@@ -656,11 +720,94 @@ mod tests {
     fn a_429_is_always_rate_limit() {
         let err = error_for_response(429, None, None, Some(Duration::from_secs(5)));
         match err {
-            Error::RateLimit { retry_after, .. } => {
+            Error::RateLimit {
+                retry_after,
+                status,
+                ..
+            } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(5)));
+                assert_eq!(status, Some(429));
             }
             other => panic!("expected Error::RateLimit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_429_without_a_catalogue_string_carries_status_and_retry_after() {
+        let err = error_for_response(429, None, None, Some(Duration::from_secs(120)));
+        match &err {
+            Error::RateLimit {
+                status,
+                retry_after,
+                message,
+                error_code,
+                ..
+            } => {
+                assert_eq!(*status, Some(429));
+                assert_eq!(*retry_after, Some(Duration::from_secs(120)));
+                assert_eq!(message, "unrecognised error string");
+                assert_eq!(*error_code, None);
+            }
+            other => panic!("expected Error::RateLimit, got {other:?}"),
+        }
+        assert_eq!(err.status(), Some(429));
+        assert!(!err.is_auth_error());
+    }
+
+    #[test]
+    fn the_rate_limit_string_carries_the_actual_status_on_any_status() {
+        // `error.rate.limit` is status-independent: the variant is chosen by the string, so the
+        // status is whatever the response carried, not necessarily 429.
+        for status in [400_u16, 404, 429, 500, 503] {
+            let envelope = json!({"meta": {"code": status, "error": "error.rate.limit"}});
+            let err = error_for_response(
+                status,
+                Some(envelope.clone()),
+                Some("error.rate.limit".to_owned()),
+                Some(Duration::from_secs(30)),
+            );
+            match &err {
+                Error::RateLimit {
+                    status: carried,
+                    retry_after,
+                    envelope: attached,
+                    error_code,
+                    ..
+                } => {
+                    assert_eq!(*carried, Some(status), "status {status}");
+                    assert_eq!(*retry_after, Some(Duration::from_secs(30)));
+                    assert_eq!(attached.as_ref(), Some(&envelope));
+                    assert_eq!(error_code.as_deref(), Some("error.rate.limit"));
+                }
+                other => panic!("status {status}: expected Error::RateLimit, got {other:?}"),
+            }
+            assert_eq!(err.status(), Some(status));
+            assert!(!err.is_auth_error(), "status {status}");
+        }
+    }
+
+    #[test]
+    fn retry_after_is_dropped_by_every_variant_without_the_field() {
+        let nine = Some(Duration::from_secs(9));
+        assert!(matches!(
+            error_for_response(403, None, None, nine),
+            Error::Api { status: 403, .. }
+        ));
+        assert!(matches!(
+            error_for_response(404, None, None, nine),
+            Error::NotFound { status: 404, .. }
+        ));
+        assert!(matches!(
+            error_for_response(500, None, None, nine),
+            Error::Api { status: 500, .. }
+        ));
+        assert!(matches!(
+            error_for_response(401, None, None, nine),
+            Error::Authentication {
+                status: Some(401),
+                ..
+            }
+        ));
     }
 
     #[test]

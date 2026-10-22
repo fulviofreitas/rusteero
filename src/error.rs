@@ -1,9 +1,11 @@
 //! The crate error type.
 //!
-//! Ported from `eero-api`'s `src/eero/exceptions.py` at `v8.0.4`. Every variant carries the
+//! Ported from `eero-api`'s `src/eero/exceptions.py` at `v8.4.1`. Every variant carries the
 //! parsed response `envelope` and `error_code` (`meta.error`) it was classified from, mirroring
-//! every Python exception now doing the same (`exceptions.py:9-30`); classification itself
-//! happens in [`crate::errors`].
+//! every Python exception doing the same (`exceptions.py:8-31`); classification itself happens in
+//! [`crate::errors`]. [`Error::Authentication`] and [`Error::RateLimit`] also carry the HTTP
+//! `status` of the response (`exceptions.py:38-98`), which is `None` for a failure raised before
+//! any request was made.
 //!
 //! | Python | Rust |
 //! |---|---|
@@ -34,13 +36,13 @@ use crate::redact;
 
 /// The crate's error type.
 ///
-/// Mirrors the exception hierarchy of `eero-api`'s `exceptions.py` at `v8.0.4`: every variant
+/// Mirrors the exception hierarchy of `eero-api`'s `exceptions.py` at `v8.4.1`: every variant
 /// here corresponds to exactly one `Eero*Exception` subclass (see the module-level mapping
 /// table), plus two variants added for the Rust port ([`Error::Storage`], [`Error::Json`]).
 ///
 /// `Display` strings mirror Python's `str(exc)` character-for-character wherever Python's
 /// `__init__` builds a fixed format string. `message` is *never* built from a raw response body
-/// or the request URL (`errors.py:204-224`) — only from the catalogue string a recognised
+/// or the request URL (`errors.py:237-258`) — only from the catalogue string a recognised
 /// `error_code` classifies to, or the fixed fallback `"unrecognised error string"`; the full
 /// parsed response is still available, verbatim, via [`Error::envelope`].
 ///
@@ -56,11 +58,14 @@ use crate::redact;
 pub enum Error {
     /// Authentication failed, or no session token is available.
     ///
-    /// Ported from `EeroAuthenticationException` (`exceptions.py`). Covers both the client-side
-    /// "no token in memory" pre-flight guard (the literal message `"Not authenticated"`, built
-    /// via [`Error::authentication`]) and the server-driven HTTP 401 case, where `message` is
-    /// always [`crate::errors::message_for_error_code`]'s output — never raw body text.
-    /// `envelope`/`error_code` are `None` for the client-side guard case.
+    /// Ported from `EeroAuthenticationException` (`exceptions.py:38-65`). Covers both the
+    /// client-side "no token in memory" pre-flight guard (the literal message
+    /// `"Not authenticated"`, built via [`Error::authentication`]) and the server-driven HTTP 401
+    /// case, where `message` is always [`crate::errors::message_for_error_code`]'s output — never
+    /// raw body text. `envelope`/`error_code`/`status` are `None` for the client-side guard case.
+    ///
+    /// A 401 is always classified as this variant, whatever `meta.error` it carries — including
+    /// `error.rate.limit`, which stays an authentication failure on a 401 (`errors.py:322-325`).
     #[error("{message}")]
     Authentication {
         /// Human-readable message. Either the fixed `"Not authenticated"` guard text, or a
@@ -70,25 +75,38 @@ pub enum Error {
         envelope: Option<Value>,
         /// The value of `envelope["meta"]["error"]`, when present.
         error_code: Option<String>,
+        /// The HTTP status of the response this error was classified from: `Some(401)` for every
+        /// server-driven authentication error, which is the only status that selects this
+        /// variant. `None` for a failure raised before any request was made (`"Not
+        /// authenticated"`, `"No session token available. Login first."`), and for the
+        /// `"Login failed: …"` / `"Verification failed: …"` errors that `LoginFlow::start` and
+        /// `PendingLogin::verify` build around another failure, which Python raises without a
+        /// status code (`api/auth.py:241-255,280,305-308`).
+        status: Option<u16>,
     },
 
     /// The server rejected the request with HTTP 429 (Too Many Requests), or reported
     /// `error.rate.limit` on any other status (status-independent classification).
     ///
-    /// Ported from `EeroRateLimitException`. `retry_after` is an addition on top of the Python
-    /// contract: Python discards the response's `Retry-After` header entirely; this port
-    /// surfaces it when the server sends one.
+    /// Ported from `EeroRateLimitException` (`exceptions.py:68-98`). Never an authentication
+    /// error, whatever its `status` — see [`Error::is_auth_error`].
     #[error("{message}")]
     RateLimit {
         /// Human-readable message: a catalogue string, or the fixed unrecognised-string
         /// fallback.
         message: String,
-        /// The parsed `Retry-After` header value, if the server sent one.
+        /// The parsed `Retry-After` header value, if the server sent one and it was parseable
+        /// (`api/base.py:366-393`, where Python caps it at one day; see
+        /// [`crate::consts::RETRY_AFTER_MAX`]).
         retry_after: Option<Duration>,
         /// The raw, parsed response envelope, when the response body was valid JSON.
         envelope: Option<Value>,
         /// The value of `envelope["meta"]["error"]`, when present.
         error_code: Option<String>,
+        /// The HTTP status of the response. Not necessarily `429`: `error.rate.limit` is
+        /// classified as a rate limit on any status other than `401`, so this can be `400`,
+        /// `503` and so on. `None` only for a hand-built error with no status known.
+        status: Option<u16>,
     },
 
     /// A transport-level failure (DNS, TCP, TLS, connect, etc.) below the HTTP status layer.
@@ -299,23 +317,27 @@ impl std::fmt::Debug for Error {
                 message,
                 envelope,
                 error_code,
+                status,
             } => f
                 .debug_struct("Authentication")
                 .field("message", message)
                 .field("envelope", &debug_envelope(envelope.as_ref()))
                 .field("error_code", error_code)
+                .field("status", status)
                 .finish(),
             Error::RateLimit {
                 message,
                 retry_after,
                 envelope,
                 error_code,
+                status,
             } => f
                 .debug_struct("RateLimit")
                 .field("message", message)
                 .field("retry_after", retry_after)
                 .field("envelope", &debug_envelope(envelope.as_ref()))
                 .field("error_code", error_code)
+                .field("status", status)
                 .finish(),
             Error::Network(err) => f.debug_tuple("Network").field(err).finish(),
             Error::Api {
@@ -417,14 +439,16 @@ impl Error {
     ///
     /// The literal message `"Not authenticated"` matches every `EeroAuthenticationException`
     /// call site in `eero-api` that fires before any request was sent (dozens of call sites
-    /// across `api/*.py`). `envelope`/`error_code` are always `None` for this shape, since no
-    /// response was ever received.
+    /// across `api/*.py`). `envelope`, `error_code` and `status` are always `None` for this
+    /// shape, since no response was ever received — matching Python's `status_code=None`
+    /// default (`exceptions.py:41-61`).
     #[must_use]
     pub fn authentication(message: impl Into<String>) -> Self {
         Error::Authentication {
             message: message.into(),
             envelope: None,
             error_code: None,
+            status: None,
         }
     }
 
@@ -490,9 +514,12 @@ impl Error {
 
     /// Returns the HTTP status code this error carries, if any.
     ///
-    /// `None` for [`Error::PremiumRequired`]/[`Error::FeatureUnavailable`] when constructed
-    /// without a response (the original, client-side-only Python shape — never produced by this
-    /// crate's own transport, kept for parity), and for every variant with no status at all.
+    /// For [`Error::Authentication`] and [`Error::RateLimit`] this is their `status` field: `Some`
+    /// for a server-driven error (always `401` for the former, the actual response status for the
+    /// latter), `None` for one raised before any request was made. `None` for
+    /// [`Error::PremiumRequired`]/[`Error::FeatureUnavailable`] when constructed without a
+    /// response (the original, client-side-only Python shape — never produced by this crate's own
+    /// transport, kept for parity), and for every variant with no status at all.
     #[must_use]
     pub fn status(&self) -> Option<u16> {
         match self {
@@ -500,12 +527,11 @@ impl Error {
             | Error::AccessDenied { status, .. }
             | Error::ClientBlocked { status, .. }
             | Error::NotFound { status, .. } => Some(*status),
-            Error::PremiumRequired { status, .. } | Error::FeatureUnavailable { status, .. } => {
-                *status
-            }
-            Error::Authentication { .. }
-            | Error::RateLimit { .. }
-            | Error::Network(_)
+            Error::Authentication { status, .. }
+            | Error::RateLimit { status, .. }
+            | Error::PremiumRequired { status, .. }
+            | Error::FeatureUnavailable { status, .. } => *status,
+            Error::Network(_)
             | Error::Timeout
             | Error::Validation { .. }
             | Error::MissingNetworkId
@@ -517,16 +543,22 @@ impl Error {
     /// Returns `true` if this error represents an authentication failure.
     ///
     /// Mirrors the Python `is_auth_error()` predicate exactly: `true` for
-    /// [`Error::Authentication`] unconditionally (`exceptions.py`'s override on
-    /// `EeroAuthenticationException`), and for every status-carrying variant whose `status`
-    /// (when known) equals `401` (`EeroAPIException.is_auth_error`, inherited by every one of
-    /// its subclasses). In practice no variant other than `Authentication` is ever constructed
-    /// with `status == 401` by this crate's own classification (401 always routes to
+    /// [`Error::Authentication`] unconditionally, whatever its `status`
+    /// (`exceptions.py:63-65`); `false` for [`Error::RateLimit`] whatever its `status`, because
+    /// `EeroRateLimitException` keeps the base class's `False` (`exceptions.py:33-35`) even
+    /// though it now carries a status; and for every other variant `true` exactly when its
+    /// `status` equals `401` (`EeroAPIException.is_auth_error`, inherited by every one of its
+    /// subclasses). In practice no variant other than `Authentication` is ever constructed with
+    /// `status == 401` by this crate's own classification (401 always routes to
     /// `Authentication` first, per [`crate::errors::error_for_response`]'s precedence), but the
     /// check is written generically so it stays correct for any hand-constructed error too.
     #[must_use]
     pub fn is_auth_error(&self) -> bool {
-        matches!(self, Error::Authentication { .. }) || self.status() == Some(401)
+        match self {
+            Error::Authentication { .. } => true,
+            Error::RateLimit { .. } => false,
+            other => other.status() == Some(401),
+        }
     }
 }
 
@@ -587,6 +619,7 @@ mod tests {
             retry_after: None,
             envelope: None,
             error_code: Some("error.rate.limit".to_owned()),
+            status: Some(429),
         };
         assert_eq!(err.to_string(), "error.rate.limit");
 
@@ -595,6 +628,7 @@ mod tests {
             retry_after: Some(Duration::from_secs(30)),
             envelope: None,
             error_code: None,
+            status: None,
         };
         assert_eq!(err.to_string(), "error.rate.limit");
     }
@@ -841,6 +875,17 @@ mod tests {
                 retry_after: None,
                 envelope: None,
                 error_code: None,
+                status: Some(429),
+            }
+            .is_auth_error()
+        );
+        assert!(
+            !Error::RateLimit {
+                message: String::new(),
+                retry_after: None,
+                envelope: None,
+                error_code: None,
+                status: None,
             }
             .is_auth_error()
         );
@@ -870,6 +915,148 @@ mod tests {
             !Error::Json(serde_json::from_str::<serde_json::Value>("bad").unwrap_err())
                 .is_auth_error()
         );
+    }
+
+    #[test]
+    fn is_auth_error_authentication_is_true_whatever_its_status() {
+        for status in [None, Some(401), Some(200), Some(403)] {
+            let err = Error::Authentication {
+                message: String::new(),
+                envelope: None,
+                error_code: None,
+                status,
+            };
+            assert!(err.is_auth_error(), "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn is_auth_error_rate_limit_is_false_whatever_its_status() {
+        // `EeroRateLimitException` keeps the base class's `False`, even though it now carries a
+        // status code; a hand-built one with a 401 must not turn into an auth error.
+        for status in [None, Some(401), Some(429), Some(503)] {
+            let err = Error::RateLimit {
+                message: String::new(),
+                retry_after: None,
+                envelope: None,
+                error_code: None,
+                status,
+            };
+            assert!(!err.is_auth_error(), "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn is_auth_error_status_carrying_variants_follow_a_401() {
+        assert!(
+            Error::PremiumRequired {
+                status: Some(401),
+                message: String::new(),
+                envelope: None,
+                error_code: None,
+            }
+            .is_auth_error()
+        );
+        assert!(
+            Error::FeatureUnavailable {
+                status: Some(401),
+                message: String::new(),
+                envelope: None,
+                error_code: None,
+            }
+            .is_auth_error()
+        );
+        assert!(
+            Error::ClientBlocked {
+                status: 401,
+                message: String::new(),
+                envelope: None,
+                error_code: None,
+            }
+            .is_auth_error()
+        );
+        assert!(
+            Error::NotFound {
+                status: 401,
+                message: String::new(),
+                envelope: None,
+                error_code: None,
+            }
+            .is_auth_error()
+        );
+    }
+
+    // ===================== status on Authentication / RateLimit =====================
+
+    #[test]
+    fn authentication_helper_builds_a_client_side_error_without_a_status() {
+        let err = Error::authentication("session expired");
+        assert_eq!(err.to_string(), "session expired");
+        assert_eq!(err.envelope(), None);
+        assert_eq!(err.error_code(), None);
+        assert_eq!(err.status(), None);
+        assert!(err.is_auth_error());
+    }
+
+    #[test]
+    fn status_returns_the_field_of_authentication_and_rate_limit() {
+        let auth = Error::Authentication {
+            message: "error.session.expired".to_owned(),
+            envelope: None,
+            error_code: Some("error.session.expired".to_owned()),
+            status: Some(401),
+        };
+        assert_eq!(auth.status(), Some(401));
+
+        let rate_limit = Error::RateLimit {
+            message: "error.rate.limit".to_owned(),
+            retry_after: None,
+            envelope: None,
+            error_code: Some("error.rate.limit".to_owned()),
+            status: Some(503),
+        };
+        assert_eq!(rate_limit.status(), Some(503));
+
+        let rate_limit = Error::RateLimit {
+            message: "error.rate.limit".to_owned(),
+            retry_after: None,
+            envelope: None,
+            error_code: None,
+            status: None,
+        };
+        assert_eq!(rate_limit.status(), None);
+    }
+
+    #[test]
+    fn validation_carries_no_status() {
+        assert_eq!(Error::validation("f", "m").status(), None);
+    }
+
+    #[test]
+    fn display_is_unchanged_by_the_status_field() {
+        let with_status = Error::Authentication {
+            message: "error.session.expired".to_owned(),
+            envelope: None,
+            error_code: None,
+            status: Some(401),
+        };
+        let without_status = Error::Authentication {
+            message: "error.session.expired".to_owned(),
+            envelope: None,
+            error_code: None,
+            status: None,
+        };
+        assert_eq!(with_status.to_string(), "error.session.expired");
+        assert_eq!(with_status.to_string(), without_status.to_string());
+
+        let rate_limit = Error::RateLimit {
+            message: "error.rate.limit".to_owned(),
+            retry_after: None,
+            envelope: None,
+            error_code: None,
+            status: Some(429),
+        };
+        assert_eq!(rate_limit.to_string(), "error.rate.limit");
     }
 
     // ===================== #[from] conversions =====================
@@ -937,10 +1124,37 @@ mod tests {
             message: "failed".to_owned(),
             envelope: Some(serde_json::json!({"token": "abc123456"})),
             error_code: None,
+            status: Some(401),
         };
         let debug = format!("{err:?}");
         assert!(!debug.contains("abc123456"));
         assert!(debug.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn authentication_and_rate_limit_debug_show_the_status() {
+        let err = Error::Authentication {
+            message: "error.session.expired".to_owned(),
+            envelope: None,
+            error_code: None,
+            status: Some(401),
+        };
+        assert!(
+            format!("{err:?}").contains("status: Some(401)"),
+            "got {err:?}"
+        );
+        assert!(format!("{:?}", Error::authentication("x")).contains("status: None"));
+
+        let err = Error::RateLimit {
+            message: "error.rate.limit".to_owned(),
+            retry_after: Some(Duration::from_secs(5)),
+            envelope: None,
+            error_code: None,
+            status: Some(503),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("status: Some(503)"), "got {debug}");
+        assert!(debug.contains("retry_after: Some(5s)"), "got {debug}");
     }
 
     #[test]

@@ -253,6 +253,7 @@ fn wrap(prefix: &str, other: &Error) -> Error {
         message,
         envelope,
         error_code,
+        status: None,
     }
 }
 
@@ -377,6 +378,7 @@ mod tests {
             retry_after: None,
             envelope: None,
             error_code: Some("error.rate.limit".to_owned()),
+            status: Some(429),
         };
         assert!(matches!(
             wrap_as_authentication("Login", true, original),

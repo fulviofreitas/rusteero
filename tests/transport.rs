@@ -251,6 +251,67 @@ async fn status_429_with_delta_seconds_retry_after_carries_the_parsed_duration()
 }
 
 #[tokio::test]
+async fn status_401_and_429_carry_their_http_status_on_the_error() -> anyhow::Result<()> {
+    let rate_limited = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "5"))
+        .expect(1)
+        .mount(&rate_limited.server)
+        .await;
+
+    let err = rate_limited
+        .transport_with_token(TEST_TOKEN)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await
+        .expect_err("429 must surface as Error::RateLimit");
+    assert!(
+        matches!(
+            err,
+            Error::RateLimit {
+                status: Some(429),
+                retry_after: Some(retry_after),
+                ..
+            } if retry_after == Duration::from_secs(5)
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(err.status(), Some(429));
+    assert!(!err.is_auth_error());
+
+    let unauthorised = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+        .expect(1)
+        .mount(&unauthorised.server)
+        .await;
+
+    let err = unauthorised
+        .transport_with_token(TEST_TOKEN)
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await
+        .expect_err("a plain 401 must surface as Error::Authentication");
+    assert!(
+        matches!(
+            err,
+            Error::Authentication {
+                status: Some(401),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(err.status(), Some(401));
+    assert!(err.is_auth_error());
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_500_is_api_error_with_the_fixed_unrecognised_message_never_the_body()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
