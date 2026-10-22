@@ -1,5 +1,5 @@
 //! `DnsPoliciesApi`: `dns_policies` endpoints (`eero-api src/eero/api/dns_policies.py`, new in
-//! v8.0.0).
+//! v8.0.0; every line citation in this module is to `v8.4.1`).
 //!
 //! Premium (Eero Plus/Secure) feature family; replaces the removed `ProfilesAPI` content-filter/
 //! block-list/blocked-application writes (`crate::endpoints::profiles`'s module docs) — those
@@ -61,7 +61,7 @@ fn validate_network_dns_policy_key(key: &str) -> Result<(), Error> {
 
 /// Builds a request body from required fields plus only the supplied optional ones.
 ///
-/// Ported from `_payload` (`dns_policies.py:50-65`).
+/// Ported from `_payload` (`dns_policies.py:55-81`).
 fn payload(required: &[(&str, Value)], optional: &[(&str, Option<Value>)]) -> Value {
     let mut map = Map::new();
     for (key, value) in required {
@@ -156,7 +156,7 @@ impl DnsPoliciesApi {
     /// Gets the network's advanced content filter allow/block lists — returns the raw Eero API
     /// response. Live-verified.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:129-163`
+    /// Ported from `eero-api src/eero/api/dns_policies.py:135-171`
     /// (`DnsPoliciesAPI.get_advanced_content_filter`): sends `GET`
     /// `routes::dns_policies::DNS_POLICIES_GET_ADVANCED_CONTENT_FILTER`, preferring the parent
     /// network envelope's own `advanced_content_filter` link when supplied and resolvable.
@@ -188,14 +188,14 @@ impl DnsPoliciesApi {
     /// Only `domain` plus whichever optional fields are `Some` are sent; every `None` optional is
     /// omitted from the request entirely.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:167-230` (`DnsPoliciesAPI.allow_domain`):
+    /// Ported from `eero-api src/eero/api/dns_policies.py:173-237` (`DnsPoliciesAPI.allow_domain`):
     /// sends `PUT` `routes::dns_policies::DNS_POLICIES_ALLOW_DOMAIN`. Logs one
     /// `warn_uncharacterised_write("allow domain for network")` immediately before the request.
     ///
     /// # Errors
     ///
     /// See [`DnsPoliciesApi::get_advanced_content_filter`].
-    #[allow(clippy::too_many_arguments)] // mirrors dns_policies.py:167-176's own signature
+    #[allow(clippy::too_many_arguments)] // mirrors dns_policies.py:173-183's own signature
     pub async fn allow_domain(
         &self,
         network_id: &str,
@@ -227,7 +227,7 @@ impl DnsPoliciesApi {
 
     /// Allows a list of CNAME domains network-wide — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:233-272` (`DnsPoliciesAPI.allow_cnames`):
+    /// Ported from `eero-api src/eero/api/dns_policies.py:239-279` (`DnsPoliciesAPI.allow_cnames`):
     /// sends `PUT` `routes::dns_policies::DNS_POLICIES_ALLOW_CNAMES` with body `{"domains":
     /// domains}` — this endpoint declares only the `domains` field. Logs one
     /// `warn_uncharacterised_write("allow CNAMEs for network")` immediately before the request.
@@ -254,7 +254,7 @@ impl DnsPoliciesApi {
     /// Adds (or, with `is_delete: Some(true)`, removes) a domain from the network-wide block
     /// list — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:275-324` (`DnsPoliciesAPI.block_domain`):
+    /// Ported from `eero-api src/eero/api/dns_policies.py:281-331` (`DnsPoliciesAPI.block_domain`):
     /// sends `PUT` `routes::dns_policies::DNS_POLICIES_BLOCK_DOMAIN`. Logs one
     /// `warn_uncharacterised_write("block domain for network")` immediately before the request.
     ///
@@ -291,7 +291,7 @@ impl DnsPoliciesApi {
     ///
     /// `domain` and `profiles` are always sent; the remaining fields only when `Some`.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:327-389`
+    /// Ported from `eero-api src/eero/api/dns_policies.py:333-396`
     /// (`DnsPoliciesAPI.allow_domain_for_profiles`): sends `PUT`
     /// `routes::dns_policies::DNS_POLICIES_ALLOW_DOMAIN_FOR_PROFILES`. Logs one
     /// `warn_uncharacterised_write("allow domain for profiles on network")` immediately before
@@ -300,7 +300,7 @@ impl DnsPoliciesApi {
     /// # Errors
     ///
     /// See [`DnsPoliciesApi::get_advanced_content_filter`].
-    #[allow(clippy::too_many_arguments)] // mirrors dns_policies.py:327-336's own signature
+    #[allow(clippy::too_many_arguments)] // mirrors dns_policies.py:333-344's own signature
     pub async fn allow_domain_for_profiles(
         &self,
         network_id: &str,
@@ -337,7 +337,7 @@ impl DnsPoliciesApi {
     /// Allows a list of CNAME domains for one or more profiles — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:392-432`
+    /// Ported from `eero-api src/eero/api/dns_policies.py:398-441`
     /// (`DnsPoliciesAPI.allow_cnames_for_profiles`): sends `PUT`
     /// `routes::dns_policies::DNS_POLICIES_ALLOW_CNAMES_FOR_PROFILES` with body `{"domains":
     /// domains, "profiles": profiles}`. Logs one `warn_uncharacterised_write("allow CNAMEs for
@@ -368,7 +368,7 @@ impl DnsPoliciesApi {
     ///
     /// `domain` and `profiles` are always sent; `is_delete`/`override_` only when `Some`.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:437-488`
+    /// Ported from `eero-api src/eero/api/dns_policies.py:443-495`
     /// (`DnsPoliciesAPI.block_domain_for_profiles`): sends `PUT`
     /// `routes::dns_policies::DNS_POLICIES_BLOCK_DOMAIN_FOR_PROFILES`. Logs one
     /// `warn_uncharacterised_write("block domain for profiles on network")` immediately before
@@ -413,10 +413,10 @@ impl DnsPoliciesApi {
     /// already-bare id) before being substituted into the `dns_policies/profiles/{id}` sub-tree —
     /// a profile's own path/URL (`networks/{id}/profiles/{pid}`) cannot be mapped onto that
     /// sub-tree by template substitution, since the two resource families share only the trailing
-    /// id (`dns_policies.py:77-92`). Takes no `parent`: this sub-tree publishes no link on any
+    /// id (`dns_policies.py:91-113`). Takes no `parent`: this sub-tree publishes no link on any
     /// envelope this SDK can read.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:491-521`
+    /// Ported from `eero-api src/eero/api/dns_policies.py:497-525`
     /// (`DnsPoliciesAPI.get_profile_applications`): sends `GET`
     /// `routes::dns_policies::DNS_POLICIES_GET_PROFILE_APPLICATIONS`.
     ///
@@ -449,7 +449,7 @@ impl DnsPoliciesApi {
     /// primitive. Same `profile_id` normalisation as
     /// [`DnsPoliciesApi::get_profile_applications`]. Takes no `parent`.
     ///
-    /// Ported from `eero-api src/eero/api/dns_policies.py:521-551`
+    /// Ported from `eero-api src/eero/api/dns_policies.py:527-554`
     /// (`DnsPoliciesAPI.set_profile_blocked_applications`): sends `PUT`
     /// `routes::dns_policies::DNS_POLICIES_SET_PROFILE_BLOCKED_APPLICATIONS` with body
     /// `{"applications": applications}`. Logs one `warn_uncharacterised_write("set blocked
