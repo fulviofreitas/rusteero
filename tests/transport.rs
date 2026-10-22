@@ -917,18 +917,27 @@ async fn legacy_cookie_is_absent_when_disabled() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mounts, ahead of whatever else the test mounts, one mock per credential this transport can
+/// send (`X-User-Token` and the legacy `Cookie: s=<token>`) that must never match a request:
+/// `.expect(0)` fails the test when the server receives either header.
+async fn mount_credential_tripwires(server: &MockServer) {
+    for credential in ["x-user-token", "cookie"] {
+        Mock::given(header_exists(credential))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+}
+
 #[tokio::test]
 async fn credential_is_withheld_from_a_request_to_a_foreign_host() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let foreign = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(header_exists("x-user-token"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&foreign)
-        .await;
+    mount_credential_tripwires(&foreign).await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
         .mount(&foreign)
         .await;
 
@@ -941,27 +950,37 @@ async fn credential_is_withheld_from_a_request_to_a_foreign_host() -> anyhow::Re
     Ok(())
 }
 
+/// A transport whose configured origin is the mock server's authority over `https`, so that a
+/// request to the (plain-http) mock itself is the scheme-mismatch case and actually reaches it:
+/// the wire can then show which headers were sent.
+fn transport_configured_for_https(mock: &MockEero) -> Transport {
+    let https_base = mock.uri().replacen("http://", "https://", 1);
+    Transport::builder()
+        .base_url(https_base)
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .build()
+        .expect("an https loopback URL is a valid base URL")
+}
+
 #[tokio::test]
 async fn credential_is_withheld_from_a_scheme_mismatch() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(header_exists("x-user-token"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
+    mount_credential_tripwires(&mock.server).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
         .mount(&mock.server)
         .await;
 
-    let transport = mock.transport_with_token(TEST_TOKEN);
-    // Same host:port as the configured base, but `https` instead of the mock server's plain
-    // `http` — the scheme-mismatch half of the credential-placement gate.
-    let mismatched = mock.uri().replacen("http://", "https://", 1);
-    let mismatched_url = url::Url::parse(&format!("{mismatched}/2.2/account"))?;
-
-    // This request never actually reaches the (http-only) mock server successfully — it fails at
-    // the TLS layer — but the only thing under test is that no credential was ever attached, which
-    // the `.expect(0)` mock above already verifies regardless of how the connection attempt ends.
-    let _ = transport
+    // Configured for `https`, asked for the same host:port over plain `http`: the scheme-mismatch
+    // half of the credential-placement gate. The request reaches the mock, which would answer
+    // 500 and fail the test if it carried either credential.
+    let transport = transport_configured_for_https(&mock);
+    let mismatched_url = url::Url::parse(&format!("{}/2.2/account", mock.uri()))?;
+    let env = transport
         .request(Method::GET, mismatched_url, &[], RequestBody::None)
-        .await;
+        .await?;
+    assert_eq!(env.into_value(), json!({}));
     Ok(())
 }
 
@@ -1312,14 +1331,16 @@ async fn concurrent_refresh_calls_coalesce_into_a_single_request() -> anyhow::Re
 // ===================== per-call RequestTimeout =====================
 //
 // Real clock throughout: the crate's own timeouts and a paused clock do not mix with a real
-// HTTP round trip. The delays are chosen so a 100 ms default is exceeded by a 1.5 s response,
+// HTTP round trip. The delays are chosen so a 250 ms default is exceeded by a 2 s response,
 // a gap wide enough that a starved runtime cannot let the response win the race, while every
 // per-call budget below (10 s) is not.
 
-/// Short enough that a [`SLOW`] response trips it, with a 15x margin.
-const SHORT: Duration = Duration::from_millis(100);
+/// Short enough that a [`SLOW`] response trips it, with an 8x margin, and not shorter than
+/// 250 ms: each call still has to reach its mock before the bound expires, or the mock's exact
+/// `.expect(n)` count fails the test for a reason that has nothing to do with its subject.
+const SHORT: Duration = Duration::from_millis(250);
 /// How long the delayed responses below are held back.
-const SLOW: Duration = Duration::from_millis(1500);
+const SLOW: Duration = Duration::from_millis(2000);
 /// A per-call budget no test response comes near.
 const GENEROUS: Duration = Duration::from_secs(10);
 
@@ -1490,7 +1511,7 @@ async fn per_call_total_and_read_replace_both_defaults() -> anyhow::Result<()> {
 #[tokio::test]
 async fn per_call_total_only_drops_the_default_read_bound() -> anyhow::Result<()> {
     // Wholesale replacement: `RequestTimeout::total(..)` leaves `read` unset, which means "no read
-    // bound", not "keep the 100 ms default read bound". A merge would time out here.
+    // bound", not "keep the 250 ms default read bound". A merge would time out here.
     let mock = MockEero::start().await;
     mount_delayed_account(&mock, SLOW, 1).await;
     let transport = transport_with_bounds(&mock, SHORT, SHORT);
@@ -1520,20 +1541,14 @@ async fn a_per_call_value_can_shorten_the_default() -> anyhow::Result<()> {
     // Sanity: the generous default lets the slow response through.
     get_account(&transport, None).await?;
 
-    let err = get_account(
-        &transport,
-        Some(RequestTimeout::new(None, Some(Duration::from_millis(100)))),
-    )
-    .await
-    .expect_err("a 100 ms per-call read bound beats the 10 s default");
+    let err = get_account(&transport, Some(RequestTimeout::new(None, Some(SHORT))))
+        .await
+        .expect_err("a short per-call read bound beats the 10 s default");
     assert!(matches!(err, Error::Timeout), "{err:?}");
 
-    let err = get_account(
-        &transport,
-        Some(RequestTimeout::total(Duration::from_millis(100))),
-    )
-    .await
-    .expect_err("a 100 ms per-call total bound beats the 10 s default");
+    let err = get_account(&transport, Some(RequestTimeout::total(SHORT)))
+        .await
+        .expect_err("a short per-call total bound beats the 10 s default");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     Ok(())
 }
@@ -1591,7 +1606,7 @@ async fn request_and_nested_entry_points_take_a_per_call_timeout_too() -> anyhow
     let err = transport
         .nested_with_timeout(&route, "net-1", "dev-1", None, &[], RequestBody::None, None)
         .await
-        .expect_err("None keeps the 100 ms default");
+        .expect_err("None keeps the 250 ms default");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     transport
         .nested_with_timeout(
@@ -1614,7 +1629,7 @@ async fn a_stalled_body_trips_the_default_read_bound() -> anyhow::Result<()> {
 
     let err = get_account(&transport, None)
         .await
-        .expect_err("a 1.5 s gap between chunks exceeds the 100 ms read bound");
+        .expect_err("a 2 s gap between chunks exceeds the 250 ms read bound");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     Ok(())
 }
@@ -1667,7 +1682,7 @@ async fn the_read_bound_restarts_for_every_chunk() -> anyhow::Result<()> {
 async fn per_call_timeout_gives_each_get_retry_attempt_a_full_budget() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     // Attempt 1 outlives the 1 s per-call total; attempt 2 answers in 500 ms, which is within
-    // the per-call budget but over the 100 ms default. Succeeding after the 500 ms retry delay
+    // the per-call budget but over the 250 ms default. Succeeding after the 500 ms retry delay
     // (about 2 s in all) shows the budget restarts per attempt instead of being one shared
     // deadline.
     Mock::given(method("GET"))
@@ -1745,7 +1760,7 @@ async fn per_call_timeout_carries_into_the_refresh_replay() -> anyhow::Result<()
     assert_eq!(
         env.into_value(),
         fixture_json("account.json"),
-        "the replay was slower than the 100 ms default, so the per-call value must have applied"
+        "the replay was slower than the 250 ms default, so the per-call value must have applied"
     );
     Ok(())
 }
@@ -1780,7 +1795,7 @@ async fn the_refresh_post_keeps_the_transport_default_timeout() -> anyhow::Resul
     let transport = transport_with_bounds(&mock, SHORT, SHORT);
 
     // The generous per-call value must not leak into the refresh POST: it times out under the
-    // 100 ms default, the timeout propagates, and the request is never replayed (the single
+    // 250 ms default, the timeout propagates, and the request is never replayed (the single
     // 401 mock above is `expect(1)`).
     let err = get_account(&transport, Some(RequestTimeout::total(GENEROUS)))
         .await
@@ -1813,7 +1828,7 @@ async fn a_per_call_value_applies_on_top_of_a_caller_supplied_http_builder() -> 
     let mock = MockEero::start().await;
     mount_delayed_account(&mock, SLOW, 4).await;
 
-    // The caller's builder carries a 100 ms total timeout of its own.
+    // The caller's builder carries a 250 ms total timeout of its own.
     let capped = Transport::builder()
         .base_url(mock.uri())
         .session(Some(Session::from_token(TEST_TOKEN)))
@@ -1833,12 +1848,9 @@ async fn a_per_call_value_applies_on_top_of_a_caller_supplied_http_builder() -> 
         .session(Some(Session::from_token(TEST_TOKEN)))
         .http_builder(reqwest::Client::builder())
         .build()?;
-    let err = get_account(
-        &unbounded,
-        Some(RequestTimeout::new(None, Some(Duration::from_millis(100)))),
-    )
-    .await
-    .expect_err("a per-call read bound applies under http_builder");
+    let err = get_account(&unbounded, Some(RequestTimeout::new(None, Some(SHORT))))
+        .await
+        .expect_err("a per-call read bound applies under http_builder");
     assert!(matches!(err, Error::Timeout), "{err:?}");
 
     // The documented limit: a read timeout set on the caller's builder sits below the crate and
@@ -1881,12 +1893,14 @@ async fn mount_slow_and_fast(mock: &MockEero, slow_delay: Duration) {
 #[tokio::test]
 async fn cancelled_get_does_not_leak_its_response_into_the_next_request() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    mount_slow_and_fast(&mock, Duration::from_millis(1500)).await;
+    mount_slow_and_fast(&mock, Duration::from_millis(2500)).await;
     let transport = mock.transport_with_token(TEST_TOKEN);
 
     let slow = Url::parse(&format!("{}/2.2/networks/slow", mock.uri()))?;
+    // The caller gives up after 300 ms: long enough for the request to have reached the mock
+    // (the slow mock expects exactly one call), short of the 2.5 s the response is held.
     let cancelled = tokio::time::timeout(
-        Duration::from_millis(50),
+        Duration::from_millis(300),
         transport.request(Method::GET, slow, &[], RequestBody::None),
     )
     .await;
@@ -2018,6 +2032,8 @@ async fn timeout_error_line_names_the_method_but_not_the_path() -> anyhow::Resul
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path(DEVICES_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("{}")
@@ -2212,6 +2228,8 @@ async fn get_retry_warning_has_no_path_and_debug_keeps_it() -> anyhow::Result<()
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path(DEVICES_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(503))
         .up_to_n_times(1)
         .expect(1)
@@ -2219,6 +2237,8 @@ async fn get_retry_warning_has_no_path_and_debug_keeps_it() -> anyhow::Result<()
         .await;
     Mock::given(method("GET"))
         .and(path(DEVICES_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
         .expect(1)
         .mount(&mock.server)
@@ -2254,6 +2274,8 @@ async fn get_retry_warning_counts_attempts_out_of_the_total() -> anyhow::Result<
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path(DEVICES_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(503))
         .expect(4)
         .mount(&mock.server)
@@ -2287,6 +2309,8 @@ async fn blocked_redirect_location_is_debug_only() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path(DEVICES_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(302).insert_header(
             "location",
             format!("https://api.example.com/networks/{NETWORK_ID}/devices?token={QUERY_CANARY}"),
@@ -2320,6 +2344,8 @@ async fn a_redirect_without_a_location_logs_none_at_debug() -> anyhow::Result<()
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path(DEVICES_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(307))
         .expect(1)
         .mount(&mock.server)
@@ -2375,6 +2401,8 @@ fn debug_shows_the_mac(logs: &LogCapture) -> bool {
 async fn timeouts_and_retries_do_not_log_identifiers_above_debug() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string("{}")
@@ -2443,6 +2471,8 @@ async fn server_errors_and_retries_do_not_log_identifiers_above_debug() -> anyho
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path(DEVICE_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(503).set_body_string(format!(
             r#"{{"meta":{{"code":503,"error":"{NETWORK_ID} {MAC_CANARY}"}}}}"#
         )))
@@ -2512,6 +2542,8 @@ async fn redirects_and_error_statuses_do_not_log_identifiers_above_debug() -> an
     ] {
         Mock::given(method("GET"))
             .and(path(DEVICE_PATH))
+            .and(user_token_header())
+            .and(session_cookie())
             .respond_with(response)
             .up_to_n_times(1)
             .expect(1)
@@ -2634,6 +2666,8 @@ async fn an_undecodable_5xx_is_retried_like_any_other_server_error() -> anyhow::
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(502).set_body_bytes(vec![0xff, 0xfe]))
         .expect(2)
         .mount(&mock.server)
@@ -2793,6 +2827,9 @@ async fn a_non_object_success_body_is_a_typed_error() -> anyhow::Result<()> {
     let (_guard, logs) = capture_logs();
     for status in statuses {
         for (body, kind) in bodies {
+            // One call, one ERROR line: the capture is emptied first, so a line logged for an
+            // earlier body or status cannot satisfy this call's expectation.
+            logs.clear();
             let err = account(&transport).await.expect_err("not an object");
             assert!(
                 matches!(
@@ -2807,14 +2844,9 @@ async fn a_non_object_success_body_is_a_typed_error() -> anyhow::Result<()> {
                 format!("API error {status}: Unexpected JSON response: expected an object")
             );
             let expected = format!("Unexpected {kind} in JSON response ({} bytes)", body.len());
-            assert!(
-                logs.contains(Level::ERROR, &expected),
-                "{expected}: {:?}",
-                logs.errors()
-            );
+            assert_eq!(logs.errors(), [expected], "{status} {body}");
         }
     }
-    assert_eq!(logs.errors().len(), statuses.len() * bodies.len());
     Ok(())
 }
 
@@ -2824,6 +2856,8 @@ async fn a_non_object_success_body_on_a_write_is_attempted_once() -> anyhow::Res
     for verb in ["POST", "PUT", "DELETE"] {
         Mock::given(method(verb))
             .and(path("/2.2/account"))
+            .and(user_token_header())
+            .and(session_cookie())
             .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
             .expect(1)
             .mount(&mock.server)
@@ -2942,12 +2976,16 @@ async fn a_429_is_never_retried_and_a_write_gets_one_attempt() -> anyhow::Result
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
         .and(path("/2.2/logout"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
         .expect(1)
         .mount(&mock.server)
         .await;
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
         .expect(1)
         .mount(&mock.server)
@@ -3042,6 +3080,8 @@ async fn a_5xx_carrying_a_rate_limit_is_not_retried() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(
             ResponseTemplate::new(503)
                 .insert_header("retry-after", "1")
@@ -3076,6 +3116,8 @@ async fn a_5xx_without_a_rate_limit_is_retried_to_the_limit() -> anyhow::Result<
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"meta":{"code":503}}"#))
         .expect(3)
         .mount(&mock.server)
@@ -3098,8 +3140,12 @@ async fn the_credential_withheld_warning_names_the_reason_and_the_host_only() ->
 {
     let mock = MockEero::start().await;
     let foreign = MockServer::start().await;
+    // Both requests below go to this server, one per branch of the gate (a foreign host, then the
+    // configured host on another port), and neither may carry either credential.
+    mount_credential_tripwires(&foreign).await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(2)
         .mount(&foreign)
         .await;
     let port = foreign.address().port();
@@ -3134,37 +3180,73 @@ async fn the_credential_withheld_warning_names_the_reason_and_the_host_only() ->
 #[tokio::test]
 async fn the_withheld_warning_for_a_scheme_mismatch_names_the_scheme() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(header_exists("x-user-token"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
+    mount_credential_tripwires(&mock.server).await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
         .mount(&mock.server)
         .await;
-    let transport = mock.transport_with_token(TEST_TOKEN);
-    // The configured authority over `https`; the plain-http mock cannot answer, so the request
-    // fails at the TLS layer, which is not under test.
-    let mismatched = mock.uri().replacen("http://", "https://", 1);
+    // Configured for `https`, asked for the plain-http mock: the request reaches it, without
+    // credentials, so the tripwires above can see what was sent.
+    let transport = transport_configured_for_https(&mock);
 
     let (_guard, logs) = capture_logs();
-    let _ = send_canary(&transport, Method::GET, &mismatched).await;
+    send_canary(&transport, Method::GET, &mock.uri()).await?;
     assert_eq!(
         logs.warnings(),
-        ["Session header withheld from a request to a non-matching scheme: https://127.0.0.1"]
+        ["Session header withheld from a request to a non-matching scheme: http://127.0.0.1"]
     );
     Ok(())
 }
 
-#[tokio::test]
-async fn an_explicit_default_port_is_the_same_origin() -> anyhow::Result<()> {
-    // `http://127.0.0.1:80` is the configured origin of a base with no port, so the credential
-    // is attached to it; the request itself is refused by the (closed) port, which is the point:
-    // the gate said yes and nothing was logged about a withheld header.
-    let transport = transport_at("http://127.0.0.1");
-    let (_guard, logs) = capture_logs();
-    let url = Url::parse("http://127.0.0.1:80/2.2/account")?;
-    let _ = transport
-        .request(Method::GET, url, &[], RequestBody::None)
-        .await;
-    assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+/// The origin rule compares effective ports, so an explicit default port is the same origin as
+/// none. `Url::parse` already drops a default port from a parsed `Url`, so a `Url` handed to the
+/// transport cannot show the difference; it survives where a caller's raw text is judged, and
+/// that is where it is pinned here, with nothing sent (a request to port 80 would reach whatever
+/// listens there).
+#[test]
+fn an_explicit_default_port_is_the_same_origin() -> anyhow::Result<()> {
+    use rusteero::links::{ORIGIN_PORT, origin_mismatch};
+
+    for (base, same, other) in [
+        (
+            "http://127.0.0.1",
+            "http://127.0.0.1:80/2.2/account",
+            "http://127.0.0.1:8080/2.2/account",
+        ),
+        (
+            "https://api.example.test",
+            "https://API.example.test:443/2.2/account",
+            "https://api.example.test:8443/2.2/account",
+        ),
+    ] {
+        let base = Url::parse(base)?;
+        assert!(
+            origin_mismatch(&Url::parse(same)?, &base).is_none(),
+            "{same} against {base}"
+        );
+        let mismatch = origin_mismatch(&Url::parse(other)?, &base)
+            .unwrap_or_else(|| panic!("{other} against {base} is another port"));
+        assert_eq!(mismatch.reason, ORIGIN_PORT, "{other} against {base}");
+    }
+
+    // The same through the text a caller passes as an id-or-url, against a base with no port.
+    let host = Url::parse("http://127.0.0.1")?;
+    let route = Resource {
+        method: Method::GET,
+        version: ApiVersion::V2_2,
+        template: "eeros/{id}",
+        link: None,
+    };
+    let resolved = route.resolve(&host, "http://127.0.0.1:80/2.2/eeros/1", None)?;
+    assert_eq!(resolved.as_str(), "http://127.0.0.1/2.2/eeros/1");
+    let err = route
+        .resolve(&host, "http://127.0.0.1:8080/2.2/eeros/1", None)
+        .expect_err("another port is another origin");
+    assert!(
+        matches!(err, Error::Validation { ref field, .. } if field == "url"),
+        "{err:?}"
+    );
     Ok(())
 }
 
