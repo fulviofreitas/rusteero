@@ -415,14 +415,14 @@ mod tests {
         use super::{LOGIN, LOGIN_VERIFY};
         use url::Url;
 
-        let host = Url::parse("https://api-user.e2ro.com").unwrap();
+        let host = Url::parse("http://mock.test:1234").unwrap();
         assert_eq!(
             LOGIN.resolve(&host, "", None).unwrap().as_str(),
-            "https://api-user.e2ro.com/2.2/login"
+            "http://mock.test:1234/2.2/login"
         );
         assert_eq!(
             LOGIN_VERIFY.resolve(&host, "", None).unwrap().as_str(),
-            "https://api-user.e2ro.com/2.2/login/verify"
+            "http://mock.test:1234/2.2/login/verify"
         );
     }
 
@@ -498,8 +498,10 @@ mod tests {
     use super::{Nested, Resource};
     use url::Url;
 
+    /// A host that is not the production one, so a resolution that compared against (or built
+    /// from) `consts::API_HOST` instead of its `host` argument cannot pass.
     fn fake_host() -> Url {
-        Url::parse("https://api-user.e2ro.com").unwrap()
+        Url::parse("http://mock.test:1234").unwrap()
     }
 
     #[test]
@@ -511,7 +513,7 @@ mod tests {
             link: None,
         };
         let url = resource.resolve(&fake_host(), "100", None).unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/networks/100");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/100");
     }
 
     #[test]
@@ -523,7 +525,7 @@ mod tests {
             link: None,
         };
         let url = resource.resolve(&fake_host(), "ignored", None).unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/account");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/account");
     }
 
     #[test]
@@ -540,7 +542,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.4/networks/100/settings"
+            "http://mock.test:1234/2.4/networks/100/settings"
         );
     }
 
@@ -555,7 +557,7 @@ mod tests {
         let url = resource.resolve(&fake_host(), "100", None).unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/settings"
+            "http://mock.test:1234/2.2/networks/100/settings"
         );
     }
 
@@ -571,7 +573,7 @@ mod tests {
         let url = nested.resolve(&fake_host(), "100", "p1", None).unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/profiles/p1"
+            "http://mock.test:1234/2.2/networks/100/profiles/p1"
         );
     }
 
@@ -590,7 +592,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.5/networks/100/profiles/p1/schedules"
+            "http://mock.test:1234/2.5/networks/100/profiles/p1/schedules"
         );
     }
 
@@ -611,12 +613,12 @@ mod tests {
         for supplied in [
             "/2.3/networks/100",
             "/2.3/networks/100/",
-            "https://api-user.e2ro.com/2.3/networks/100",
+            "http://mock.test:1234/2.3/networks/100",
         ] {
             let url = resource.resolve(&fake_host(), supplied, None).unwrap();
             assert_eq!(
                 url.as_str(),
-                "https://api-user.e2ro.com/2.3/networks/100/settings",
+                "http://mock.test:1234/2.3/networks/100/settings",
                 "{supplied}"
             );
         }
@@ -634,7 +636,9 @@ mod tests {
             "/2.2/networks/%2e%2e/account",
             "/2.2/networks/100?x=1",
             "/2.2/networks/100\n",
-            "https://api-user.e2ro.com/2.2/account",
+            "http://mock.test:1234/2.2/account",
+            // In the family, but on another origin: the production host is not this one.
+            "https://api-user.e2ro.com/2.3/networks/100",
         ] {
             let err = resource.resolve(&fake_host(), supplied, None).unwrap_err();
             assert!(
@@ -650,7 +654,7 @@ mod tests {
         let url = settings_resource()
             .resolve(&fake_host(), "100", Some(&parent))
             .unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.4/account/other");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.4/account/other");
     }
 
     #[test]
@@ -667,7 +671,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/profiles/p1"
+            "http://mock.test:1234/2.2/networks/100/profiles/p1"
         );
         for child in [
             "/2.2/networks/200/profiles/p1",
