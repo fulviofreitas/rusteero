@@ -1,4 +1,4 @@
-//! Schedule API: `eero-api`'s `ScheduleAPI` at v8.0.4.
+//! Schedule API: `eero-api`'s `ScheduleAPI` at v8.4.1.
 //!
 //! Ported from `eero-api src/eero/api/schedule.py`. Scheduled pauses are sub-resources of a
 //! profile, not a field on the profile itself: they live at
@@ -22,7 +22,7 @@ use crate::links;
 use crate::routes::{self, Resource};
 use crate::transport::{RequestBody, Transport};
 
-/// All seven days, spelled exactly as `eero-api`'s bedtime helpers do (`schedule.py:34-42`), in
+/// All seven days, spelled exactly as `eero-api`'s bedtime helpers do (`schedule.py:37-45`), in
 /// the order [`ScheduleApi::enable_bedtime`]'s own default uses.
 const ALL_DAYS: &[&str] = &[
     "monday",
@@ -34,19 +34,28 @@ const ALL_DAYS: &[&str] = &[
     "sunday",
 ];
 
-/// Monday through Friday, verbatim from `eero-api src/eero/api/schedule.py:44`
+/// Monday through Friday, verbatim from `eero-api src/eero/api/schedule.py:47`
 /// (`ScheduleAPI.set_weekday_bedtime`'s `WEEKDAYS` tuple).
 const WEEKDAYS: &[&str] = &["monday", "tuesday", "wednesday", "thursday", "friday"];
 
-/// Saturday and Sunday, verbatim from `eero-api src/eero/api/schedule.py:45`
+/// Saturday and Sunday, verbatim from `eero-api src/eero/api/schedule.py:48`
 /// (`ScheduleAPI.set_weekend_bedtime`'s `WEEKEND` tuple).
 const WEEKEND: &[&str] = &["saturday", "sunday"];
+
+/// The shape of a scheduled pause's own path, after the version segment (`schedule.py:34`,
+/// `_SCHEDULE_FAMILY`).
+const SCHEDULE_FAMILY: &str = "networks/{id}/profiles/{id}/schedules/{id}";
+
+/// Why a bare id cannot name a scheduled pause (`schedule.py:83-88`): a pause lives under a
+/// network and a profile that the update and delete methods are not given.
+const BARE_ID_MESSAGE: &str =
+    "must be the schedule's path, absolute URL or envelope; a bare id cannot be resolved";
 
 /// Every optional keyword argument [`ScheduleApi::update_schedule`] accepts.
 ///
 /// More than four optional keyword arguments, per this port's conventions
 /// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2). Ported from `ScheduleAPI.update_schedule`'s
-/// own five independent keyword-only fields (`schedule.py:194-202`).
+/// own five independent keyword-only fields (`schedule.py:215-223`).
 #[derive(Debug, Default, Clone)]
 pub struct UpdateScheduleOptions<'a> {
     /// The schedule's name. Omitted from the request when `None`.
@@ -61,7 +70,7 @@ pub struct UpdateScheduleOptions<'a> {
     pub enabled: Option<bool>,
 }
 
-/// `eero-api`'s `ScheduleAPI` (`src/eero/api/schedule.py`) at v8.0.4.
+/// `eero-api`'s `ScheduleAPI` (`src/eero/api/schedule.py`) at v8.4.1.
 #[derive(Debug)]
 pub struct ScheduleApi {
     transport: Arc<Transport>,
@@ -76,25 +85,26 @@ impl ScheduleApi {
 
     /// Resolves a single scheduled pause's request URL.
     ///
-    /// Ported from `_resolve_schedule_url` (`schedule.py:48-74`), which takes one argument that
+    /// Ported from `_resolve_schedule_url` (`schedule.py:51-95`), which takes one argument that
     /// is *either* a cached pause envelope *or* an id/path/URL string — decomposed here into two
-    /// Rust parameters per this port's id-or-url-plus-parent convention
-    /// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2). The two are mutually exclusive, not a
-    /// preference-with-fallback: when `parent` is `Some`, `id_or_url` is ignored entirely and
-    /// [`links::self_url`] must resolve something, exactly like Python's `Mapping` branch (a
-    /// `parent` envelope with no `url` field is a validation error, not a silent fallback to
-    /// `id_or_url`); when `parent` is `None`, `id_or_url` is resolved via `route`'s `"{id}"`
-    /// template, exactly like Python's `str` branch.
+    /// Rust parameters per this port's id-or-url-plus-parent convention. The two are mutually
+    /// exclusive, not a preference-with-fallback: when `parent` is `Some`, `id_or_url` is ignored
+    /// entirely, exactly like Python's `Mapping` branch (`clear_profile_schedule` passes `""`);
+    /// when `parent` is `None`, `id_or_url` is the `str` branch.
     ///
-    /// # Security (finding 2)
-    ///
-    /// Whichever branch resolves a URL, the result is required to actually name a scheduled
-    /// pause — `networks/{id}/profiles/{id}/schedules/{id}` — via
-    /// [`crate::params::require_schedule_family`], before it is returned to a caller that is
-    /// about to `PUT`/`DELETE` it. Without this, a bare identifier (`"networks"`), an unrelated
-    /// same-host path (`"/2.2/networks/1"`), or a *network's* own envelope passed as `parent`
-    /// would all resolve to *some* URL via the generic `{id}`-template/`self_url` machinery and
-    /// be sent a mutating request without ever being confirmed to be a schedule.
+    /// - **An envelope** (`parent`, a full envelope or its `data` object) is trusted as published:
+    ///   its `url` is taken through [`links::self_url`], which applies only the plain-path shape
+    ///   rule (field `link`), and is **not** confined to the schedule family. An envelope with no
+    ///   resolvable `url` is a validation error, not a silent fall-back to `id_or_url`.
+    /// - **A bare id** is refused up front (field `schedule`): a pause lives under a network and
+    ///   a profile that these methods are not given, so the id alone cannot be resolved, and
+    ///   placing it under the version root would address whatever one-segment endpoint shares its
+    ///   name (`/2.2/account`).
+    /// - **A path or absolute URL a caller supplies** goes through the route's `"{id}"` template
+    ///   (the shape rules, field `id_or_url` or `url`) and must then be exactly a scheduled
+    ///   pause's own path, `/<version>/networks/{id}/profiles/{id}/schedules/{id}` (field
+    ///   `schedule`), so a write cannot be redirected to another resource on the API host. The
+    ///   caller's own version is kept, and every trailing `/` is dropped before the check.
     fn resolve_schedule_url(
         &self,
         route: &Resource,
@@ -102,19 +112,22 @@ impl ScheduleApi {
         parent: Option<&Value>,
     ) -> Result<Url, Error> {
         let host = self.transport.api_host();
-        let url = if let Some(parent) = parent {
-            links::self_url(host, parent)?.ok_or_else(|| {
+        if let Some(parent) = parent {
+            return links::self_url(host, parent)?.ok_or_else(|| {
                 Error::validation("schedule", "envelope has no resolvable 'url' field")
-            })?
-        } else {
-            route.resolve(host, id_or_url, None)?
-        };
-        crate::params::require_schedule_family(&url)
+            });
+        }
+        if !is_path_or_url(id_or_url) {
+            return Err(Error::validation("schedule", BARE_ID_MESSAGE));
+        }
+        let url = route.resolve(host, id_or_url, None)?;
+        require_schedule_path(id_or_url.trim_end_matches('/'))?;
+        Ok(url)
     }
 
     /// Gets the scheduled pauses for a profile — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:123-150` (`ScheduleAPI.get_schedules`):
+    /// Ported from `eero-api src/eero/api/schedule.py:144-171` (`ScheduleAPI.get_schedules`):
     /// sends `GET` `routes::schedule::SCHEDULE_GET_SCHEDULES`
     /// (`networks/{network_id}/profiles/{profile_id}/schedules`), preferring the profile's own
     /// published `schedules` link when `parent` is supplied and resolvable.
@@ -147,7 +160,7 @@ impl ScheduleApi {
     /// `create_schedule`'s own `enabled: bool = True` default. All five body keys (`name`,
     /// `days`, `start`, `end`, `enabled`) are always sent.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:152-192` (`ScheduleAPI.create_schedule`):
+    /// Ported from `eero-api src/eero/api/schedule.py:173-213` (`ScheduleAPI.create_schedule`):
     /// sends `POST` `routes::schedule::SCHEDULE_CREATE_SCHEDULE` with body `{"name": name, "days":
     /// days, "start": start, "end": end, "enabled": enabled}`. Logs one
     /// `warn_uncharacterised_write("create_schedule")` immediately before the request.
@@ -155,7 +168,7 @@ impl ScheduleApi {
     /// # Errors
     ///
     /// See [`ScheduleApi::get_schedules`].
-    #[allow(clippy::too_many_arguments)] // mirrors schedule.py:152-162's own signature
+    #[allow(clippy::too_many_arguments)] // mirrors schedule.py:173-183's own signature
     pub async fn create_schedule(
         &self,
         network_id: &str,
@@ -195,19 +208,22 @@ impl ScheduleApi {
     /// Every field is optional; only the supplied ones are sent. See
     /// `resolve_schedule_url` for how `schedule`/`parent` resolve the pause's URL.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:194-247` (`ScheduleAPI.update_schedule`):
+    /// Ported from `eero-api src/eero/api/schedule.py:215-272` (`ScheduleAPI.update_schedule`):
     /// sends `PUT` `routes::schedule::SCHEDULE_UPDATE`. Logs one
     /// `warn_uncharacterised_write("update_schedule")` immediately before the request — but only
     /// once local validation has passed (see the `# Errors` section below), matching Python's own
-    /// ordering (`schedule.py:227-246`).
+    /// ordering (`schedule.py:263-270`).
     ///
     /// # Errors
     ///
     /// Returns `Error::Validation { field: "schedule", .. }` if every one of `name`, `days`,
     /// `start`, `end`, `enabled` is `None` — checked *before* any request is sent, matching
-    /// Python's own `if not payload: raise ...` (`schedule.py:227-231`). Returns
-    /// `Error::Validation { field: "schedule", .. }` if `schedule`/`parent` cannot be resolved to
-    /// a URL. Otherwise, [`Error::Authentication`] if no valid session is configured, or whatever
+    /// Python's own `if not payload: raise ...` (`schedule.py:263-266`), and before the
+    /// reference below is looked at. Returns `Error::Validation { field: "schedule", .. }` if
+    /// `schedule` is a bare id, if a `schedule` path or URL is not a scheduled pause's own path,
+    /// or if `parent` has no resolvable `url`; a shape error in a path, URL or published `url`
+    /// (a dot segment, a control character, a query) reports `id_or_url`, `url` or `link`.
+    /// Otherwise, [`Error::Authentication`] if no valid session is configured, or whatever
     /// status-mapped [`Error`] the request produces.
     pub async fn update_schedule(
         &self,
@@ -264,15 +280,18 @@ impl ScheduleApi {
     /// See `resolve_schedule_url` for how `schedule`/`parent` resolve the pause's
     /// URL.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:250-270` (`ScheduleAPI.delete_schedule`):
+    /// Ported from `eero-api src/eero/api/schedule.py:274-298` (`ScheduleAPI.delete_schedule`):
     /// sends `DELETE` `routes::schedule::SCHEDULE_DELETE`. Logs one
     /// `warn_uncharacterised_write("delete_schedule")` immediately before the request.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation { field: "schedule", .. }` if `schedule`/`parent` cannot be
-    /// resolved to a URL. Otherwise, [`Error::Authentication`] if no valid session is configured,
-    /// or whatever status-mapped [`Error`] the request produces.
+    /// Returns `Error::Validation { field: "schedule", .. }` if `schedule` is a bare id, if a
+    /// `schedule` path or URL is not a scheduled pause's own path, or if `parent` has no
+    /// resolvable `url`; a shape error in a path, URL or published `url` (a dot segment, a
+    /// control character, a query) reports `id_or_url`, `url` or `link`. Otherwise,
+    /// [`Error::Authentication`] if no valid session is configured, or whatever status-mapped
+    /// [`Error`] the request produces.
     pub async fn delete_schedule(
         &self,
         schedule: &str,
@@ -296,9 +315,9 @@ impl ScheduleApi {
     /// Issues one read ([`ScheduleApi::get_schedules`]) followed by one `DELETE` per existing
     /// pause. Never retried; a pause that fails to delete aborts every remaining delete and its
     /// error propagates immediately — matching Python's own "not swallowed" behaviour
-    /// (`schedule.py:274-317`) exactly.
+    /// (`schedule.py:300-343`) exactly.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:274-317`
+    /// Ported from `eero-api src/eero/api/schedule.py:300-343`
     /// (`ScheduleAPI.clear_profile_schedule`). Unlike every other method in this module, returns
     /// `Vec<Envelope>` — one raw response per `DELETE`, in read order — matching Python's own
     /// `List[Dict[str, Any]]` return shape.
@@ -319,7 +338,7 @@ impl ScheduleApi {
 
         let mut results = Vec::with_capacity(pauses.len());
         for pause in pauses {
-            // Ported from `delete_schedule(pause)` (`schedule.py:313`): Python passes the pause's
+            // Ported from `delete_schedule(pause)` (`schedule.py:342`): Python passes the pause's
             // own *envelope* (mapping), not a bare URL string, so this goes through the same
             // `parent`-is-`Some` branch of `resolve_schedule_url`/`_resolve_schedule_url` every
             // other caller uses — the placeholder `""` `id_or_url` is never consulted, matching
@@ -339,7 +358,7 @@ impl ScheduleApi {
     /// Built on [`ScheduleApi::create_schedule`] (one pause), not a `schedule` array written onto
     /// the profile.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:319-368` (`ScheduleAPI.enable_bedtime`).
+    /// Ported from `eero-api src/eero/api/schedule.py:345-394` (`ScheduleAPI.enable_bedtime`).
     ///
     /// # Errors
     ///
@@ -366,7 +385,7 @@ impl ScheduleApi {
     /// Delegates to [`ScheduleApi::enable_bedtime`] with `days` fixed to `["monday", "tuesday",
     /// "wednesday", "thursday", "friday"]`.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:370-393` (`ScheduleAPI.set_weekday_bedtime`).
+    /// Ported from `eero-api src/eero/api/schedule.py:396-419` (`ScheduleAPI.set_weekday_bedtime`).
     ///
     /// # Errors
     ///
@@ -395,7 +414,7 @@ impl ScheduleApi {
     /// Delegates to [`ScheduleApi::enable_bedtime`] with `days` fixed to `["saturday",
     /// "sunday"]`.
     ///
-    /// Ported from `eero-api src/eero/api/schedule.py:395-418` (`ScheduleAPI.set_weekend_bedtime`).
+    /// Ported from `eero-api src/eero/api/schedule.py:421-444` (`ScheduleAPI.set_weekend_bedtime`).
     ///
     /// # Errors
     ///
@@ -417,5 +436,61 @@ impl ScheduleApi {
             parent,
         )
         .await
+    }
+}
+
+/// Returns `true` when `reference` is a host-relative path (`/…`) or an absolute `http(s)` URL
+/// rather than a bare id (`schedule.py:83`; the scheme is matched case-insensitively).
+fn is_path_or_url(reference: &str) -> bool {
+    let lower = reference.to_lowercase();
+    reference.starts_with('/') || lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Returns `true` when `segment` is one identifier of a family path: an ASCII alphanumeric
+/// followed by ASCII alphanumerics, `.`, `_`, `:` or `-` (`links.py:47`, `_SEGMENT`).
+fn is_family_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// Requires `reference` — a caller's path or absolute URL, trailing slashes already dropped — to
+/// name exactly one scheduled pause: its path must be
+/// `/<version>/networks/{id}/profiles/{id}/schedules/{id}` and nothing else (`schedule.py:90`,
+/// `require_family_path(url, _SCHEDULE_FAMILY, field="schedule")`).
+///
+/// The raw string is checked, not the parsed URL: the URL parser resolves dot segments and strips
+/// control characters, which would let a path that does not name a pause pass as one that does.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] with `field: "schedule"` and `"must be a path under
+/// networks/{id}/profiles/{id}/schedules/{id} on the API host"` for any other shape.
+fn require_schedule_path(reference: &str) -> Result<(), Error> {
+    let path = match reference.find("://") {
+        // An absolute URL: the path starts at the first `/` after the authority.
+        Some(scheme_end) => reference[scheme_end + 3..]
+            .find('/')
+            .map_or("", |slash| &reference[scheme_end + 3 + slash..]),
+        None => reference,
+    };
+    let segments: Vec<&str> = path
+        .strip_prefix('/')
+        .map_or_else(Vec::new, |rest| rest.split('/').collect());
+    let is_pause = matches!(
+        segments.as_slice(),
+        [version, "networks", network, "profiles", profile, "schedules", schedule]
+            if links::is_version_segment(version)
+                && is_family_segment(network)
+                && is_family_segment(profile)
+                && is_family_segment(schedule)
+    );
+    if is_pause {
+        Ok(())
+    } else {
+        Err(Error::validation(
+            "schedule",
+            format!("must be a path under {SCHEDULE_FAMILY} on the API host"),
+        ))
     }
 }
