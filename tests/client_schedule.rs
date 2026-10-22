@@ -8,7 +8,9 @@ use tracing::Level;
 use wiremock::matchers::{any, body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie};
+use common::{
+    MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie, user_token_header,
+};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 use rusteero::endpoints::schedule::UpdateScheduleOptions;
@@ -34,6 +36,7 @@ async fn get_schedules_reaches_the_schedules_collection_endpoint() -> anyhow::Re
             "/2.2/networks/network-0001/profiles/profile-0001/schedules",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedules.json")))
         .expect(1)
         .mount(&mock.server)
@@ -55,6 +58,7 @@ async fn create_schedule_posts_to_the_schedules_collection() -> anyhow::Result<(
             "/2.2/networks/network-0001/profiles/profile-0001/schedules",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({
             "name": "Study Time",
             "days": ["wednesday"],
@@ -91,6 +95,7 @@ async fn update_schedule_takes_no_network_id_and_resolves_from_its_own_path() ->
             "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "enabled": false })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
@@ -121,6 +126,7 @@ async fn update_schedule_accepts_a_cached_pause_envelope_as_parent() -> anyhow::
             "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "enabled": false })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
@@ -152,6 +158,7 @@ async fn delete_schedule_takes_no_network_id() -> anyhow::Result<()> {
             "/2.2/networks/network-0001/profiles/profile-0001/schedules/schedule-0001",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
@@ -175,12 +182,14 @@ async fn clear_profile_schedule_returns_one_response_per_deleted_pause() -> anyh
             "/2.2/networks/network-0001/profiles/profile-0001/schedules",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedules.json")))
         .expect(1)
         .mount(&mock.server)
         .await;
     Mock::given(method("DELETE"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(2)
         .mount(&mock.server)
@@ -202,6 +211,7 @@ async fn enable_bedtime_reaches_the_schedules_collection() -> anyhow::Result<()>
             "/2.2/networks/network-0001/profiles/profile-0001/schedules",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
         .expect(1)
         .mount(&mock.server)
@@ -263,6 +273,7 @@ async fn mount_get(mock: &MockEero, get_path: &str, body: String, times: u64) {
     Mock::given(method("GET"))
         .and(path(get_path))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .expect(times)
         .mount(&mock.server)
@@ -276,6 +287,7 @@ async fn the_bedtime_helpers_post_one_schedule_with_their_day_set() -> anyhow::R
         Mock::given(method("POST"))
             .and(path(SCHEDULES_PATH))
             .and(session_cookie())
+            .and(user_token_header())
             .and(body_json(json!({
                 "name": "Bedtime",
                 "days": bedtime.days(),
@@ -360,6 +372,7 @@ async fn the_bedtime_helpers_ignore_cached_envelopes() -> anyhow::Result<()> {
         Mock::given(method("POST"))
             .and(path(SCHEDULES_PATH))
             .and(session_cookie())
+            .and(user_token_header())
             .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
             .expect(1)
             .mount(&mock.server)
@@ -396,6 +409,7 @@ async fn the_bedtime_helpers_forward_an_explicit_profile_parent() -> anyhow::Res
                 "/2.2/networks/network-0001/profiles/profile-0001/custom-schedules",
             ))
             .and(session_cookie())
+            .and(user_token_header())
             .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
             .expect(1)
             .mount(&mock.server)
@@ -448,6 +462,8 @@ async fn the_bedtime_helpers_invalidate_the_profile_and_the_profile_list_only() 
         )
         .await;
         Mock::given(method("POST"))
+            .and(session_cookie())
+            .and(user_token_header())
             .and(path(SCHEDULES_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_string(fixture("schedule.json")))
             .expect(1)

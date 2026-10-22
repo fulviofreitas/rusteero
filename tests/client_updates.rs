@@ -27,6 +27,7 @@ async fn get_updates_resolves_the_explicit_network() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/updates"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -44,6 +45,7 @@ async fn apply_update_invalidates_the_network_bucket() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"meta":{"code":200},"data":{"id":"network-0001"}})),
@@ -54,6 +56,7 @@ async fn apply_update_invalidates_the_network_bucket() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/updates"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"meta":{"code":200},"data":{}})),
         )
@@ -144,6 +147,7 @@ async fn set_preferred_update_hour_uses_the_preferred_network_without_discovery(
             "/2.2/networks/network-0002/updates/preferred_update_hour",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({"preferred_update_hour": 7})))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
@@ -227,6 +231,7 @@ async fn set_preferred_update_hour_invalidates_only_the_written_networks_cache_e
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"meta":{"code":200},"data":{"id":"network-0001"}})),
@@ -238,6 +243,7 @@ async fn set_preferred_update_hour_invalidates_only_the_written_networks_cache_e
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0002"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"meta":{"code":200},"data":{"id":"network-0002"}})),
@@ -248,6 +254,7 @@ async fn set_preferred_update_hour_invalidates_only_the_written_networks_cache_e
     Mock::given(method("POST"))
         .and(path(HOUR_PATH))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
         .mount(&mock.server)
@@ -270,6 +277,7 @@ async fn set_preferred_update_hour_failed_write_keeps_the_network_cache() -> any
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"meta":{"code":200},"data":{"id":"network-0001"}})),
@@ -280,6 +288,7 @@ async fn set_preferred_update_hour_failed_write_keeps_the_network_cache() -> any
     Mock::given(method("POST"))
         .and(path(HOUR_PATH))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
         .expect(1)
         .mount(&mock.server)

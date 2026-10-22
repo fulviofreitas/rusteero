@@ -32,6 +32,7 @@ async fn get_blacklist_hits_the_blacklist_path() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/blacklist"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
         .mount(&mock.server)
@@ -398,6 +399,8 @@ async fn remove_from_blacklist_rejects_an_empty_id_before_any_request() -> anyho
 async fn a_failed_write_leaves_the_device_cache_alone() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/blacklist"))
         .respond_with(ResponseTemplate::new(500))
         .expect(1)

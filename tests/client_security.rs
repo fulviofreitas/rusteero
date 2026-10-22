@@ -29,6 +29,7 @@ async fn set_wpa3_invalidates_the_network_bucket() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -36,6 +37,7 @@ async fn set_wpa3_invalidates_the_network_bucket() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -54,6 +56,7 @@ async fn set_wpa3_forwards_the_cached_network_as_parent() -> anyhow::Result<()> 
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -64,6 +67,7 @@ async fn set_wpa3_forwards_the_cached_network_as_parent() -> anyhow::Result<()> 
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "wpa3": true })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
@@ -82,6 +86,7 @@ async fn get_security_settings_forwards_the_cached_network_as_parent() -> anyhow
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -94,6 +99,7 @@ async fn get_security_settings_forwards_the_cached_network_as_parent() -> anyhow
     Mock::given(method("GET"))
         .and(path("/2.4/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -119,6 +125,7 @@ async fn configure_security_no_longer_accepts_a_thread_argument_and_still_invali
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -126,6 +133,7 @@ async fn configure_security_no_longer_accepts_a_thread_argument_and_still_invali
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "wpa3": true })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
@@ -148,6 +156,7 @@ async fn set_band_steering_forwards_the_cached_network_as_parent_and_invalidates
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -158,6 +167,7 @@ async fn set_band_steering_forwards_the_cached_network_as_parent_and_invalidates
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "band_steering": true })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
@@ -177,6 +187,7 @@ async fn set_upnp_forwards_the_cached_network_as_parent_and_invalidates_it() -> 
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -187,6 +198,7 @@ async fn set_upnp_forwards_the_cached_network_as_parent_and_invalidates_it() -> 
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "upnp": false })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
@@ -206,6 +218,7 @@ async fn set_ipv6_forwards_the_cached_network_as_parent_and_invalidates_it() -> 
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -216,6 +229,7 @@ async fn set_ipv6_forwards_the_cached_network_as_parent_and_invalidates_it() -> 
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -235,6 +249,7 @@ async fn set_mlo_mode_forwards_the_cached_network_as_parent_and_invalidates_it()
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -245,6 +260,7 @@ async fn set_mlo_mode_forwards_the_cached_network_as_parent_and_invalidates_it()
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/mlo_mode"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -266,6 +282,7 @@ async fn set_passpoint_enabled_forwards_the_cached_network_as_parent_and_invalid
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -276,6 +293,7 @@ async fn set_passpoint_enabled_forwards_the_cached_network_as_parent_and_invalid
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/passpoint/enabled"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -297,6 +315,7 @@ async fn set_proxied_nodes_forwards_the_cached_network_as_parent_and_invalidates
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -307,6 +326,7 @@ async fn set_proxied_nodes_forwards_the_cached_network_as_parent_and_invalidates
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/proxied_nodes"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -326,6 +346,7 @@ async fn get_fast_transition_never_invalidates_and_set_fast_transition_does() ->
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -333,6 +354,7 @@ async fn get_fast_transition_never_invalidates_and_set_fast_transition_does() ->
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/fast_transition"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(json!({"meta": {"code": 200}, "data": {}}).to_string()),
@@ -343,6 +365,7 @@ async fn get_fast_transition_never_invalidates_and_set_fast_transition_does() ->
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/fast_transition"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(json!({"meta": {"code": 200}, "data": {}}).to_string()),
@@ -374,6 +397,7 @@ async fn mount_get(mock: &MockEero, path_str: &str, body: String, times: u64) {
     Mock::given(method("GET"))
         .and(path(path_str))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .expect(times)
         .mount(&mock.server)
@@ -519,6 +543,8 @@ async fn set_ipv6_upstream_failed_write_keeps_the_network_cache() -> anyhow::Res
     )
     .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path(SETTINGS_PATH))
         .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
         .expect(1)

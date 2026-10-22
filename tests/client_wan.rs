@@ -6,7 +6,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 
@@ -37,6 +37,7 @@ async fn get_multistaticip_prefers_the_cached_networks_published_link() -> anyho
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -44,6 +45,7 @@ async fn get_multistaticip_prefers_the_cached_networks_published_link() -> anyho
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/multistaticip"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -61,6 +63,7 @@ async fn set_multistaticip_invalidates_the_network_bucket() -> anyhow::Result<()
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -68,6 +71,7 @@ async fn set_multistaticip_invalidates_the_network_bucket() -> anyhow::Result<()
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/multistaticip"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -88,6 +92,7 @@ async fn set_secondary_wan_config_invalidates_the_network_bucket() -> anyhow::Re
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -97,6 +102,7 @@ async fn set_secondary_wan_config_invalidates_the_network_bucket() -> anyhow::Re
             "/2.3/networks/network-0001/devices/secondary_wan_config",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -118,6 +124,7 @@ async fn set_device_secondary_wan_access_invalidates_the_device_bucket_not_the_n
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
@@ -125,6 +132,7 @@ async fn set_device_secondary_wan_access_invalidates_the_device_bucket_not_the_n
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -132,6 +140,7 @@ async fn set_device_secondary_wan_access_invalidates_the_device_bucket_not_the_n
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/aa:bb:cc:00:00:01"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -174,6 +183,7 @@ async fn get_multistaticip_pins_to_2_3_when_the_cached_network_publishes_a_2_2_l
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -187,6 +197,7 @@ async fn get_multistaticip_pins_to_2_3_when_the_cached_network_publishes_a_2_2_l
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/multistaticip"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -216,6 +227,7 @@ async fn the_wan_writes_pin_v2_3_for_a_path_form_network() -> anyhow::Result<()>
         Mock::given(method("PUT"))
             .and(path(format!("/2.3/networks/network-0001/{tail}")))
             .and(session_cookie())
+            .and(user_token_header())
             .respond_with(
                 ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()),
             )

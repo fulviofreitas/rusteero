@@ -33,6 +33,7 @@ async fn get_advanced_content_filter_reaches_the_literal_path() -> anyhow::Resul
             "/2.2/networks/network-0001/dns_policies/advanced_content_filter",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200).set_body_string(fixture("advanced_content_filter.json")),
         )
@@ -55,6 +56,7 @@ async fn allow_domain_for_profiles_invalidates_the_profiles_list_bucket() -> any
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profiles.json")))
         .expect(2)
         .mount(&mock.server)
@@ -64,6 +66,7 @@ async fn allow_domain_for_profiles_invalidates_the_profiles_list_bucket() -> any
             "/2.2/networks/network-0001/dns_policies/profiles/allowed",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -92,6 +95,7 @@ async fn allow_domain_invalidates_the_network_bucket() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -101,6 +105,7 @@ async fn allow_domain_invalidates_the_network_bucket() -> anyhow::Result<()> {
             "/2.2/networks/network-0001/dns_policies/network/allowed",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "domain": "homework.example" })))
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
@@ -130,6 +135,7 @@ async fn set_profile_blocked_applications_invalidates_the_profile_and_list_bucke
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(2)
         .mount(&mock.server)
@@ -139,6 +145,7 @@ async fn set_profile_blocked_applications_invalidates_the_profile_and_list_bucke
             "/2.2/networks/network-0001/dns_policies/profiles/profile-0001/applications/blocked",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200}}"#))
         .expect(1)
         .mount(&mock.server)
@@ -351,6 +358,8 @@ async fn set_network_ad_block_premium_error_keeps_the_cache(
 ) -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/dns_policies/adblock"))
         .respond_with(ResponseTemplate::new(status).set_body_string(PREMIUM_REFUSAL))
         .expect(1)
@@ -552,6 +561,8 @@ async fn set_network_block_malware_evicts_the_network_but_not_profiles() -> anyh
 async fn set_network_block_malware_premium_error_keeps_the_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/dns_policies/network"))
         .respond_with(ResponseTemplate::new(402).set_body_string(PREMIUM_REFUSAL))
         .expect(1)

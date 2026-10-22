@@ -11,7 +11,9 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie};
+use common::{
+    MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie, user_token_header,
+};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 use rusteero::error::Error;
@@ -35,6 +37,7 @@ async fn get_devices_caches_the_unfiltered_response() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(1)
         .mount(&mock.server)
@@ -54,6 +57,8 @@ async fn get_devices_caches_the_unfiltered_response() -> anyhow::Result<()> {
 async fn get_devices_with_a_filter_never_reads_or_writes_the_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .and(query_param("thread", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
@@ -87,6 +92,7 @@ async fn set_device_nickname_reaches_the_v2_3_device_put_endpoint() -> anyhow::R
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
         .mount(&mock.server)
@@ -108,6 +114,7 @@ async fn pause_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
@@ -115,6 +122,7 @@ async fn pause_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
         .mount(&mock.server)
@@ -137,12 +145,16 @@ async fn pause_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
 async fn block_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("POST"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/blacklist"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -166,12 +178,16 @@ async fn block_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
 async fn unblock_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("DELETE"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/blacklist/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -198,12 +214,16 @@ async fn update_device_via_link_invalidates_every_cached_profile_only_when_profi
     let profiles_body =
         serde_json::json!({"meta": {"code": 200}, "data": [{"id": "profile-0001"}]});
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/profiles"))
         .respond_with(ResponseTemplate::new(200).set_body_string(profiles_body.to_string()))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -237,12 +257,16 @@ async fn update_device_via_link_drops_single_profile_entries_too_when_profile_su
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -279,12 +303,16 @@ async fn update_device_via_link_leaves_profiles_cached_when_profile_is_none() ->
     let profiles_body =
         serde_json::json!({"meta": {"code": 200}, "data": [{"id": "profile-0001"}]});
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/profiles"))
         .respond_with(ResponseTemplate::new(200).set_body_string(profiles_body.to_string()))
         .expect(1)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -322,6 +350,7 @@ async fn update_device_via_link_passes_the_cached_device_url_as_parent() -> anyh
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(device_on_v23.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -335,6 +364,7 @@ async fn update_device_via_link_passes_the_cached_device_url_as_parent() -> anyh
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
         .mount(&mock.server)
@@ -360,12 +390,16 @@ async fn update_device_via_link_passes_the_cached_device_url_as_parent() -> anyh
 async fn set_device_type_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -389,6 +423,8 @@ async fn set_device_type_invalidates_the_devices_bucket() -> anyhow::Result<()> 
 async fn get_device_priority_never_touches_the_devices_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(2)
@@ -438,6 +474,7 @@ async fn device_writes_pin_v2_3_for_a_path_form_network() -> anyhow::Result<()> 
         Mock::given(method("PUT"))
             .and(path("/2.3/networks/network-0001/devices/device-0001"))
             .and(session_cookie())
+            .and(user_token_header())
             .and(body_json(body))
             .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
             .expect(1)
@@ -464,6 +501,7 @@ async fn device_requests_carry_the_callers_id_spelling() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
         .mount(&mock.server)
@@ -471,6 +509,7 @@ async fn device_requests_carry_the_callers_id_spelling() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "paused": true })))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -495,6 +534,7 @@ async fn set_profile_devices_sends_the_device_urls_as_given() -> anyhow::Result<
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({
             "devices": [{ "url": "/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF" }],
         })))
@@ -526,6 +566,7 @@ async fn block_device_does_not_log_the_uncharacterised_write_warning() -> anyhow
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/blacklist"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(wiremock::matchers::header(
             "content-type",
             "application/x-www-form-urlencoded",

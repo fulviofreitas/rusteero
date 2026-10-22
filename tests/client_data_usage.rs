@@ -35,6 +35,7 @@ async fn get_data_usage_forwards_every_parameter() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(query_param("start", "s"))
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
@@ -55,6 +56,8 @@ async fn get_data_usage_forwards_every_parameter() -> anyhow::Result<()> {
 async fn get_data_usage_breakdown_hits_the_expected_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/data_usage/breakdown"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
@@ -72,6 +75,8 @@ async fn get_data_usage_breakdown_hits_the_expected_path() -> anyhow::Result<()>
 async fn get_devices_data_usage_hits_the_expected_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/data_usage/devices"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
@@ -89,6 +94,8 @@ async fn get_devices_data_usage_hits_the_expected_path() -> anyhow::Result<()> {
 async fn get_device_data_usage_hits_the_per_device_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path(
             "/2.2/networks/network-0001/data_usage/devices/aa:bb:cc",
         ))
@@ -116,6 +123,8 @@ async fn get_device_data_usage_hits_the_per_device_path() -> anyhow::Result<()> 
 async fn get_eeros_data_usage_summary_hits_the_expected_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/data_usage/eeros/summary"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
@@ -133,6 +142,8 @@ async fn get_eeros_data_usage_summary_hits_the_expected_path() -> anyhow::Result
 async fn get_eero_data_usage_hits_the_per_eero_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path(
             "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
         ))
@@ -160,6 +171,8 @@ async fn get_eero_data_usage_hits_the_per_eero_path() -> anyhow::Result<()> {
 async fn get_profile_data_usage_hits_the_per_profile_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path(
             "/2.2/networks/network-0001/data_usage/profiles/profile-0001",
         ))
@@ -187,6 +200,8 @@ async fn get_profile_data_usage_hits_the_per_profile_path() -> anyhow::Result<()
 async fn get_unprofiled_devices_data_usage_hits_the_expected_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path(
             "/2.2/networks/network-0001/data_usage/unprofiled/devices",
         ))
@@ -206,6 +221,8 @@ async fn get_unprofiled_devices_data_usage_hits_the_expected_path() -> anyhow::R
 async fn get_unprofiled_data_usage_summary_hits_the_expected_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path(
             "/2.2/networks/network-0001/data_usage/unprofiled/summary",
         ))
@@ -225,6 +242,8 @@ async fn get_unprofiled_data_usage_summary_hits_the_expected_path() -> anyhow::R
 async fn get_data_usage_report_settings_hits_the_expected_path() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path(
             "/2.2/networks/network-0001/data_usage/report_settings",
         ))
@@ -244,6 +263,8 @@ async fn get_data_usage_report_settings_hits_the_expected_path() -> anyhow::Resu
 async fn set_data_usage_report_settings_invalidates_the_network_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(
             json!({"meta": {"code": 200}, "data": {"id": "network-0001"}}).to_string(),
@@ -256,6 +277,7 @@ async fn set_data_usage_report_settings_invalidates_the_network_cache() -> anyho
             "/2.2/networks/network-0001/data_usage/report_settings",
         ))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(
             json!({ "cadence": "daily", "notification_day": "monday" }),
         ))

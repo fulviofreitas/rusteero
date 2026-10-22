@@ -7,7 +7,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 
@@ -37,6 +37,7 @@ async fn get_forwards_pins_to_2_2_when_the_cached_network_publishes_a_2_3_link()
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -50,6 +51,7 @@ async fn get_forwards_pins_to_2_2_when_the_cached_network_publishes_a_2_3_link()
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/forwards"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": []}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -78,6 +80,7 @@ async fn create_forward_follows_the_cached_networks_published_link_unpinned() ->
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -91,6 +94,7 @@ async fn create_forward_follows_the_cached_networks_published_link_unpinned() ->
     Mock::given(method("POST"))
         .and(path("/2.3/networks/network-0001/forwards"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -112,6 +116,7 @@ async fn forward_setter_does_not_invalidate_the_network_bucket() -> anyhow::Resu
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -119,6 +124,7 @@ async fn forward_setter_does_not_invalidate_the_network_bucket() -> anyhow::Resu
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/forwards"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -144,6 +150,7 @@ async fn update_forward_resolves_network_id_and_reaches_the_template_path() -> a
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/forwards/fwd-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -162,6 +169,7 @@ async fn delete_forward_resolves_network_id() -> anyhow::Result<()> {
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/forwards/fwd-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)

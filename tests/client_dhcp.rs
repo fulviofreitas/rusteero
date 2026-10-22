@@ -6,7 +6,7 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 
@@ -27,6 +27,7 @@ async fn set_dhcp_invalidates_the_network_bucket() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -34,6 +35,7 @@ async fn set_dhcp_invalidates_the_network_bucket() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -54,6 +56,7 @@ async fn set_connection_mode_invalidates_the_network_bucket() -> anyhow::Result<
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -61,6 +64,7 @@ async fn set_connection_mode_invalidates_the_network_bucket() -> anyhow::Result<
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -81,6 +85,7 @@ async fn set_nat_port_randomization_invalidates_the_network_bucket() -> anyhow::
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -88,6 +93,7 @@ async fn set_nat_port_randomization_invalidates_the_network_bucket() -> anyhow::
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -108,6 +114,7 @@ async fn set_dhcp_forwards_the_cached_network_as_parent() -> anyhow::Result<()> 
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -118,6 +125,7 @@ async fn set_dhcp_forwards_the_cached_network_as_parent() -> anyhow::Result<()> 
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -137,6 +145,7 @@ async fn set_connection_mode_forwards_the_cached_network_as_parent() -> anyhow::
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -147,6 +156,7 @@ async fn set_connection_mode_forwards_the_cached_network_as_parent() -> anyhow::
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -166,6 +176,7 @@ async fn set_nat_port_randomization_forwards_the_cached_network_as_parent() -> a
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(fixture("dns_network_with_settings_link.json")),
@@ -176,6 +187,7 @@ async fn set_nat_port_randomization_forwards_the_cached_network_as_parent() -> a
     Mock::given(method("PUT"))
         .and(path("/2.4/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -195,6 +207,7 @@ async fn set_pppoe_is_not_network_scoped() -> anyhow::Result<()> {
     Mock::given(method("POST"))
         .and(path("/2.2/eeros/eero-serial-0001/pppoe"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -216,6 +229,7 @@ async fn set_dhcp_manual_mode_is_sent_as_custom_and_invalidates_the_network_buck
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(2)
         .mount(&mock.server)
@@ -223,6 +237,7 @@ async fn set_dhcp_manual_mode_is_sent_as_custom_and_invalidates_the_network_buck
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/settings"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(body_json(json!({ "dhcp": { "mode": "custom" } })))
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
