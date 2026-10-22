@@ -416,13 +416,13 @@ async fn get_networks_account_fallback_timeout_propagates_and_caches_nothing() -
             .get_networks(false)
             .await
             .expect_err("the fallback times out");
-        assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
+        assert!(matches!(err, Error::Timeout), "{err:?}");
     }
     let err = client
         .get_account(false)
         .await
         .expect_err("the account read times out");
-    assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
+    assert!(matches!(err, Error::Timeout), "{err:?}");
     assert_eq!(client.preferred_network_id(), None);
     Ok(())
 }
