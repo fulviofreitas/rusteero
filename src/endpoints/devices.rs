@@ -27,7 +27,7 @@
 //! Unlike the pre-8.0.0 shape this crate previously shipped (a single `block_device(..., blocked:
 //! bool)` that `GET`s the device first to resolve its MAC, then `POST`s/`DELETE`s `/blacklist`),
 //! `v8.0.4` splits this into two methods that are **pure delegates** to [`BlacklistApi`] — no
-//! `GET` at all (`devices.py:437-472`).
+//! `GET` at all (`devices.py:441-477`).
 
 use std::sync::Arc;
 
@@ -379,8 +379,10 @@ impl DevicesApi {
     /// Adds a device (by MAC) to the blacklist — a pure delegate to
     /// [`BlacklistApi::add_to_blacklist`], no round trip of its own.
     ///
-    /// Ported from `DevicesAPI.block_device` (`devices.py:437-454`): `BlacklistAPI(self._auth_api)
-    /// .add_to_blacklist(network, mac)` (`devices.py:454`). **Breaking shape change** from the
+    /// Ported from `DevicesAPI.block_device` (`devices.py:441-458`): `BlacklistAPI(self._auth_api)
+    /// .add_to_blacklist(network, mac)` (`devices.py:458`). Live-verified on 2026-10-06 (a
+    /// form-encoded `mac`, `POST networks/{id}/blacklist`), so like the blacklist add it
+    /// delegates to, it logs no uncharacterised-write warning. **Breaking shape change** from the
     /// pre-8.0.0 port this crate previously shipped: there is no `blocked: bool` parameter any
     /// more (unblocking is [`DevicesApi::unblock_device`], a separate method) and no `GET` of the
     /// device first — v8.0.4 never resolves the MAC itself, it hands `mac` straight to
@@ -398,8 +400,8 @@ impl DevicesApi {
     /// Removes a device from the blacklist — a pure delegate to
     /// [`BlacklistApi::remove_from_blacklist`].
     ///
-    /// Ported from `DevicesAPI.unblock_device` (`devices.py:456-472`): `BlacklistAPI(
-    /// self._auth_api).remove_from_blacklist(network, mac)` (`devices.py:472`).
+    /// Ported from `DevicesAPI.unblock_device` (`devices.py:460-477`): `BlacklistAPI(
+    /// self._auth_api).remove_from_blacklist(network, mac)` (`devices.py:477`).
     ///
     /// # Errors
     ///

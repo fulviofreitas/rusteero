@@ -124,6 +124,6 @@ pub const UPDATE_DEVICE_VIA_LINK: Nested = Nested {
     link: None,
 };
 
-// `DevicesAPI.block_device`/`unblock_device` (`devices.py:437-472`) delegate entirely to
+// `DevicesAPI.block_device`/`unblock_device` (`devices.py:441-477`) delegate entirely to
 // `BlacklistAPI.add_to_blacklist`/`remove_from_blacklist` — no route constant of their own here;
 // see `src/routes/blacklist.rs`'s `V8_GET_BLACKLIST`/`V8_ADD_TO_BLACKLIST`.

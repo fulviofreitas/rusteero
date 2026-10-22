@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
+use common::{
+    MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie, user_token_header,
+};
 
 fn devices_api(mock: &MockEero) -> DevicesApi {
     DevicesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
@@ -649,5 +651,42 @@ async fn unblock_device_deletes_from_blacklist_with_no_device_get() -> anyhow::R
 
     let api = devices_api(&mock);
     api.unblock_device("network-0001", "device-0001").await?;
+    Ok(())
+}
+
+/// `block_device` is a pure delegate to the blacklist add, which is live-verified: it must log no
+/// uncharacterised-write warning.
+///
+/// Passes only once `BlacklistApi::add_to_blacklist` itself stops warning; until that lands the
+/// delegate still logs its `add_to_blacklist` warning.
+#[tokio::test]
+async fn block_device_does_not_log_the_uncharacterised_write_warning() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/blacklist"))
+        .and(session_cookie())
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        ))
+        .and(wiremock::matchers::body_string(
+            "mac=aa%3Abb%3Acc%3A00%3A00%3A01",
+        ))
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = devices_api(&mock);
+    let (_guard, logs) = capture_logs();
+    api.block_device("network-0001", "aa:bb:cc:00:00:01")
+        .await?;
+
+    assert!(
+        logs.warnings().is_empty(),
+        "block_device must not warn, got {:?}",
+        logs.warnings()
+    );
     Ok(())
 }

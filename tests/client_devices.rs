@@ -11,7 +11,7 @@ use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 use rusteero::error::Error;
@@ -511,5 +511,43 @@ async fn set_profile_devices_sends_the_device_urls_as_given() -> anyhow::Result<
             Some("network-0001"),
         )
         .await?;
+    Ok(())
+}
+
+// ===================== block_device: verified, no warning =====================
+
+/// `Client::block_device` goes through the blacklist add, which is live-verified: no
+/// uncharacterised-write warning. An explicit network id means no discovery `GET`.
+///
+/// Passes only once `BlacklistApi::add_to_blacklist` itself stops warning.
+#[tokio::test]
+async fn block_device_does_not_log_the_uncharacterised_write_warning() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/blacklist"))
+        .and(session_cookie())
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        ))
+        .and(wiremock::matchers::body_string(
+            "mac=aa%3Abb%3Acc%3A00%3A00%3A01",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let (_guard, logs) = capture_logs();
+    client
+        .block_device("aa:bb:cc:00:00:01", Some("network-0001"))
+        .await?;
+
+    assert!(
+        logs.warnings().is_empty(),
+        "block_device must not warn, got {:?}",
+        logs.warnings()
+    );
     Ok(())
 }
