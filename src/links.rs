@@ -384,6 +384,154 @@ pub fn rewrite_version(url: &Url, version: crate::routes::ApiVersion) -> Url {
     rewritten
 }
 
+/// Reason reported by [`origin_mismatch`] when the URL's host is not the base URL's host (or the
+/// URL has no host at all).
+///
+/// Ported from `ORIGIN_FOREIGN_HOST` (`base.py:217`). All `ORIGIN_*` phrases are short and fixed
+/// because they are logged: none may ever carry a value taken from a URL.
+pub const ORIGIN_FOREIGN_HOST: &str = "foreign host";
+
+/// Reason reported by [`origin_mismatch`] when the URL's scheme is not the base URL's scheme.
+///
+/// Ported from `ORIGIN_SCHEME` (`base.py:218`).
+pub const ORIGIN_SCHEME: &str = "non-matching scheme";
+
+/// Reason reported by [`origin_mismatch`] when the URL's effective port is not the base URL's.
+///
+/// Ported from `ORIGIN_PORT` (`base.py:219`).
+pub const ORIGIN_PORT: &str = "non-matching port";
+
+/// Reason reported by [`origin_mismatch`] when the URL carries userinfo (`user@`, `user:pass@`).
+///
+/// Ported from `ORIGIN_USERINFO` (`base.py:220`).
+pub const ORIGIN_USERINFO: &str = "URL with userinfo";
+
+/// Reason for a URL whose authority cannot be parsed.
+///
+/// Ported from `ORIGIN_UNPARSEABLE` (`base.py:221`). [`origin_mismatch`] takes an already parsed
+/// [`Url`] and therefore never returns it; it is exported so a caller that starts from a raw
+/// string can report a [`Url::parse`] failure (a bad port, an unterminated IPv6 literal, a
+/// forbidden host character) with the same phrase Python logs.
+pub const ORIGIN_UNPARSEABLE: &str = "unparseable authority";
+
+/// Reason for a configured base URL that cannot define an origin.
+///
+/// Ported from `ORIGIN_BAD_BASE` (`base.py:222`). Like [`ORIGIN_UNPARSEABLE`] it is never returned
+/// by [`origin_mismatch`], whose `base` is a parsed [`Url`]; it is exported for a caller that
+/// holds the base as a raw string.
+pub const ORIGIN_BAD_BASE: &str = "unusable base URL";
+
+/// The outcome of a failed [`origin_mismatch`] comparison.
+///
+/// Ported from `OriginMismatch` (`base.py:225-237`). Both fields are safe to log: `reason` is one
+/// of the fixed `ORIGIN_*` phrases and `target` never carries userinfo, a port, a path or a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginMismatch {
+    /// One of the `ORIGIN_*` phrases ([`ORIGIN_FOREIGN_HOST`], [`ORIGIN_SCHEME`],
+    /// [`ORIGIN_PORT`] or [`ORIGIN_USERINFO`]).
+    pub reason: &'static str,
+    /// `scheme://host` of the offending URL, lower-cased, for logging (`<unknown>` stands in for
+    /// a missing host). `None` when the URL carried userinfo, so a credential embedded in a URL is
+    /// never echoed.
+    pub target: Option<String>,
+}
+
+/// Decides whether `url` is on the same origin as the configured API `base`.
+///
+/// This is the one origin rule of the crate, shared by the link validator and the credential
+/// gate. Origin means scheme, host and *effective* port, each compared case-insensitively, where
+/// the effective port is the explicit one or else the scheme's default (443 for `https`, 80 for
+/// `http`), so `https://h:443/` and `https://h/` are the same origin. A URL carrying userinfo is
+/// never on the origin, whatever its host: userinfo is how a request is made to look like one
+/// host while addressing another.
+///
+/// Ported from `origin_mismatch` and `_parse_origin` (`base.py:240-308`, with `_DEFAULT_PORTS` at
+/// `:213`). Returns `None` when `url` is on the origin; otherwise the first check that failed, in
+/// Python's order: userinfo, host, scheme, port. The userinfo of `base` is ignored, as in Python
+/// (a base URL is validated when the client is configured, not here).
+///
+/// # Differences from Python
+///
+/// Python compares raw text, so it has parse-failure outcomes. A [`Url`] has already been through
+/// the WHATWG parser, which changes what is and is not reachable here:
+///
+/// - **Unreachable.** [`ORIGIN_UNPARSEABLE`] and [`ORIGIN_BAD_BASE`] cannot be returned: a bad
+///   port (`:abc`, `:99999`), an unterminated IPv6 literal and forbidden host characters (such as
+///   a fullwidth `：`) make [`Url::parse`] fail before a `Url` exists. The scheme and host are
+///   already lower-cased, tab, carriage return and line feed are already stripped, an empty port
+///   (`host:`) and leading zeros (`:0443`) are normalised, and an explicit default port is
+///   dropped by the parser. None of those need a check here.
+/// - **Still needs a check on the raw string**, because the parser silently rewrites it into
+///   something that looks innocent. A caller that starts from text must inspect that text before
+///   parsing it:
+///   - a backslash in the authority: `https://base.host\@evil.example/x` parses as host
+///     `base.host` with path `/@evil.example/x`, so it is on the origin here although Python
+///     reports [`ORIGIN_UNPARSEABLE`];
+///   - an empty userinfo (`https://@base.host/`, `https://:@base.host/`) is dropped by the
+///     parser, so it is invisible here although Python reports [`ORIGIN_USERINFO`];
+///   - non-ASCII characters that IDNA maps to ASCII (`https://ａpi.base.host/`) and
+///     percent-escapes (`https://api%2ebase.host/`) are folded into the host, which Python
+///     keeps distinct and reports as [`ORIGIN_FOREIGN_HOST`].
+///
+///   In each case the request still goes to the host the `Url` names, never to the one the text
+///   appears to name.
+/// - Effective ports use [`Url::port_or_known_default`], which for `http` and `https` is exactly
+///   Python's `_DEFAULT_PORTS` table; it also knows the defaults of other schemes, which only
+///   matters for a non-HTTP base.
+///
+/// # Examples
+///
+/// ```
+/// use rusteero::links::{ORIGIN_PORT, origin_mismatch};
+/// use url::Url;
+///
+/// let base = Url::parse("https://api.example.test").unwrap();
+/// let same = Url::parse("https://API.example.test:443/2.2/networks").unwrap();
+/// assert!(origin_mismatch(&same, &base).is_none());
+///
+/// let other_port = Url::parse("https://api.example.test:8443/2.2/networks").unwrap();
+/// let mismatch = origin_mismatch(&other_port, &base).unwrap();
+/// assert_eq!(mismatch.reason, ORIGIN_PORT);
+/// assert_eq!(mismatch.target.as_deref(), Some("https://api.example.test"));
+/// ```
+#[must_use]
+pub fn origin_mismatch(url: &Url, base: &Url) -> Option<OriginMismatch> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some(OriginMismatch {
+            reason: ORIGIN_USERINFO,
+            target: None,
+        });
+    }
+
+    let host = url.host_str().map(str::to_ascii_lowercase);
+    let target = format!(
+        "{}://{}",
+        url.scheme().to_ascii_lowercase(),
+        host.as_deref().unwrap_or("<unknown>")
+    );
+    let mismatch = |reason| {
+        Some(OriginMismatch {
+            reason,
+            target: Some(target.clone()),
+        })
+    };
+
+    let same_host = match (host.as_deref(), base.host_str()) {
+        (Some(host), Some(base_host)) => host.eq_ignore_ascii_case(base_host),
+        _ => false,
+    };
+    if !same_host {
+        return mismatch(ORIGIN_FOREIGN_HOST);
+    }
+    if !url.scheme().eq_ignore_ascii_case(base.scheme()) {
+        return mismatch(ORIGIN_SCHEME);
+    }
+    if url.port_or_known_default() != base.port_or_known_default() {
+        return mismatch(ORIGIN_PORT);
+    }
+    None
+}
+
 /// Logs exactly one fixed `WARNING` before issuing a write whose side effects have not been
 /// fully characterised against a live network.
 ///
@@ -403,8 +551,9 @@ pub fn warn_uncharacterised_write(operation: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        child_url, is_version_segment, join_api_path, resolve_link, resource_url, rewrite_version,
-        self_url, sub_resource_url, validate_identifier,
+        ORIGIN_FOREIGN_HOST, ORIGIN_PORT, ORIGIN_SCHEME, ORIGIN_USERINFO, OriginMismatch,
+        child_url, is_version_segment, join_api_path, origin_mismatch, resolve_link, resource_url,
+        rewrite_version, self_url, sub_resource_url, validate_identifier,
     };
     use crate::error::Error;
     use crate::routes::ApiVersion;
@@ -988,6 +1137,292 @@ mod tests {
         ] {
             assert!(!is_version_segment(bad), "{bad:?}");
         }
+    }
+
+    // ===================== origin_mismatch / TestOriginMismatch =====================
+
+    /// The configured origin the cases below are compared against (Python's
+    /// `TestOriginMismatch.BASE`); not the production host.
+    fn origin_base() -> Url {
+        Url::parse("https://api.example.com").unwrap()
+    }
+
+    fn mismatch_of(raw: &str) -> Option<OriginMismatch> {
+        origin_mismatch(&Url::parse(raw).unwrap(), &origin_base())
+    }
+
+    #[test]
+    fn origin_mismatch_same_origin() {
+        // Case and an explicit or empty default port do not change the origin.
+        for raw in [
+            "https://api.example.com/x",
+            "https://api.example.com:443/x",
+            "https://api.example.com:/x",
+            "https://api.example.com:0443/x",
+            "HTTPS://API.EXAMPLE.COM/x",
+            "https://api.example.com/x?q=1#f",
+        ] {
+            assert_eq!(mismatch_of(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn origin_mismatch_reasons() {
+        let cases = [
+            ("https://other.example.com/x", ORIGIN_FOREIGN_HOST),
+            (
+                "https://api.example.com.evil.example/x",
+                ORIGIN_FOREIGN_HOST,
+            ),
+            ("https://api.example.com./x", ORIGIN_FOREIGN_HOST),
+            ("https://api.example.com@evil.example/x", ORIGIN_USERINFO),
+            ("https://user:pass@api.example.com/x", ORIGIN_USERINFO),
+            ("https://user@api.example.com/x", ORIGIN_USERINFO),
+            ("https://:pass@api.example.com/x", ORIGIN_USERINFO),
+            (
+                "https://api.example.com:443@evil.example/x",
+                ORIGIN_USERINFO,
+            ),
+            ("http://api.example.com/x", ORIGIN_SCHEME),
+            ("ftp://api.example.com/x", ORIGIN_SCHEME),
+            ("https://api.example.com:8443/x", ORIGIN_PORT),
+            ("https://api.example.com:80/x", ORIGIN_PORT),
+            ("https://api.example.com:0/x", ORIGIN_PORT),
+        ];
+        for (raw, reason) in cases {
+            let result = mismatch_of(raw).unwrap_or_else(|| panic!("{raw} should not match"));
+            assert_eq!(result.reason, reason, "{raw}");
+        }
+    }
+
+    #[test]
+    fn origin_mismatch_reports_the_first_failing_check_in_order() {
+        // Userinfo beats host, host beats scheme, scheme beats port.
+        assert_eq!(
+            mismatch_of("http://user@evil.example:8443/x")
+                .unwrap()
+                .reason,
+            ORIGIN_USERINFO
+        );
+        assert_eq!(
+            mismatch_of("http://evil.example:8443/x").unwrap().reason,
+            ORIGIN_FOREIGN_HOST
+        );
+        assert_eq!(
+            mismatch_of("http://api.example.com:8443/x").unwrap().reason,
+            ORIGIN_SCHEME
+        );
+    }
+
+    #[test]
+    fn origin_mismatch_default_port_is_per_scheme() {
+        // Port 80 is the default for http only; 443 is not implied there.
+        let base = Url::parse("http://api.example.com").unwrap();
+        let on_80 = Url::parse("http://api.example.com:80/x").unwrap();
+        let on_443 = Url::parse("http://api.example.com:443/x").unwrap();
+        assert_eq!(origin_mismatch(&on_80, &base), None);
+        assert_eq!(origin_mismatch(&on_443, &base).unwrap().reason, ORIGIN_PORT);
+    }
+
+    #[test]
+    fn origin_mismatch_base_with_a_non_default_port() {
+        let base = Url::parse("https://api.example.com:8443").unwrap();
+        let same = Url::parse("https://api.example.com:8443/x").unwrap();
+        let default_port = Url::parse("https://api.example.com/x").unwrap();
+        assert_eq!(origin_mismatch(&same, &base), None);
+        assert_eq!(
+            origin_mismatch(&default_port, &base).unwrap().reason,
+            ORIGIN_PORT
+        );
+        // An explicit default port on the base is the same as none.
+        let explicit = Url::parse("https://api.example.com:443").unwrap();
+        assert_eq!(origin_mismatch(&default_port, &explicit), None);
+    }
+
+    #[test]
+    fn origin_mismatch_base_userinfo_and_path_are_ignored() {
+        let base = Url::parse("https://user:pw@api.example.com/2.2/ignored?q=1").unwrap();
+        let url = Url::parse("https://api.example.com/x").unwrap();
+        assert_eq!(origin_mismatch(&url, &base), None);
+    }
+
+    #[test]
+    fn origin_mismatch_target_is_scheme_and_host_only() {
+        assert_eq!(
+            mismatch_of("http://api.example.com:81/x?secret=1#frag")
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("http://api.example.com")
+        );
+        assert_eq!(
+            mismatch_of("https://Other.Example.COM:8443/a/b?token=abc")
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("https://other.example.com")
+        );
+        // Userinfo is never echoed: no target at all.
+        assert_eq!(
+            mismatch_of("https://user:pass@api.example.com/x")
+                .unwrap()
+                .target,
+            None
+        );
+    }
+
+    #[test]
+    fn origin_mismatch_target_never_leaks_the_query_or_path() {
+        for raw in [
+            "https://other.example.com/a/b?token=abc#frag",
+            "http://api.example.com/a/b?token=abc#frag",
+            "https://api.example.com:8443/a/b?token=abc#frag",
+        ] {
+            let target = mismatch_of(raw).unwrap().target.unwrap();
+            assert!(
+                !target.contains("token") && !target.contains("/a/b"),
+                "{target}"
+            );
+            assert!(!target.contains('?') && !target.contains('#'), "{target}");
+            assert!(!target.contains("8443"), "{target}");
+        }
+    }
+
+    #[test]
+    fn origin_mismatch_hostless_url_is_a_foreign_host_with_an_unknown_target() {
+        // Python's `("/relative/path", "foreign host")` and `("", "foreign host")` cannot be
+        // parsed into a `Url`; the closest reachable inputs are hostless absolute URLs.
+        for (raw, target) in [
+            ("file:///etc/passwd", "file://<unknown>"),
+            ("mailto:someone@example.com", "mailto://<unknown>"),
+            ("data:text/plain,hello", "data://<unknown>"),
+        ] {
+            let result = mismatch_of(raw).unwrap();
+            assert_eq!(result.reason, ORIGIN_FOREIGN_HOST, "{raw}");
+            assert_eq!(result.target.as_deref(), Some(target), "{raw}");
+        }
+    }
+
+    #[test]
+    fn origin_mismatch_hostless_base_matches_nothing() {
+        let base = Url::parse("data:text/plain,hello").unwrap();
+        let url = Url::parse("https://api.example.com/x").unwrap();
+        assert_eq!(
+            origin_mismatch(&url, &base).unwrap().reason,
+            ORIGIN_FOREIGN_HOST
+        );
+        assert_eq!(
+            origin_mismatch(&base, &base).unwrap().reason,
+            ORIGIN_FOREIGN_HOST
+        );
+    }
+
+    #[test]
+    fn origin_mismatch_ipv6_literals_compare_by_value() {
+        let base = Url::parse("http://[::1]:8080").unwrap();
+        let same = Url::parse("http://[0:0:0:0:0:0:0:1]:8080/x").unwrap();
+        let other_port = Url::parse("http://[::1]:9090/x").unwrap();
+        let other_host = Url::parse("http://[::2]:8080/x").unwrap();
+        assert_eq!(origin_mismatch(&same, &base), None);
+        assert_eq!(
+            origin_mismatch(&other_port, &base).unwrap().reason,
+            ORIGIN_PORT
+        );
+        assert_eq!(
+            origin_mismatch(&other_host, &base).unwrap().reason,
+            ORIGIN_FOREIGN_HOST
+        );
+    }
+
+    #[test]
+    fn origin_mismatch_parser_normalisations_agree_with_the_request_destination() {
+        // Tab, CR and LF are stripped by the parser (as by the HTTP client), so these name the
+        // configured origin and are sent to it.
+        for raw in [
+            "https://api.example.\tcom/x",
+            "https://api.example.\rcom/x",
+            "https://api.example.\ncom/x",
+            "https://api.example.com:4\t43/x",
+            "https://api.example.com\t:443/x",
+            "https://api.example.com#@evil.example/x",
+            "https://api.example.com?@evil.example/x",
+        ] {
+            assert_eq!(mismatch_of(raw), None, "{raw}");
+        }
+        // ...and a stripped control character cannot hide userinfo either.
+        assert_eq!(
+            mismatch_of("https://api.example.com\n@evil.example/x")
+                .unwrap()
+                .reason,
+            ORIGIN_USERINFO
+        );
+    }
+
+    #[test]
+    fn origin_mismatch_unparseable_authorities_never_become_a_url() {
+        // Python reports these as "unparseable authority". With a `Url` input they are rejected
+        // earlier, by `Url::parse`; a caller holding the raw text maps that failure to
+        // `ORIGIN_UNPARSEABLE`.
+        for raw in [
+            "https://api.example.com:99999/x",
+            "https://api.example.com:abc/x",
+            "https://api.example.com\u{ff1a}99/x",
+            "https://[::1/x",
+            "https://api.example.com%40evil.example/x",
+            "/relative/path",
+            "",
+        ] {
+            assert!(Url::parse(raw).is_err(), "{raw:?} unexpectedly parsed");
+        }
+    }
+
+    #[test]
+    fn origin_mismatch_fullwidth_solidus_before_an_at_sign_is_userinfo() {
+        // Python: "unparseable authority" (NFKC maps `／` to `/`). The URL parser keeps `／` as an
+        // ordinary character, so the text before `@` is userinfo and the real host is
+        // `evil.example`; the URL is rejected either way.
+        assert_eq!(
+            mismatch_of("https://api.example.com\u{ff0f}@evil.example/x")
+                .unwrap()
+                .reason,
+            ORIGIN_USERINFO
+        );
+    }
+
+    #[test]
+    fn origin_mismatch_raw_text_forms_the_parser_rewrites_need_a_text_check() {
+        // These are rejected by Python but are rewritten by the parser into something that does
+        // name the configured origin (or a different one), so `origin_mismatch` cannot see the
+        // original form. Pinned so a later change to the parser's behaviour is noticed.
+        //
+        // A backslash is a path separator for http(s): the host is `api.example.com`.
+        assert_eq!(
+            mismatch_of("https://api.example.com\\@evil.example/x"),
+            None
+        );
+        // ...and here it ends the authority at `evil.example`.
+        assert_eq!(
+            mismatch_of("https://evil.example\\@api.example.com/x")
+                .unwrap()
+                .reason,
+            ORIGIN_FOREIGN_HOST
+        );
+        // An empty userinfo is dropped.
+        assert_eq!(mismatch_of("https://@api.example.com/x"), None);
+        assert_eq!(mismatch_of("https://:@api.example.com/x"), None);
+        // IDNA folds a fullwidth letter into ASCII, and a percent-escape in the host is decoded.
+        assert_eq!(mismatch_of("https://\u{ff41}pi.example.com/x"), None);
+        assert_eq!(mismatch_of("https://api%2eexample.com/x"), None);
+    }
+
+    #[test]
+    fn origin_mismatch_reason_phrases_are_the_fixed_python_texts() {
+        assert_eq!(ORIGIN_FOREIGN_HOST, "foreign host");
+        assert_eq!(ORIGIN_SCHEME, "non-matching scheme");
+        assert_eq!(ORIGIN_PORT, "non-matching port");
+        assert_eq!(ORIGIN_USERINFO, "URL with userinfo");
+        assert_eq!(super::ORIGIN_UNPARSEABLE, "unparseable authority");
+        assert_eq!(super::ORIGIN_BAD_BASE, "unusable base URL");
     }
 
     // ===================== TestReadOnlyMappingParents =====================
