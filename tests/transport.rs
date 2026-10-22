@@ -3129,16 +3129,18 @@ async fn a_url_with_userinfo_is_rejected_for_writes_and_unauthenticated_calls_to
     Ok(())
 }
 
-// ===================== storage failures: not-retained writes =====================
+// ===================== storage failures: one line per failure =====================
 
-/// A store whose `save` fails: with `StorageError::NotRetained` when `not_retained`, otherwise with
-/// a backend error.
+/// A store whose `save` and `clear` fail: `save` with `StorageError::NotRetained` when
+/// `not_retained`, otherwise with a backend error. `reports` is what it says about logging the
+/// failure itself; it logs nothing either way.
 #[derive(Debug)]
-struct FailingSaveStore {
+struct FailingStore {
     not_retained: bool,
+    reports: bool,
 }
 
-impl rusteero::storage::CredentialStore for FailingSaveStore {
+impl rusteero::storage::CredentialStore for FailingStore {
     fn load(&self) -> Result<Session, rusteero::error::StorageError> {
         Ok(Session::empty())
     }
@@ -3157,39 +3159,94 @@ impl rusteero::storage::CredentialStore for FailingSaveStore {
     }
 
     fn clear(&self) -> Result<(), rusteero::error::StorageError> {
-        Ok(())
+        Err(rusteero::error::StorageError::Backend {
+            backend: "fake".to_owned(),
+            message: "disk is on fire".to_owned(),
+        })
+    }
+
+    fn reports_failures(&self) -> bool {
+        self.reports
     }
 }
 
+fn transport_over(store: FailingStore) -> Transport {
+    Transport::builder()
+        .store(Some(Arc::new(store)))
+        .build()
+        .expect("builds")
+}
+
+/// A store that does not say it logs its own failures may have logged nothing, so the transport
+/// logs every failed save at `WARN`, a not-retained write included. A store that does say so has
+/// logged it, and the transport adds a `DEBUG` line only: one failure, one line.
 #[test]
-fn a_not_retained_write_is_logged_at_debug_and_other_failures_stay_at_warn() {
-    for (not_retained, message, level) in [
-        (true, "not retained", Level::DEBUG),
-        (false, "backend failure", Level::WARN),
-    ] {
-        let transport = Transport::builder()
-            .store(Some(Arc::new(FailingSaveStore { not_retained })))
-            .build()
-            .expect("builds");
+fn a_failed_save_is_logged_once_at_warn_unless_the_store_reported_it() {
+    for (reports, not_retained) in [(false, true), (false, false), (true, true), (true, false)] {
+        let transport = transport_over(FailingStore {
+            not_retained,
+            reports,
+        });
         let (_guard, logs) = capture_logs();
         transport
             .set_session(Some(Session::from_token(TEST_TOKEN)))
             .expect("the Warn policy swallows the failure");
 
-        assert!(!transport.credentials_persisted(), "{message}");
-        let warned = logs.contains(Level::WARN, "failed to persist session to credential store");
-        let debugged = logs.contains(Level::DEBUG, "credential store did not retain the session");
-        assert_eq!(
-            warned,
-            level == Level::WARN,
-            "{message}: {:?}",
+        let case = format!("reports={reports} not_retained={not_retained}");
+        assert!(!transport.credentials_persisted(), "{case}");
+        if reports {
+            assert!(logs.warnings().is_empty(), "{case}: {:?}", logs.records());
+            assert_eq!(
+                logs.count(
+                    Level::DEBUG,
+                    "credential store failed to persist the session (already reported)"
+                ),
+                1,
+                "{case}: {:?}",
+                logs.records()
+            );
+        } else {
+            assert_eq!(logs.warnings().len(), 1, "{case}: {:?}", logs.records());
+            assert!(
+                logs.contains(Level::WARN, "failed to persist session to credential store"),
+                "{case}: {:?}",
+                logs.records()
+            );
+        }
+        assert!(logs.errors().is_empty(), "{case}");
+    }
+}
+
+/// A failed clear is a clear, not a persist, in the line the transport writes.
+#[test]
+fn a_failed_clear_is_logged_once_and_not_as_a_persist() {
+    for reports in [false, true] {
+        let transport = transport_over(FailingStore {
+            not_retained: false,
+            reports,
+        });
+        let (_guard, logs) = capture_logs();
+        transport
+            .set_session(None)
+            .expect("the Warn policy swallows the failure");
+
+        assert!(
+            !logs.contains(Level::WARN, "persist"),
+            "reports={reports}: {:?}",
             logs.records()
         );
-        assert_eq!(
-            debugged,
-            level == Level::DEBUG,
-            "{message}: {:?}",
-            logs.records()
-        );
+        if reports {
+            assert!(logs.warnings().is_empty(), "{:?}", logs.records());
+            assert_eq!(
+                logs.count(
+                    Level::DEBUG,
+                    "credential store failed to clear the session (already reported)"
+                ),
+                1
+            );
+        } else {
+            assert_eq!(logs.warnings().len(), 1, "{:?}", logs.records());
+            assert!(logs.contains(Level::WARN, "failed to clear session from credential store"));
+        }
     }
 }

@@ -30,6 +30,21 @@ use super::CredentialStore;
 /// unavailable) and is left in place (`auth_storage.py:757-778`). The remembered token is kept
 /// in memory only, never logged, and is dropped once the fallback has been cleared.
 ///
+/// The same rule covers the primary. When a save is not retained by the primary, `eero-api`
+/// leaves whatever the primary holds alone; this port also retires a stale record there, so the
+/// primary's preference in [`load`](CredentialStore::load) cannot hand back a credential a newer
+/// fallback write superseded, but only one it knows is its own: the token it last loaded from or
+/// wrote to the primary, or the one just saved. A different record (the default keyring entry
+/// is shared with `eero-api` and with other processes, and one of them may have written it
+/// between this instance's write and its read-back) is left in place.
+///
+/// # Logging
+///
+/// Every failure the chain returns has been logged once, so [`CredentialStore::reports_failures`]
+/// is `true`: a failed clear logs `eero-api`'s fixed `WARN`, and a save that neither backend
+/// retained is logged by the fallback when the fallback reports its own failures (the shipped
+/// [`FileStore`](super::FileStore) does) and by the chain when it does not.
+///
 /// The chain holds no lock of its own: each backend serialises itself, and a chained operation
 /// is not atomic across the two (`auth_storage.py:645-652`).
 ///
@@ -41,7 +56,16 @@ pub struct ChainedStore {
     /// The session token this instance last loaded from, promoted out of, or wrote to the
     /// fallback (`ChainedStorage._fallback_token_seen`, `auth_storage.py:663-667`).
     fallback_token_seen: Mutex<Option<SecretString>>,
+    /// The session token this instance last loaded from or wrote to the primary. Not in
+    /// `eero-api`: it lets a failed primary save retire a stale primary record of this
+    /// instance's own without touching another process's. Memory only, never logged.
+    primary_token_seen: Mutex<Option<SecretString>>,
 }
+
+/// The fixed `WARN` logged when a fallback accepted a save and a read-back did not find it, which
+/// no backend has reported yet; never carries the token.
+const UNRETAINED_WARNING: &str = "Credential storage did not retain the saved session; \
+     credentials are not persisted and will be lost when this process exits";
 
 impl std::fmt::Debug for ChainedStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,6 +87,7 @@ impl ChainedStore {
             primary,
             fallback,
             fallback_token_seen: Mutex::new(None),
+            primary_token_seen: Mutex::new(None),
         }
     }
 
@@ -138,6 +163,23 @@ impl ChainedStore {
         *self.seen() = None;
     }
 
+    /// The remembered primary token, poison-tolerant (it guards a plain value).
+    fn primary_seen(&self) -> MutexGuard<'_, Option<SecretString>> {
+        self.primary_token_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Remembers `session`'s token as one this instance loaded from or wrote to the primary.
+    fn remember_primary_token(&self, session: &Session) {
+        *self.primary_seen() = Some(SecretString::from(session.expose_token().to_owned()));
+    }
+
+    /// Forgets the remembered primary token, once the primary has been cleared.
+    fn forget_primary_token(&self) {
+        *self.primary_seen() = None;
+    }
+
     /// Reads `store` back and reports whether it holds `session`'s token.
     ///
     /// Ported from `_retains` (`auth_storage.py:169-187`): a read that fails counts as "not
@@ -165,6 +207,7 @@ impl ChainedStore {
         self.remember_fallback_token(session);
         match self.primary.save(session) {
             Ok(()) if Self::retains(self.primary.as_ref(), session) => {
+                self.remember_primary_token(session);
                 match self.fallback.clear() {
                     Ok(()) => self.forget_fallback_token(),
                     Err(err) => {
@@ -213,6 +256,39 @@ impl ChainedStore {
         match self.fallback.clear() {
             Ok(()) => self.forget_fallback_token(),
             Err(err) => tracing::debug!("Could not clear superseded fallback record: {err}"),
+        }
+    }
+
+    /// Best-effort removal of the record the primary still holds after it failed to retain
+    /// `saved`, so a later [`load`](CredentialStore::load), which prefers the primary, cannot
+    /// resurrect a credential this write superseded.
+    ///
+    /// Not in `eero-api`, which leaves the primary alone. The primary is read first and cleared
+    /// only if it holds a record this instance owns: the token it last remembered there, or the
+    /// one just saved. A read that fails, an empty primary, or a different token leaves it
+    /// untouched (a different token may be another process's live session), and nothing here
+    /// fails the save.
+    fn clear_superseded_primary(&self, saved: &Session) {
+        let held = match self.primary.load() {
+            Ok(held) if held.is_valid() => held,
+            Ok(_) => return,
+            Err(err) => {
+                tracing::debug!("Could not clear superseded primary record: {err}");
+                return;
+            }
+        };
+        let ours = held.expose_token() == saved.expose_token()
+            || self
+                .primary_seen()
+                .as_ref()
+                .is_some_and(|seen| seen.expose_secret() == held.expose_token());
+        if !ours {
+            tracing::debug!("Primary holds a record this instance did not write; left in place");
+            return;
+        }
+        match self.primary.clear() {
+            Ok(()) => self.forget_primary_token(),
+            Err(err) => tracing::debug!("Could not clear superseded primary record: {err}"),
         }
     }
 }
@@ -269,6 +345,7 @@ impl CredentialStore for ChainedStore {
             Ok(_) | Err(_) => None,
         };
         if let Some(session) = primary_usable {
+            self.remember_primary_token(&session);
             return Ok(session);
         }
 
@@ -314,23 +391,29 @@ impl CredentialStore for ChainedStore {
     /// instance owns (see the type docs): a record someone else left there is left alone, and a
     /// failing read or clear of the fallback never fails the save.
     ///
-    /// # Security: a stale primary credential is invalidated first
+    /// # Security: a stale primary credential of this instance's own is invalidated first
     ///
-    /// Before writing to `fallback`, this also best-effort clears `primary` — discarding that
-    /// `clear`'s own error — so a stale credential left behind by the failed `primary.save()` is
-    /// invalidated rather than left readable. Without this, [`CredentialStore::load`]'s
-    /// unconditional preference for `primary` would keep handing back the *old* token
-    /// indefinitely once `primary` becomes reachable again — even though a newer credential
-    /// (including the emptied "logged out" session written by a caller like `logout`/`refresh`)
-    /// had already superseded it in `fallback`. The chain must never serve a credential a later
-    /// write superseded.
+    /// When the primary did not retain the record, whatever it still holds may be an older
+    /// credential: [`CredentialStore::load`] prefers the primary unconditionally, so once it
+    /// becomes reachable again it would keep handing back the *old* token even though a newer
+    /// credential (including the emptied "logged out" session written by a caller like
+    /// `logout`/`refresh`) had already superseded it in the fallback. So before writing the
+    /// fallback, the chain clears the primary's record, best effort, but only if it is one this
+    /// instance owns: the token it last loaded from or wrote to the primary, or the one just
+    /// saved. A different record is left alone. The primary is shared (the default keyring entry
+    /// belongs to every `eero-api` process of the user), so a write that another process landed
+    /// between this instance's write and its read-back must not be erased on the strength of a
+    /// read-back mismatch. `eero-api` never clears the primary here; this keeps the protection
+    /// for the instance's own stale record without its cost to anyone else's.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::Backend`] (`backend: "chained"`) if **both** `primary` and
     /// `fallback` fail to save, and [`StorageError::NotRetained`] (`backend: "chained"`) if the
-    /// fallback accepted the save but a read-back did not find the record, i.e. no backend was
-    /// read back holding the token. Otherwise the error from a failed `primary` write is
+    /// fallback did not retain the record, i.e. no backend was read back holding the token: its
+    /// own `save` reported [`StorageError::NotRetained`] (the shipped [`FileStore`](super::FileStore)
+    /// verifies its writes), or it accepted the save and the chain's read-back did not find the
+    /// record. Otherwise the error from a failed `primary` write is
     /// discarded once `fallback` succeeds, matching Python's swallow-on-recovery behaviour
     /// (there is no separate "primary failed but fallback succeeded" error to report — the
     /// session did end up durably stored).
@@ -339,6 +422,7 @@ impl CredentialStore for ChainedStore {
             Ok(()) => {
                 if Self::retains(self.primary.as_ref(), session) {
                     tracing::debug!("Saved to primary storage");
+                    self.remember_primary_token(session);
                     self.clear_superseded_fallback(session);
                     return Ok(());
                 }
@@ -353,20 +437,27 @@ impl CredentialStore for ChainedStore {
             }
         };
 
-        // Best-effort: invalidate whatever `primary` was still holding so a later `load()`
-        // (which unconditionally prefers `primary`) can never resurrect a credential this write
-        // was meant to supersede. Its own failure is discarded — if `primary` cannot be written
-        // to right now, it may well be unreachable for clearing too, and either way the fallback
-        // write below must still happen.
-        let _ = self.primary.clear();
+        // Best-effort: retire a stale record of this instance's own that the primary still
+        // holds, so a later `load()` (which unconditionally prefers `primary`) cannot resurrect a
+        // credential this write was meant to supersede. Another process's record is left alone.
+        // Its failure never matters: if `primary` cannot be written to right now, it may well be
+        // unreachable for clearing too, and the fallback write below must still happen.
+        self.clear_superseded_primary(session);
         if let Err(fallback_err) = self.fallback.save(session) {
-            return Err(Self::both_failed(&primary_err, &fallback_err));
+            if !self.fallback.reports_failures() {
+                tracing::error!("Both primary and fallback storage failed: {fallback_err}");
+            }
+            return Err(match fallback_err {
+                StorageError::NotRetained { .. } => Self::not_retained(),
+                other => Self::both_failed(&primary_err, &other),
+            });
         }
         tracing::debug!("Saved to fallback storage");
         if Self::retains(self.fallback.as_ref(), session) {
             self.remember_fallback_token(session);
             Ok(())
         } else {
+            tracing::warn!("{UNRETAINED_WARNING}");
             Err(Self::not_retained())
         }
     }
@@ -428,6 +519,9 @@ impl CredentialStore for ChainedStore {
                  remain in the one that failed"
             );
         }
+        if primary_result.is_ok() {
+            self.forget_primary_token();
+        }
         match (primary_result, fallback_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(primary_err), Ok(())) => Err(Self::primary_only_failed(&primary_err)),
@@ -436,6 +530,12 @@ impl CredentialStore for ChainedStore {
                 Err(Self::both_failed(&primary_err, &fallback_err))
             }
         }
+    }
+
+    /// `true`: every failure the chain returns is logged once, by the chain or by the backend
+    /// that failed (see the type's "Logging" docs).
+    fn reports_failures(&self) -> bool {
+        true
     }
 }
 
@@ -1062,7 +1162,7 @@ mod tests {
     // ===================== save: a failed primary save invalidates the stale primary =====================
 
     #[test]
-    fn save_failure_on_primary_clears_the_stale_primary_credential_before_writing_fallback() {
+    fn save_failure_on_primary_clears_the_stale_primary_credential_this_instance_loaded() {
         let inner_primary = Arc::new(MemoryStore::new());
         inner_primary
             .save(&Session::from_token("stale-token"))
@@ -1073,6 +1173,11 @@ mod tests {
         let fallback = store(None);
 
         let chained = ChainedStore::new(primary, Arc::clone(&fallback) as _);
+        // The chain loaded the stale record from the primary, so it is the chain's own.
+        assert_eq!(
+            chained.load().expect("load succeeds").expose_token(),
+            "stale-token"
+        );
         chained
             .save(&Session::from_token("new-token"))
             .expect("fallback save succeeds even though primary failed");
@@ -1081,7 +1186,7 @@ mod tests {
         // otherwise a later reachable primary would keep serving it forever.
         assert!(
             !inner_primary.load().expect("load never fails").is_valid(),
-            "a failed primary save must clear whatever primary was still holding"
+            "a failed primary save must clear the stale record this instance loaded"
         );
 
         // A subsequent chained load must not resurrect the stale primary credential: with
@@ -1092,6 +1197,261 @@ mod tests {
             "new-token",
             "load must never resurrect a credential a later write superseded"
         );
+    }
+
+    #[test]
+    fn save_failure_on_primary_clears_the_stale_primary_credential_this_instance_wrote() {
+        let primary = FlakyStore::new();
+        let fallback = FlakyStore::new();
+        let chained = chain(&primary, &fallback);
+
+        chained
+            .save(&Session::from_token("first_token"))
+            .expect("the primary takes it");
+        assert_eq!(primary.held(), "first_token");
+
+        FlakyStore::set(&primary.fail_save, true);
+        chained
+            .save(&Session::from_token("second_token"))
+            .expect("the fallback takes it");
+
+        assert_eq!(
+            primary.held(),
+            "",
+            "the chain's own stale record is retired"
+        );
+        assert_eq!(fallback.held(), "second_token");
+    }
+
+    /// A primary record the chain never loaded or wrote is not its to delete, even when the
+    /// primary failed to retain the chain's own write: the default keyring entry is shared with
+    /// every other `eero-api` process.
+    #[test]
+    fn a_primary_record_this_instance_never_saw_is_left_alone_after_a_failed_save() {
+        let (_guard, logs) = capture_logs();
+        let inner_primary = Arc::new(MemoryStore::new());
+        inner_primary
+            .save(&Session::from_token("other_process_token"))
+            .expect("seed save never fails");
+        let primary: Arc<dyn CredentialStore> = Arc::new(SaveFailsDelegatingStore {
+            inner: Arc::clone(&inner_primary),
+        });
+        let fallback = store(None);
+
+        ChainedStore::new(primary, Arc::clone(&fallback) as _)
+            .save(&Session::from_token("my_token"))
+            .expect("the fallback takes it");
+
+        assert_eq!(
+            inner_primary.load().expect("load").expose_token(),
+            "other_process_token"
+        );
+        assert_eq!(fallback.load().expect("load").expose_token(), "my_token");
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "Primary holds a record this instance did not write; left in place"
+            ),
+            1
+        );
+        assert!(!logs.mentions("other_process_token") && !logs.mentions("my_token"));
+    }
+
+    /// A primary whose read-back finds another process's token, written between this
+    /// instance's write and its read-back, must not have that session erased.
+    #[test]
+    fn a_session_another_process_wrote_during_the_read_back_window_is_not_cleared() {
+        /// Accepts a save, but the record that ends up in the store is `rival`'s.
+        #[derive(Debug)]
+        struct RacedStore {
+            inner: MemoryStore,
+            clears: AtomicUsize,
+        }
+
+        impl CredentialStore for RacedStore {
+            fn load(&self) -> Result<Session, StorageError> {
+                self.inner.load()
+            }
+
+            fn save(&self, _session: &Session) -> Result<(), StorageError> {
+                self.inner.save(&Session::from_token("rival_token"))
+            }
+
+            fn clear(&self) -> Result<(), StorageError> {
+                self.clears.fetch_add(1, Ordering::SeqCst);
+                self.inner.clear()
+            }
+        }
+
+        let primary = Arc::new(RacedStore {
+            inner: MemoryStore::new(),
+            clears: AtomicUsize::new(0),
+        });
+        let fallback = FlakyStore::new();
+
+        ChainedStore::new(Arc::clone(&primary) as _, Arc::clone(&fallback) as _)
+            .save(&Session::from_token("my_token"))
+            .expect("the fallback retains it");
+
+        assert_eq!(
+            primary.inner.load().expect("load").expose_token(),
+            "rival_token"
+        );
+        assert_eq!(primary.clears.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.held(), "my_token");
+    }
+
+    // ===================== save: every failure is logged once =====================
+
+    /// A fallback whose `save` fails with [`StorageError::NotRetained`] the way the shipped,
+    /// verifying `FileStore` does. With `reports`, it also logs the one `WARN` such a store logs
+    /// and says so through [`CredentialStore::reports_failures`].
+    #[derive(Debug)]
+    struct UnretainingFallback {
+        reports: bool,
+    }
+
+    impl CredentialStore for UnretainingFallback {
+        fn load(&self) -> Result<Session, StorageError> {
+            Ok(Session::empty())
+        }
+
+        fn save(&self, _session: &Session) -> Result<(), StorageError> {
+            if self.reports {
+                tracing::warn!("fallback says: not retained");
+            }
+            Err(StorageError::NotRetained {
+                backend: "fake".to_owned(),
+            })
+        }
+
+        fn clear(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn reports_failures(&self) -> bool {
+            self.reports
+        }
+    }
+
+    /// A fallback that returns `NotRetained` is reported as `NotRetained`, not folded into
+    /// `Backend`, and its own `WARN` is the only line: the chain adds nothing.
+    #[test]
+    fn a_fallback_that_reports_not_retained_is_returned_as_not_retained_and_logged_once() {
+        let (_guard, logs) = capture_logs();
+        let chained = ChainedStore::new(
+            FlakyStore::null(),
+            Arc::new(UnretainingFallback { reports: true }),
+        );
+
+        let err = chained
+            .save(&Session::from_token("live_token"))
+            .expect_err("the fallback did not retain the record");
+
+        assert!(
+            matches!(&err, StorageError::NotRetained { backend } if backend == "chained"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            logs.messages(Level::WARN),
+            vec!["fallback says: not retained".to_owned()]
+        );
+        assert!(logs.messages(Level::ERROR).is_empty());
+        assert!(!logs.mentions("live_token"));
+    }
+
+    /// A fallback that logs nothing leaves the chain to report: Python's fixed `ERROR`.
+    #[test]
+    fn a_fallback_that_does_not_report_is_reported_by_the_chain_at_error() {
+        let (_guard, logs) = capture_logs();
+        let chained = ChainedStore::new(
+            FlakyStore::null(),
+            Arc::new(UnretainingFallback { reports: false }),
+        );
+
+        let err = chained
+            .save(&Session::from_token("live_token"))
+            .expect_err("the fallback did not retain the record");
+
+        assert!(matches!(&err, StorageError::NotRetained { backend } if backend == "chained"));
+        assert_eq!(
+            logs.messages(Level::ERROR),
+            vec![
+                "Both primary and fallback storage failed: fake storage did not retain the \
+                 saved session"
+                    .to_owned()
+            ]
+        );
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert!(!logs.mentions("live_token"));
+    }
+
+    #[test]
+    fn both_backends_failing_to_save_is_logged_once_at_error() {
+        let (_guard, logs) = capture_logs();
+        let primary = FlakyStore::new();
+        FlakyStore::set(&primary.fail_save, true);
+        let fallback = FlakyStore::new();
+        FlakyStore::set(&fallback.fail_save, true);
+
+        chain(&primary, &fallback)
+            .save(&Session::from_token("live_token"))
+            .expect_err("neither backend took the record");
+
+        assert_eq!(
+            logs.messages(Level::ERROR),
+            vec![
+                "Both primary and fallback storage failed: always-fails storage error: \
+                 deliberate test failure"
+                    .to_owned()
+            ]
+        );
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert!(!logs.mentions("live_token"));
+    }
+
+    /// A fallback that accepted the save and was not read back holding the token has reported
+    /// nothing itself, so the chain logs the one fixed `WARN`.
+    #[test]
+    fn a_fallback_that_accepts_and_does_not_retain_is_logged_once_by_the_chain() {
+        let (_guard, logs) = capture_logs();
+
+        chain(&FlakyStore::null(), &FlakyStore::null())
+            .save(&Session::from_token("live_token"))
+            .expect_err("nothing retained the record");
+
+        assert_eq!(
+            logs.messages(Level::WARN),
+            vec![
+                "Credential storage did not retain the saved session; credentials are not \
+                 persisted and will be lost when this process exits"
+                    .to_owned()
+            ]
+        );
+        assert!(logs.messages(Level::ERROR).is_empty());
+        assert!(!logs.mentions("live_token"));
+    }
+
+    #[test]
+    fn a_successful_save_logs_nothing_above_debug() {
+        let (_guard, logs) = capture_logs();
+
+        chain(&FlakyStore::new(), &FlakyStore::new())
+            .save(&Session::from_token("live_token"))
+            .expect("the primary takes it");
+        chain(&FlakyStore::null(), &FlakyStore::new())
+            .save(&Session::from_token("live_token"))
+            .expect("the fallback takes it");
+
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert!(logs.messages(Level::ERROR).is_empty());
+    }
+
+    #[test]
+    fn the_chain_reports_its_own_failures() {
+        let chained = chain(&FlakyStore::new(), &FlakyStore::new());
+        assert!(chained.reports_failures());
+        assert!(!MemoryStore::new().reports_failures());
     }
 
     // ===================== clear =====================

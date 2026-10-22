@@ -531,8 +531,20 @@ enum ParkOn {
     AnyClear,
 }
 
+/// The longest a parked store call waits for [`ProbeStore::open`]. A test whose assertions fail
+/// between `wait_parked()` and `open()` would otherwise leave the blocking-pool thread parked
+/// forever, and the runtime's drop would wait for it without end.
+const PARK_LIMIT: Duration = Duration::from_secs(10);
+
 /// A [`CredentialStore`] test double over a [`MemoryStore`]: records every call and the thread it
 /// ran on, can be told to fail, and can park a chosen call until it is opened.
+///
+/// A parked call never outlives [`PARK_LIMIT`] (it then fails with a [`StorageError`]), and one
+/// that arrives on the thread that built the store, which is the thread driving a
+/// `#[tokio::test]` runtime, panics instead of parking: a store call that ran inline on the
+/// runtime would otherwise block the very runtime whose timeouts are meant to report it. A test
+/// that parks creates a [`ProbeStore::release_on_drop`] guard so a failing assertion releases the
+/// parked thread.
 ///
 /// Integration-test binaries cannot share code except through `tests/common`, so
 /// `tests/client_core.rs` carries its own trimmed copy.
@@ -540,6 +552,7 @@ enum ParkOn {
 struct ProbeStore {
     inner: MemoryStore,
     park_on: ParkOn,
+    test_thread: ThreadId,
     gate_open: Mutex<bool>,
     gate_changed: Condvar,
     parked: AtomicBool,
@@ -554,6 +567,7 @@ impl ProbeStore {
         Arc::new(Self {
             inner: MemoryStore::new(),
             park_on,
+            test_thread: std::thread::current().id(),
             gate_open: Mutex::new(false),
             gate_changed: Condvar::new(),
             parked: AtomicBool::new(false),
@@ -580,6 +594,12 @@ impl ProbeStore {
     fn open(&self) {
         *self.gate_open.lock().expect("gate lock") = true;
         self.gate_changed.notify_all();
+    }
+
+    /// Opens the gate when dropped, so a test that fails with a store call still parked releases
+    /// the blocking-pool thread instead of hanging the runtime's shutdown.
+    fn release_on_drop(self: &Arc<Self>) -> OpenOnDrop {
+        OpenOnDrop(Arc::clone(self))
     }
 
     /// Waits (up to 5 s) until some call is parked inside the store.
@@ -615,12 +635,27 @@ impl ProbeStore {
             .to_owned()
     }
 
-    fn park(&self) {
+    /// Parks the calling blocking-pool thread until [`ProbeStore::open`], or fails after
+    /// [`PARK_LIMIT`].
+    fn park(&self) -> Result<(), StorageError> {
+        assert_ne!(
+            std::thread::current().id(),
+            self.test_thread,
+            "a store call ran on the runtime thread instead of the blocking pool"
+        );
         self.parked.store(true, Ordering::SeqCst);
-        let mut open = self.gate_open.lock().expect("gate lock");
-        while !*open {
-            open = self.gate_changed.wait(open).expect("gate wait");
+        let open = self.gate_open.lock().expect("gate lock");
+        let (_open, waited) = self
+            .gate_changed
+            .wait_timeout_while(open, PARK_LIMIT, |open| !*open)
+            .expect("gate wait");
+        if waited.timed_out() {
+            return Err(StorageError::Backend {
+                backend: "probe".to_owned(),
+                message: "the gate was never opened".to_owned(),
+            });
         }
+        Ok(())
     }
 
     fn failure(&self) -> Result<(), StorageError> {
@@ -632,6 +667,15 @@ impl ProbeStore {
         } else {
             Ok(())
         }
+    }
+}
+
+/// See [`ProbeStore::release_on_drop`].
+struct OpenOnDrop(Arc<ProbeStore>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
     }
 }
 
@@ -653,7 +697,7 @@ impl CredentialStore for ProbeStore {
             ParkOn::Never | ParkOn::AnyClear => false,
         };
         if parks {
-            self.park();
+            self.park()?;
         }
         self.failure()?;
         self.inner.save(session)
@@ -666,7 +710,7 @@ impl CredentialStore for ProbeStore {
             .expect("threads lock")
             .push(std::thread::current().id());
         if self.park_on == ParkOn::AnyClear {
-            self.park();
+            self.park()?;
         }
         self.failure()?;
         self.inner.clear()
@@ -769,6 +813,7 @@ async fn set_session_token_with_an_invalid_token_never_reaches_the_store() {
 #[tokio::test]
 async fn auth_api_set_session_token_store_write_does_not_block_the_runtime() -> anyhow::Result<()> {
     let probe = ProbeStore::new(ParkOn::AnySave);
+    let _release = probe.release_on_drop();
     let auth = auth_with_store(&probe, StorageFailures::Warn);
 
     let task = tokio::spawn({
@@ -802,6 +847,7 @@ async fn auth_api_set_session_token_store_write_does_not_block_the_runtime() -> 
 async fn auth_api_clear_session_token_store_clear_does_not_block_the_runtime() -> anyhow::Result<()>
 {
     let probe = ProbeStore::new(ParkOn::AnyClear);
+    let _release = probe.release_on_drop();
     probe.seed("stored-token");
     let transport = Transport::builder()
         .session(Some(Session::from_token("stored-token")))
@@ -852,6 +898,7 @@ async fn auth_api_logout_store_clear_does_not_block_the_runtime() -> anyhow::Res
         .await;
 
     let probe = ProbeStore::new(ParkOn::AnyClear);
+    let _release = probe.release_on_drop();
     probe.seed(TEST_TOKEN);
     let store: Arc<dyn CredentialStore> = Arc::clone(&probe) as Arc<dyn CredentialStore>;
     let auth = Arc::new(AuthApi::new(mock.transport_with_store(TEST_TOKEN, store)));
@@ -897,6 +944,7 @@ async fn refresh_session_terminal_clear_runs_off_the_runtime_thread() -> anyhow:
         .await;
 
     let probe = ProbeStore::new(ParkOn::AnyClear);
+    let _release = probe.release_on_drop();
     probe.seed(TEST_TOKEN);
     let store: Arc<dyn CredentialStore> = Arc::clone(&probe) as Arc<dyn CredentialStore>;
     let auth = Arc::new(AuthApi::new(mock.transport_with_store(TEST_TOKEN, store)));
@@ -1016,6 +1064,7 @@ async fn concurrent_setters_leave_the_last_one_in_memory_and_in_the_store() -> a
     // "zero" parks inside the store, holding the persistence gate, while "first" and then
     // "second" are applied to memory; their persists queue behind it.
     let probe = ProbeStore::new(ParkOn::SaveOf("zero"));
+    let _release = probe.release_on_drop();
     let auth = auth_with_store(&probe, StorageFailures::Warn);
 
     let zero = tokio::spawn({
@@ -1059,6 +1108,7 @@ async fn concurrent_setters_leave_the_last_one_in_memory_and_in_the_store() -> a
 #[tokio::test]
 async fn a_clear_issued_after_a_save_is_never_overtaken_by_it() -> anyhow::Result<()> {
     let probe = ProbeStore::new(ParkOn::SaveOf("doomed"));
+    let _release = probe.release_on_drop();
     let auth = auth_with_store(&probe, StorageFailures::Warn);
 
     let save = tokio::spawn({
@@ -1089,6 +1139,7 @@ async fn a_clear_issued_after_a_save_is_never_overtaken_by_it() -> anyhow::Resul
 #[tokio::test]
 async fn a_save_issued_after_a_clear_is_never_overtaken_by_it() -> anyhow::Result<()> {
     let probe = ProbeStore::new(ParkOn::AnyClear);
+    let _release = probe.release_on_drop();
     probe.seed("old-token");
     let transport = Transport::builder()
         .session(Some(Session::from_token("old-token")))
@@ -2032,9 +2083,12 @@ async fn a_failed_clear_during_logout_under_warn_logs_exactly_one_warning() -> a
 
     assert!(auth.logout().await?);
 
+    // The probe logs nothing and does not claim to, so the transport reports the failure, and
+    // calls it a failed clear.
     let warnings = logs.warnings();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("failed to persist session to credential store"));
+    assert!(warnings[0].contains("failed to clear session from credential store"));
+    assert!(!warnings[0].contains("persist"));
     Ok(())
 }
 
@@ -2079,10 +2133,15 @@ impl CredentialStore for UnretainingStore {
     fn clear(&self) -> Result<(), StorageError> {
         Ok(())
     }
+
+    fn reports_failures(&self) -> bool {
+        true
+    }
 }
 
-/// The transport logs a `NotRetained` failure at `DEBUG` rather than `WARN`: the store has
-/// already logged the one fixed `WARN`, and a second one would be a duplicate.
+/// The transport logs a failure at `DEBUG` rather than `WARN` when the store says it reports its
+/// own failures: the store has already logged the one fixed `WARN`, and a second one would be a
+/// duplicate.
 mod not_retained_logging {
     use super::*;
 
@@ -2168,18 +2227,15 @@ async fn logout_survives_a_failing_primary_clear() -> anyhow::Result<()> {
         !fallback.load()?.is_valid(),
         "the fallback was still cleared"
     );
-    assert_eq!(
-        logs.count(
-            Level::WARN,
-            "Could not clear every credential storage backend; a stored session may remain in \
-             the one that failed"
-        ),
-        1,
-        "the chain logs its fixed warning once: {:?}",
-        logs.warnings()
-    );
+    // The chain reports its own failed clear, so the transport adds no second line (and none
+    // that calls a clear a persist).
+    assert_eq!(logs.warnings(), vec![CHAIN_CLEAR_WARNING.to_owned()]);
+    assert!(logs.errors().is_empty());
     Ok(())
 }
+
+const CHAIN_CLEAR_WARNING: &str = "Could not clear every credential storage backend; a stored \
+     session may remain in the one that failed";
 
 #[tokio::test]
 async fn clear_session_token_and_clear_auth_data_survive_a_failing_primary_clear()
@@ -2229,4 +2285,143 @@ async fn a_single_failing_backend_under_fatal_names_the_backend_that_kept_a_copy
     assert!(!auth.is_authenticated(), "memory is cleared regardless");
     assert!(!fallback.load()?.is_valid());
     Ok(())
+}
+
+// ===================== The shipped stores: one line per failure =====================
+
+/// The shipped stores on a Linux host with no Secret Service (a container, CI, a headless box):
+/// the keyring cannot be opened at all, so every keyring save and clear fails. Each failure is
+/// logged exactly once, by the store that failed, and the transport adds no second line.
+///
+/// On a machine that does have a reachable keyring (a desktop session) there is nothing to
+/// observe and these tests must not write to it, so they return early there.
+#[cfg(all(target_os = "linux", feature = "keyring"))]
+mod without_a_keyring {
+    use rusteero::storage::KeyringStore;
+
+    use super::*;
+
+    const UNPERSISTED: &str = "Keyring did not retain the session; credentials are not persisted \
+         and will be lost when this process exits";
+    const UNCLEARED: &str = "Keyring could not be cleared; a stored session may remain in it";
+
+    /// A keyring store on an entry of its own, or `None` when a keyring is reachable.
+    fn unreachable_keyring(test: &str) -> Option<KeyringStore> {
+        let store = KeyringStore::with_entry(
+            "rusteero-test-service-no-backend",
+            format!("rusteero-test-account-no-backend-{test}"),
+        );
+        store.load().is_err().then_some(store)
+    }
+
+    fn auth_over(store: Arc<dyn CredentialStore>) -> AuthApi {
+        AuthApi::new(
+            Transport::builder()
+                .session(Some(Session::from_token(TEST_TOKEN)))
+                .store(Some(store))
+                .build()
+                .expect("a transport with a store builds"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_bare_keyring_that_rejects_the_write_warns_exactly_once() -> anyhow::Result<()> {
+        let Some(keyring) = unreachable_keyring("bare_save") else {
+            return Ok(());
+        };
+        let (_guard, logs) = capture_logs();
+        let auth = auth_over(Arc::new(keyring));
+
+        auth.set_session_token("injected_token").await?;
+
+        assert_eq!(logs.warnings(), vec![UNPERSISTED.to_owned()]);
+        assert!(logs.errors().is_empty());
+        assert!(!auth.credentials_persisted());
+        assert!(auth.is_authenticated(), "the session works in memory");
+        assert!(!logs.mentions("injected_token"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bare_keyring_that_cannot_clear_warns_exactly_once() -> anyhow::Result<()> {
+        let Some(keyring) = unreachable_keyring("bare_clear") else {
+            return Ok(());
+        };
+        let (_guard, logs) = capture_logs();
+        let auth = auth_over(Arc::new(keyring));
+
+        auth.clear_session_token().await?;
+
+        assert_eq!(logs.warnings(), vec![UNCLEARED.to_owned()]);
+        assert!(logs.errors().is_empty());
+        assert!(!auth.is_authenticated());
+        Ok(())
+    }
+
+    /// The default `create_storage(use_keyring: true, Some(file))` shape: a silenced keyring in
+    /// front of a file. The file takes the write, so nothing is worth a line above `DEBUG`.
+    #[tokio::test]
+    async fn a_keyring_chained_before_a_file_saves_to_the_file_without_a_warning()
+    -> anyhow::Result<()> {
+        let Some(keyring) = unreachable_keyring("chain_save") else {
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("cookies.json");
+        let (_guard, logs) = capture_logs();
+        let chain = ChainedStore::new(
+            Arc::new(keyring.warn_on_unpersisted(false)),
+            Arc::new(FileStore::new(&file)),
+        );
+        let auth = auth_over(Arc::new(chain));
+
+        auth.set_session_token("injected_token").await?;
+
+        assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+        assert!(logs.errors().is_empty(), "{:?}", logs.errors());
+        assert!(auth.credentials_persisted());
+        assert!(std::fs::read_to_string(&file)?.contains("injected_token"));
+        Ok(())
+    }
+
+    /// The same chain on a clear: the keyring cannot be cleared and the chain says so once, with
+    /// Python's fixed text. The keyring is silenced, so it adds nothing, and the transport adds
+    /// no line that calls a clear a persist.
+    #[tokio::test]
+    async fn a_keyring_chained_before_a_file_warns_exactly_once_on_every_kind_of_clear()
+    -> anyhow::Result<()> {
+        for destroy in 0..3 {
+            let Some(keyring) = unreachable_keyring(&format!("chain_clear_{destroy}")) else {
+                return Ok(());
+            };
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("cookies.json");
+            let mock = MockEero::start().await;
+            Mock::given(method("POST"))
+                .and(path("/2.2/logout"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&mock.server)
+                .await;
+            let chain = ChainedStore::new(
+                Arc::new(keyring.warn_on_unpersisted(false)),
+                Arc::new(FileStore::new(&file)),
+            );
+            let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, Arc::new(chain)));
+            let (_guard, logs) = capture_logs();
+
+            match destroy {
+                0 => auth.clear_session_token().await?,
+                1 => auth.clear_auth_data().await?,
+                _ => assert!(auth.logout().await?),
+            }
+
+            assert_eq!(
+                logs.warnings(),
+                vec![CHAIN_CLEAR_WARNING.to_owned()],
+                "destroy {destroy}"
+            );
+            assert!(logs.errors().is_empty(), "destroy {destroy}");
+        }
+        Ok(())
+    }
 }

@@ -39,6 +39,12 @@ const BACKEND_NAME: &str = "keyring";
 const UNPERSISTED_WARNING: &str = "Keyring did not retain the session; credentials are not \
      persisted and will be lost when this process exits";
 
+/// The fixed `WARN` logged, once, when a clear failed (and the store is not silenced); never
+/// carries the token. `KeyringStorage._clear_sync` logs this failure at `DEBUG` only and swallows
+/// it (`auth_storage.py:421-422`), but this port returns it, and a credential that could not be
+/// destroyed is worth a line above `DEBUG`.
+const UNCLEARED_WARNING: &str = "Keyring could not be cleared; a stored session may remain in it";
+
 /// A [`CredentialStore`] backed by the operating system's native credential store: Keychain
 /// Services on macOS, Credential Manager on Windows, or the Secret Service on *nix, via the
 /// `keyring` crate's synchronous `Entry` API.
@@ -122,12 +128,15 @@ impl KeyringStore {
         }
     }
 
-    /// Sets whether a save that is not retained logs the fixed `WARN` (default `true`).
+    /// Sets whether a save that is not retained, and a clear that fails, log the fixed `WARN`
+    /// (default `true`).
     ///
-    /// Mirrors `KeyringStorage(warn_on_unpersisted=...)` (`auth_storage.py:319-329`). Turn it off
-    /// when the keyring sits in front of a file fallback in a [`super::ChainedStore`], where an
-    /// unretained keyring write is routine and handled; the cause of a rejected write is still
-    /// logged at `DEBUG`, and the failed save is still reported as an error.
+    /// Mirrors `KeyringStorage(warn_on_unpersisted=...)` (`auth_storage.py:319-329`), which
+    /// governs the save warning; this port applies it to the clear warning as well, because a
+    /// keyring behind a [`super::ChainedStore`] has both reported by the chain. Turn it off when
+    /// the keyring sits in front of a file fallback there, where an unretained keyring write is
+    /// routine and handled; the cause of a rejected write is still logged at `DEBUG`, and the
+    /// failed save or clear is still reported as an error.
     #[must_use]
     pub fn warn_on_unpersisted(mut self, warn: bool) -> Self {
         self.warn_on_unpersisted = warn;
@@ -204,6 +213,23 @@ impl KeyringStore {
 
     /// The body of [`CredentialStore::clear`]; the caller holds the operation lock.
     fn clear_unlocked(&self) -> Result<(), StorageError> {
+        let outcome = self.delete_entry();
+        if let Err(err) = &outcome {
+            match err {
+                StorageError::Backend { message, .. } => {
+                    tracing::debug!("Error clearing keyring: {message}");
+                }
+                other => tracing::debug!("Error clearing keyring: {other}"),
+            }
+            if self.warn_on_unpersisted {
+                tracing::warn!("{UNCLEARED_WARNING}");
+            }
+        }
+        outcome
+    }
+
+    /// Deletes the entry; an entry that was never there is not an error.
+    fn delete_entry(&self) -> Result<(), StorageError> {
         let entry = self.entry()?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -280,10 +306,20 @@ impl CredentialStore for KeyringStore {
     ///
     /// Any *other* failure is returned as [`StorageError::Backend`] rather than swallowed at
     /// DEBUG (`auth_storage.py:421-422`), for the same reason documented on
-    /// [`CredentialStore::load`] above.
+    /// [`CredentialStore::load`] above. The cause goes to `DEBUG` as in Python, and the store
+    /// also logs one fixed `WARN` (never the token) unless silenced with
+    /// [`KeyringStore::warn_on_unpersisted`].
     fn clear(&self) -> Result<(), StorageError> {
         let _guard = self.lock_operations();
         self.clear_unlocked()
+    }
+
+    /// Whether the store's own fixed `WARN` is on ([`KeyringStore::warn_on_unpersisted`], on by
+    /// default): then every failed save and every failed clear is logged by the store. Silenced,
+    /// it logs nothing above `DEBUG` and leaves the report to whoever silenced it, which is a
+    /// [`ChainedStore`](super::ChainedStore) in front of a file fallback.
+    fn reports_failures(&self) -> bool {
+        self.warn_on_unpersisted
     }
 }
 
@@ -337,7 +373,7 @@ mod tests {
     use tracing::Level;
 
     use super::{
-        ACCOUNT_NAME, BACKEND_NAME, CredentialStore, KeyringStore, SERVICE_NAME,
+        ACCOUNT_NAME, BACKEND_NAME, CredentialStore, KeyringStore, SERVICE_NAME, UNCLEARED_WARNING,
         UNPERSISTED_WARNING, check_readback,
     };
     use crate::auth::Session;
@@ -722,6 +758,53 @@ mod tests {
         assert_eq!(logs.messages(Level::WARN).len(), 1);
         assert_eq!(logs.count(Level::DEBUG, "Error saving to keyring"), 1);
         assert!(!logs.mentions("secret_token"));
+    }
+
+    /// Linux with no D-Bus session bus: the clear fails before any entry exists. The cause goes
+    /// to `DEBUG` as in Python, and the store adds one fixed `WARN`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_clear_without_a_dbus_session_bus_warns_exactly_once() {
+        let (_guard, logs) = capture_logs();
+        let store = KeyringStore::with_entry(
+            "rusteero-test-service-no-backend",
+            "rusteero-test-account-no-backend-a_clear_without_a_dbus_session_bus_warns_exactly_once",
+        );
+
+        let err = store.clear().expect_err("no keyring is reachable");
+
+        assert!(matches!(err, StorageError::Backend { .. }), "got {err:?}");
+        assert_eq!(
+            logs.messages(Level::WARN),
+            vec![UNCLEARED_WARNING.to_owned()]
+        );
+        assert_eq!(logs.count(Level::DEBUG, "Error clearing keyring"), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_silenced_clear_without_a_dbus_session_bus_logs_only_the_cause() {
+        let (_guard, logs) = capture_logs();
+        let store = KeyringStore::with_entry(
+            "rusteero-test-service-no-backend",
+            "rusteero-test-account-no-backend-a_silenced_clear_without_a_dbus_session_bus_logs_only_the_cause",
+        )
+        .warn_on_unpersisted(false);
+
+        store.clear().expect_err("no keyring is reachable");
+
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert_eq!(logs.count(Level::DEBUG, "Error clearing keyring"), 1);
+    }
+
+    #[test]
+    fn the_keyring_store_reports_its_failures_unless_silenced() {
+        assert!(KeyringStore::with_entry("svc", "acct").reports_failures());
+        assert!(
+            !KeyringStore::with_entry("svc", "acct")
+                .warn_on_unpersisted(false)
+                .reports_failures()
+        );
     }
 
     #[cfg(target_os = "linux")]

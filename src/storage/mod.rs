@@ -160,6 +160,23 @@ pub trait CredentialStore: Send + Sync + std::fmt::Debug {
     /// entry that was never there is *not* an error (mirrors every Python backend's tolerant
     /// `clear()`, e.g. the swallowed `PasswordDeleteError` at `auth_storage.py:418-420`).
     fn clear(&self) -> Result<(), StorageError>;
+
+    /// Whether the store itself logs, at `WARN` or above, every failure that
+    /// [`save`](Self::save) and [`clear`](Self::clear) return.
+    ///
+    /// `false` by default, the right answer for an implementation that returns its errors and
+    /// logs nothing: the transport then logs each failure itself (at `WARN` under the default
+    /// [`StorageFailures::Warn`](crate::transport::StorageFailures::Warn) policy). The shipped
+    /// [`FileStore`], [`ChainedStore`] and (unless silenced with
+    /// `KeyringStore::warn_on_unpersisted(false)`) `KeyringStore` return `true`, because they
+    /// log `eero-api`'s fixed texts for their own failures; the transport then logs the same
+    /// failure at `DEBUG` only, so a failure is one line and not two.
+    ///
+    /// Override it to return `true` only if *every* `Err` the store can return from `save` or
+    /// `clear` is logged by the store before it returns.
+    fn reports_failures(&self) -> bool {
+        false
+    }
 }
 
 // ===================== async spawn_blocking adapters =====================

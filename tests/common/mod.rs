@@ -293,6 +293,16 @@ impl LogCapture {
             .map(|(_, value)| value)
     }
 
+    /// Whether any captured event, at any level, has `needle` in its message or in the rendered
+    /// value of one of its structured fields. For leak assertions: a credential that reaches the
+    /// log through `error = %err` or `token = %x` is as much a leak as one in the message.
+    #[must_use]
+    pub fn mentions(&self, needle: &str) -> bool {
+        self.lock().iter().any(|((_, _, message), fields)| {
+            message.contains(needle) || fields.iter().any(|(_, value)| value.contains(needle))
+        })
+    }
+
     /// Whether nothing at all has been captured.
     #[must_use]
     pub fn is_empty(&self) -> bool {

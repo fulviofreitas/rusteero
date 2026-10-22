@@ -212,7 +212,12 @@ pub struct Transport {
 /// even attempted, regardless of this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageFailures {
-    /// Log the failure at `WARN` and proceed as though the operation had succeeded. The default.
+    /// Log the failure and proceed as though the operation had succeeded. The default.
+    ///
+    /// The line is at `WARN`, unless the store [reports its own
+    /// failures](CredentialStore::reports_failures): the shipped stores log `eero-api`'s fixed
+    /// texts themselves, and the transport then adds a `DEBUG` line only, so one failure is one
+    /// line.
     #[default]
     Warn,
     /// Return [`Error::Storage`] immediately instead of swallowing the failure.
@@ -361,7 +366,7 @@ impl Transport {
     ///
     /// Otherwise honours this transport's [`StorageFailures`] policy: under the default
     /// [`StorageFailures::Warn`], a configured credential store failing to persist the change is
-    /// logged at `WARN` and this returns `Ok(())` regardless; under [`StorageFailures::Fatal`],
+    /// logged (once; see [`StorageFailures::Warn`]) and this returns `Ok(())` regardless; under [`StorageFailures::Fatal`],
     /// it returns `Error::Storage` instead. Either way, the in-memory session is updated
     /// regardless of whether persistence succeeds, and *before* the (potentially slow or hung)
     /// blocking store call even starts — a hung Secret Service/D-Bus call or a slow `fsync` must
@@ -376,11 +381,12 @@ impl Transport {
             return Ok(());
         };
         let for_store = session.clone();
+        let saving = for_store.is_some();
         let ticket = self.replace_session(session);
         let outcome = self
             .persistence
             .persist(store.as_ref(), ticket, for_store.as_ref());
-        self.apply_storage_policy(outcome)
+        self.apply_storage_policy(outcome, saving)
     }
 
     /// Replaces the in-memory session and persists the change without blocking the async
@@ -401,7 +407,7 @@ impl Transport {
     /// As [`Transport::set_session`]. Under [`StorageFailures::Fatal`] a store task that panics
     /// (or is cancelled at runtime shutdown) is reported as [`Error::Storage`] with a fixed
     /// message that never carries the panic payload; under [`StorageFailures::Warn`] it is logged
-    /// at `WARN` and this returns `Ok(())`.
+    /// and this returns `Ok(())`.
     pub async fn set_session_async(&self, session: Option<Session>) -> Result<(), Error> {
         self.set_session_async_then(session, || {}).await
     }
@@ -452,7 +458,7 @@ impl Transport {
             // older one's outcome says nothing about the record now on disk.
             self.persistence.last_ok.store(false, Ordering::SeqCst);
         }
-        self.apply_storage_policy(outcome)
+        self.apply_storage_policy(outcome, saving)
     }
 
     /// Whether the most recent attempt to persist a session change to the configured credential
@@ -475,19 +481,44 @@ impl Transport {
         self.persistence.last_ok.load(Ordering::SeqCst)
     }
 
-    /// Applies this transport's [`StorageFailures`] policy to the outcome of one persist.
-    fn apply_storage_policy(&self, outcome: Result<(), StorageError>) -> Result<(), Error> {
+    /// Applies this transport's [`StorageFailures`] policy to the outcome of one persist (`saving`)
+    /// or clear.
+    ///
+    /// Under [`StorageFailures::Warn`] the failure is logged exactly once. A store that
+    /// [reports its own failures](CredentialStore::reports_failures) has logged it already, with
+    /// `eero-api`'s fixed text, so the transport adds a `DEBUG` line only; any other store may
+    /// have logged nothing, so the transport logs the failure at `WARN`. The wording says what
+    /// failed: a clear is not a persist.
+    fn apply_storage_policy(
+        &self,
+        outcome: Result<(), StorageError>,
+        saving: bool,
+    ) -> Result<(), Error> {
         match outcome {
             Ok(()) => Ok(()),
             Err(err) => match self.storage_failures {
                 StorageFailures::Warn => {
-                    if is_not_retained(&err) {
-                        // The store has already logged `eero-api`'s fixed WARN text for a write
-                        // it accepted but could not read back, so a second WARN would duplicate
-                        // it. The failure still sets `credentials_persisted`.
-                        tracing::debug!(error = %err, "credential store did not retain the session");
-                    } else {
-                        tracing::warn!(error = %err, "failed to persist session to credential store");
+                    let reported = self
+                        .store
+                        .as_deref()
+                        .is_some_and(CredentialStore::reports_failures);
+                    match (reported, saving) {
+                        (true, true) => tracing::debug!(
+                            error = %err,
+                            "credential store failed to persist the session (already reported)"
+                        ),
+                        (true, false) => tracing::debug!(
+                            error = %err,
+                            "credential store failed to clear the session (already reported)"
+                        ),
+                        (false, true) => tracing::warn!(
+                            error = %err,
+                            "failed to persist session to credential store"
+                        ),
+                        (false, false) => tracing::warn!(
+                            error = %err,
+                            "failed to clear session from credential store"
+                        ),
                     }
                     Ok(())
                 }
@@ -1154,13 +1185,6 @@ impl Transport {
             url,
         })
     }
-}
-
-/// Whether `err` is the store's "accepted but not retained" failure, which the store has already
-/// logged at `WARNING` with `eero-api`'s fixed text (`auth_storage.py`), so the transport logs it
-/// at `DEBUG` only.
-fn is_not_retained(err: &StorageError) -> bool {
-    matches!(err, StorageError::NotRetained { .. })
 }
 
 /// The `WARNING` text for a request whose credential was withheld (`base.py:625-635`): the

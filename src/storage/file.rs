@@ -153,8 +153,22 @@ impl FileStore {
         }
     }
 
-    /// The body of [`CredentialStore::save`]; the caller holds the operation lock.
+    /// The body of [`CredentialStore::save`]; the caller holds the operation lock. Logs a failure
+    /// the way `FileStorage._save_sync` does (`auth_storage.py:589-593`) and returns it: at
+    /// `ERROR` with the error's text, never the token. A record that was not retained has already
+    /// logged its own fixed `WARN` in [`verify_file_retains`].
     fn save_unlocked(&self, session: &Session) -> Result<(), StorageError> {
+        let outcome = self.write_and_verify(session);
+        match &outcome {
+            Ok(()) => tracing::debug!("Saved authentication data to {}", self.path.display()),
+            Err(StorageError::NotRetained { .. }) => {}
+            Err(err) => tracing::error!("Error saving to file: {err}"),
+        }
+        outcome
+    }
+
+    /// Writes `session` atomically and reads the file back.
+    fn write_and_verify(&self, session: &Session) -> Result<(), StorageError> {
         // Mirrors `os.makedirs(cookie_dir, exist_ok=True)` (`auth_storage.py:545-546`); an empty
         // parent (a bare file name with no directory component) has nothing to create.
         //
@@ -171,9 +185,7 @@ impl FileStore {
         }
         let json = session.to_json()?;
         write_private_atomically(&self.path, json.as_bytes())?;
-        verify_file_retains(&self.path, session)?;
-        tracing::debug!("Saved authentication data to {}", self.path.display());
-        Ok(())
+        verify_file_retains(&self.path, session)
     }
 
     /// The body of [`CredentialStore::clear`]; the caller holds the operation lock.
@@ -184,7 +196,12 @@ impl FileStore {
             // (`auth_storage.py:601-604`): removing an entry that was never there is not an
             // error.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(StorageError::Io(err)),
+            Err(err) => {
+                // `FileStorage._clear_sync` logs this at `WARN` and swallows it
+                // (`auth_storage.py:605-606`); here it is also returned.
+                tracing::warn!("Error removing cookie file: {err}");
+                Err(StorageError::Io(err))
+            }
         };
         // Also remove any temporary file `write_private_atomically` may have left behind after a
         // crash between creating it and renaming it into place — otherwise a full plaintext
@@ -211,6 +228,12 @@ impl CredentialStore for FileStore {
     fn clear(&self) -> Result<(), StorageError> {
         let _guard = self.lock_operations();
         self.clear_unlocked()
+    }
+
+    /// `true`: a failed save is logged at `ERROR` (or, for a record that was not retained, at
+    /// `WARN`) and a failed clear at `WARN`, with `eero-api`'s texts.
+    fn reports_failures(&self) -> bool {
+        true
     }
 }
 
@@ -810,6 +833,71 @@ mod tests {
             vec![OsString::from("cookies.json")],
             "a failed write must not leave any temporary file behind, got {leftovers:?}"
         );
+    }
+
+    // ===================== failures are logged by the store =====================
+
+    #[test]
+    fn a_failed_write_is_logged_once_at_error_without_the_token() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        // The final rename cannot replace a directory.
+        fs::create_dir(&path).expect("create a directory at the target path");
+
+        let err = FileStore::new(&path)
+            .save(&Session::from_token("file_token"))
+            .expect_err("the rename onto a directory must fail");
+
+        assert!(matches!(err, StorageError::Io(_)), "got {err:?}");
+        let errors = logs.messages(Level::ERROR);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("Error saving to file: "),
+            "{errors:?}"
+        );
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert!(!logs.mentions("file_token"));
+    }
+
+    #[test]
+    fn a_failed_clear_is_logged_once_at_warn() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        // `remove_file` refuses a directory.
+        fs::create_dir(&path).expect("create a directory at the target path");
+
+        let err = FileStore::new(&path)
+            .clear()
+            .expect_err("a directory is not a credential file");
+
+        assert!(matches!(err, StorageError::Io(_)), "got {err:?}");
+        let warnings = logs.messages(Level::WARN);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Error removing cookie file: "),
+            "{warnings:?}"
+        );
+        assert!(logs.messages(Level::ERROR).is_empty());
+    }
+
+    #[test]
+    fn clearing_a_file_that_was_never_there_logs_nothing_above_debug() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        FileStore::new(dir.path().join("cookies.json"))
+            .clear()
+            .expect("an entry that was never there is not an error");
+
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert!(logs.messages(Level::ERROR).is_empty());
+    }
+
+    #[test]
+    fn the_file_store_reports_its_own_failures() {
+        assert!(FileStore::new("cookies.json").reports_failures());
     }
 
     // ===================== read-back verification =====================
