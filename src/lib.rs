@@ -45,10 +45,14 @@ pub use client::{Client, ClientBuilder};
 pub use envelope::{Envelope, Meta};
 pub use error::{Error, StorageError};
 pub use errors::{ErrorGroup, classify_error_code};
-pub use links::{join_api_path, resolve_link, resource_url, self_url, sub_resource_url};
+pub use links::{
+    OriginMismatch, join_api_path, origin_mismatch, resolve_link, resource_url, rewrite_version,
+    self_url, sub_resource_url,
+};
 #[cfg(feature = "keyring")]
 pub use storage::KeyringStore;
 pub use storage::{ChainedStore, CredentialStore, FileStore, MemoryStore};
+pub use transport::RequestTimeout;
 
 /// Crate version, as compiled from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
