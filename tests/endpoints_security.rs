@@ -12,10 +12,25 @@ use std::sync::Arc;
 use rusteero::endpoints::security::SecurityApi;
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use tracing::Level;
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
+
+/// [`common::capture_logs`] plus an always-live second dispatcher.
+///
+/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
+/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
+/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
+/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
+/// capture then misses events nondeterministically. Keeping this anchor registered makes every
+/// rebuild consult all live dispatchers, the capture included.
+fn capture_logs() -> (common::LogGuard, common::LogCapture) {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+    common::capture_logs()
+}
 
 /// Builds a [`SecurityApi`] pointed at `mock`, wrapping a `Transport` already authenticated with
 /// [`TEST_TOKEN`].
@@ -514,5 +529,155 @@ async fn set_proxied_nodes_prefers_the_parents_proxied_nodes_link() -> anyhow::R
     let api = security_api(&mock);
     api.set_proxied_nodes("network-0001", true, Some(&parent))
         .await?;
+    Ok(())
+}
+
+// ============================== SecurityApi::set_ipv6_upstream ==============================
+
+#[tokio::test]
+async fn set_ipv6_upstream_puts_settings_with_only_the_upstream_flag() -> anyhow::Result<()> {
+    for enabled in [true, false] {
+        let mock = MockEero::start().await;
+        // Exact-match body carrying ONLY `ipv6_upstream`: an added `ipv6_downstream` (what
+        // `set_ipv6` sends) would never match.
+        Mock::given(method("PUT"))
+            .and(path("/2.2/networks/network-0001/settings"))
+            .and(session_cookie())
+            .and(user_token_header())
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({ "ipv6_upstream": enabled })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let api = security_api(&mock);
+        let env = api.set_ipv6_upstream("network-0001", enabled, None).await?;
+        assert_eq!(env.into_value(), ok_envelope(), "enabled={enabled}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_prefers_the_parents_published_settings_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.4/networks/network-0001/settings"))
+        .and(body_json(json!({ "ipv6_upstream": true })))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = parent_with_links();
+    let before = parent.clone();
+    let api = security_api(&mock);
+    api.set_ipv6_upstream("network-0001", true, Some(&parent))
+        .await?;
+    assert_eq!(parent, before, "the caller's parent is read only");
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_warns_once_with_the_reboot_class_operation() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    let (_guard, logs) = capture_logs();
+    let api = security_api(&mock);
+
+    api.set_ipv6_upstream("network-0001", true, None).await?;
+    assert_eq!(logs.warnings().len(), 1, "got {:?}", logs.warnings());
+    assert_eq!(
+        logs.count(
+            Level::WARN,
+            "Issuing write (set IPv6 upstream for network -- may reboot every eero, like the \
+             confirmed DNS write path)"
+        ),
+        1,
+        "got {:?}",
+        logs.warnings()
+    );
+
+    // `set_ipv6` keeps its own, different operation string.
+    logs.clear();
+    api.set_ipv6("network-0001", true, None).await?;
+    assert_eq!(logs.warnings().len(), 1, "got {:?}", logs.warnings());
+    assert!(logs.contains(
+        Level::WARN,
+        "Issuing write (set IPv6 for network -- may reboot every eero, like the confirmed DNS \
+         write path)"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_with_an_unresolvable_id_sends_nothing_and_does_not_warn()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let (_guard, logs) = capture_logs();
+    let api = security_api(&mock);
+
+    for bad_id in ["", "../x"] {
+        let err = api
+            .set_ipv6_upstream(bad_id, true, None)
+            .await
+            .expect_err("an invalid network id must be rejected before any request");
+        assert!(
+            matches!(err, Error::Validation { .. }),
+            "{bad_id:?}: got {err:?}"
+        );
+    }
+
+    assert!(
+        logs.warnings().is_empty(),
+        "the warning follows URL resolution: {:?}",
+        logs.warnings()
+    );
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_ipv6_upstream_not_authenticated_returns_authentication_error_without_a_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = SecurityApi::new(Arc::new(mock.transport_anonymous()));
+    let err = api
+        .set_ipv6_upstream("network-0001", true, None)
+        .await
+        .expect_err("an unauthenticated write must fail");
+    assert!(err.is_auth_error(), "got {err:?}");
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
     Ok(())
 }
