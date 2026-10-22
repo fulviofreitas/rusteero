@@ -548,6 +548,16 @@ impl Client {
             .map(Envelope::into_value)
     }
 
+    /// Returns the caller's own `parent` envelope when one was supplied, otherwise the cached
+    /// network envelope for `network_id` (see [`Client::network_parent`]).
+    ///
+    /// Ported from `_network_parent_kwargs_or` (`eero-api src/eero/client.py:345-362` at
+    /// `v8.4.1`): the caller's envelope is forwarded unchanged and wins over the cache.
+    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    fn network_parent_or(&self, network_id: &str, parent: Option<&Value>) -> Option<Value> {
+        parent.cloned().or_else(|| self.network_parent(network_id))
+    }
+
     /// Finds the entry in `envelopes` whose `id` field, or whose `url` field's trailing path
     /// segment, matches `resource_id` exactly.
     ///
@@ -637,12 +647,17 @@ impl Client {
         self.cache.invalidate(&CacheKey::eeros(network_id));
     }
 
-    /// Drops both `devices[{nid}_{did}]` and `devices[{nid}_devices]` for one device.
+    /// Drops `devices[{nid}_{did}]` for every id in `device_ids`, then `devices[{nid}_devices]`.
     ///
-    /// Mirrors `_invalidate_device_cache` (`eero-api src/eero/client.py:567-575`).
-    fn invalidate_device_cache(&self, network_id: &str, device_id: &str) {
-        self.cache
-            .invalidate(&CacheKey::device(network_id, device_id));
+    /// Mirrors `_invalidate_device_cache(network_id, *device_ids)` (`eero-api
+    /// src/eero/client.py:1173-1185` at `v8.4.1`): zero or more devices, and the network's device
+    /// list is always dropped — a write that touches no single device (a network reboot, say)
+    /// passes an empty slice.
+    fn invalidate_device_cache(&self, network_id: &str, device_ids: &[&str]) {
+        for &device_id in device_ids {
+            self.cache
+                .invalidate(&CacheKey::device(network_id, device_id));
+        }
         self.cache.invalidate(&CacheKey::devices(network_id));
     }
 

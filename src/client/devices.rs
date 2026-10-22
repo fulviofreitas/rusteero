@@ -131,7 +131,7 @@ impl Client {
             .devices()
             .set_device_nickname(&network_id, device_id, nickname)
             .await?;
-        self.invalidate_device_cache(network_id.as_str(), device_id);
+        self.invalidate_device_cache(network_id.as_str(), &[device_id]);
         Ok(response)
     }
 
@@ -157,7 +157,7 @@ impl Client {
             .devices()
             .block_device(&network_id, device_id)
             .await?;
-        self.invalidate_device_cache(network_id.as_str(), device_id);
+        self.invalidate_device_cache(network_id.as_str(), &[device_id]);
         Ok(response)
     }
 
@@ -182,7 +182,7 @@ impl Client {
             .devices()
             .unblock_device(&network_id, device_id)
             .await?;
-        self.invalidate_device_cache(network_id.as_str(), device_id);
+        self.invalidate_device_cache(network_id.as_str(), &[device_id]);
         Ok(response)
     }
 
@@ -207,7 +207,7 @@ impl Client {
             .devices()
             .pause_device(&network_id, device_id, paused)
             .await?;
-        self.invalidate_device_cache(network_id.as_str(), device_id);
+        self.invalidate_device_cache(network_id.as_str(), &[device_id]);
         Ok(response)
     }
 
@@ -249,7 +249,7 @@ impl Client {
                 parent.as_ref(),
             )
             .await?;
-        self.invalidate_device_cache(network_id.as_str(), device_id);
+        self.invalidate_device_cache(network_id.as_str(), &[device_id]);
         if profile.is_some() {
             self.cache
                 .invalidate_bucket(Bucket::Profiles, network_id.as_str());
@@ -278,7 +278,7 @@ impl Client {
             .devices()
             .set_device_type(&network_id, device_id, device_type)
             .await?;
-        self.invalidate_device_cache(network_id.as_str(), device_id);
+        self.invalidate_device_cache(network_id.as_str(), &[device_id]);
         Ok(response)
     }
 
@@ -336,7 +336,7 @@ impl Client {
                 type_label,
             )
             .await?;
-        self.invalidate_device_cache(network_id.as_str(), device_id);
+        self.invalidate_device_cache(network_id.as_str(), &[device_id]);
         Ok(response)
     }
 }

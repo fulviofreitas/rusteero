@@ -101,7 +101,7 @@ impl Client {
             .wan()
             .set_device_secondary_wan_access(&network_id, mac, deny)
             .await?;
-        self.invalidate_device_cache(&network_id, mac);
+        self.invalidate_device_cache(&network_id, &[mac]);
         Ok(response)
     }
 }
