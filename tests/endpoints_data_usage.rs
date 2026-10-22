@@ -15,7 +15,7 @@ use rusteero::envelope::Envelope;
 use rusteero::error::Error;
 use rusteero::transport::{RequestTimeout, Transport};
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path, query_param};
+use wiremock::matchers::{body_json, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, Request, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
@@ -378,6 +378,122 @@ async fn get_eeros_summary_url_and_params() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn get_eeros_usage_url_and_params() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({"meta": {"code": 200}, "data": [{"eero": "eero-0001"}]});
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/data_usage/eeros"))
+        .and(query_param("start", "s"))
+        .and(query_param("end", "e"))
+        .and(query_param("cadence", "daily"))
+        .and(query_param_is_missing("timezone"))
+        .and(session_cookie())
+        .and(user_token_header())
+        // The parameters are sent in Python's order, with no body.
+        .and(|request: &Request| {
+            request.url.query() == Some("start=s&end=e&cadence=daily") && request.body.is_empty()
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // The sibling paths must stay untouched: this is neither the summary nor a single eero.
+    for sibling in [
+        "/2.2/networks/network-0001/data_usage/eeros/summary",
+        "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(sibling))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock.server)
+            .await;
+    }
+
+    let api = data_usage_api(&mock);
+    let env = api
+        .get_eeros_usage("network-0001", "s", "e", "daily", None, None, None)
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eeros_usage_includes_timezone_when_supplied() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/data_usage/eeros"))
+        .and(query_param("cadence", "hourly"))
+        .and(query_param("timezone", "UTC"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(|request: &Request| {
+            request.url.query() == Some("start=s&end=e&cadence=hourly&timezone=UTC")
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    api.get_eeros_usage("network-0001", "s", "e", "hourly", Some("UTC"), None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eeros_usage_rejects_invalid_cadence_before_any_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    let err = api
+        .get_eeros_usage("network-0001", "s", "e", "weekly", None, None, None)
+        .await
+        .expect_err("an invalid cadence must be rejected before any request");
+    assert!(
+        matches!(
+            &err,
+            Error::Validation { field, message, .. }
+                if field == "cadence"
+                    && message == "must be one of ('daily', 'hourly'), got 'weekly'"
+        ),
+        "{err:?}"
+    );
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eeros_usage_not_authenticated() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = DataUsageApi::new(Arc::new(mock.transport_anonymous()));
+    let err = api
+        .get_eeros_usage("network-0001", "s", "e", "daily", None, None, None)
+        .await
+        .expect_err("no session must fail before any request");
+    assert!(err.is_auth_error());
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_eero_usage_url_and_params() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
@@ -550,6 +666,7 @@ async fn network_and_device_level_methods_prefer_parents_self_url() -> anyhow::R
             "/2.2/networks/network-0001/data_usage/breakdown",
             "/2.2/networks/network-0001/data_usage/devices",
             "/2.2/networks/network-0001/data_usage/devices/dev-0001",
+            "/2.2/networks/network-0001/data_usage/eeros",
             "/2.2/networks/network-0001/data_usage/eeros/summary",
             "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
         ],
@@ -558,6 +675,7 @@ async fn network_and_device_level_methods_prefer_parents_self_url() -> anyhow::R
             "/2.4/networks/other-network/data_usage/breakdown",
             "/2.4/networks/other-network/data_usage/devices",
             "/2.4/networks/other-network/data_usage/devices/dev-0001",
+            "/2.4/networks/other-network/data_usage/eeros",
             "/2.4/networks/other-network/data_usage/eeros/summary",
             "/2.4/networks/other-network/data_usage/eeros/eero-0001",
         ],
@@ -591,6 +709,8 @@ async fn network_and_device_level_methods_prefer_parents_self_url() -> anyhow::R
         Some(&parent),
     )
     .await?;
+    api.get_eeros_usage("network-0001", "s", "e", "daily", None, None, Some(&parent))
+        .await?;
     api.get_eeros_summary("network-0001", "s", "e", "daily", None, None, Some(&parent))
         .await?;
     api.get_eero_usage(
@@ -713,12 +833,13 @@ fn short_timeout_api(mock: &MockEero) -> DataUsageApi {
     DataUsageApi::new(Arc::new(transport))
 }
 
-/// The paths of the nine time-windowed reads, in declaration order.
-const TIME_WINDOWED_PATHS: [&str; 9] = [
+/// The paths of the ten time-windowed reads, in declaration order.
+const TIME_WINDOWED_PATHS: [&str; 10] = [
     "/2.2/networks/network-0001/data_usage",
     "/2.2/networks/network-0001/data_usage/breakdown",
     "/2.2/networks/network-0001/data_usage/devices",
     "/2.2/networks/network-0001/data_usage/devices/aa:bb:cc",
+    "/2.2/networks/network-0001/data_usage/eeros",
     "/2.2/networks/network-0001/data_usage/eeros/summary",
     "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
     "/2.2/networks/network-0001/data_usage/profiles/profile-0001",
@@ -747,17 +868,18 @@ async fn mount_slow_time_windowed_reads(mock: &MockEero) {
     }
 }
 
-/// Calls all nine time-windowed reads concurrently with `timeout`, in [`TIME_WINDOWED_PATHS`]
+/// Calls all ten time-windowed reads concurrently with `timeout`, in [`TIME_WINDOWED_PATHS`]
 /// order.
 async fn call_every_time_windowed_read(
     api: &DataUsageApi,
     timeout: Option<RequestTimeout>,
-) -> [Result<Envelope, Error>; 9] {
+) -> [Result<Envelope, Error>; 10] {
     let (
         data_usage,
         breakdown,
         devices,
         device,
+        eeros,
         eeros_summary,
         eero,
         profile,
@@ -777,6 +899,7 @@ async fn call_every_time_windowed_read(
             timeout,
             None
         ),
+        api.get_eeros_usage("network-0001", "s", "e", "daily", None, timeout, None),
         api.get_eeros_summary("network-0001", "s", "e", "daily", None, timeout, None),
         api.get_eero_usage(
             "network-0001",
@@ -806,6 +929,7 @@ async fn call_every_time_windowed_read(
         breakdown,
         devices,
         device,
+        eeros,
         eeros_summary,
         eero,
         profile,

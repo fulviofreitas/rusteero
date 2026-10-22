@@ -4,7 +4,7 @@
 //! (`.claude/tasks/briefs/v8/g3-devices.md`). The whole module was rewritten in `05a2b07`
 //! (v8.0.0): the pre-8.0.0 shape this crate previously shipped — one `get_data_usage(payload:
 //! Value, resource: Option<&str>)` method that attached an arbitrary JSON body to a `GET`
-//! request — is gone entirely, replaced by eleven distinct, **query-params-only** methods, one
+//! request — is gone entirely, replaced by twelve distinct, **query-params-only** methods, one
 //! per resource. `data_usage.py`'s own module docstring is explicit: "None of these endpoints
 //! accept a request body; the API rejects a body-bearing `GET` with a `400`"
 //! (`data_usage.py:10-11`).
@@ -14,17 +14,18 @@
 //! `DataUsageApi::network_id_or_self_url` for why this is implemented locally rather than by
 //! threading `parent` through [`crate::routes::Resource::resolve`] itself.
 //!
-//! `cadence` is required on six of the eleven methods (`get_data_usage`, `get_device_usage`,
-//! `get_eeros_summary`, `get_eero_usage`, `get_profile_usage`, `get_unprofiled_summary` — taking
-//! `cadence: &str`) and optional on the other three (`get_breakdown`, `get_devices_usage`,
-//! `get_unprofiled_devices` — taking `cadence: Option<&str>`); `get_report_settings` takes no
-//! query parameters at all. Every method here funnels through [`crate::transport::Transport`],
+//! `cadence` is required on seven of the twelve methods (`get_data_usage`, `get_device_usage`,
+//! `get_eeros_summary`, `get_eeros_usage`, `get_eero_usage`, `get_profile_usage`,
+//! `get_unprofiled_summary` — taking `cadence: &str`) and optional on three more
+//! (`get_breakdown`, `get_devices_usage`, `get_unprofiled_devices` — taking `cadence:
+//! Option<&str>`); `get_report_settings` takes no query parameters at all, and
+//! `set_report_settings` is the one write. Every method here funnels through [`crate::transport::Transport`],
 //! which already implements the "not authenticated" precondition and every status-to-error
 //! mapping a response can produce.
 //!
 //! # Per-call timeout
 //!
-//! All nine time-windowed reads (everything except `get_report_settings`/`set_report_settings`)
+//! All ten time-windowed reads (everything except `get_report_settings`/`set_report_settings`)
 //! take `timeout: Option<RequestTimeout>` immediately before `parent` (`data_usage.py:111,
 //! 159-160` at `v8.4.1`, where the keyword-only `timeout` is forwarded only when supplied).
 //! `Some(timeout)` replaces the transport default (30 s total, 10 s read, unless the builder
@@ -245,6 +246,47 @@ impl DataUsageApi {
         let cadence = validated_cadence(cadence)?;
         self.get_usage(
             &routes::data_usage::GET_EEROS_DATA_USAGE_SUMMARY,
+            network_id,
+            start,
+            end,
+            Some(cadence),
+            timezone,
+            timeout,
+            parent,
+        )
+        .await
+    }
+
+    /// `GET /2.2/networks/{network_id}/data_usage/eeros` — data-usage statistics for every eero
+    /// on a network.
+    ///
+    /// Ported from `DataUsageAPI.get_eeros_usage` (`data_usage.py:354-404` at `v8.4.1`). The API
+    /// requires `start`, `end` and `cadence` on this endpoint, so `cadence` is required. The
+    /// path is not in the observed spec; it is used by a downstream integration and exposed here
+    /// on that basis. Distinct from [`DataUsageApi::get_eeros_summary`]
+    /// (`.../data_usage/eeros/summary`) and from [`DataUsageApi::get_eero_usage`]
+    /// (`.../data_usage/eeros/{eero_id}`).
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
+    /// # Errors
+    ///
+    /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_eeros_usage(
+        &self,
+        network_id: &str,
+        start: &str,
+        end: &str,
+        cadence: &str,
+        timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        let cadence = validated_cadence(cadence)?;
+        self.get_usage(
+            &routes::data_usage::GET_EEROS_DATA_USAGE,
             network_id,
             start,
             end,

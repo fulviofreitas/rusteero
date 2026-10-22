@@ -69,12 +69,14 @@ pub const GET_EEROS_DATA_USAGE_SUMMARY: Resource = Resource {
     link: None,
 };
 
-/// `GET /2.2/networks/{id}/data_usage/eeros` — the collection
-/// `DataUsageApi::get_eero_usage` appends a single validated eero id onto.
+/// `GET /2.2/networks/{id}/data_usage/eeros` — data-usage statistics for every eero on a
+/// network (`DataUsageApi::get_eeros_usage`), and the collection `DataUsageApi::get_eero_usage`
+/// appends a single validated eero id onto.
 ///
-/// Ported from `DataUsageAPI.get_eero_usage` (`data_usage.py:370-413`):
-/// `.../data_usage/eeros/{_validate_child_id(eero_id)}`. `cadence` is required.
-/// API-Reference.md:992.
+/// Ported from `DataUsageAPI.get_eeros_usage` (`data_usage.py:354-404` at `v8.4.1`, `cadence`
+/// required, a path that is not in the observed spec) and `DataUsageAPI.get_eero_usage`
+/// (`data_usage.py:370-413`): `.../data_usage/eeros/{_validate_child_id(eero_id)}`. `cadence` is
+/// required on both. API-Reference.md:992.
 pub const GET_EEROS_DATA_USAGE: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
