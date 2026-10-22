@@ -191,6 +191,14 @@ pub const SESSION_COOKIE_PREFIX: &str = "s=";
 /// (`TransportBuilder::get_retries`).
 pub const GET_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Upper bound on a parsed `Retry-After` value: one day.
+///
+/// Ported from `RETRY_AFTER_MAX_SECONDS` (`api/base.py:45-50`, `86400.0`). The header is
+/// server-controlled input: an HTTP-date far in the future, or a very long digit string, would
+/// otherwise make a caller that sleeps for the value stall indefinitely. A parsed delay is capped
+/// at this value before it reaches [`crate::Error::RateLimit`]'s `retry_after`.
+pub const RETRY_AFTER_MAX: Duration = Duration::from_secs(86_400);
+
 /// Version marker written to every persisted credential record.
 ///
 /// Ported from `CREDENTIAL_SCHEMA_VERSION` (`const.py:118`). A record loaded without this key
@@ -213,8 +221,8 @@ mod tests {
         API_VERSION_MULTISTATICIP, API_VERSION_SECONDARY_WAN, CREDENTIAL_SCHEMA_VERSION,
         DEFAULT_ACCEPT_LANGUAGE, DEFAULT_CACHE_TTL, DEFAULT_USER_AGENT, GET_RETRY_DELAY,
         LEGACY_USER_AGENT, LOGOUT_COOKIE_FIELD_NAME, MAX_RESPONSE_BYTES, READ_TIMEOUT,
-        REQUEST_TIMEOUT, SESSION_COOKIE_NAME, SESSION_COOKIE_PREFIX, SESSION_REFRESH_GUARD_TIMEOUT,
-        USER_TOKEN_HEADER, USER_TOKEN_KEY, api_endpoint,
+        REQUEST_TIMEOUT, RETRY_AFTER_MAX, SESSION_COOKIE_NAME, SESSION_COOKIE_PREFIX,
+        SESSION_REFRESH_GUARD_TIMEOUT, USER_TOKEN_HEADER, USER_TOKEN_KEY, api_endpoint,
     };
     use std::time::Duration;
 
@@ -303,6 +311,12 @@ mod tests {
     #[test]
     fn get_retry_delay_matches_const_py() {
         assert_eq!(GET_RETRY_DELAY, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn retry_after_max_is_one_day() {
+        assert_eq!(RETRY_AFTER_MAX, Duration::from_secs(86_400));
+        assert_eq!(RETRY_AFTER_MAX, Duration::from_secs(24 * 60 * 60));
     }
 
     #[test]
