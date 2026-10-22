@@ -279,13 +279,13 @@ async fn set_data_usage_report_settings_invalidates_the_network_cache() -> anyho
 //
 // Real clock (the crate's timeouts and a paused clock do not mix with a real HTTP round trip).
 // `ClientBuilder` has no timeout setters, so the short default comes from a caller-supplied
-// `reqwest` builder with a 150 ms total timeout; a per-call `RequestTimeout` replaces it.
+// `reqwest` builder with a 250 ms total timeout; a per-call `RequestTimeout` replaces it.
 
-const SLOW: Duration = Duration::from_millis(400);
-const SHORT: Duration = Duration::from_millis(150);
-const GENEROUS: Duration = Duration::from_secs(3);
+const SLOW: Duration = Duration::from_millis(2000);
+const SHORT: Duration = Duration::from_millis(250);
+const GENEROUS: Duration = Duration::from_secs(6);
 
-/// A [`Client`] whose underlying HTTP client times out after 150 ms.
+/// A [`Client`] whose underlying HTTP client times out after 250 ms.
 async fn short_timeout_client(mock: &MockEero) -> Client {
     Client::builder()
         .base_url(mock.uri())
@@ -405,6 +405,7 @@ async fn get_data_usage_with_a_timeout_sends_the_same_query_and_no_body() -> any
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/data_usage"))
         .and(session_cookie())
+        .and(user_token_header())
         .and(query_param("start", "s"))
         .and(query_param("end", "e"))
         .and(query_param("cadence", "daily"))
@@ -455,12 +456,12 @@ async fn report_settings_wrappers_take_no_timeout_and_keep_the_transport_default
     let err = client
         .get_data_usage_report_settings(Some("network-0001"))
         .await
-        .expect_err("the 150 ms transport default applies");
+        .expect_err("the 250 ms transport default applies");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     let err = client
         .set_data_usage_report_settings("daily", "monday", Some("network-0001"))
         .await
-        .expect_err("the 150 ms transport default applies");
+        .expect_err("the 250 ms transport default applies");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     Ok(())
 }

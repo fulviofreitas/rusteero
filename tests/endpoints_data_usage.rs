@@ -1013,14 +1013,16 @@ async fn a_caller_supplied_network_outside_the_network_family_is_rejected() -> a
 // ===================== per-call timeout =====================
 //
 // Real clock (the crate's timeouts and a paused clock do not mix with a real HTTP round trip):
-// every response is held back 400 ms, longer than the 150 ms default these tests configure and
-// shorter than the 3 s budget they supply per call.
+// every response is held back 2 s, eight times the 250 ms default these tests configure and
+// well inside the 6 s budget they supply per call. The default is not made shorter than 250 ms:
+// each "must time out" call still has to reach the mock server before it expires, so that the
+// mock's `.expect(1)` holds on a loaded machine.
 
-const SLOW: Duration = Duration::from_millis(400);
-const SHORT: Duration = Duration::from_millis(150);
-const GENEROUS: Duration = Duration::from_secs(3);
+const SLOW: Duration = Duration::from_millis(2000);
+const SHORT: Duration = Duration::from_millis(250);
+const GENEROUS: Duration = Duration::from_secs(6);
 
-/// A `DataUsageApi` whose transport times out after 150 ms (total and read).
+/// A `DataUsageApi` whose transport times out after 250 ms (total and read).
 fn short_timeout_api(mock: &MockEero) -> DataUsageApi {
     let transport = Transport::builder()
         .base_url(mock.uri())
@@ -1143,7 +1145,7 @@ async fn every_time_windowed_read_honours_a_supplied_timeout() {
     mount_slow_time_windowed_reads(&mock).await;
     let api = short_timeout_api(&mock);
 
-    // `total` only: the 150 ms default read bound is replaced too, not merged back in.
+    // `total` only: the 250 ms default read bound is replaced too, not merged back in.
     let results = Box::pin(call_every_time_windowed_read(
         &api,
         Some(RequestTimeout::total(GENEROUS)),
@@ -1250,12 +1252,12 @@ async fn report_settings_methods_take_no_timeout_and_keep_the_transport_default(
     let err = api
         .get_report_settings("network-0001", None)
         .await
-        .expect_err("the 150 ms transport default applies");
+        .expect_err("the 250 ms transport default applies");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     let err = api
         .set_report_settings("network-0001", "daily", "monday", None)
         .await
-        .expect_err("the 150 ms transport default applies");
+        .expect_err("the 250 ms transport default applies");
     assert!(matches!(err, Error::Timeout), "{err:?}");
     Ok(())
 }
