@@ -40,6 +40,15 @@ fn login_fixture_token() -> String {
 /// `LoginFlow::start`, handing back the resulting `PendingLogin` together with the login token
 /// `fixtures/login.json` carries.
 async fn start_pending_login(mock: &MockEero) -> anyhow::Result<(PendingLogin, String)> {
+    start_pending_login_on(mock, mock.login_flow()).await
+}
+
+/// As [`start_pending_login`], on a caller-built flow: one whose transport shares a credential
+/// store with something the test inspects, so the flow touching that store can fail the test.
+async fn start_pending_login_on(
+    mock: &MockEero,
+    flow: LoginFlow,
+) -> anyhow::Result<(PendingLogin, String)> {
     Mock::given(method("POST"))
         .and(path("/2.2/login"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("login.json")))
@@ -47,7 +56,7 @@ async fn start_pending_login(mock: &MockEero) -> anyhow::Result<(PendingLogin, S
         .mount(&mock.server)
         .await;
 
-    let pending = mock.login_flow().start("you@example.com").await?;
+    let pending = flow.start("you@example.com").await?;
     Ok((pending, login_fixture_token()))
 }
 
@@ -1395,6 +1404,10 @@ async fn login_flow_start_never_touches_a_configured_store() -> anyhow::Result<(
         requests[0].headers.get("x-user-token").is_none(),
         "the login request is unauthenticated even though the transport holds a session"
     );
+    assert!(
+        requests[0].headers.get("cookie").is_none(),
+        "and it carries no legacy session cookie either, which this transport sends by default"
+    );
     Ok(())
 }
 
@@ -1551,14 +1564,21 @@ async fn only_a_successful_verify_can_replace_the_stored_session() -> anyhow::Re
     Ok(())
 }
 
+/// The in-memory half of "a pending login never becomes the active session" is a matter of
+/// ownership, not behaviour: `LoginFlow::with_transport` takes its transport by value and
+/// `Transport` is not `Clone`, so no flow can be pointed at an `AuthApi`'s transport, and no test
+/// could make it so. What can fail is the shared record: the flow here runs on its own transport
+/// over the same credential store as the `AuthApi`, so a handshake that saved the unverified login
+/// token would show up in the store.
 #[tokio::test]
 async fn a_pending_login_never_becomes_the_active_session() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
     store.save(&Session::from_token(TEST_TOKEN))?;
     let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, Arc::clone(&store)));
+    let flow = LoginFlow::with_transport(mock.transport_with_store(TEST_TOKEN, Arc::clone(&store)));
 
-    let (_pending, login_token) = start_pending_login(&mock).await?;
+    let (_pending, login_token) = start_pending_login_on(&mock, flow).await?;
 
     assert_ne!(login_token, TEST_TOKEN);
     assert!(auth.is_authenticated());
@@ -1570,10 +1590,17 @@ async fn a_pending_login_never_becomes_the_active_session() -> anyhow::Result<()
         TEST_TOKEN,
         "the unverified login token is never the in-memory session"
     );
-    assert_eq!(store.load()?.token().expose_secret(), TEST_TOKEN);
+    assert_eq!(
+        store.load()?.token().expose_secret(),
+        TEST_TOKEN,
+        "nor the stored one"
+    );
     Ok(())
 }
 
+/// `credentials_persisted` is per transport, so a flow's own transport cannot change an
+/// `AuthApi`'s by construction (see the test above). The flow here shares the `AuthApi`'s store,
+/// which does make it observable that the handshake saves and clears nothing.
 #[tokio::test]
 async fn a_login_on_another_transport_leaves_credentials_persisted_alone() -> anyhow::Result<()> {
     let probe = ProbeStore::new(ParkOn::Never);
@@ -1583,12 +1610,20 @@ async fn a_login_on_another_transport_leaves_credentials_persisted_alone() -> an
     assert!(!auth.credentials_persisted());
 
     let mock = MockEero::start().await;
-    let _ = start_pending_login(&mock).await?;
+    let flow =
+        LoginFlow::with_transport(mock.transport_with_store(TEST_TOKEN, Arc::clone(&probe) as _));
+    let _ = start_pending_login_on(&mock, flow).await?;
 
     assert!(
         !auth.credentials_persisted(),
         "the flag keeps describing the last session that was actually saved"
     );
+    assert_eq!(
+        probe.saved_tokens(),
+        ["injected_token"],
+        "the handshake saved nothing"
+    );
+    assert_eq!(probe.clear_count(), 0, "and cleared nothing");
     Ok(())
 }
 
