@@ -20,7 +20,19 @@
 //! strict single-path-segment whitelist (`^[A-Za-z0-9][A-Za-z0-9._:-]*$`, plus an explicit `".."`
 //! rejection) — an empty, `"."`, `".."`, control-character-bearing, or separator-bearing value is
 //! rejected outright, before any request is sent, rather than silently percent-encoded or
-//! (worse) collapsed onto a parent collection. `validate_segment`/`SegmentError` below are a
+//! (worse) collapsed onto a parent collection.
+//!
+//! An id-or-url argument that is a *path or URL* instead of a bare id is held to two more rules,
+//! also applied before any request: it must be a plain path (no whitespace or control character,
+//! query, fragment, dot segment, `%2e` or backslash), and it must name one resource of the family
+//! the route's template addresses. A [`Resource`] whose template is `eeros/{id}/reboot` accepts
+//! `/2.2/eeros/9` but not `/2.2/networks/123` or `/2.2/account`, and a [`Nested`] route accepts
+//! only a child under the addressed network's own `prefix` collection (see
+//! [`crate::links::resource_url`] and [`crate::links::require_family_path`]). A link the API
+//! published on a parent envelope is not confined: it may name any resource on any version, and
+//! only the plain-path rule applies to it.
+//!
+//! `validate_segment`/`SegmentError` below are a
 //! second, narrower rule used only where a candidate identifier is *not* going through
 //! `resource_url`/`child_url` — currently [`crate::client`]'s network-id auto-discovery
 //! (`extract_network_id`), which reads a candidate id straight out of an untrusted `/networks`
@@ -586,5 +598,97 @@ mod tests {
             url.as_str(),
             "https://api-user.e2ro.com/2.5/networks/100/profiles/p1/schedules"
         );
+    }
+
+    // ----------------------- path or URL arguments are confined to the family -----------------------
+
+    fn settings_resource() -> Resource {
+        Resource {
+            method: Method::PUT,
+            version: ApiVersion::V2_2,
+            template: "networks/{id}/settings",
+            link: Some("settings"),
+        }
+    }
+
+    #[test]
+    fn resource_accepts_a_path_or_url_in_its_family_and_keeps_the_callers_version() {
+        let resource = settings_resource();
+        for supplied in [
+            "/2.3/networks/100",
+            "/2.3/networks/100/",
+            "https://api-user.e2ro.com/2.3/networks/100",
+        ] {
+            let url = resource.resolve(&fake_host(), supplied, None).unwrap();
+            assert_eq!(
+                url.as_str(),
+                "https://api-user.e2ro.com/2.3/networks/100/settings",
+                "{supplied}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_rejects_a_path_or_url_from_another_family() {
+        let resource = settings_resource();
+        for supplied in [
+            "/2.2/account",
+            "/2.2/eeros/9",
+            "/2.2/networks/100/devices",
+            "/2.2/networks/100//",
+            "/2.2/networks/../account",
+            "/2.2/networks/%2e%2e/account",
+            "/2.2/networks/100?x=1",
+            "/2.2/networks/100\n",
+            "https://api-user.e2ro.com/2.2/account",
+        ] {
+            let err = resource.resolve(&fake_host(), supplied, None).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Validation { .. }),
+                "{supplied:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_does_not_confine_the_parents_published_link() {
+        let parent = serde_json::json!({"resources": {"settings": "/2.4/account/other"}});
+        let url = settings_resource()
+            .resolve(&fake_host(), "100", Some(&parent))
+            .unwrap();
+        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.4/account/other");
+    }
+
+    #[test]
+    fn nested_accepts_only_a_child_under_the_addressed_networks_collection() {
+        let nested = Nested {
+            method: Method::DELETE,
+            version: ApiVersion::V2_2,
+            prefix: "profiles",
+            suffix: "",
+            link: None,
+        };
+        let url = nested
+            .resolve(&fake_host(), "100", "/2.2/networks/100/profiles/p1/", None)
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api-user.e2ro.com/2.2/networks/100/profiles/p1"
+        );
+        for child in [
+            "/2.2/networks/200/profiles/p1",
+            "/2.2/networks/100/profiles/..",
+            "/2.2/networks/100/profiles/p1/../p2",
+            "/2.2/account",
+            "/2.2/networks/100/profiles",
+        ] {
+            let err = nested
+                .resolve(&fake_host(), "100", child, None)
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Validation { .. }),
+                "{child:?}"
+            );
+        }
     }
 }
