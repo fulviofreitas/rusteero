@@ -203,7 +203,9 @@ async fn both_invalidate_the_device_entry_and_list_but_not_the_network() -> anyh
         3,
     )
     .await;
-    // Each target entry is fetched twice: once before its own write, once after.
+    // `MAC` and `DEVICE_ID` are two spellings of one device, so they share one canonical cache
+    // entry: it is fetched once before the writes and once after each write, under whichever
+    // spelling asks first.
     mount_get(
         &mock,
         "/2.2/networks/network-0001/devices/aa:bb:cc:11:22:33",
@@ -215,7 +217,7 @@ async fn both_invalidate_the_device_entry_and_list_but_not_the_network() -> anyh
         &mock,
         "/2.2/networks/network-0001/devices/aabbcc112233",
         fixture("device.json"),
-        2,
+        1,
     )
     .await;
     mount_get(
@@ -253,20 +255,21 @@ async fn both_invalidate_the_device_entry_and_list_but_not_the_network() -> anyh
     };
     prime(&client).await?;
     client.get_device(MAC, nid, false).await?;
+    // Same device, other spelling: served from the entry `MAC` just filled.
     client.get_device(DEVICE_ID, nid, false).await?;
 
     client.add_to_blacklist(MAC, nid, None).await?;
-    // Dropped: the list and the added device's entry (each a fresh request) ...
+    // Dropped: the list and the device's canonical entry (each a fresh request) ...
     client.get_devices(nid, false, None, None).await?;
     client.get_device(MAC, nid, false).await?;
-    // ... kept: the other device's entry, the bystander, the other network's list, the network.
     client.get_device(DEVICE_ID, nid, false).await?;
+    // ... kept: the bystander, the other network's list and the network.
     prime(&client).await?;
 
+    // Removing by the other spelling drops the same canonical entry.
     client.remove_from_blacklist(DEVICE_ID, nid, None).await?;
     client.get_devices(nid, false, None, None).await?;
     client.get_device(DEVICE_ID, nid, false).await?;
-    // The earlier write's entry is not the removed one, so it is still cached.
     client.get_device(MAC, nid, false).await?;
     prime(&client).await?;
     Ok(())

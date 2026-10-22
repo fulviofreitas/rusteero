@@ -11,7 +11,6 @@ use serde_json::Value;
 use super::Client;
 use crate::envelope::Envelope;
 use crate::error::Error;
-use crate::util::id_from_url;
 
 impl Client {
     /// Gets the device blacklist — returns the raw Eero API response.
@@ -64,8 +63,9 @@ impl Client {
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
-        // Python derives the cache key from `mac` only after the write; validate first.
-        id_from_url(mac)?;
+        // Python derives the cache key from `mac` only after the write; derive it first so an
+        // unusable MAC fails before anything is sent.
+        Self::device_cache_key(network_id.as_str(), mac)?;
         let parent = self.network_parent_or(network_id.as_str(), parent);
         let response = self
             .api

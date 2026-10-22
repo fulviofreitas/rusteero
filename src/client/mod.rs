@@ -690,7 +690,6 @@ impl Client {
     /// `v8.4.1`): the caller's envelope is forwarded unchanged and wins over the cache, and an
     /// empty object still counts as supplied. The cache lookup is keyed by the *resolved*
     /// `network_id`, so an explicit network with nothing cached yields no parent.
-    #[allow(dead_code)] // the network-scoped wrappers that use it are added next to it
     fn network_parent_or(&self, network_id: &str, parent: Option<&Value>) -> Option<Value> {
         parent.cloned().or_else(|| self.network_parent(network_id))
     }
@@ -819,7 +818,6 @@ impl Client {
     /// [`Client::set_led`]/[`Client::set_led_brightness`]/[`Client::set_nightlight`] etc.
     /// currently call `self.cache.invalidate(&CacheKey::eeros(..))` inline rather than through
     /// this helper; either spelling has the same effect.
-    #[allow(dead_code)] // the network-wide reboot wrapper that uses it is added next to it
     fn invalidate_eeros_cache(&self, network_id: &str) {
         self.cache.invalidate(&CacheKey::eeros(network_id));
     }

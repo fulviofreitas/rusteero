@@ -153,7 +153,8 @@ impl Client {
     /// `auto_discover = true`. **Breaking shape change**: the pre-8.0.0 `blocked: bool`
     /// parameter this crate previously shipped is gone — unblocking is
     /// [`Client::unblock_device`], a separate method. On success, invalidates both the device's
-    /// entry (through its canonical key) and `devices[{nid}_devices]`. No `parent=`.
+    /// entry (through its canonical key) and `devices[{nid}_devices]`. No `parent=`. The write
+    /// was live-verified upstream on 2026-10-06 and logs no uncharacterised-write warning.
     ///
     /// An empty `device_id` is rejected before the request is sent. Python's block write has no
     /// check of its own: it posts `mac=`, and only afterwards fails to derive the cache key,
