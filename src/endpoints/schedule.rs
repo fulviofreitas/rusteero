@@ -121,7 +121,12 @@ impl ScheduleApi {
             return Err(Error::validation("schedule", BARE_ID_MESSAGE));
         }
         let url = route.resolve(host, id_or_url, None)?;
-        require_schedule_path(id_or_url.trim_end_matches('/'))?;
+        links::require_family_path(
+            id_or_url.trim_end_matches('/'),
+            SCHEDULE_FAMILY,
+            "",
+            "schedule",
+        )?;
         Ok(url)
     }
 
@@ -444,53 +449,4 @@ impl ScheduleApi {
 fn is_path_or_url(reference: &str) -> bool {
     let lower = reference.to_lowercase();
     reference.starts_with('/') || lower.starts_with("http://") || lower.starts_with("https://")
-}
-
-/// Returns `true` when `segment` is one identifier of a family path: an ASCII alphanumeric
-/// followed by ASCII alphanumerics, `.`, `_`, `:` or `-` (`links.py:47`, `_SEGMENT`).
-fn is_family_segment(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
-}
-
-/// Requires `reference` — a caller's path or absolute URL, trailing slashes already dropped — to
-/// name exactly one scheduled pause: its path must be
-/// `/<version>/networks/{id}/profiles/{id}/schedules/{id}` and nothing else (`schedule.py:90`,
-/// `require_family_path(url, _SCHEDULE_FAMILY, field="schedule")`).
-///
-/// The raw string is checked, not the parsed URL: the URL parser resolves dot segments and strips
-/// control characters, which would let a path that does not name a pause pass as one that does.
-///
-/// # Errors
-///
-/// Returns [`Error::validation`] with `field: "schedule"` and `"must be a path under
-/// networks/{id}/profiles/{id}/schedules/{id} on the API host"` for any other shape.
-fn require_schedule_path(reference: &str) -> Result<(), Error> {
-    let path = match reference.find("://") {
-        // An absolute URL: the path starts at the first `/` after the authority.
-        Some(scheme_end) => reference[scheme_end + 3..]
-            .find('/')
-            .map_or("", |slash| &reference[scheme_end + 3 + slash..]),
-        None => reference,
-    };
-    let segments: Vec<&str> = path
-        .strip_prefix('/')
-        .map_or_else(Vec::new, |rest| rest.split('/').collect());
-    let is_pause = matches!(
-        segments.as_slice(),
-        [version, "networks", network, "profiles", profile, "schedules", schedule]
-            if links::is_version_segment(version)
-                && is_family_segment(network)
-                && is_family_segment(profile)
-                && is_family_segment(schedule)
-    );
-    if is_pause {
-        Ok(())
-    } else {
-        Err(Error::validation(
-            "schedule",
-            format!("must be a path under {SCHEDULE_FAMILY} on the API host"),
-        ))
-    }
 }
