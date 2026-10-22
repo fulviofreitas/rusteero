@@ -244,8 +244,13 @@ async fn create_burst_reporter_invalidates_only_the_device_list() -> anyhow::Res
 #[tokio::test]
 async fn create_burst_reporter_failure_leaves_the_device_list_cached() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
+    // The same authenticated `""` POST `mount_burst_post` pins, answered with a 500.
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/burst_reporters"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/json"))
+        .and(body_string("\"\""))
         .respond_with(ResponseTemplate::new(500))
         .expect(1)
         .mount(&mock.server)
@@ -266,7 +271,7 @@ async fn create_burst_reporter_failure_leaves_the_device_list_cached() -> anyhow
         .create_burst_reporter(Some("network-0001"), None)
         .await
         .expect_err("a server error must propagate");
-    assert!(!matches!(err, Error::MissingNetworkId), "{err:?}");
+    assert!(matches!(err, Error::Api { status: 500, .. }), "{err:?}");
 
     // Still served from the cache: the mock allows only the first list request.
     client

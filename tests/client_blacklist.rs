@@ -398,10 +398,13 @@ async fn remove_from_blacklist_rejects_an_empty_id_before_any_request() -> anyho
 #[tokio::test]
 async fn a_failed_write_leaves_the_device_cache_alone() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
+    // The same authenticated `mac=` form POST `mount_add_post` pins, answered with a 500.
     Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/blacklist"))
         .and(session_cookie())
         .and(user_token_header())
-        .and(path("/2.2/networks/network-0001/blacklist"))
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("mac=aa%3Abb%3Acc%3A11%3A22%3A33"))
         .respond_with(ResponseTemplate::new(500))
         .expect(1)
         .mount(&mock.server)
@@ -418,10 +421,11 @@ async fn a_failed_write_leaves_the_device_cache_alone() -> anyhow::Result<()> {
     client
         .get_devices(Some("network-0001"), false, None, None)
         .await?;
-    client
+    let err = client
         .add_to_blacklist(MAC, Some("network-0001"), None)
         .await
         .expect_err("a server error must propagate");
+    assert!(matches!(err, Error::Api { status: 500, .. }), "{err:?}");
     client
         .get_devices(Some("network-0001"), false, None, None)
         .await?;
