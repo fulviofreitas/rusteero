@@ -13,7 +13,7 @@ use reqwest::Method;
 
 /// `PUT /2.2/account/name` — set the account's display name (form-encoded `name=`).
 ///
-/// Ported from `AccountAPI.set_name` (`account.py:51-72`).
+/// Ported from `AccountAPI.set_name` (`account.py:73-94`).
 pub const SET_ACCOUNT_NAME: Resource = Resource {
     method: Method::PUT,
     version: ApiVersion::V2_2,
@@ -23,7 +23,7 @@ pub const SET_ACCOUNT_NAME: Resource = Resource {
 
 /// `PUT /2.2/account/email` — start an account email change (form-encoded `email=`).
 ///
-/// Ported from `AccountAPI.set_email` (`account.py:74-98`). `email` is never logged.
+/// Ported from `AccountAPI.set_email` (`account.py:96-119`). `email` is never logged.
 pub const SET_ACCOUNT_EMAIL: Resource = Resource {
     method: Method::PUT,
     version: ApiVersion::V2_2,
@@ -33,7 +33,7 @@ pub const SET_ACCOUNT_EMAIL: Resource = Resource {
 
 /// `POST /2.2/account/email/verify` — confirm a pending email change (form-encoded `code=`).
 ///
-/// Ported from `AccountAPI.verify_email` (`account.py:99-122`). `code` is never logged.
+/// Ported from `AccountAPI.verify_email` (`account.py:121-143`). `code` is never logged.
 pub const VERIFY_ACCOUNT_EMAIL: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
@@ -43,7 +43,7 @@ pub const VERIFY_ACCOUNT_EMAIL: Resource = Resource {
 
 /// `PUT /2.2/account/phone` — start an account phone number change (form-encoded `phone=`).
 ///
-/// Ported from `AccountAPI.set_phone` (`account.py:123-145`). `phone` is never logged.
+/// Ported from `AccountAPI.set_phone` (`account.py:145-168`). `phone` is never logged.
 pub const SET_ACCOUNT_PHONE: Resource = Resource {
     method: Method::PUT,
     version: ApiVersion::V2_2,
@@ -54,7 +54,7 @@ pub const SET_ACCOUNT_PHONE: Resource = Resource {
 /// `POST /2.2/account/phone/verify` — confirm a pending phone number change (form-encoded
 /// `code=`).
 ///
-/// Ported from `AccountAPI.verify_phone` (`account.py:148-171`). `code` is never logged.
+/// Ported from `AccountAPI.verify_phone` (`account.py:170-192`). `code` is never logged.
 pub const VERIFY_ACCOUNT_PHONE: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
@@ -65,7 +65,7 @@ pub const VERIFY_ACCOUNT_PHONE: Resource = Resource {
 /// `PUT /2.2/account/consents` — set marketing-email consent (form-encoded
 /// `marketing_emails=<"true"|"false">`).
 ///
-/// Ported from `AccountAPI.set_consents` (`account.py:172-199`).
+/// Ported from `AccountAPI.set_consents` (`account.py:194-220`).
 pub const SET_ACCOUNT_CONSENTS: Resource = Resource {
     method: Method::PUT,
     version: ApiVersion::V2_2,
@@ -75,7 +75,7 @@ pub const SET_ACCOUNT_CONSENTS: Resource = Resource {
 
 /// `GET /2.2/countries/sms` — the SMS country-code catalogue.
 ///
-/// Ported from `AccountAPI.get_sms_countries` (`account.py:200-217`).
+/// Ported from `AccountAPI.get_sms_countries` (`account.py:222-239`).
 pub const GET_SMS_COUNTRIES: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,

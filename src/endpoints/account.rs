@@ -1,4 +1,5 @@
-//! `AccountApi`: `account` endpoints (`eero-api src/eero/api/account.py`, new in v8.0.0).
+//! `AccountApi`: `account` endpoints (`eero-api src/eero/api/account.py`, new in v8.0.0; every
+//! line citation in this module is to `v8.4.1`).
 //!
 //! Reads and manages the caller's own account profile: the account record, display name, email,
 //! phone, marketing consent, and the SMS country-code catalogue. Every write in this module is
@@ -8,7 +9,7 @@
 //! this module logs only the fact a call was made, never an argument's value.
 //!
 //! Account deletion is deliberately not exposed by this module (a destructive, irreversible
-//! operation, excluded by product decision — `account.py:16-18`).
+//! operation, excluded by product decision — `account.py:17-19`).
 
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ impl AccountApi {
 
     /// Gets the account record — returns the raw Eero API response.
     ///
-    /// Ported from `AccountAPI.get_account` (`account.py:52-71` at `v8.4.1`). Sends `GET`
+    /// Ported from `AccountAPI.get_account` (`account.py:52-71`). Sends `GET`
     /// [`crate::routes::ACCOUNT`] (`/2.2/account`) with no body and no query. A read, so no
     /// uncharacterised-write warning is logged. A `401` whose `meta.error` is
     /// `error.session.refresh` is refreshed once and the identical request replayed with the
@@ -55,9 +56,9 @@ impl AccountApi {
 
     /// Sets the account's display name — returns the raw Eero API response.
     ///
-    /// Ported from `AccountAPI.set_name` (`account.py:51-72`). Sends a form-encoded body
+    /// Ported from `AccountAPI.set_name` (`account.py:73-94`). Sends a form-encoded body
     /// (`name=<value>`) to [`crate::routes::account::SET_ACCOUNT_NAME`]. Unverified: logs one
-    /// `WARNING` via [`warn_uncharacterised_write`] before issuing the request (`account.py:70`).
+    /// `WARNING` via [`warn_uncharacterised_write`] before issuing the request (`account.py:93`).
     ///
     /// # Errors
     ///
@@ -78,10 +79,10 @@ impl AccountApi {
 
     /// Sets the account's email address — returns the raw Eero API response.
     ///
-    /// Ported from `AccountAPI.set_email` (`account.py:74-98`). Sends a form-encoded body
+    /// Ported from `AccountAPI.set_email` (`account.py:96-119`). Sends a form-encoded body
     /// (`email=<value>`) to [`crate::routes::account::SET_ACCOUNT_EMAIL`]. The new address is
     /// not active until confirmed via [`AccountApi::verify_email`]. `email` is never logged.
-    /// Unverified: logs one `WARNING` via [`warn_uncharacterised_write`] (`account.py:96`).
+    /// Unverified: logs one `WARNING` via [`warn_uncharacterised_write`] (`account.py:118`).
     ///
     /// # Errors
     ///
@@ -102,10 +103,10 @@ impl AccountApi {
     /// Confirms a pending email change with its verification code — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `AccountAPI.verify_email` (`account.py:99-122`). Sends a form-encoded body
+    /// Ported from `AccountAPI.verify_email` (`account.py:121-143`). Sends a form-encoded body
     /// (`code=<value>`) to [`crate::routes::account::VERIFY_ACCOUNT_EMAIL`]. `code` is never
     /// logged. Unverified: logs one `WARNING` via [`warn_uncharacterised_write`]
-    /// (`account.py:121`).
+    /// (`account.py:142`).
     ///
     /// # Errors
     ///
@@ -125,10 +126,10 @@ impl AccountApi {
 
     /// Sets the account's phone number — returns the raw Eero API response.
     ///
-    /// Ported from `AccountAPI.set_phone` (`account.py:123-145`). Sends a form-encoded body
+    /// Ported from `AccountAPI.set_phone` (`account.py:145-168`). Sends a form-encoded body
     /// (`phone=<value>`) to [`crate::routes::account::SET_ACCOUNT_PHONE`]. The new number is not
     /// active until confirmed via [`AccountApi::verify_phone`]. `phone` is never logged.
-    /// Unverified: logs one `WARNING` via [`warn_uncharacterised_write`] (`account.py:144`).
+    /// Unverified: logs one `WARNING` via [`warn_uncharacterised_write`] (`account.py:167`).
     ///
     /// # Errors
     ///
@@ -149,10 +150,10 @@ impl AccountApi {
     /// Confirms a pending phone number change with its verification code — returns the raw Eero
     /// API response.
     ///
-    /// Ported from `AccountAPI.verify_phone` (`account.py:148-171`). Sends a form-encoded body
+    /// Ported from `AccountAPI.verify_phone` (`account.py:170-192`). Sends a form-encoded body
     /// (`code=<value>`) to [`crate::routes::account::VERIFY_ACCOUNT_PHONE`]. `code` is never
     /// logged. Unverified: logs one `WARNING` via [`warn_uncharacterised_write`]
-    /// (`account.py:170`).
+    /// (`account.py:191`).
     ///
     /// # Errors
     ///
@@ -172,10 +173,10 @@ impl AccountApi {
 
     /// Sets the account's marketing-email consent — returns the raw Eero API response.
     ///
-    /// Ported from `AccountAPI.set_consents` (`account.py:172-199`). Sends a form-encoded body
+    /// Ported from `AccountAPI.set_consents` (`account.py:194-220`). Sends a form-encoded body
     /// (`marketing_emails=<"true"|"false">`) to
     /// [`crate::routes::account::SET_ACCOUNT_CONSENTS`]. Unverified: logs one `WARNING` via
-    /// [`warn_uncharacterised_write`] (`account.py:194`).
+    /// [`warn_uncharacterised_write`] (`account.py:215`).
     ///
     /// # Errors
     ///
@@ -196,7 +197,7 @@ impl AccountApi {
 
     /// Gets the SMS country-code catalogue — returns the raw Eero API response.
     ///
-    /// Ported from `AccountAPI.get_sms_countries` (`account.py:200-217`). Sends `GET`
+    /// Ported from `AccountAPI.get_sms_countries` (`account.py:222-239`). Sends `GET`
     /// [`crate::routes::account::GET_SMS_COUNTRIES`].
     ///
     /// # Errors
