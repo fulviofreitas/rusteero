@@ -1,11 +1,12 @@
-//! v8.0.4 transport suite: `Transport::request`/`resource`'s status-code mapping, the 10 MiB
-//! response cap, redirect refusal, header construction, credential placement (`X-User-Token` +
-//! optional legacy cookie), `RequestBody` encoding, the bounded `GET`-only retry, and the
-//! server-driven refresh handshake (including single-flight coalescing), all against a local
-//! `wiremock` server per the crate's testing conventions. `Transport`'s own unit tests (in
-//! `src/transport.rs`) already cover `parse_retry_after`, `refresh_signal_detected`, and
-//! `matches_configured_host` in isolation; this file exercises the same logic end-to-end, over
-//! real HTTP.
+//! Transport suite: `Transport::request`/`resource`'s status-code mapping, the 10 MiB response
+//! cap, redirect refusal, header construction, credential placement (`X-User-Token` + optional
+//! legacy cookie) and the origin rule behind it, `RequestBody` encoding, undecodable and
+//! non-object response bodies, the bounded `GET`-only retry, the transport's WARN and ERROR log
+//! lines, and the server-driven refresh handshake (including single-flight coalescing), all
+//! against a local `wiremock` server per the crate's testing conventions. `Transport`'s own unit
+//! tests (in `src/transport.rs`) already cover `parse_retry_after`, `refresh_requested`,
+//! `is_transient_failure` and the `base_url` validation in isolation; this file exercises the
+//! same logic end-to-end, over real HTTP.
 
 mod common;
 
