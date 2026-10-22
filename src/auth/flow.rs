@@ -2,7 +2,7 @@
 //! [`crate::storage::CredentialStore`].
 //!
 //! Ported from the session-establishing half of `eero-api`'s `AuthAPI` (`src/eero/api/auth.py`
-//! at `v8.0.4`). `AuthAPI` is a single stateful object: `login()` stashes an unverified token
+//! at `v8.4.1`). `AuthAPI` is a single stateful object: `login()` stashes an unverified token
 //! straight into `self._credentials.session_id`, and nothing stops a caller from attempting an
 //! authenticated request with it before `verify()` ever runs — the real server would just reject
 //! that with a `401`. `rusteero` splits the same handshake into a type-state pair instead:
@@ -27,7 +27,7 @@ use crate::routes;
 use crate::transport::{RequestBody, Transport};
 
 /// The exact message this crate raises when `login()` receives no user token back
-/// (`api/auth.py:193-196` logs this at DEBUG and returns `False`); promoted to an
+/// (`api/auth.py:230-232` logs this at DEBUG and returns `False`); promoted to an
 /// [`Error::Authentication`] message here since a missing token leaves nothing meaningful to hand
 /// back as a [`PendingLogin`] — a documented divergence from Python, whose type-state has no such
 /// constraint.
@@ -86,9 +86,11 @@ impl LoginFlow {
     /// server (and this client) never distinguishes between the two, matching Python's untyped
     /// pass-through.
     ///
-    /// Ported from `login()` (`api/auth.py:155-218`): sends `POST` [`crate::routes::LOGIN`] with
-    /// a **form** body `login=<user_identifier>` (`auth.py:186-189`), **unauthenticated**. Reads
-    /// `data.user_token` out of the response; nothing else in the response is consulted.
+    /// Ported from `login()` (`api/auth.py:186-262`): sends `POST` [`crate::routes::LOGIN`] with
+    /// a **form** body `login=<user_identifier>` (`auth.py:222-225`), **unauthenticated**. Reads
+    /// `data.user_token` out of the response; nothing else in the response is consulted. Nothing
+    /// is stored: the token lives in the returned [`PendingLogin`] only, so a failed, tokenless
+    /// or abandoned login never touches a configured credential store (`auth.py:213-217`).
     ///
     /// # Errors
     ///
@@ -97,9 +99,13 @@ impl LoginFlow {
     /// this module's own doc comment for why this port promotes Python's swallowed `False` return
     /// to a typed error here. Every other `Error::Api`/`Error::Validation`/other
     /// API-classified error is re-wrapped as `Error::Authentication { message: "Login failed:
-    /// {err}", envelope, error_code }` (`auth.py:203-218`), so every login failure surfaces
-    /// uniformly; `Error::Authentication` (an actual `401`) and `Error::Network`/`Error::Timeout`
-    /// propagate unmodified.
+    /// {err}", envelope, error_code, status: None }` (`auth.py:240-255`), so every login failure
+    /// surfaces uniformly, and the new error carries no status of its own;
+    /// `Error::Authentication` (an actual `401`, status included), `Error::RateLimit` and
+    /// `Error::Network`/`Error::Timeout` propagate unmodified. A `2xx` body that is not a JSON
+    /// object reaches here as the transport's `Error::Api` ("Unexpected JSON response: expected
+    /// an object") and so fails as `"Login failed: API error 200: Unexpected JSON response:
+    /// expected an object"`.
     pub async fn start(&self, user_identifier: &str) -> Result<PendingLogin, Error> {
         let url = routes::LOGIN.resolve(self.transport.api_host(), "", None)?;
         let body = RequestBody::Form(login_request_body(user_identifier));
@@ -134,7 +140,7 @@ pub struct PendingLogin {
 impl PendingLogin {
     /// Asks the server to resend the verification code.
     ///
-    /// Ported from `resend_verification_code()` (`api/auth.py:220-237`): sends `POST`
+    /// Ported from `resend_verification_code()` (`api/auth.py:310-336`): sends `POST`
     /// [`crate::routes::LOGIN_RESEND`] with a **JSON** body `{}` (the one asymmetric encoding
     /// among the login handshake's requests), authenticated by the login token. The response
     /// envelope is returned as-is rather than discarded, unlike Python's
@@ -148,7 +154,8 @@ impl PendingLogin {
     /// Python: Python catches only the generic `EeroAPIException` case and returns `false`
     /// instead of raising, while a `401`/`429` still propagates uncaught — this port does not
     /// attempt to reproduce that partial catch; every failure mode surfaces as its matching
-    /// [`Error`] variant here.
+    /// [`Error`] variant here. That includes a `2xx` body that is not a JSON object, which is an
+    /// API-level failure in Python (`False`) and here the transport's [`Error::Api`].
     pub async fn resend(&self) -> Result<Envelope, Error> {
         let url = routes::LOGIN_RESEND.resolve(self.transport.api_host(), "", None)?;
         self.transport
@@ -164,23 +171,26 @@ impl PendingLogin {
 
     /// Completes the login handshake with the one-time `code`, consuming this `PendingLogin`.
     ///
-    /// Ported from `verify()` (`api/auth.py:219-263`): sends `POST` [`crate::routes::LOGIN_VERIFY`]
+    /// Ported from `verify()` (`api/auth.py:264-307`): sends `POST` [`crate::routes::LOGIN_VERIFY`]
     /// with a **form** body `code=<code>`, authenticated by the login token. The response is
     /// discarded entirely and the login token itself becomes the permanent session token
-    /// (`auth.py:247-250`: *"The response carries the user object, not a new token -- the
+    /// (`auth.py:292-295`: *"The response carries the user object, not a new token -- the
     /// `session_id` set during `login()` is what's now verified"*) — no fresh `Set-Cookie` is ever
-    /// consulted (`v8.0.4` has no `Set-Cookie` reader anywhere in `base.py`/`auth.py`; the earlier
-    /// D-16 hedge this method used to apply is removed as of this phase, since it hedged against
-    /// a question the Python source itself never answers either way, and never will observably
-    /// differ from "use the login token" from outside this crate).
+    /// consulted (`v8.4.1` has no `Set-Cookie` reader anywhere in `base.py`/`auth.py`, so the login
+    /// token is the session token, `auth.py:264-307`).
     ///
     /// # Errors
     ///
     /// A `401` (a wrong code) propagates unchanged as [`Error::Authentication`], matching
-    /// `auth.py:258-262`'s `except EeroAuthenticationException: raise`. Any other API-classified
-    /// error is re-wrapped as `Error::Authentication { message: "Verification failed: {err}",
-    /// .. }`, the same shape [`LoginFlow::start`] applies. `Error::Network`/`Error::Timeout`
-    /// propagate unmodified.
+    /// `auth.py:298-303`'s `except EeroAuthenticationException: raise`, status included. Any
+    /// other API-classified error is re-wrapped as `Error::Authentication { message:
+    /// "Verification failed: {err}", .., status: None }`, the same shape [`LoginFlow::start`]
+    /// applies; that includes a `2xx` body that is not a JSON object ("Verification failed: API
+    /// error 200: Unexpected JSON response: expected an object"), which is no longer a
+    /// successful verification. `Error::Network`/`Error::Timeout` propagate unmodified.
+    ///
+    /// Python keeps the login pending after a failed verification so the code can be retried;
+    /// this method consumes the [`PendingLogin`], so a retry starts a new login.
     pub async fn verify(self, code: &str) -> Result<Session, Error> {
         let url = routes::LOGIN_VERIFY.resolve(self.transport.api_host(), "", None)?;
         let body = RequestBody::Form(verify_request_body(code));
@@ -218,15 +228,15 @@ impl std::fmt::Debug for PendingLogin {
 
 /// Re-wraps the errors Python's `except` clauses catch at these two call sites into
 /// `Error::Authentication { message: "{prefix} failed: {err}", .. }`, carrying the inner error's
-/// `envelope`/`error_code` forward. Shared by [`LoginFlow::start`] (`prefix = "Login"`,
+/// `envelope`/`error_code` forward but no `status` (Python's new exception has none). Shared by [`LoginFlow::start`] (`prefix = "Login"`,
 /// `wrap_validation = true`) and [`PendingLogin::verify`] (`prefix = "Verification"`,
 /// `wrap_validation = false`).
 ///
 /// Exactly the `EeroAPIException` family is wrapped — [`Error::Api`], [`Error::AccessDenied`],
 /// [`Error::ClientBlocked`], [`Error::NotFound`], [`Error::PremiumRequired`],
 /// [`Error::FeatureUnavailable`] (`exceptions.py:59-92,113-181,192-241,258-303`) — plus
-/// [`Error::Validation`] for `login` only (`auth.py:206-217`; `verify` has no such clause,
-/// `auth.py:253-263`). Everything else passes through unchanged: `Error::Authentication` (a real
+/// [`Error::Validation`] for `login` only (`auth.py:245-255`; `verify` has no such clause,
+/// `auth.py:298-309`). Everything else passes through unchanged: `Error::Authentication` (a real
 /// `401` already carries its own message), `Error::RateLimit` (`EeroRateLimitException` is a
 /// sibling of `EeroAPIException`, not a subclass, `exceptions.py:44-47`), `Network`, `Timeout`,
 /// and the Rust-only variants.
@@ -372,7 +382,7 @@ mod tests {
     #[test]
     fn wrap_as_authentication_leaves_a_rate_limit_unchanged() {
         // `EeroRateLimitException` is a sibling of `EeroAPIException`, so neither `login` nor
-        // `verify` catches it (`auth.py:201-217,253-263`).
+        // `verify` catches it (`auth.py:240-255,298-309`).
         let original = Error::RateLimit {
             message: "error.rate.limit".to_owned(),
             retry_after: None,
@@ -388,7 +398,7 @@ mod tests {
 
     #[test]
     fn wrap_as_authentication_leaves_a_validation_error_unchanged_for_verify() {
-        // `verify` has no `except EeroValidationException` clause (`auth.py:253-263`).
+        // `verify` has no `except EeroValidationException` clause (`auth.py:298-309`).
         let original = Error::validation("request", "error.form.errors");
         assert!(matches!(
             wrap_as_authentication("Verification", false, original),

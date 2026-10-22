@@ -435,8 +435,8 @@ mod tests {
     // ===================== create_storage matrix — feature = "keyring" =====================
     //
     // The `true`+`None` and `true`+`Some` rows deliberately never call `.save`/`.load`/`.clear`
-    // on the resulting store: `KeyringStore::new()` uses the *shared* `eero-api` entry (decision
-    // D-5, `SERVICE_NAME`/`ACCOUNT_NAME`), and this container happens to have no reachable
+    // on the resulting store: `KeyringStore::new()` uses the *shared* `eero-api` entry
+    // (`SERVICE_NAME`/`ACCOUNT_NAME`), and this container happens to have no reachable
     // keyring backend (see `keyring.rs`'s own tests), but a real backend on a developer's
     // machine would make an actual OS call against a real, shared credential entry. Constructing
     // a `KeyringStore` never touches the OS (only `load`/`save`/`clear` open an `Entry`), so
@@ -492,6 +492,10 @@ mod tests {
             assert!(debug.contains("KeyringStore"));
             assert!(!debug.contains("ChainedStore"));
             assert!(!debug.contains("FileStore"));
+            assert!(
+                debug.contains("warn_on_unpersisted: true"),
+                "a bare keyring warns when a save is not retained: {debug}"
+            );
         }
 
         #[test]
@@ -504,6 +508,10 @@ mod tests {
             assert!(debug.contains("ChainedStore"));
             assert!(debug.contains("KeyringStore"));
             assert!(debug.contains("FileStore"));
+            assert!(
+                debug.contains("warn_on_unpersisted: false"),
+                "a keyring in front of a file fallback is silenced: {debug}"
+            );
         }
     }
 
@@ -696,7 +704,7 @@ mod tests {
         );
     }
 
-    // ===================== async adapters: finding S4 =====================
+    // ===================== async adapters: a panic payload never reaches the error =====================
 
     /// A [`CredentialStore`] whose panic payload is a distinctive, easy-to-grep string, so the
     /// test below can assert it never reaches a [`StorageError`]'s `Display`/`Debug` output.

@@ -8,7 +8,7 @@
 //!
 //! [`Session`] deliberately does **not** implement `Serialize`/`Deserialize` directly: the
 //! wire-compatible shape (`{"session_id", "schema_version"}`, shared with `eero-api`'s cookie
-//! file and keyring blob per decision D-5) is expressed by the [`StoredSession`] type instead,
+//! file and keyring blob) is expressed by the [`StoredSession`] type instead,
 //! which has no public constructor and is reached only through `Session::to_json` /
 //! [`Session::from_json`]. This keeps the on-disk format defined in exactly one place, so
 //! `FileStore` and `KeyringStore` (`src/storage/*`) can both build on it without duplicating the
@@ -282,7 +282,7 @@ fn non_empty(s: &str) -> Option<String> {
 
 /// The on-disk / in-keyring JSON representation of a [`Session`].
 ///
-/// This is a **public wire contract** (decision D-5): its JSON shape — `session_id` plus
+/// This is a **public wire contract**: its JSON shape — `session_id` plus
 /// `schema_version` at `v8.0.4` — is shared byte-for-byte with the Python `eero-api` library's
 /// `AuthCredentials` (`eero-api` `src/eero/api/auth_storage.py:23-91`), so a cookie file or
 /// keyring entry written by either implementation can be read back by the other. Field names and
@@ -332,7 +332,7 @@ impl fmt::Debug for StoredSession {
 mod tests {
     use super::{Error, Session, StoredSession, validate_token_shape};
 
-    // ===================== Wire-format round trip (D-5, v8.0.4 shape) =====================
+    // ===================== Wire-format round trip (v8.0.4 shape) =====================
 
     #[test]
     fn round_trip_matches_v8_0_4_wire_shape() {

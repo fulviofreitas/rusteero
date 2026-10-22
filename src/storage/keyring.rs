@@ -389,11 +389,10 @@ mod tests {
 
     // ===================== behaviour without a *reachable* keyring backend =====================
     //
-    // Corrected justification (phase-2 storage review, finding S5): the previous comment here
-    // claimed "CI runners are headless Linux with no D-Bus session bus at all" as a blanket
-    // justification for expecting every one of these tests to fail fast with a typed error.
-    // That is false for 2 of the 3 runners in `ci.yml`'s matrix (`ubuntu-latest`, `macos-latest`,
-    // `windows-latest`): `keyring` 4.2's default `v1` feature registers
+    // Not every CI runner is a headless Linux box with no D-Bus session bus, so these tests
+    // cannot all expect to fail fast with a typed error. Of the three runners in `ci.yml`'s
+    // matrix (`ubuntu-latest`, `macos-latest`, `windows-latest`), two have a working native
+    // backend: `keyring` 4.2's default `v1` feature registers
     // `apple_native_keyring_store::keychain::Store::new()` on macOS — an **infallible**
     // constructor — and an analogous native, generally-available Windows Credential Manager
     // backend on Windows. On those two platforms `Entry::new()` always succeeds and
@@ -469,7 +468,7 @@ mod tests {
     /// on drop — including when a later assertion panics. Exists so tests that call
     /// [`CredentialStore::save`] against this entry can never leave a real credential behind on
     /// a host with a genuinely working native backend (macOS Keychain, Windows Credential
-    /// Manager), per finding S5's requirement that a test must never leave a credential behind.
+    /// Manager): a test must never leave a credential behind.
     struct ClearEntryOnDrop<'a>(&'a KeyringStore);
 
     impl Drop for ClearEntryOnDrop<'_> {
@@ -490,10 +489,10 @@ mod tests {
 
         let session = Session::from_token("should-never-appear-in-any-error-message");
         match store.save(&session) {
-            // Reachable on macOS/Windows CI runners: the write itself is not the bug this
-            // finding is about (a genuinely working backend doing genuine work is correct
-            // behaviour) — only leaving it behind afterwards would be, and `_cleanup` above
-            // removes it unconditionally when this test returns.
+            // Reachable on macOS/Windows CI runners: the write itself is not the problem (a
+            // genuinely working backend doing genuine work is correct behaviour) — only leaving
+            // it behind afterwards would be, and `_cleanup` above removes it unconditionally
+            // when this test returns.
             Ok(()) => {}
             Err(StorageError::Backend { backend, message }) => {
                 assert_eq!(backend, BACKEND_NAME);

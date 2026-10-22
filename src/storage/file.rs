@@ -245,7 +245,7 @@ fn verify_file_retains(path: &Path, saved: &Session) -> Result<(), StorageError>
 /// [`fs::rename`] is guaranteed to be on the same filesystem and therefore atomic), then renames
 /// it over `path`.
 ///
-/// # Security (phase-2 storage review, finding S3(b))
+/// # Security: no orphaned plaintext after a failed write
 ///
 /// If any step of the create/write/sync/rename sequence fails, the temporary file is removed
 /// before the error is returned (see [`write_to_temp_and_rename`]) — no error path here can
@@ -293,7 +293,7 @@ fn temp_file_prefix(path: &Path) -> String {
 /// stages content in, by mixing the current process id and a monotonically increasing
 /// in-process counter into `path`'s file name, ahead of a fixed `.tmp` suffix.
 ///
-/// # Security (phase-2 storage review, finding S3(c))
+/// # Security: unique temporary names
 ///
 /// The previous implementation used a single fixed `<name>.tmp` sibling for every save, cleaned
 /// up with an unconditional `fs::remove_file` at the start of each write. Two processes (or two
@@ -373,7 +373,7 @@ fn create_private_file(path: &Path) -> std::io::Result<File> {
 
 /// Creates `parent` and every missing ancestor directory with owner-only (`0700`) permissions,
 /// set at creation time rather than via a separate `chmod` afterwards — the same atomic-mode
-/// discipline [`create_private_file`] applies to the credential file itself (security finding 8).
+/// discipline [`create_private_file`] applies to the credential file itself (the directory-permission hardening).
 ///
 /// [`std::fs::DirBuilder::mode`] applies to every directory this call actually creates, not just
 /// the deepest one; an already-existing ancestor is left with whatever permissions it already
@@ -409,7 +409,7 @@ fn has_loose_permissions(path: &Path) -> bool {
 /// Logs a fixed `WARN` (never fails, never blocks the read) if [`has_loose_permissions`] reports
 /// `path` is readable/writable by group or other — e.g. a credential file this crate did not
 /// itself create, copied in from elsewhere, or left over from an older non-atomic
-/// implementation. Security finding 8: this crate's own [`create_private_file`]/
+/// implementation. This crate's own [`create_private_file`]/
 /// [`create_private_dir_all`] never produce such a file, but nothing prevents one from appearing
 /// at `path` by some other means, and a loosely-permissioned plaintext credential file should
 /// never go unnoticed merely because it still parses.
@@ -465,7 +465,7 @@ mod tests {
         // The exact on-disk shape `FileStorage.save()` writes at v8.0.4 (`auth_storage.py:50-56`):
         // key order `session_id`, `schema_version`, with Python's default `json.dump` separators
         // (a space after `:`/`,`). This differs byte-for-byte from this port's compact
-        // `serde_json` output, but both are valid JSON over the same D-5 wire contract, so a file
+        // `serde_json` output, but both are valid JSON over the same wire contract, so a file
         // a Python install wrote must still load cleanly here.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cookies.json");
@@ -624,7 +624,7 @@ mod tests {
         assert!(path.exists());
     }
 
-    // ===================== Parent directory / loose-permission warning (finding 8) =====================
+    // ===================== Parent directory / loose-permission warning =====================
 
     #[cfg(unix)]
     #[test]
@@ -753,7 +753,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    // ===================== clear(): finding S3 =====================
+    // ===================== clear(): orphaned temporary files =====================
 
     #[test]
     fn clear_removes_a_stale_temporary_file_left_by_a_crashed_write() {
