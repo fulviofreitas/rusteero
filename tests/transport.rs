@@ -3131,10 +3131,11 @@ async fn a_url_with_userinfo_is_rejected_for_writes_and_unauthenticated_calls_to
 
 // ===================== storage failures: not-retained writes =====================
 
-/// A store whose `save` fails with `message`.
+/// A store whose `save` fails: with `StorageError::NotRetained` when `not_retained`, otherwise with
+/// a backend error.
 #[derive(Debug)]
 struct FailingSaveStore {
-    message: &'static str,
+    not_retained: bool,
 }
 
 impl rusteero::storage::CredentialStore for FailingSaveStore {
@@ -3143,9 +3144,15 @@ impl rusteero::storage::CredentialStore for FailingSaveStore {
     }
 
     fn save(&self, _session: &Session) -> Result<(), rusteero::error::StorageError> {
-        Err(rusteero::error::StorageError::Backend {
-            backend: "fake".to_owned(),
-            message: self.message.to_owned(),
+        Err(if self.not_retained {
+            rusteero::error::StorageError::NotRetained {
+                backend: "fake".to_owned(),
+            }
+        } else {
+            rusteero::error::StorageError::Backend {
+                backend: "fake".to_owned(),
+                message: "disk is on fire".to_owned(),
+            }
         })
     }
 
@@ -3156,12 +3163,12 @@ impl rusteero::storage::CredentialStore for FailingSaveStore {
 
 #[test]
 fn a_not_retained_write_is_logged_at_debug_and_other_failures_stay_at_warn() {
-    for (message, level) in [
-        ("storage did not retain the saved session", Level::DEBUG),
-        ("disk is on fire", Level::WARN),
+    for (not_retained, message, level) in [
+        (true, "not retained", Level::DEBUG),
+        (false, "backend failure", Level::WARN),
     ] {
         let transport = Transport::builder()
-            .store(Some(Arc::new(FailingSaveStore { message })))
+            .store(Some(Arc::new(FailingSaveStore { not_retained })))
             .build()
             .expect("builds");
         let (_guard, logs) = capture_logs();

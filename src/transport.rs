@@ -1136,15 +1136,11 @@ impl Transport {
     }
 }
 
-/// Whether `err` reports a store that accepted a write and could not read it back.
-///
-/// Recognised by the fixed text of that error, `"<backend> storage did not retain the saved
-/// session"`, so that this stays correct without naming the variant that carries it. Once the
-/// storage layer's dedicated `StorageError::NotRetained { .. }` variant is in this crate's base,
-/// `matches!(err, StorageError::NotRetained { .. })` replaces the text check.
+/// Whether `err` is the store's "accepted but not retained" failure, which the store has already
+/// logged at `WARNING` with `eero-api`'s fixed text (`auth_storage.py`), so the transport logs it
+/// at `DEBUG` only.
 fn is_not_retained(err: &StorageError) -> bool {
-    err.to_string()
-        .ends_with(" storage did not retain the saved session")
+    matches!(err, StorageError::NotRetained { .. })
 }
 
 /// The `WARNING` text for a request whose credential was withheld (`base.py:625-635`): the
@@ -2145,7 +2141,7 @@ mod tests {
     #[test]
     fn retry_after_is_capped_at_one_day() {
         let cap = Some(crate::consts::RETRY_AFTER_MAX);
-        assert_eq!(cap, Some(Duration::from_secs(86_400)));
+        assert_eq!(cap, Some(Duration::from_hours(24)));
         // A value at the cap passes through, one second over is capped.
         assert_eq!(at("86400"), cap);
         assert_eq!(at("86399"), Some(Duration::from_secs(86_399)));
