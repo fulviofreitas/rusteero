@@ -41,9 +41,11 @@ use super::CredentialStore;
 /// # Logging
 ///
 /// Every failure the chain returns has been logged once, so [`CredentialStore::reports_failures`]
-/// is `true`: a failed clear logs `eero-api`'s fixed `WARN`, and a save that neither backend
-/// retained is logged by the fallback when the fallback reports its own failures (the shipped
-/// [`FileStore`](super::FileStore) does) and by the chain when it does not.
+/// is `true`. A save that neither backend retained is logged by the fallback when the fallback
+/// reports its own failures (the shipped [`FileStore`](super::FileStore) does) and by the chain
+/// when it does not. A failed clear is logged the same way: by each failed backend that reports
+/// its own failures, and, with `eero-api`'s fixed `WARN`, by the chain when a failed backend does
+/// not (a file fallback that cannot remove its file says so itself, so the chain stays quiet).
 ///
 /// The chain holds no lock of its own: each backend serialises itself, and a chained operation
 /// is not atomic across the two (`auth_storage.py:645-652`).
@@ -467,7 +469,12 @@ impl CredentialStore for ChainedStore {
     ///
     /// Mirrors `ChainedStorage.clear()` (`auth_storage.py:780-805`), which always attempts both
     /// backends, logs each failure at `DEBUG` ("Error clearing a storage backend: ..."), logs
-    /// one fixed `WARN` if any backend failed, and re-raises only when *both* did.
+    /// one fixed `WARN` if any backend failed, and re-raises only when *both* did. Python's
+    /// shipped backends never raise from `clear()` (the file one logs its own `WARN` and swallows
+    /// the error, `auth_storage.py:605-606`), so there a failed clear is one line and the chain's
+    /// `WARN` is for a backend that does raise. Here a backend that logs its own failure (see
+    /// [`CredentialStore::reports_failures`]) has said so already, and the chain adds its `WARN`
+    /// only when a failed backend has not.
     ///
     /// This method previously reported success as soon as *either* backend cleared
     /// successfully — the inverse of the guarantee a caller destroying a credential actually
@@ -494,8 +501,9 @@ impl CredentialStore for ChainedStore {
     /// raises only when both fail, so `logout()` never fails because one backend did
     /// (`auth_storage.py:780-805`). This method keeps its `Err` for a single failure, so a
     /// caller destroying a credential can see that a copy survived, and adds Python's fixed
-    /// `WARN` on top. The transport's default policy still swallows the error when it clears the
-    /// session on logout, so the observable outcome there is Python's.
+    /// `WARN` on top unless every failed backend has already logged its own failure. The
+    /// transport's default policy still swallows the error when it clears the session on logout,
+    /// so the observable outcome there is Python's.
     ///
     /// # Errors
     ///
@@ -507,13 +515,20 @@ impl CredentialStore for ChainedStore {
         // regardless of which one (if either) fails.
         let primary_result = self.primary.clear();
         let fallback_result = self.fallback.clear();
-        for err in [&primary_result, &fallback_result]
-            .into_iter()
-            .filter_map(|result| result.as_ref().err())
-        {
-            tracing::debug!("Error clearing a storage backend: {err}");
+        // The chain's own `WARN` is for a failure no backend has reported: a backend that logs
+        // its own failed clear (the shipped file store, an unsilenced keyring) has already said
+        // so, and a second line for the same failure would only repeat it. Mirrors `save`.
+        let mut unreported = false;
+        for (backend, result) in [
+            (&self.primary, &primary_result),
+            (&self.fallback, &fallback_result),
+        ] {
+            if let Err(err) = result {
+                tracing::debug!("Error clearing a storage backend: {err}");
+                unreported |= !backend.reports_failures();
+            }
         }
-        if primary_result.is_err() || fallback_result.is_err() {
+        if unreported {
             tracing::warn!(
                 "Could not clear every credential storage backend; a stored session may \
                  remain in the one that failed"
@@ -549,6 +564,7 @@ mod tests {
     use super::{ChainedStore, CredentialStore};
     use crate::auth::Session;
     use crate::error::StorageError;
+    use crate::storage::file::FileStore;
     use crate::storage::memory::MemoryStore;
     use crate::storage::test_support::capture_logs;
 
@@ -1571,6 +1587,97 @@ mod tests {
         assert_eq!(
             logs.count(Level::DEBUG, "Error clearing a storage backend"),
             0
+        );
+    }
+
+    /// A file store whose path is a directory: `remove_file` refuses it, so the clear fails, and
+    /// the store logs `eero-api`'s `WARN` for it.
+    fn file_store_that_cannot_clear(dir: &tempfile::TempDir, name: &str) -> Arc<FileStore> {
+        let path = dir.path().join(name);
+        std::fs::create_dir(&path).expect("create a directory at the target path");
+        Arc::new(FileStore::new(path))
+    }
+
+    /// The shipped file fallback reports its own failed clear, so the chain adds no second `WARN`
+    /// for the same failure: one failure, one line.
+    #[test]
+    fn a_file_fallback_that_fails_to_clear_is_logged_once_by_the_file() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = FlakyStore::seeded("primary_token");
+        let fallback = file_store_that_cannot_clear(&dir, "cookies.json");
+
+        let err = ChainedStore::new(Arc::clone(&primary) as _, fallback)
+            .clear()
+            .expect_err("the fallback could not remove its file");
+
+        assert!(
+            matches!(&err, StorageError::Backend { backend, .. } if backend == "chained-fallback"),
+            "got {err:?}"
+        );
+        let warnings = logs.messages(Level::WARN);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Error removing cookie file: "),
+            "{warnings:?}"
+        );
+        assert!(logs.messages(Level::ERROR).is_empty());
+        assert_eq!(
+            logs.count(Level::DEBUG, "Error clearing a storage backend"),
+            1,
+            "the chain still records the failure at DEBUG"
+        );
+        assert_eq!(primary.held(), "", "the primary was still cleared");
+        assert!(!logs.mentions("primary_token"));
+    }
+
+    /// A file primary reports its own failure too; a quiet fallback that also fails is the one
+    /// failure nobody has logged, so the chain adds its fixed `WARN` for it: one line per failed
+    /// backend, none repeated.
+    #[test]
+    fn a_failed_clear_is_logged_once_per_backend_by_whoever_reports_it() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = file_store_that_cannot_clear(&dir, "cookies.json");
+        let fallback = FlakyStore::new();
+        FlakyStore::set(&fallback.fail_clear, true);
+
+        ChainedStore::new(primary, fallback)
+            .clear()
+            .expect_err("both backends failed to clear");
+
+        let warnings = logs.messages(Level::WARN);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Error removing cookie file: "),
+            "{warnings:?}"
+        );
+        assert_eq!(warnings[1], CLEAR_WARNING);
+    }
+
+    /// Two backends that both report their own failed clear leave the chain nothing to add.
+    #[test]
+    fn two_backends_that_report_their_failed_clear_leave_the_chain_silent() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = file_store_that_cannot_clear(&dir, "primary.json");
+        let fallback = file_store_that_cannot_clear(&dir, "fallback.json");
+
+        let err = ChainedStore::new(primary, fallback)
+            .clear()
+            .expect_err("both files are directories");
+
+        assert!(
+            matches!(&err, StorageError::Backend { backend, .. } if backend == "chained"),
+            "got {err:?}"
+        );
+        let warnings = logs.messages(Level::WARN);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|line| line.starts_with("Error removing cookie file: ")),
+            "{warnings:?}"
         );
     }
 

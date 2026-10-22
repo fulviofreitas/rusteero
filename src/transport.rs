@@ -217,7 +217,8 @@ pub enum StorageFailures {
     /// The line is at `WARN`, unless the store [reports its own
     /// failures](CredentialStore::reports_failures): the shipped stores log `eero-api`'s fixed
     /// texts themselves, and the transport then adds a `DEBUG` line only, so one failure is one
-    /// line.
+    /// line. A failure of the blocking task that ran the store (a panic, a cancellation, a task
+    /// that could not start) never reached the store, so it is always a `WARN` here.
     #[default]
     Warn,
     /// Return [`Error::Storage`] immediately instead of swallowing the failure.
@@ -487,8 +488,10 @@ impl Transport {
     /// Under [`StorageFailures::Warn`] the failure is logged exactly once. A store that
     /// [reports its own failures](CredentialStore::reports_failures) has logged it already, with
     /// `eero-api`'s fixed text, so the transport adds a `DEBUG` line only; any other store may
-    /// have logged nothing, so the transport logs the failure at `WARN`. The wording says what
-    /// failed: a clear is not a persist.
+    /// have logged nothing, so the transport logs the failure at `WARN`. A failure of the blocking
+    /// task that ran the store (it panicked, was cancelled or could not start) was never seen by
+    /// the store, so it is always logged here at `WARN`. The wording says what failed: a clear is
+    /// not a persist.
     fn apply_storage_policy(
         &self,
         outcome: Result<(), StorageError>,
@@ -498,10 +501,11 @@ impl Transport {
             Ok(()) => Ok(()),
             Err(err) => match self.storage_failures {
                 StorageFailures::Warn => {
-                    let reported = self
-                        .store
-                        .as_deref()
-                        .is_some_and(CredentialStore::reports_failures);
+                    let reported = !storage::is_task_failure(&err)
+                        && self
+                            .store
+                            .as_deref()
+                            .is_some_and(CredentialStore::reports_failures);
                     match (reported, saving) {
                         (true, true) => tracing::debug!(
                             error = %err,

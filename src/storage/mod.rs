@@ -174,6 +174,11 @@ pub trait CredentialStore: Send + Sync + std::fmt::Debug {
     ///
     /// Override it to return `true` only if *every* `Err` the store can return from `save` or
     /// `clear` is logged by the store before it returns.
+    ///
+    /// Failures of the [`save_async`]/[`clear_async`] adapters themselves are not covered: a store
+    /// that panicked, a blocking task cancelled at runtime shutdown or one that could not start
+    /// (the `"credential-store-task"` backend) never reached the store's logging, so the
+    /// transport logs those at `WARN` whatever this returns.
     fn reports_failures(&self) -> bool {
         false
     }
@@ -185,6 +190,17 @@ pub trait CredentialStore: Send + Sync + std::fmt::Debug {
 /// blocking task itself (a panic, a cancellation, a task that could not start), as opposed to an
 /// error the store returned.
 const TASK_BACKEND: &str = "credential-store-task";
+
+/// Whether `err` is a failure of the async adapters' blocking task (a store that panicked, a task
+/// cancelled at runtime shutdown, a task that could not start) rather than an error the store
+/// itself returned.
+///
+/// The store never got to log such a failure, whatever its
+/// [`reports_failures`](CredentialStore::reports_failures) says, so the caller that receives it
+/// must report it.
+pub(crate) fn is_task_failure(err: &StorageError) -> bool {
+    matches!(err, StorageError::Backend { backend, .. } if backend == TASK_BACKEND)
+}
 
 /// Maps a panicked/cancelled blocking task's `JoinError` onto a [`StorageError`].
 ///
@@ -1164,6 +1180,32 @@ mod tests {
                 let loaded = load_async(Arc::clone(&store)).await.expect("load succeeds");
                 assert_eq!(loaded.expose_token(), token);
             });
+        }
+    }
+
+    /// The adapters' own failures are told apart from an error a store returned, by backend name.
+    #[tokio::test]
+    async fn only_the_adapters_own_failures_are_task_failures() {
+        let unstartable = spawn_guarded::<()>(|| panic!("OS can't spawn worker thread: test"))
+            .expect_err("the spawner panicked");
+        assert!(super::is_task_failure(&unstartable));
+
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingStore);
+        let panicked = save_async(store, Session::from_token("tok"))
+            .await
+            .expect_err("the store panicked");
+        assert!(super::is_task_failure(&panicked), "{panicked:?}");
+
+        for returned in [
+            StorageError::Backend {
+                backend: "file".to_owned(),
+                message: "disk is on fire".to_owned(),
+            },
+            StorageError::NotRetained {
+                backend: "credential-store-task".to_owned(),
+            },
+        ] {
+            assert!(!super::is_task_failure(&returned), "{returned:?}");
         }
     }
 

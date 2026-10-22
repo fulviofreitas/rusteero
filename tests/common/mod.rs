@@ -230,6 +230,14 @@ impl LogCapture {
             .collect()
     }
 
+    /// Every captured event together with its structured fields, oldest first. For hygiene checks
+    /// that must see what a formatting subscriber would print on the same line: the fields are
+    /// not part of [`LogCapture::records`].
+    #[must_use]
+    pub fn entries(&self) -> Vec<(LogRecord, LogFields)> {
+        self.lock().clone()
+    }
+
     /// The messages of every captured event at exactly `level`, oldest first.
     #[must_use]
     pub fn messages(&self, level: Level) -> Vec<String> {

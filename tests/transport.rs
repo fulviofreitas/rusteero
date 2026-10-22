@@ -30,8 +30,8 @@ use wiremock::matchers::{
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use common::{
-    LogCapture, MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie,
-    user_token_header,
+    LogCapture, LogFields, MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json,
+    session_cookie, user_token_header,
 };
 use tracing::Level;
 
@@ -1991,40 +1991,89 @@ fn own_messages(logs: &LogCapture, level: Level) -> Vec<String> {
         .collect()
 }
 
+/// One captured event as a formatting subscriber prints it: the message, then ` name=value` for
+/// each structured field. A URL in a field is as visible in a log as one in the message.
+fn rendered_line(message: &str, fields: &LogFields) -> String {
+    fields
+        .iter()
+        .fold(message.to_owned(), |line, (name, value)| {
+            format!("{line} {name}={value}")
+        })
+}
+
 /// Asserts that no WARN or ERROR record, from any crate, carries a request identifier, the
-/// configured host, a query string or any part of a URL, and that no log line at all carries the
-/// query value.
+/// configured host, a query string or any part of a URL, in its message or in the value of any
+/// structured field, and that no log line of this crate, at any level, carries the query value in
+/// either.
 fn assert_nothing_above_debug_identifies_the_request(logs: &LogCapture) {
-    let loud: Vec<_> = logs
-        .records()
-        .into_iter()
-        .filter(|(level, ..)| *level == Level::WARN || *level == Level::ERROR)
-        .collect();
-    for (level, _, message) in &loud {
-        for forbidden in [
-            NETWORK_ID,
-            MAC_CANARY,
-            QUERY_CANARY,
-            "127.0.0.1",
-            "localhost",
-            "?",
-            "://",
-            "/2.2",
-        ] {
-            assert!(
-                !message.contains(forbidden),
-                "{level} record {message:?} carries {forbidden:?}"
-            );
+    for ((level, target, message), fields) in logs.entries() {
+        let line = rendered_line(&message, &fields);
+        if level == Level::WARN || level == Level::ERROR {
+            for forbidden in [
+                NETWORK_ID,
+                MAC_CANARY,
+                QUERY_CANARY,
+                "127.0.0.1",
+                "localhost",
+                "?",
+                "://",
+                "/2.2",
+            ] {
+                assert!(
+                    !line.contains(forbidden),
+                    "{level} record {line:?} carries {forbidden:?}"
+                );
+            }
         }
-    }
-    for (level, target, message) in logs.records() {
         if target.starts_with("rusteero") {
             assert!(
-                !message.contains(QUERY_CANARY),
-                "{level} record {message:?} carries the query value"
+                !line.contains(QUERY_CANARY),
+                "{level} record {line:?} carries the query value"
             );
         }
     }
+}
+
+/// Negative control for the hygiene helper: a URL in a field of an ERROR event is caught, though
+/// the message is clean (a regression such as `tracing::error!(url = %url, "API error ..")`).
+#[test]
+#[should_panic(expected = "carries \"://\"")]
+fn the_hygiene_helper_reads_the_fields_of_an_error_event() {
+    let (_guard, logs) = capture_logs();
+    tracing::error!(
+        url = "https://api.example.com/networks",
+        "API error 500 on GET request"
+    );
+    assert_nothing_above_debug_identifies_the_request(&logs);
+}
+
+/// Negative control for the hygiene helper: a path in a field of a WARN event is caught.
+#[test]
+#[should_panic(expected = "carries \"/2.2\"")]
+fn the_hygiene_helper_reads_the_fields_of_a_warn_event() {
+    let (_guard, logs) = capture_logs();
+    tracing::warn!(path = "/2.2/networks", "Session header withheld");
+    assert_nothing_above_debug_identifies_the_request(&logs);
+}
+
+/// Negative control for the hygiene helper: the query value in a field of a DEBUG event of this
+/// crate is caught, and the same value from another crate's target is not this crate's leak.
+#[test]
+#[should_panic(expected = "carries the query value")]
+fn the_hygiene_helper_reads_the_fields_of_a_debug_event() {
+    let (_guard, logs) = capture_logs();
+    tracing::debug!(target: "rusteero::transport", token = QUERY_CANARY, "Retrying GET");
+    assert_nothing_above_debug_identifies_the_request(&logs);
+}
+
+/// A clean capture passes: a DEBUG line may carry the path, and another crate's DEBUG line is not
+/// held to the query rule.
+#[test]
+fn the_hygiene_helper_accepts_a_path_at_debug() {
+    let (_guard, logs) = capture_logs();
+    tracing::debug!(target: "rusteero::transport", path = "/2.2/networks", "Retrying GET");
+    tracing::error!(status = 500_u16, "API error 500 on GET request");
+    assert_nothing_above_debug_identifies_the_request(&logs);
 }
 
 #[tokio::test]
@@ -3166,7 +3215,11 @@ async fn the_credential_withheld_warning_names_the_reason_and_the_host_only() ->
             "Session header withheld from a request to a non-matching port: http://127.0.0.1",
         ]
     );
-    for warning in logs.warnings() {
+    for ((level, _, message), fields) in logs.entries() {
+        if level != Level::WARN {
+            continue;
+        }
+        let warning = rendered_line(&message, &fields);
         for forbidden in [NETWORK_ID, QUERY_CANARY, "?", &port.to_string(), "/2.2"] {
             assert!(
                 !warning.contains(forbidden),
@@ -3436,4 +3489,113 @@ fn a_failed_clear_is_logged_once_and_not_as_a_persist() {
             assert!(logs.contains(Level::WARN, "failed to clear session from credential store"));
         }
     }
+}
+
+/// A store that says it logs its own failures, and then panics before it logs anything.
+#[derive(Debug)]
+struct PanickingReportingStore;
+
+impl rusteero::storage::CredentialStore for PanickingReportingStore {
+    fn load(&self) -> Result<Session, rusteero::error::StorageError> {
+        Ok(Session::empty())
+    }
+
+    fn save(&self, _session: &Session) -> Result<(), rusteero::error::StorageError> {
+        panic!("PanickingReportingStore::save always panics");
+    }
+
+    fn clear(&self) -> Result<(), rusteero::error::StorageError> {
+        panic!("PanickingReportingStore::clear always panics");
+    }
+
+    fn reports_failures(&self) -> bool {
+        true
+    }
+}
+
+/// A store task that panicked never reached the store's own logging, so the store's claim to
+/// report its failures does not cover it: the transport logs it at `WARN`, once, as a persist or a
+/// clear, and never as "already reported".
+#[tokio::test]
+async fn a_store_task_that_panicked_is_logged_once_at_warn_though_the_store_reports()
+-> anyhow::Result<()> {
+    let transport = Transport::builder()
+        .store(Some(Arc::new(PanickingReportingStore)))
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    transport
+        .set_session_async(Some(Session::from_token(TEST_TOKEN)))
+        .await?;
+    assert_eq!(
+        logs.warnings(),
+        ["failed to persist session to credential store"]
+    );
+    assert_eq!(
+        logs.field(Level::WARN, "failed to persist", "error")
+            .as_deref()
+            .map(|error| error.contains("credential-store-task")),
+        Some(true),
+        "the WARN names the adapter that failed: {:?}",
+        logs.entries()
+    );
+    assert!(!transport.credentials_persisted());
+
+    logs.clear();
+    transport.set_session_async(None).await?;
+    assert_eq!(
+        logs.warnings(),
+        ["failed to clear session from credential store"]
+    );
+    assert!(!logs.mentions("already reported"), "{:?}", logs.entries());
+    assert!(logs.errors().is_empty());
+    Ok(())
+}
+
+/// Polls `future` once, on a thread with no Tokio runtime, and expects it to be finished.
+fn poll_once<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => panic!("the future must not wait on anything"),
+    }
+}
+
+/// `set_session_async` driven by an executor that is not Tokio: the blocking task cannot be
+/// started at all, so the shipped file store is never called and logs nothing. The session works
+/// in memory and is not persisted, and the transport's `WARN` is the only line that says so.
+#[test]
+fn a_file_store_task_that_cannot_start_is_logged_once_at_warn() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cookies.json");
+    let transport = Transport::builder()
+        .store(Some(Arc::new(rusteero::storage::FileStore::new(&path))))
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    poll_once(transport.set_session_async(Some(Session::from_token(TEST_TOKEN))))?;
+
+    assert_eq!(
+        logs.warnings(),
+        ["failed to persist session to credential store"],
+        "{:?}",
+        logs.entries()
+    );
+    assert!(!logs.mentions("already reported"), "{:?}", logs.entries());
+    assert!(logs.errors().is_empty());
+    assert!(!path.exists(), "the store was never called");
+    assert!(!transport.credentials_persisted());
+    assert!(transport.is_authenticated(), "the session works in memory");
+    assert!(!logs.mentions(TEST_TOKEN));
+
+    logs.clear();
+    poll_once(transport.set_session_async(None))?;
+    assert_eq!(
+        logs.warnings(),
+        ["failed to clear session from credential store"],
+        "{:?}",
+        logs.entries()
+    );
+    Ok(())
 }
