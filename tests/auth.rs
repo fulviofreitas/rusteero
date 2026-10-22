@@ -81,6 +81,31 @@ async fn login_flow_start_posts_a_form_encoded_body_unauthenticated() -> anyhow:
     Ok(())
 }
 
+/// A `LoginFlow` built on a transport with an overridden User-Agent sends it on the login
+/// handshake too (`eero-api` 8.0.5 threads `user_agent` through `AuthAPI`).
+#[tokio::test]
+async fn login_flow_start_sends_the_transports_user_agent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .and(header("user-agent", rusteero::consts::LEGACY_USER_AGENT))
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("login=user%40example.com"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("login.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .user_agent(Some(rusteero::consts::LEGACY_USER_AGENT.to_owned()))
+        .build()?;
+    LoginFlow::with_transport(transport)
+        .start("user@example.com")
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn login_flow_start_with_a_phone_number_sends_an_identical_request_shape()
 -> anyhow::Result<()> {

@@ -1594,12 +1594,9 @@ async fn a_bad_header_under_fatal_is_a_validation_error_and_the_store_is_untouch
 }
 
 /// A `base_url` that smuggles another host through userinfo is rejected by the transport's
-/// `base_url` validation, before the store is reached.
-///
-/// Ignored until that validation rejects userinfo (`https://api.example.com@evil.example`
-/// parses as host `evil.example` with user `api.example.com`): today the base is accepted.
+/// `base_url` validation, before the store is reached (`https://api.example.com@evil.example`
+/// parses as host `evil.example` with user `api.example.com`).
 #[tokio::test]
-#[ignore = "needs base_url userinfo rejection in the transport's base_url validation"]
 async fn a_base_url_with_userinfo_is_rejected_before_the_store_is_read() {
     let store = Arc::new(CountingStore::failing());
 
@@ -1634,12 +1631,7 @@ async fn build_reads_the_store_exactly_once_for_a_valid_configuration() -> anyho
 
 /// A `2xx` whose body is not a JSON object is an error from the transport, so `get_networks`
 /// returns it before the `/account` fallback and before anything is cached or selected.
-///
-/// Ignored until the transport rejects non-object `2xx` bodies (`Unexpected JSON response:
-/// expected an object`): today it wraps `[]` in an empty envelope, which sends `get_networks`
-/// on to `/account`. Drop the `#[ignore]` when that change is in.
 #[tokio::test]
-#[ignore = "needs the transport to reject non-object 2xx bodies with Error::Api"]
 async fn get_networks_with_a_non_object_body_is_an_error_and_caches_nothing() -> anyhow::Result<()>
 {
     let mock = MockEero::start().await;

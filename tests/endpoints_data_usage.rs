@@ -989,10 +989,8 @@ async fn a_malformed_published_url_is_still_rejected_before_any_request(
 }
 
 /// Only a caller-supplied `network_id` (the template fallback, no parent) is confined to
-/// `networks/{id}`. The confinement itself is `links::resource_url`'s, so this holds once that
-/// check exists.
+/// `networks/{id}`; the confinement itself is `links::resource_url`'s.
 #[tokio::test]
-#[ignore = "needs the caller-path family check in links::resource_url; un-ignore when it lands"]
 async fn a_caller_supplied_network_outside_the_network_family_is_rejected() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))

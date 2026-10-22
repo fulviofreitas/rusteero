@@ -810,7 +810,11 @@ fn leftover_temp_files(dir: &Path) -> Vec<String> {
         .expect("read dir")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".tmp"))
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        })
         .collect()
 }
 
