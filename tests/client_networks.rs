@@ -12,7 +12,7 @@
 mod common;
 
 use serde_json::json;
-use wiremock::matchers::{body_string, header, method, path};
+use wiremock::matchers::{body_json, body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
@@ -731,5 +731,174 @@ async fn name_wrappers_forward_valid_names_unchanged() -> anyhow::Result<()> {
     client
         .set_guest_network(false, Some("  preserve spaces  "), Some("network-0001"))
         .await?;
+    Ok(())
+}
+
+// ===================== set_hide_5g =====================
+
+const HIDE_5G_PATH: &str = "/2.2/networks/network-0001/temporary_flags/hide_5g";
+
+#[tokio::test]
+async fn set_hide_5g_true_reaches_the_temporary_flag_put() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path(HIDE_5G_PATH))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/json"))
+        .and(body_json(json!({"value": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(HIDE_5G_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.set_hide_5g(true, Some("network-0001")).await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_false_reaches_the_temporary_flag_delete() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(HIDE_5G_PATH))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_string(""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(HIDE_5G_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.set_hide_5g(false, Some("network-0001")).await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_uses_the_preferred_network_without_discovery() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0002/temporary_flags/hide_5g"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(json!({"value": true})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.set_preferred_network("network-0002");
+    client.set_hide_5g(true, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_without_a_network_is_missing_network_id_without_discovery()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    for enabled in [true, false] {
+        let err = client
+            .set_hide_5g(enabled, None)
+            .await
+            .expect_err("no explicit and no preferred network");
+        assert!(matches!(err, Error::MissingNetworkId), "got {err:?}");
+    }
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_invalidates_only_the_written_networks_cache_entry() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    // The other network's entry must survive the write: it is fetched once, then served cached.
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0002"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(HIDE_5G_PATH))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_network(Some("network-0002"), false).await?;
+    client.set_hide_5g(true, Some("network-0001")).await?;
+    client.get_network(Some("network-0001"), false).await?;
+    client.get_network(Some("network-0002"), false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_failed_write_keeps_the_network_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(HIDE_5G_PATH))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    let err = client
+        .set_hide_5g(true, Some("network-0001"))
+        .await
+        .expect_err("a 500 must surface");
+    assert!(matches!(err, Error::Api { status: 500, .. }), "got {err:?}");
+
+    let cached = client.get_network(Some("network-0001"), false).await?;
+    assert_eq!(cached.as_value(), &fixture_json("network.json"));
     Ok(())
 }

@@ -240,6 +240,41 @@ impl Client {
         Ok(response)
     }
 
+    /// Temporarily hides (or un-hides) the network's 5 GHz band — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `set_hide_5g` (`eero-api src/eero/client.py:752-779`). `auto_discover =
+    /// false`. `enabled = true` sends `PUT {"value": true}` to the network's
+    /// `temporary_flags/hide_5g` resource, `false` sends a `DELETE` to it — see
+    /// [`crate::endpoints::networks::NetworksApi::set_hide_5g`]. **Passes no `parent=`**: the
+    /// resource has no published link, so Python builds the path from the template and neither
+    /// takes nor forwards a cached envelope. The flag is reported in the network envelope's
+    /// `temporary_flags`, so a successful write drops `network[nid]`.
+    ///
+    /// **Hiding 5 GHz disconnects 5 GHz clients while it takes effect, and the write is
+    /// unverified against a live account.** Read the current flag first, skip the write when it
+    /// already matches, and never retry a failed write in a loop.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingNetworkId`] if `network_id` is absent and no preferred network is set —
+    /// auto-discovery is not attempted. Otherwise, whatever status-mapped [`Error`] the request
+    /// produces. The cache is left untouched on any `Err`.
+    pub async fn set_hide_5g(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let response = self
+            .api
+            .networks()
+            .set_hide_5g(&network_id, enabled)
+            .await?;
+        self.invalidate_network_cache(&network_id);
+        Ok(response)
+    }
+
     /// Sets the network's Wi-Fi password — returns the raw Eero API response.
     ///
     /// Ported from `set_network_password()` (`client.py:781-796`). `auto_discover = false`.
