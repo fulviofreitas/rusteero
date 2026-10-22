@@ -576,6 +576,8 @@ async fn set_ipv6_upstream_prefers_the_parents_published_settings_link() -> anyh
 async fn set_ipv6_upstream_warns_once_with_the_reboot_class_operation() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/settings"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(2)

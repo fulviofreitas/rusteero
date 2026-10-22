@@ -121,6 +121,8 @@ async fn set_thread_enabled_matches_update_thread() -> anyhow::Result<()> {
 async fn set_thread_enabled_logs_the_update_thread_warning() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/thread"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({ "meta": {"code": 200}, "data": {} })),

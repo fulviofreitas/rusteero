@@ -885,6 +885,8 @@ async fn password_validation_precedes_url_resolution_and_the_warning() -> anyhow
 async fn set_network_password_still_warns_once_for_a_valid_password() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/password"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
@@ -917,6 +919,8 @@ async fn set_network_password_still_warns_once_for_a_valid_password() -> anyhow:
 async fn set_guest_password_logs_no_uncharacterised_write_warning() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/guestnetwork/password"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
@@ -1058,6 +1062,8 @@ async fn name_validation_precedes_auth_and_url_resolution() -> anyhow::Result<()
 async fn set_network_name_still_warns_once_for_a_valid_name() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/settings"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)
@@ -1085,6 +1091,8 @@ async fn set_network_name_still_warns_once_for_a_valid_name() -> anyhow::Result<
 async fn set_guest_network_logs_no_uncharacterised_write_warning() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/guestnetwork"))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
         .expect(1)

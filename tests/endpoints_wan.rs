@@ -432,10 +432,28 @@ async fn set_device_secondary_wan_access_pin_does_not_bypass_the_network_check()
 #[tokio::test]
 async fn wan_writes_warn_once_after_resolving_and_pinning() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    Mock::given(method("PUT"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&mock.server)
-        .await;
+    // One authenticated mock per write, each expecting exactly one request on its 2.3 path.
+    for (put_path, body) in [
+        ("/2.3/networks/network-0001/multistaticip", json!({})),
+        (
+            "/2.3/networks/network-0001/devices/secondary_wan_config",
+            json!({}),
+        ),
+        (
+            "/2.3/networks/network-0001/devices/aa:bb:cc:00:00:01",
+            json!({ "secondary_wan_deny_access": true }),
+        ),
+    ] {
+        Mock::given(method("PUT"))
+            .and(path(put_path))
+            .and(session_cookie())
+            .and(user_token_header())
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
     let api = wan_api(&mock);
     let (_guard, logs) = capture_logs();
 

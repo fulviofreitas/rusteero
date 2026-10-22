@@ -100,6 +100,8 @@ async fn get_account_session_refresh_signal_refreshes_once_and_replays() -> anyh
         .await;
     Mock::given(method("POST"))
         .and(path("/2.2/login/refresh"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(header("content-type", "application/json"))
         .and(body_string("\"\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))

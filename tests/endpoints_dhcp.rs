@@ -512,6 +512,8 @@ async fn set_pppoe_sends_nested_json_to_eero_pppoe_path() -> anyhow::Result<()> 
 async fn set_dhcp_logs_the_warning_once_after_resolving_the_url() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/settings"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -560,6 +562,8 @@ async fn set_dhcp_logs_the_warning_once_after_resolving_the_url() -> anyhow::Res
 async fn set_connection_mode_logs_the_warning_once_after_resolving_the_url() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/settings"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -599,6 +603,8 @@ async fn set_nat_port_randomization_logs_the_warning_once_after_resolving_the_ur
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/settings"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
