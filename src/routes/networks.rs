@@ -183,3 +183,27 @@ pub const CLEAR_GUEST_PASSWORD: Resource = Resource {
     template: GUEST_PASSWORD_TEMPLATE,
     link: Some("password"),
 };
+
+/// `PUT /2.2/networks/{id}/temporary_flags/hide_5g` — temporarily hide (pause) the network's
+/// 5 GHz band.
+///
+/// Ported from `NetworksAPI.set_hide_5g` (`networks.py:562-598`), enable branch. Template only
+/// (`link: None`): the network envelope publishes no link to this resource, so the path is always
+/// built from the template and a caller's `parent` plays no part.
+pub const NETWORKS_SET_HIDE_5G: Resource = Resource {
+    method: Method::PUT,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}/temporary_flags/hide_5g",
+    link: None,
+};
+
+/// `DELETE /2.2/networks/{id}/temporary_flags/hide_5g` — clear the hide-5 GHz flag, same
+/// resource as [`NETWORKS_SET_HIDE_5G`].
+///
+/// Ported from `NetworksAPI.set_hide_5g` (`networks.py:562-598`), disable branch.
+pub const NETWORKS_CLEAR_HIDE_5G: Resource = Resource {
+    method: Method::DELETE,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}/temporary_flags/hide_5g",
+    link: None,
+};

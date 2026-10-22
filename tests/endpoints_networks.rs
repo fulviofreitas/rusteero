@@ -13,7 +13,9 @@ use std::sync::Arc;
 use rusteero::endpoints::networks::NetworksApi;
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{body_string, header, method, path, query_param, query_param_is_missing};
+use wiremock::matchers::{
+    body_json, body_string, header, method, path, query_param, query_param_is_missing,
+};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{
@@ -1140,5 +1142,211 @@ async fn name_setters_forward_padded_and_literal_none_values_unchanged() -> anyh
         api.set_guest_network("network-0001", false, Some(name), None)
             .await?;
     }
+    Ok(())
+}
+
+// ================================ NetworksApi::set_hide_5g ================================
+
+/// Mounts `PUT /2.2/networks/network-0001/temporary_flags/hide_5g` expecting exactly one JSON
+/// `{"value": true}` request with both credentials.
+async fn mount_hide_5g_put(mock: &MockEero) {
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/temporary_flags/hide_5g"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/json"))
+        .and(body_json(json!({ "value": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+}
+
+/// Mounts `DELETE /2.2/networks/network-0001/temporary_flags/hide_5g` expecting exactly one
+/// body-less request with both credentials, plus a `PUT` mock on the same path that must never fire.
+async fn mount_hide_5g_delete(mock: &MockEero) {
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/temporary_flags/hide_5g"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_string(""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/temporary_flags/hide_5g"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+}
+
+#[tokio::test]
+async fn set_hide_5g_true_puts_value_true_to_the_temporary_flag() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_hide_5g_put(&mock).await;
+    Mock::given(method("DELETE"))
+        .and(path("/2.2/networks/network-0001/temporary_flags/hide_5g"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let env = networks_api(&mock)
+        .set_hide_5g("network-0001", true)
+        .await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_false_deletes_the_temporary_flag_with_no_body() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_hide_5g_delete(&mock).await;
+
+    let env = networks_api(&mock)
+        .set_hide_5g("network-0001", false)
+        .await?;
+    assert_eq!(env.into_value(), ok_envelope());
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert_eq!(requests.len(), 1, "got {requests:?}");
+    assert!(requests[0].body.is_empty());
+    assert!(
+        requests[0].headers.get("content-type").is_none(),
+        "a body-less DELETE must not declare a content type: {:?}",
+        requests[0].headers
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_accepts_an_api_network_path() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // A `/2.2/networks/{id}` API path resolves to the same single, undoubled path.
+    mount_hide_5g_put(&mock).await;
+
+    networks_api(&mock)
+        .set_hide_5g("/2.2/networks/network-0001", true)
+        .await?;
+
+    let mock = MockEero::start().await;
+    mount_hide_5g_delete(&mock).await;
+    networks_api(&mock)
+        .set_hide_5g("/2.2/networks/network-0001", false)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_accepts_an_absolute_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_hide_5g_put(&mock).await;
+    let url = format!("{}/2.2/networks/network-0001", mock.uri());
+
+    networks_api(&mock).set_hide_5g(&url, true).await?;
+
+    let mock = MockEero::start().await;
+    mount_hide_5g_delete(&mock).await;
+    let url = format!("{}/2.2/networks/network-0001", mock.uri());
+    networks_api(&mock).set_hide_5g(&url, false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_warns_once_with_a_different_operation_per_branch() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_hide_5g_put(&mock).await;
+    let (_guard, logs) = capture_logs();
+    let api = networks_api(&mock);
+
+    api.set_hide_5g("network-0001", true).await?;
+    assert_eq!(logs.warnings().len(), 1, "got {:?}", logs.warnings());
+    assert_eq!(
+        logs.count(
+            tracing::Level::WARN,
+            "Issuing write (hide 5 GHz for network)"
+        ),
+        1
+    );
+    assert!(!logs.contains(tracing::Level::WARN, "clear hide 5 GHz"));
+
+    let mock = MockEero::start().await;
+    mount_hide_5g_delete(&mock).await;
+    logs.clear();
+    networks_api(&mock)
+        .set_hide_5g("network-0001", false)
+        .await?;
+    assert_eq!(logs.warnings().len(), 1, "got {:?}", logs.warnings());
+    assert_eq!(
+        logs.count(
+            tracing::Level::WARN,
+            "Issuing write (clear hide 5 GHz for network)"
+        ),
+        1
+    );
+    assert!(!logs.contains(
+        tracing::Level::WARN,
+        "Issuing write (hide 5 GHz for network)"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_with_an_unresolvable_id_sends_nothing_and_does_not_warn() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let (_guard, logs) = capture_logs();
+    let api = networks_api(&mock);
+
+    for enabled in [true, false] {
+        for bad_id in ["", "../x"] {
+            let err = api
+                .set_hide_5g(bad_id, enabled)
+                .await
+                .expect_err("an invalid network id must be rejected before any request");
+            assert!(
+                matches!(err, Error::Validation { .. }),
+                "{bad_id:?} / {enabled}: got {err:?}"
+            );
+        }
+    }
+
+    assert!(
+        logs.warnings().is_empty(),
+        "the warning follows URL resolution: {:?}",
+        logs.warnings()
+    );
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_hide_5g_not_authenticated_returns_authentication_error_without_a_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    for verb in ["PUT", "DELETE"] {
+        Mock::given(method(verb))
+            .and(path("/2.2/networks/network-0001/temporary_flags/hide_5g"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+            .expect(0)
+            .mount(&mock.server)
+            .await;
+    }
+    let api = NetworksApi::new(Arc::new(mock.transport_anonymous()));
+
+    for enabled in [true, false] {
+        let err = api
+            .set_hide_5g("network-0001", enabled)
+            .await
+            .expect_err("an unauthenticated write must fail");
+        assert!(err.is_auth_error(), "enabled={enabled}: got {err:?}");
+    }
+    assert_no_requests(&mock).await;
     Ok(())
 }

@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use reqwest::Method;
-use serde_json::Value;
+use serde_json::{Value, json};
 use url::Url;
 
 use crate::envelope::Envelope;
@@ -499,5 +499,67 @@ impl NetworksApi {
         self.transport
             .request(Method::DELETE, url, &[], RequestBody::None)
             .await
+    }
+
+    /// `PUT`/`DELETE /2.2/networks/{id}/temporary_flags/hide_5g` — temporarily hide (pause) the
+    /// network's 5 GHz band, or clear that flag.
+    ///
+    /// Ported from `NetworksAPI.set_hide_5g` (`networks.py:562-598`). With `enabled` it sends a
+    /// JSON `PUT` of exactly `{"value": true}` to
+    /// [`crate::routes::networks::NETWORKS_SET_HIDE_5G`] (`networks.py:594-596`); without it, a
+    /// body-less `DELETE` to [`crate::routes::networks::NETWORKS_CLEAR_HIDE_5G`]
+    /// (`networks.py:597-598`). The flag is temporary: the API expires it on its own, and the
+    /// network envelope's `temporary_flags.hide_5g` carries the current `value` and its
+    /// expiration. The network envelope publishes no link to this resource, so the path is
+    /// always built from the template and there is no `parent` parameter; `network_id` may be a
+    /// bare id, a host-relative API path or an absolute API-host URL.
+    ///
+    /// **This write disconnects 5 GHz clients while it takes effect, and is unverified against a
+    /// live account.** Read the current flag first, skip the write when it already matches, and
+    /// never retry a failed write in a loop. Logs one `WARNING` via
+    /// [`warn_uncharacterised_write`] after URL resolution and immediately before the request:
+    /// `"hide 5 GHz for network"` when enabling, `"clear hide 5 GHz for network"` when clearing.
+    ///
+    /// Python validates `enabled` as a real `bool` at runtime (`require_bool`); the `bool`
+    /// parameter enforces that at compile time, so there is no validation error path here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `network_id` cannot be resolved to a URL, before the
+    /// warning is logged or anything is sent. Otherwise [`Error::Authentication`] if no valid
+    /// session is configured (raised by the transport, which — unlike Python — runs after URL
+    /// resolution and the warning), or whatever status-mapped [`Error`] the request produces.
+    pub async fn set_hide_5g(&self, network_id: &str, enabled: bool) -> Result<Envelope, Error> {
+        if enabled {
+            let url = routes::networks::NETWORKS_SET_HIDE_5G.resolve(
+                self.transport.api_host(),
+                network_id,
+                None,
+            )?;
+            warn_uncharacterised_write("hide 5 GHz for network");
+            self.transport
+                .request(
+                    routes::networks::NETWORKS_SET_HIDE_5G.method.clone(),
+                    url,
+                    &[],
+                    RequestBody::Json(json!({ "value": true })),
+                )
+                .await
+        } else {
+            let url = routes::networks::NETWORKS_CLEAR_HIDE_5G.resolve(
+                self.transport.api_host(),
+                network_id,
+                None,
+            )?;
+            warn_uncharacterised_write("clear hide 5 GHz for network");
+            self.transport
+                .request(
+                    routes::networks::NETWORKS_CLEAR_HIDE_5G.method.clone(),
+                    url,
+                    &[],
+                    RequestBody::None,
+                )
+                .await
+        }
     }
 }
