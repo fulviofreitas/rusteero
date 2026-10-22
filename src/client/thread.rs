@@ -1,10 +1,10 @@
-//! `Client` methods for the `ThreadAPI` domain, v8.0.4.
+//! `Client` methods for the `ThreadAPI` domain, v8.4.1.
 //!
-//! Ported from `eero-api src/eero/client.py:1420-1479` (the Thread group of `EeroClient`).
+//! Ported from `eero-api src/eero/client.py:1790-1850` (the Thread group of `EeroClient`).
 //! [`Client::get_thread`] passes `**self._network_parent_kwargs(network_id)`, like every other
 //! cached-network read in this crate; the three write wrappers below do **not** — Python's own
 //! `set_thread_enabled`/`update_thread`/`regenerate_thread_credentials` never build or pass a
-//! `parent` kwarg at all (`client.py:1427-1479`), matching `ThreadAPI`'s own writes, which accept
+//! `parent` kwarg at all (`client.py:1797-1850`), matching `ThreadAPI`'s own writes, which accept
 //! but ignore it (see [`crate::endpoints::thread::ThreadApi::set_thread_enabled`]'s own docs).
 
 use super::Client;
@@ -14,7 +14,7 @@ use crate::error::Error;
 impl Client {
     /// Gets Thread protocol status — returns the raw Eero API response.
     ///
-    /// Ported from `get_thread()` (`client.py:1420-1425`). `auto_discover = false` — see
+    /// Ported from `get_thread()` (`client.py:1790-1795`). `auto_discover = false` — see
     /// [`Client::get_diagnostics`].
     ///
     /// # Errors
@@ -31,7 +31,7 @@ impl Client {
 
     /// Enables or disables Thread — returns the raw Eero API response (unverified write).
     ///
-    /// Ported from `set_thread_enabled` (`client.py:1427-1441`). `auto_discover = false`. On
+    /// Ported from `set_thread_enabled` (`client.py:1797-1811`). `auto_discover = false`. On
     /// success, invalidates `network[nid]`. Passes no `parent` — see this module's own docs.
     ///
     /// # Errors
@@ -54,7 +54,7 @@ impl Client {
 
     /// Updates Thread configuration — returns the raw Eero API response (unverified write).
     ///
-    /// Ported from `update_thread` (`client.py:1443-1465`). `auto_discover = false`. On success,
+    /// Ported from `update_thread` (`client.py:1813-1835`). `auto_discover = false`. On success,
     /// invalidates `network[nid]`. Passes no `parent` — see this module's own docs.
     ///
     /// # Errors
@@ -82,7 +82,7 @@ impl Client {
     /// Regenerates Thread network credentials — returns the raw Eero API response (unverified
     /// write; response's `network` key is of unknown shape).
     ///
-    /// Ported from `regenerate_thread_credentials` (`client.py:1467-1479`). `auto_discover =
+    /// Ported from `regenerate_thread_credentials` (`client.py:1837-1850`). `auto_discover =
     /// false`. On success, invalidates `network[nid]`. Passes no `parent` — see this module's own
     /// docs.
     ///

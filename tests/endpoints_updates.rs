@@ -15,7 +15,21 @@ use serde_json::json;
 use wiremock::matchers::{body_json, body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, capture_logs, session_cookie, user_token_header};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
+
+/// [`common::capture_logs`] plus an always-live second dispatcher.
+///
+/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
+/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
+/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
+/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
+/// capture then misses events nondeterministically. Keeping this anchor registered makes every
+/// rebuild consult all live dispatchers, the capture included.
+fn capture_logs() -> (common::LogGuard, common::LogCapture) {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+    common::capture_logs()
+}
 
 fn updates_api(mock: &MockEero) -> UpdatesApi {
     UpdatesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
