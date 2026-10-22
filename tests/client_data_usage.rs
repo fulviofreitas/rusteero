@@ -1,6 +1,6 @@
 //! `Client` integration suite for `DataUsageApi`'s pass-throughs at `v8.0.4`.
 //!
-//! None of these eleven methods is cached; `set_data_usage_report_settings` is the only write
+//! None of these twelve methods is cached; `set_data_usage_report_settings` is the only write
 //! and is the only one that invalidates anything.
 
 mod common;
@@ -275,6 +275,156 @@ async fn set_data_usage_report_settings_invalidates_the_network_cache() -> anyho
     Ok(())
 }
 
+// ===================== get_eeros_data_usage =====================
+
+#[tokio::test]
+async fn get_eeros_data_usage_hits_the_eeros_path_with_every_query_param() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let response = json!({"meta": {"code": 200}, "data": [{"eero": "eero-0001"}]});
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/data_usage/eeros"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(query_param("start", "s"))
+        .and(query_param("end", "e"))
+        .and(query_param("cadence", "hourly"))
+        .and(query_param("timezone", "Europe/London"))
+        .and(|request: &Request| request.url.query_pairs().count() == 4 && request.body.is_empty())
+        .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    // Neither the summary nor a single-eero path is the target.
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/data_usage/eeros/summary"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client
+        .get_eeros_data_usage(
+            "s",
+            "e",
+            "hourly",
+            Some("Europe/London"),
+            None,
+            Some("network-0001"),
+        )
+        .await?;
+    assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eeros_data_usage_is_never_cached_and_invalidates_nothing() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/data_usage/eeros"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    // A primed network entry survives both reads: it is fetched once, then served from cache.
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    for _ in 0..2 {
+        client
+            .get_eeros_data_usage("s", "e", "daily", None, None, Some("network-0001"))
+            .await?;
+    }
+    client.get_network(Some("network-0001"), false).await?;
+    Ok(())
+}
+
+/// The facade forwards no `parent=`, even when a network envelope is cached.
+#[tokio::test]
+async fn get_eeros_data_usage_does_not_forward_the_cached_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": {"code": 200},
+            "data": {"id": "network-0001", "url": "/2.4/networks/network-0001"},
+        })))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/data_usage/eeros"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.4/networks/network-0001/data_usage/eeros"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .get_eeros_data_usage("s", "e", "daily", None, None, Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eeros_data_usage_resolves_the_network_without_auto_discovery() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let err = client
+        .get_eeros_data_usage("s", "e", "daily", None, None, None)
+        .await
+        .expect_err("no network_id and no preferred network must fail without auto-discovery");
+    assert!(matches!(err, Error::MissingNetworkId));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eeros_data_usage_rejects_an_invalid_cadence_before_any_request() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let err = client
+        .get_eeros_data_usage("s", "e", "weekly", None, None, Some("network-0001"))
+        .await
+        .expect_err("an invalid cadence must be rejected before any request");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "cadence"));
+    Ok(())
+}
+
 // ===================== per-call timeout =====================
 //
 // Real clock (the crate's timeouts and a paused clock do not mix with a real HTTP round trip).
@@ -296,12 +446,13 @@ async fn short_timeout_client(mock: &MockEero) -> Client {
         .expect("a MockServer's own URI is always a valid base URL")
 }
 
-/// The paths of the nine time-windowed reads, in declaration order.
-const TIME_WINDOWED_PATHS: [&str; 9] = [
+/// The paths of the ten time-windowed reads, in declaration order.
+const TIME_WINDOWED_PATHS: [&str; 10] = [
     "/2.2/networks/network-0001/data_usage",
     "/2.2/networks/network-0001/data_usage/breakdown",
     "/2.2/networks/network-0001/data_usage/devices",
     "/2.2/networks/network-0001/data_usage/devices/aa:bb:cc",
+    "/2.2/networks/network-0001/data_usage/eeros",
     "/2.2/networks/network-0001/data_usage/eeros/summary",
     "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
     "/2.2/networks/network-0001/data_usage/profiles/profile-0001",
@@ -330,18 +481,19 @@ async fn mount_slow_time_windowed_reads(mock: &MockEero) {
     }
 }
 
-/// Calls all nine time-windowed wrappers concurrently with `timeout`, in
+/// Calls all ten time-windowed wrappers concurrently with `timeout`, in
 /// [`TIME_WINDOWED_PATHS`] order.
 async fn call_every_time_windowed_wrapper(
     client: &Client,
     timeout: Option<RequestTimeout>,
-) -> [Result<Envelope, Error>; 9] {
+) -> [Result<Envelope, Error>; 10] {
     let nid = Some("network-0001");
     let (
         data_usage,
         breakdown,
         devices,
         device,
+        eeros,
         eeros_summary,
         eero,
         profile,
@@ -352,6 +504,7 @@ async fn call_every_time_windowed_wrapper(
         client.get_data_usage_breakdown("s", "e", None, None, timeout, nid),
         client.get_devices_data_usage("s", "e", None, None, None, timeout, nid),
         client.get_device_data_usage("aa:bb:cc", "s", "e", "daily", None, timeout, nid),
+        client.get_eeros_data_usage("s", "e", "daily", None, timeout, nid),
         client.get_eeros_data_usage_summary("s", "e", "daily", None, timeout, nid),
         client.get_eero_data_usage("eero-0001", "s", "e", "daily", None, timeout, nid),
         client.get_profile_data_usage("profile-0001", "s", "e", "daily", None, timeout, nid),
@@ -363,6 +516,7 @@ async fn call_every_time_windowed_wrapper(
         breakdown,
         devices,
         device,
+        eeros,
         eeros_summary,
         eero,
         profile,

@@ -1,13 +1,12 @@
 //! `Client` methods for the `DataUsageAPI` domain.
 //!
-//! None of these eleven methods is ever cached (behaviour brief §2.1: the whole family is
-//! time-windowed reads, not one of the eight cached getters) and every one passes
-//! `auto_discover = false`. None of them passes `parent=` at this layer either — `EeroClient`
-//! never supplies one for this family (`.claude/tasks/briefs/v8/client.md`'s `data_usage` table
-//! has no `+net` annotation on any row); the underlying domain methods still accept `parent=`
-//! for a caller reaching `client.api().data_usage()` directly with its own cached envelope.
+//! None of these twelve methods is ever cached (the whole family is time-windowed reads, not one
+//! of the eight cached getters) and every one passes `auto_discover = false`. None of them
+//! passes `parent=` at this layer either — `EeroClient` never supplies one for this family, even
+//! when a network envelope is cached; the underlying domain methods still accept `parent=` for
+//! a caller reaching `client.api().data_usage()` directly with its own cached envelope.
 //!
-//! The nine time-windowed reads take `timeout: Option<RequestTimeout>` immediately before the
+//! The ten time-windowed reads take `timeout: Option<RequestTimeout>` immediately before the
 //! trailing `network_id` and forward it unchanged to the matching `DataUsageApi` read
 //! (`client.py:2056,2077` at `v8.4.1`); `get_data_usage_report_settings` and
 //! `set_data_usage_report_settings` do not.
@@ -180,6 +179,39 @@ impl Client {
         self.api
             .data_usage()
             .get_eeros_summary(&network_id, start, end, cadence, timezone, timeout, None)
+            .await
+    }
+
+    /// Gets data-usage statistics for every eero on the network — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `get_eeros_data_usage()` (`eero-api src/eero/client.py:2154-2172` at
+    /// `v8.4.1`), a thin wrapper over [`crate::endpoints::data_usage::DataUsageApi::get_eeros_usage`]
+    /// (`GET /2.2/networks/{id}/data_usage/eeros`). `auto_discover = false`. `cadence` is
+    /// required. Not cached, and invalidates nothing, so every call reaches the API. No `parent=`
+    /// is forwarded, even when a network envelope is cached. Distinct from
+    /// [`Client::get_eeros_data_usage_summary`] (`.../data_usage/eeros/summary`) and
+    /// [`Client::get_eero_data_usage`] (`.../data_usage/eeros/{eero_id}`).
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`].
+    pub async fn get_eeros_data_usage(
+        &self,
+        start: &str,
+        end: &str,
+        cadence: &str,
+        timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
+        network_id: Option<&str>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        self.api
+            .data_usage()
+            .get_eeros_usage(&network_id, start, end, cadence, timezone, timeout, None)
             .await
     }
 
