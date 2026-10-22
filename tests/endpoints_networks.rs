@@ -194,6 +194,9 @@ async fn get_premium_status_prefers_parents_self_url() -> anyhow::Result<()> {
 
 // ===================== get_account =====================
 
+// `NetworksApi::get_account` is deprecated in favour of `AccountApi::get_account`; this pins that
+// the kept method still sends the same request.
+#[allow(deprecated)]
 #[tokio::test]
 async fn get_account_hits_account_and_returns_the_fixture_envelope() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
