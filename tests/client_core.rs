@@ -10,7 +10,7 @@
 //! (`Client::ensure_network_id` — explicit id, preferred id, auto-discovery in both its `id` and
 //! `url`-tail shapes, and the `Error::MissingNetworkId` failure path); every place `Client`
 //! clears its cache (`clear_cache`, `logout`, `set_session_token`, `clear_session_token`); and
-//! that a failed `logout` still clears the cache (security review finding F1).
+//! that a failed `logout` still clears the cache.
 //!
 //! `get_devices` is used throughout purely as a convenient, already-cached vehicle to exercise
 //! these generic `Client`/`Cache` mechanics — none of the assertions here are about `DevicesApi`
@@ -19,12 +19,12 @@
 //! judged to be networks-domain tests and live in `client_networks.rs` instead — see that file's
 //! module docs for the reasoning.
 //!
-//! Every caching test asserts on the wiremock `.expect(n)` call count, not just the returned
-//! value — a caching test that only checks the envelope is not testing caching at all (see
-//! the crate's testing conventions' "Assertion Patterns"). `logout_...`/`clear_session_token_...`
-//! restore a session directly at the `EeroApi` layer via [`Client::api`] rather than through
-//! `Client::set_session_token` — deliberately, so that restoring the ability to make a second
-//! request never itself clears the cache and masks a regression in the very call site under test.
+//! Every caching test asserts on the wiremock `.expect(n)` call count, not just the returned value
+//! — a caching test that only checks the envelope is not testing caching at all.
+//! `logout_...`/`clear_session_token_...` restore a session directly at the `EeroApi` layer via
+//! [`Client::api`] rather than through `Client::set_session_token` — deliberately, so that
+//! restoring the ability to make a second request never itself clears the cache and masks a
+//! regression in the very call site under test.
 
 mod common;
 
@@ -540,7 +540,7 @@ async fn clear_session_token_clears_the_cache() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **F1** (security review) / v8.0.4 logout contract: `AuthApi::logout` clears the in-memory
+/// v8.0.4 logout contract: `AuthApi::logout` clears the in-memory
 /// session and credential store unconditionally, on every outcome, and — at `v8.0.4` — never
 /// propagates a network/API error from the `logout` request itself (`api/auth.py:315-327`); see
 /// `src/auth/mod.rs`'s own docs. This primes the `network` bucket, forces the `logout` request to
@@ -575,7 +575,7 @@ async fn logout_failure_is_swallowed_but_still_clears_the_cache() -> anyhow::Res
     assert!(logged_out);
     assert!(!client.is_authenticated());
 
-    // Before the F1 fix this served the pre-logout envelope straight from cache (`Ok`), with no
+    // Before the fix this served the pre-logout envelope straight from cache (`Ok`), with no
     // auth check at all. After the fix the cache is empty and the session is gone, so this must
     // fail closed rather than leak the earlier authenticated response.
     let after = client.get_network(Some("network-0001"), false).await;

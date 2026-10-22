@@ -7,7 +7,7 @@
 //! [`Client::clear_profile_schedule`].
 //!
 //! **Cache invalidation.** The pre-v8 `Client` invalidated the profile cache after every schedule
-//! write (security review finding F3), because a cached profile object used to embed its own
+//! write, because a cached profile object used to embed its own
 //! `schedule` array. At v8.0.4 a profile's `GET` response carries no `schedule` field at all
 //! (schedules are sub-resources, never folded into the cached profile entry, and never cached
 //! themselves), so that invalidation no longer has anything stale to correct, and
@@ -88,8 +88,8 @@ impl Client {
     /// parameter at all — `schedule` alone resolves the pause's URL, matching Python's own
     /// signature. `parent` accepts the pause's own cached envelope (Python's `schedule: Any`
     /// accepts either a path/URL string or a mapping; this port always splits that into an
-    /// `id_or_url` plus a `parent`, per phase-G fix list item 19), placed right after `schedule`
-    /// since this method has no `network_id` to place it before. No cache invalidation.
+    /// `id_or_url` plus a `parent`), placed right after `schedule` since this method has no
+    /// `network_id` to place it before. No cache invalidation.
     ///
     /// # Errors
     ///
@@ -111,7 +111,7 @@ impl Client {
     ///
     /// Ported from `delete_schedule` (`eero-api src/eero/client.py:2044-2053`). No `network_id`
     /// parameter. `parent` accepts the pause's own cached envelope, for the same reason as
-    /// [`Client::update_schedule`] (phase-G fix list item 19). No cache invalidation.
+    /// [`Client::update_schedule`]. No cache invalidation.
     ///
     /// # Errors
     ///
@@ -149,8 +149,8 @@ impl Client {
     /// response.
     ///
     /// Ported from `enable_bedtime` (`eero-api src/eero/client.py:2064-2081`). `auto_discover =
-    /// false`. No cache invalidation (see the module docs — this drops the pre-v8 `Client`'s
-    /// deliberate F3 divergence, which no longer applies).
+    /// false`. No cache invalidation (see the module docs — the pre-v8 `Client`'s profile-cache
+    /// invalidation no longer applies).
     ///
     /// # Errors
     ///

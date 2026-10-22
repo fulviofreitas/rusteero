@@ -7,7 +7,7 @@
 //! `template`), so [`OUICHECK_GET_OUICHECK`] below is a **documentation-only** marker, exactly
 //! like [`crate::routes::permissions::PERMISSIONS_GET_PERMISSIONS`]: `src/endpoints/ouicheck.rs` builds the
 //! URL by hand from [`crate::params::resolve_network_url`] plus the literal suffix, never via
-//! [`crate::routes::Resource::resolve`] on this constant (phase-G fix list item 20).
+//! [`crate::routes::Resource::resolve`] on this constant.
 //! `OUICheckAPI.run_ouicheck` (the `v6.2.0` route this file used to declare as `RUN_OUICHECK`)
 //! has no v8.0.4 equivalent — the API has no such operation (`wiki/Migration.md:351`) — and is
 //! not ported.

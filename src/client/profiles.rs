@@ -1,10 +1,9 @@
 //! `Client` methods for the `ProfilesAPI` domain at v8.0.4.
 //!
-//! Ported from `eero-api src/eero/client.py`'s profiles-scoped wrappers
-//! (`.claude/tasks/briefs/v8/client.md` §4 "profiles"). `update_profile_content_filter`,
-//! `update_profile_block_list`, `get_blocked_applications` and `set_blocked_applications` are
-//! **removed** (client.md §5): the domain methods they wrapped never persisted anything (silent
-//! no-op, live-verified) and have no v8.0.4 `client.py` equivalent — replaced by
+//! Ported from `eero-api src/eero/client.py`'s profiles-scoped wrappers.
+//! `update_profile_content_filter`, `update_profile_block_list`, `get_blocked_applications` and
+//! `set_blocked_applications` are **removed**: the domain methods they wrapped never persisted
+//! anything (silent no-op, live-verified) and have no v8.0.4 `client.py` equivalent — replaced by
 //! [`Client::allow_domain_for_profiles`]/[`Client::block_domain_for_profiles`]/
 //! [`Client::get_dns_policy_applications`]/[`Client::set_profile_blocked_applications`]
 //! (`crate::client::dns_policies`).

@@ -43,7 +43,7 @@ impl Wpa3Api {
     /// Ported from `eero-api src/eero/api/wpa3.py:60-93` (`Wpa3API.get_wpa3_per_band`). GETs the
     /// network's `wpa3_per_band` sub-resource. A verified read. The response may carry a third
     /// key, `band_6_ghz`, that [`Wpa3Api::set_wpa3_per_band`] has no parameter for — the read and
-    /// write key sets are not symmetric (g5 brief §4).
+    /// write key sets are not symmetric.
     ///
     /// # Errors
     ///

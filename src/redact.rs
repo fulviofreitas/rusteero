@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn handles_nested_list_of_lists_of_dicts() {
-        // Security finding 7: recursion through an array must not stop after one level.
+        // Recursion through an array must not stop after one level.
         let result = redact_sensitive(&json!({
             "outer": [[{"token": "abc123"}]]
         }));

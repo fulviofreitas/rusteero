@@ -3,7 +3,7 @@
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not
-//! testing caching at all (the crate's testing conventions' "Assertion Patterns").
+//! testing caching at all.
 
 mod common;
 
@@ -228,7 +228,7 @@ async fn update_device_via_link_invalidates_every_cached_profile_only_when_profi
 }
 
 /// `Client::update_device_via_link` calling `self.cache.invalidate_bucket(Bucket::Profiles,
-/// ..)` (`client.py:832-867`'s `profile is not None` branch, §2.6 of `client.md`) drops **every**
+/// ..)` (`client.py:832-867`'s `profile is not None` branch) drops **every**
 /// cached profile entry for the network — not just the `profiles` list bucket a plain
 /// `invalidate_profile_cache` would leave alone. A single-profile entry cached via `get_profile`
 /// beforehand must be gone afterward too.

@@ -1,6 +1,6 @@
 //! `Client` integration suite for `ScheduleApi` at v8.0.4 — scheduled pauses as sub-resources of
 //! a profile, no cache invalidation anywhere in this domain (see `src/client/schedule.rs`'s
-//! module docs for why the pre-v8 F3 divergence was retired).
+//! module docs for why the pre-v8 profile-cache invalidation was retired).
 
 mod common;
 
@@ -112,8 +112,7 @@ async fn update_schedule_takes_no_network_id_and_resolves_from_its_own_path() ->
 }
 
 /// Ported from `client.py:2015-2044`'s `schedule: Any` — `Client::update_schedule` accepts the
-/// pause's own cached envelope via `parent`, not just a path/URL string (phase-G fix list item
-/// 19).
+/// pause's own cached envelope via `parent`, not just a path/URL string.
 #[tokio::test]
 async fn update_schedule_accepts_a_cached_pause_envelope_as_parent() -> anyhow::Result<()> {
     let mock = MockEero::start().await;

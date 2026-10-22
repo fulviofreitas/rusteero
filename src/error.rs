@@ -24,9 +24,10 @@
 //! | — (added) | [`Error::Storage`], [`Error::Json`] |
 //!
 //! `AccessDenied`/`ClientBlocked`/`NotFound` are separate variants rather than folded into
-//! [`Error::Api`] (decision D-8): their Python counterparts are `EeroAPIException` *subclasses*
-//! purely for `isinstance` ergonomics, but keeping the distinct shapes here means a caller can
-//! match on the specific failure without inspecting `error_code` strings.
+//! [`Error::Api`], kept for 1:1 parity with Python's exception taxonomy: their Python
+//! counterparts are `EeroAPIException` *subclasses* purely for `isinstance` ergonomics, but
+//! keeping the distinct shapes here means a caller can match on the specific failure without
+//! inspecting `error_code` strings.
 
 use std::time::Duration;
 
@@ -1132,7 +1133,7 @@ mod tests {
         assert!(matches!(err, Error::Json(_)));
     }
 
-    // ===================== Debug redaction (security finding 4) =====================
+    // ===================== Debug redaction =====================
 
     #[test]
     fn api_debug_never_prints_the_envelope_password_or_the_url_query() {

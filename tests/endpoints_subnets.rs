@@ -136,7 +136,7 @@ async fn delete_subnet_sends_delete_to_subnet_type_path() -> anyhow::Result<()> 
 
 /// Ported from `SubnetsAPI.delete_subnet`'s use of `child_url` (`subnets.py:113-141`), stricter
 /// than a [`crate::routes::Nested`] route: a path/URL-shaped `subnet_type` must be rejected
-/// outright, never resolved as an already-encoded nested path (phase-G fix list item 12).
+/// outright, never resolved as an already-encoded nested path.
 #[tokio::test]
 async fn delete_subnet_rejects_a_path_shaped_subnet_type() -> anyhow::Result<()> {
     let mock = MockEero::start().await;

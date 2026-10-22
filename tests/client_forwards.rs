@@ -106,7 +106,7 @@ async fn create_forward_follows_the_cached_networks_published_link_unpinned() ->
 
 #[tokio::test]
 async fn forward_setter_does_not_invalidate_the_network_bucket() -> anyhow::Result<()> {
-    // No `forwards` cache bucket exists (behaviour brief §2.1) — a create must not, in passing,
+    // No `forwards` cache bucket exists — a create must not, in passing,
     // touch the unrelated `network[nid]` entry either.
     let mock = MockEero::start().await;
     Mock::given(method("GET"))

@@ -43,10 +43,10 @@ pub struct Session {
 impl Session {
     /// Builds a session from a pre-obtained token, with no validation.
     ///
-    /// This is intentionally infallible — the one Rust-shape divergence the port brief calls out
-    /// explicitly: token *shape* validation (non-empty, printable ASCII with no CR/LF, since the
-    /// token becomes the literal `X-User-Token` header value) happens only at the call sites that
-    /// already return a `Result`: [`crate::transport::Transport::set_session`],
+    /// This is intentionally infallible — a deliberate Rust-shape divergence: token *shape*
+    /// validation (non-empty, printable ASCII with no CR/LF, since the token becomes the literal
+    /// `X-User-Token` header value) happens only at the call sites that already return a
+    /// `Result`: [`crate::transport::Transport::set_session`],
     /// [`crate::auth::AuthApi::set_session_token`], and [`Session::from_env`]. A token obtained
     /// from a server response (the login/verify handshake) is trusted as-is, exactly like
     /// `AuthCredentials.session_id` is at `auth.py:198-201,247-250`.
@@ -249,8 +249,8 @@ impl fmt::Display for Session {
 /// `_validate_header_value`'s printable-ASCII/no-CR/LF rule (`base.py:108-121`,
 /// `_HEADER_VALUE_RE = re.compile(r"^[\x20-\x7E]*$")`) since the token becomes a header value.
 /// Shared by [`Session::from_env`], [`crate::auth::AuthApi::set_session_token`], and
-/// [`crate::transport::Transport::set_session`] — the three call sites the port brief identifies
-/// as the ones with a `Result` on hand to reject a malformed token.
+/// [`crate::transport::Transport::set_session`] — the three call sites with a `Result` on hand
+/// to reject a malformed token.
 ///
 /// # Errors
 ///

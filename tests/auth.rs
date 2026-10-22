@@ -1742,11 +1742,11 @@ async fn a_rate_limit_through_login_is_not_rewrapped() -> anyhow::Result<()> {
 
 // ===================== A 2xx body that is not a JSON object =====================
 //
-// Once the transport rejects such a body as `Error::Api { status, "Unexpected JSON response:
-// expected an object" }`, the flow's existing re-wrapping gives Python's outcomes and messages
-// (`auth.py:186-336`). Every test in this module needs that transport rejection to pass.
+// The transport rejects such a body as `Error::Api { status, "Unexpected JSON response:
+// expected an object" }`, and the flow's re-wrapping turns that into Python's outcomes and
+// messages (`auth.py:186-336`).
 
-mod needs_transport_non_object_rejection {
+mod non_object_bodies {
     use super::*;
 
     const UNEXPECTED: &str = "API error 200: Unexpected JSON response: expected an object";
@@ -2081,9 +2081,9 @@ impl CredentialStore for UnretainingStore {
     }
 }
 
-/// Needs the transport to log a `NotRetained` failure at `DEBUG` rather than `WARN`: the store
-/// has already logged the one fixed `WARN`, and a second one would be a duplicate.
-mod needs_transport_not_retained_at_debug {
+/// The transport logs a `NotRetained` failure at `DEBUG` rather than `WARN`: the store has
+/// already logged the one fixed `WARN`, and a second one would be a duplicate.
+mod not_retained_logging {
     use super::*;
 
     #[tokio::test]

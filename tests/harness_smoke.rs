@@ -2,8 +2,8 @@
 //!
 //! This is not a test of `rusteero` itself — every behaviour it exercises is already covered by
 //! `src/transport.rs`'s own unit tests — it exists purely to prove `MockEero` actually reaches a
-//! running mock server for both API versions *before* any later-phase test file starts depending
-//! on it (see the task brief for this file: "do not hand the next wave an untested harness").
+//! running mock server for both API versions, so no other test file depends on an untested
+//! harness.
 
 mod common;
 
@@ -268,8 +268,8 @@ fn every_minimum_fixture_parses_as_an_envelope_shaped_object() {
 
 #[test]
 fn network_and_device_ids_are_consistent_across_fixtures() {
-    // The task brief requires ids to be shared across fixtures so phase-3/phase-4 tests can
-    // compose them (e.g. fetch `networks.json`, then `network.json` for one of its ids).
+    // Ids are shared across fixtures so endpoint and client tests can compose them (e.g. fetch
+    // `networks.json`, then `network.json` for one of its ids).
     let network_id = fixture_json("network.json")["data"]["id"].clone();
     assert_eq!(fixture_json("networks.json")["data"][0]["id"], network_id);
     assert_eq!(

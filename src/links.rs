@@ -981,7 +981,7 @@ mod tests {
         assert!(matches!(err, Error::Validation { .. }));
     }
 
-    // ===================== security finding 3: query/fragment rejection =====================
+    // ===================== query/fragment rejection =====================
 
     #[test]
     fn resource_url_absolute_url_with_query_is_rejected() {

@@ -7,8 +7,8 @@ use reqwest::Method;
 ///
 /// Ported from `const.py:17` (`ACCOUNT_ENDPOINT`) — a constant the Python source itself never
 /// imports outside `const.py` (dead in `eero-api`), but the endpoint is real and used by
-/// `rusteero`'s `Client::get_account` and the `get_networks` `/account` fallback (port plan
-/// §1.6). Also relied on by `tests/transport.rs`, `tests/harness_smoke.rs` and `tests/live.rs`
+/// `rusteero`'s `Client::get_account` and the `get_networks` `/account` fallback. Also relied
+/// on by `tests/transport.rs`, `tests/harness_smoke.rs` and `tests/live.rs`
 /// (shared test files) as a generic "any authenticated GET" example — do not delete. A fixed
 /// path (no `{id}` placeholder): every call site resolves it with an empty id and no parent.
 pub const ACCOUNT: Resource = Resource {
@@ -31,7 +31,7 @@ pub const GET_NETWORKS: Resource = Resource {
 
 // ============================= v8.0.4 (`Resource`) constants =============================
 //
-// Every constant below is new port work for this phase. `link: Some(name)` means the caller's
+// Every constant below is new in v8.0.4. `link: Some(name)` means the caller's
 // `parent` envelope's `resources.<name>` is preferred over the template
 // (`crate::links::sub_resource_url`); `link: None` on a template containing `{id}` means only the
 // template is ever used (no named link exists for that resource); `link: None` on a template with

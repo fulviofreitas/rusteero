@@ -1,23 +1,22 @@
-//! Path-traversal regression suite for security review finding F1 (HIGH), plus one end-to-end
-//! test for finding F3 (LOW).
+//! Path-traversal regression suite, plus one end-to-end test for network-id auto-discovery.
 //!
-//! F1: an empty, `"."`, or `".."` path parameter must never reach the wire. At v8.0.4 every
-//! identifier substituted into a resolved URL is validated by
+//! Path parameters: an empty, `"."`, or `".."` path parameter must never reach the wire. At v8.0.4
+//! every identifier substituted into a resolved URL is validated by
 //! [`rusteero::links::validate_identifier`] (a strict `^[A-Za-z0-9][A-Za-z0-9._:-]*$` whitelist,
-//! plus an explicit `".."` rejection) before it is ever joined onto a request URL — either
-//! directly (`child_url`, used by `BlacklistApi::remove_from_blacklist`), or via
+//! plus an explicit `".."` rejection) before it is ever joined onto a request URL — either directly
+//! (`child_url`, used by `BlacklistApi::remove_from_blacklist`), or via
 //! [`rusteero::params::resolve_nested_url`] (used by every `Nested`-routed delete/update below),
 //! whose own explicit empty-child check runs first (`field: "child"`) before it too falls back to
 //! `child_url` for a non-empty-but-still-invalid value (`field: "id"`). See `src/routes/mod.rs`'s
 //! module docs ("Path traversal") for the full mechanism; the pre-v8.0.4 `Route`/`validate_segment`
 //! model this file used to pin directly is gone.
 //!
-//! Every destructive route below is exercised the same way, proving the point the module docs
-//! make explicitly: checking only the returned error is not enough, because the bug this finding
-//! describes was that a request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."`
-//! case therefore mounts a catch-all `wiremock::matchers::any()` mock with `.expect(0)` — if
-//! identifier validation ever regresses to the pre-fix behaviour, the mock server's own drop-time
-//! verification fails the test, not just the returned `Result`.
+//! Every destructive route below is exercised the same way, proving the point the module docs make
+//! explicitly: checking only the returned error is not enough, because the bug this suite guards
+//! against was that a request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."` case
+//! therefore mounts a catch-all `wiremock::matchers::any()` mock with `.expect(0)` — if identifier
+//! validation ever regresses to the pre-fix behaviour, the mock server's own drop-time verification
+//! fails the test, not just the returned `Result`.
 //!
 //! A slash-bearing id (e.g. `"../../secrets"`) is also covered per route below, but its expected
 //! outcome is the opposite of the pre-v8.0.4 suite this file replaces: `validate_identifier`'s
@@ -37,12 +36,13 @@
 //! pointed at a network. Each rejected value below is checked against a catch-all
 //! `.expect(0)` mock; the legitimate path form still reaches the wire.
 //!
-//! F3: `Client::ensure_network_id`'s auto-discovery path and `Client::derive_preferred_network_id`
-//! both extract a network id out of a `/networks` response body via the shared
-//! `extract_network_id` helper (`src/client/mod.rs`), which applies `crate::routes::validate_segment`
-//! before handing a candidate id back — see `auto_discovered_network_id_rejects_a_hostile_id_field`
-//! below. Unrelated to the `Resource`/`Nested` route model: `extract_network_id` reads a candidate
-//! id straight out of an untrusted response body, never through `links::validate_identifier`.
+//! Network-id auto-discovery: `Client::ensure_network_id`'s auto-discovery path and
+//! `Client::derive_preferred_network_id` both extract a network id out of a `/networks` response
+//! body via the shared `extract_network_id` helper (`src/client/mod.rs`), which applies
+//! `crate::routes::validate_segment` before handing a candidate id back — see
+//! `auto_discovered_network_id_rejects_a_hostile_id_field` below. Unrelated to the
+//! `Resource`/`Nested` route model: `extract_network_id` reads a candidate id straight out of an
+//! untrusted response body, never through `links::validate_identifier`.
 
 mod common;
 
@@ -116,7 +116,7 @@ async fn remove_from_blacklist_single_dot_id_is_rejected_before_any_request() ->
     Ok(())
 }
 
-/// The concrete reproduction from the security finding: before the fix, this DELETE landed on
+/// The concrete reproduction: before the fix, this DELETE landed on
 /// `DELETE /2.2/networks/network-0001/blacklist` — the whole blacklist, unblocking every device
 /// on the network — instead of erroring. This must be rejected with zero requests sent.
 #[tokio::test]
@@ -697,9 +697,9 @@ async fn reboot_network_with_a_network_path_or_url_still_reaches_the_network_end
     Ok(())
 }
 
-// ============================ F3: network-id auto-discovery ============================
+// ============================ network-id auto-discovery ============================
 
-/// Security review finding F3: a hostile or buggy `/networks` response must not hand
+/// A hostile or buggy `/networks` response must not hand
 /// `Client::ensure_network_id`'s auto-discovery path a `".."` network id that then flows into
 /// every subsequent request URL. Before the fix, `extract_network_id` accepted an `id` field of
 /// `".."` verbatim; now it is rejected, auto-discovery finds no usable network, and the call

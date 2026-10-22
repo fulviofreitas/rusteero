@@ -53,9 +53,9 @@ const BARE_ID_MESSAGE: &str =
 
 /// Every optional keyword argument [`ScheduleApi::update_schedule`] accepts.
 ///
-/// More than four optional keyword arguments, per this port's conventions
-/// (`.claude/tasks/briefs/v8/phase-g-rules.md` item 2). Ported from `ScheduleAPI.update_schedule`'s
-/// own five independent keyword-only fields (`schedule.py:215-223`).
+/// More than four optional keyword arguments, so they travel as one options struct (this
+/// crate's convention). Ported from `ScheduleAPI.update_schedule`'s own five independent
+/// keyword-only fields (`schedule.py:215-223`).
 #[derive(Debug, Default, Clone)]
 pub struct UpdateScheduleOptions<'a> {
     /// The schedule's name. Omitted from the request when `None`.

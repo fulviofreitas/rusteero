@@ -6,7 +6,7 @@ use super::{ApiVersion, Nested, Resource};
 use reqwest::Method;
 
 // ============================================================================================
-// v8.0.4 constants (`.claude/tasks/briefs/v8/g3-devices.md`). Every `DevicesApi` method in
+// v8.0.4 constants. Every `DevicesApi` method in
 // `src/endpoints/devices.rs` is built on one of these.
 // ============================================================================================
 

@@ -19,7 +19,7 @@ use reqwest::Method;
 /// (`wan.py:83`) so a path, URL or published link on another version is pinned back to 2.3. On a
 /// network without the feature, the API has been
 /// observed to return HTTP 404 with `error.network.multistaticip_not_found` — a generic 404,
-/// mapped the same as any other (`Error::Api { status: 404, .. }`, decision D-8).
+/// mapped the same as any other (`Error::Api { status: 404, .. }`).
 pub const WAN_GET_MULTISTATICIP: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_3,
