@@ -173,7 +173,14 @@ async fn invalid_json_on_a_2xx_is_api_error_not_json_error() -> anyhow::Result<(
         .await
         .expect_err("malformed JSON on a 2xx must not parse as an envelope");
 
-    assert!(matches!(err, Error::Api { status: 200, .. }));
+    assert!(
+        matches!(
+            &err,
+            Error::Api { status: 200, message, envelope: None, error_code: None, .. }
+                if message == "Invalid JSON response (14 bytes)"
+        ),
+        "{err:?}"
+    );
     Ok(())
 }
 
@@ -2424,4 +2431,757 @@ async fn redirects_and_error_statuses_do_not_log_identifiers_above_debug() -> an
     );
     assert_nothing_above_debug_identifies_the_request(&logs);
     Ok(())
+}
+
+// ===================== undecodable and non-object response bodies =====================
+
+/// Mounts `response` on `GET /2.2/account`, matching the credentials, to be served exactly once.
+/// Several calls queue their responses in order.
+async fn mount_account_once(mock: &MockEero, response: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(response)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+}
+
+/// `GET /2.2/account` through `transport`.
+async fn account(transport: &Transport) -> Result<Envelope, Error> {
+    transport
+        .resource(&ACCOUNT, "", None, &[], RequestBody::None)
+        .await
+}
+
+const UNRECOGNISED: &str = "unrecognised error string";
+
+#[tokio::test]
+async fn an_undecodable_error_body_still_maps_by_status() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let statuses = [401_u16, 404, 429, 500, 502];
+    for status in statuses {
+        mount_account_once(
+            &mock,
+            ResponseTemplate::new(status).set_body_bytes(vec![0xff, 0xfe]),
+        )
+        .await;
+    }
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    for status in statuses {
+        let err = account(&transport)
+            .await
+            .expect_err("every status here is an error");
+        match (status, &err) {
+            (
+                401,
+                Error::Authentication {
+                    message,
+                    envelope: None,
+                    error_code: None,
+                    status: Some(401),
+                },
+            )
+            | (
+                404,
+                Error::NotFound {
+                    status: 404,
+                    message,
+                    envelope: None,
+                    error_code: None,
+                },
+            )
+            | (
+                429,
+                Error::RateLimit {
+                    message,
+                    envelope: None,
+                    error_code: None,
+                    status: Some(429),
+                    ..
+                },
+            ) => assert_eq!(message, UNRECOGNISED),
+            (
+                500 | 502,
+                Error::Api {
+                    status: got,
+                    message,
+                    envelope: None,
+                    error_code: None,
+                    ..
+                },
+            ) => {
+                assert_eq!(*got, status);
+                assert_eq!(message, UNRECOGNISED);
+            }
+            _ => panic!("status {status} mapped to {err:?}"),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_undecodable_5xx_is_retried_like_any_other_server_error() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .respond_with(ResponseTemplate::new(502).set_body_bytes(vec![0xff, 0xfe]))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(1)
+        .build()?;
+
+    let err = account(&transport).await.expect_err("both attempts fail");
+    assert!(matches!(err, Error::Api { status: 502, .. }), "{err:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_error_envelope_survives_a_stray_invalid_byte() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_account_once(
+        &mock,
+        ResponseTemplate::new(502)
+            .set_body_bytes(b"{\"meta\": {\"code\": 502, \"error\": \"x\xff\"}}".to_vec()),
+    )
+    .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let err = account(&transport).await.expect_err("a 502");
+    let Error::Api {
+        status: 502,
+        message,
+        envelope: Some(envelope),
+        error_code: Some(code),
+        ..
+    } = &err
+    else {
+        panic!("expected Error::Api with an envelope, got {err:?}");
+    };
+    assert_eq!(message, UNRECOGNISED);
+    assert_eq!(
+        envelope,
+        &json!({"meta": {"code": 502, "error": "x\u{fffd}"}})
+    );
+    assert_eq!(code, "x\u{fffd}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refresh_signal_in_a_lossily_decoded_401_still_triggers_the_refresh() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    mount_account_once(
+        &mock,
+        ResponseTemplate::new(401).set_body_bytes(
+            b"{\"meta\":{\"code\":401,\"error\":\"error.session.refresh\"},\"data\":\"\xff\"}"
+                .to_vec(),
+        ),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(body_string("\"\""))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"meta":{"code":200},"data":{}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    mount_account_once(
+        &mock,
+        ResponseTemplate::new(200).set_body_string(fixture("account.json")),
+    )
+    .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let env = account(&transport).await?;
+    assert_eq!(env.into_value(), fixture_json("account.json"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_undecodable_success_body_is_a_typed_error_that_keeps_the_body_out() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let statuses = [200_u16, 201];
+    for status in statuses {
+        mount_account_once(
+            &mock,
+            ResponseTemplate::new(status)
+                .set_body_bytes(b"{\"data\": \"\xff\xfe-sentinel\"}".to_vec()),
+        )
+        .await;
+    }
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let (_guard, logs) = capture_logs();
+    for status in statuses {
+        let err = account(&transport).await.expect_err("an undecodable body");
+        assert!(
+            matches!(
+                &err,
+                Error::Api { status: got, message, envelope: None, error_code: None, .. }
+                    if *got == status && message == "Response body is not valid UTF-8"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("API error {status}: Response body is not valid UTF-8")
+        );
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("sentinel") && !debug.contains("index"),
+            "{debug}"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    assert_eq!(
+        logs.errors(),
+        ["Undecodable response body (23 bytes)"; 2],
+        "one ERROR per response, with the byte count and nothing else"
+    );
+    for (level, _, message) in logs.records() {
+        assert!(
+            !message.contains("sentinel"),
+            "{level} record {message:?} carries the body"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_non_object_success_body_is_a_typed_error() -> anyhow::Result<()> {
+    // (body, the Python type name `eero-api` logs for it)
+    let bodies = [
+        ("[]", "list"),
+        ("[1, 2]", "list"),
+        ("\"text\"", "str"),
+        ("42", "int"),
+        ("1.5", "float"),
+        ("1e3", "float"),
+        ("123456789012345678901234567890", "int"),
+        ("true", "bool"),
+        ("null", "NoneType"),
+    ];
+    let mock = MockEero::start().await;
+    let statuses = [200_u16, 201];
+    for status in statuses {
+        for (body, _) in bodies {
+            mount_account_once(&mock, ResponseTemplate::new(status).set_body_string(body)).await;
+        }
+    }
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let (_guard, logs) = capture_logs();
+    for status in statuses {
+        for (body, kind) in bodies {
+            let err = account(&transport).await.expect_err("not an object");
+            assert!(
+                matches!(
+                    &err,
+                    Error::Api { status: got, message, envelope: None, error_code: None, .. }
+                        if *got == status && message == "Unexpected JSON response: expected an object"
+                ),
+                "{body}: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("API error {status}: Unexpected JSON response: expected an object")
+            );
+            let expected = format!("Unexpected {kind} in JSON response ({} bytes)", body.len());
+            assert!(
+                logs.contains(Level::ERROR, &expected),
+                "{expected}: {:?}",
+                logs.errors()
+            );
+        }
+    }
+    assert_eq!(logs.errors().len(), statuses.len() * bodies.len());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_non_object_success_body_on_a_write_is_attempted_once() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    for verb in ["POST", "PUT", "DELETE"] {
+        Mock::given(method(verb))
+            .and(path("/2.2/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(3)
+        .build()?;
+
+    for verb in [Method::POST, Method::PUT, Method::DELETE] {
+        let url = Url::parse(&format!("{}/2.2/account", mock.uri()))?;
+        let err = transport
+            .request(verb.clone(), url, &[], RequestBody::None)
+            .await
+            .expect_err("a list is not an envelope");
+        assert!(
+            matches!(&err, Error::Api { status: 200, message, .. } if message == "Unexpected JSON response: expected an object"),
+            "{verb}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_json_logs_the_byte_count_and_the_parser_position_only() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_account_once(
+        &mock,
+        ResponseTemplate::new(200).set_body_string("not valid json"),
+    )
+    .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let (_guard, logs) = capture_logs();
+    account(&transport).await.expect_err("malformed JSON");
+    let errors = logs.errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].starts_with("Error parsing JSON response (14 bytes): "),
+        "{errors:?}"
+    );
+    assert!(
+        !errors[0].contains("valid"),
+        "the body is never logged: {errors:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_or_whitespace_success_body_is_still_an_empty_object() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // Python's `str.strip()` also strips U+001C..U+001F, which `str::trim` does not.
+    let bodies = [
+        "",
+        "  \n",
+        "\u{1f}\n",
+        "\u{1c}\u{1d}\u{1e}\u{1f}",
+        " \t\r\n",
+    ];
+    for body in bodies {
+        mount_account_once(&mock, ResponseTemplate::new(200).set_body_string(body)).await;
+    }
+    mount_account_once(&mock, ResponseTemplate::new(204).set_body_string("[]")).await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    for body in bodies {
+        let env = account(&transport).await?;
+        assert_eq!(env.into_value(), json!({}), "{body:?}");
+    }
+    let env = account(&transport).await?;
+    assert_eq!(env.into_value(), json!({}), "a 204 is never parsed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_json_object_body_is_returned_unmodified() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = r#" {"meta": {"code": 200}, "data": [1, {"a": null}], "extra": "kept"} "#;
+    mount_account_once(&mock, ResponseTemplate::new(200).set_body_string(body)).await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let env = account(&transport).await?;
+    assert_eq!(
+        env.into_value(),
+        serde_json::from_str::<serde_json::Value>(body)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_retry_after_header_is_never_logged() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_account_once(
+        &mock,
+        ResponseTemplate::new(429).insert_header("retry-after", "7654"),
+    )
+    .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let (_guard, logs) = capture_logs();
+    let err = account(&transport).await.expect_err("a 429");
+    assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+    for (level, _, message) in logs.records() {
+        assert!(
+            !message.contains("7654"),
+            "{level} record {message:?} carries the header"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_429_is_never_retried_and_a_write_gets_one_attempt() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(3)
+        .build()?;
+
+    let err = transport
+        .resource(&rusteero::routes::LOGOUT, "", None, &[], RequestBody::None)
+        .await
+        .expect_err("a 429");
+    assert!(
+        matches!(&err, Error::RateLimit { status: Some(429), retry_after: Some(wait), .. } if *wait == Duration::from_secs(1)),
+        "{err:?}"
+    );
+    let err = account(&transport).await.expect_err("a 429");
+    assert!(
+        matches!(&err, Error::RateLimit { status: Some(429), retry_after: Some(wait), .. } if *wait == Duration::from_secs(1)),
+        "{err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_non_object_refresh_answer_is_not_a_successful_refresh() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(header("content-type", "application/json"))
+        .and(body_string("\"\""))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    assert!(
+        !transport.refresh_session().await?,
+        "a list is not a refresh"
+    );
+    assert!(
+        transport.is_authenticated(),
+        "the credentials are left untouched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_non_object_refresh_answer_means_no_replay() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_account_once(
+        &mock,
+        ResponseTemplate::new(401)
+            .set_body_string(r#"{"meta":{"code":401,"error":"error.session.refresh"}}"#),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(body_string("\"\""))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+
+    let err = account(&transport)
+        .await
+        .expect_err("the original 401 surfaces");
+    assert!(
+        matches!(
+            &err,
+            Error::Authentication { error_code: Some(code), status: Some(401), .. }
+                if code == "error.session.refresh"
+        ),
+        "{err:?}"
+    );
+    assert!(transport.is_authenticated());
+    Ok(())
+}
+
+// ===================== GET retry follows the classified error =====================
+
+#[tokio::test]
+async fn a_5xx_carrying_a_rate_limit_is_not_retried() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "1")
+                .set_body_string(r#"{"meta":{"code":503,"error":"error.rate.limit"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(2)
+        .build()?;
+
+    let err = account(&transport)
+        .await
+        .expect_err("a rate limit is raised on the first attempt");
+    assert!(
+        matches!(
+            &err,
+            Error::RateLimit { status: Some(503), retry_after: Some(wait), error_code: Some(code), .. }
+                if *wait == Duration::from_secs(1) && code == "error.rate.limit"
+        ),
+        "{err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_5xx_without_a_rate_limit_is_retried_to_the_limit() -> anyhow::Result<()> {
+    // The control for the test above: the same status with no `meta.error` retries.
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"meta":{"code":503}}"#))
+        .expect(3)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(2)
+        .build()?;
+
+    let err = account(&transport).await.expect_err("every attempt fails");
+    assert!(matches!(err, Error::Api { status: 503, .. }), "{err:?}");
+    Ok(())
+}
+
+// ===================== credential gate: origin rule =====================
+
+#[tokio::test]
+async fn the_credential_withheld_warning_names_the_reason_and_the_host_only() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let foreign = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&foreign)
+        .await;
+    let port = foreign.address().port();
+    let transport = transport_at(&mock.uri());
+
+    let (_guard, logs) = capture_logs();
+    // A different host name, then the configured host on another port.
+    for base in [
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1:{port}"),
+    ] {
+        send_canary(&transport, Method::GET, &base).await?;
+    }
+    assert_eq!(
+        logs.warnings(),
+        [
+            "Session header withheld from a request to a foreign host: http://localhost",
+            "Session header withheld from a request to a non-matching port: http://127.0.0.1",
+        ]
+    );
+    for warning in logs.warnings() {
+        for forbidden in [NETWORK_ID, QUERY_CANARY, "?", &port.to_string(), "/2.2"] {
+            assert!(
+                !warning.contains(forbidden),
+                "{warning:?} carries {forbidden:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_withheld_warning_for_a_scheme_mismatch_names_the_scheme() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(header_exists("x-user-token"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+    // The configured authority over `https`; the plain-http mock cannot answer, so the request
+    // fails at the TLS layer, which is not under test.
+    let mismatched = mock.uri().replacen("http://", "https://", 1);
+
+    let (_guard, logs) = capture_logs();
+    let _ = send_canary(&transport, Method::GET, &mismatched).await;
+    assert_eq!(
+        logs.warnings(),
+        ["Session header withheld from a request to a non-matching scheme: https://127.0.0.1"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_explicit_default_port_is_the_same_origin() -> anyhow::Result<()> {
+    // `http://127.0.0.1:80` is the configured origin of a base with no port, so the credential
+    // is attached to it; the request itself is refused by the (closed) port, which is the point:
+    // the gate said yes and nothing was logged about a withheld header.
+    let transport = transport_at("http://127.0.0.1");
+    let (_guard, logs) = capture_logs();
+    let url = Url::parse("http://127.0.0.1:80/2.2/account")?;
+    let _ = transport
+        .request(Method::GET, url, &[], RequestBody::None)
+        .await;
+    assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_url_with_userinfo_is_rejected_before_any_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    let transport = mock.transport_with_token(TEST_TOKEN);
+    let authority = mock.uri().replacen("http://", "", 1);
+
+    let (_guard, logs) = capture_logs();
+    for userinfo in ["user:pass@", "user@", ":pass@"] {
+        let url = Url::parse(&format!("http://{userinfo}{authority}/2.2/account"))?;
+        let err = transport
+            .request(Method::GET, url, &[], RequestBody::None)
+            .await
+            .expect_err("userinfo would become Basic credentials");
+        assert!(
+            matches!(
+                &err,
+                Error::Validation { field, message, .. }
+                    if field == "url" && message == "must not carry userinfo"
+            ),
+            "{userinfo}: {err:?}"
+        );
+        assert!(!err.to_string().contains("pass"), "{err}");
+    }
+    assert!(logs.warnings().is_empty());
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .is_empty(),
+        "no request may reach the server"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_url_with_userinfo_is_rejected_for_writes_and_unauthenticated_calls_too()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let transport = mock.transport_anonymous();
+    let authority = mock.uri().replacen("http://", "", 1);
+    let url = Url::parse(&format!("http://user:pass@{authority}/2.2/login"))?;
+
+    let err = transport
+        .request(Method::POST, url, &[], RequestBody::EmptyJsonString)
+        .await
+        .expect_err("userinfo is rejected before the authentication check");
+    assert!(
+        matches!(&err, Error::Validation { field, .. } if field == "url"),
+        "{err:?}"
+    );
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .is_empty()
+    );
+    Ok(())
+}
+
+// ===================== storage failures: not-retained writes =====================
+
+/// A store whose `save` fails with `message`.
+#[derive(Debug)]
+struct FailingSaveStore {
+    message: &'static str,
+}
+
+impl rusteero::storage::CredentialStore for FailingSaveStore {
+    fn load(&self) -> Result<Session, rusteero::error::StorageError> {
+        Ok(Session::empty())
+    }
+
+    fn save(&self, _session: &Session) -> Result<(), rusteero::error::StorageError> {
+        Err(rusteero::error::StorageError::Backend {
+            backend: "fake".to_owned(),
+            message: self.message.to_owned(),
+        })
+    }
+
+    fn clear(&self) -> Result<(), rusteero::error::StorageError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_not_retained_write_is_logged_at_debug_and_other_failures_stay_at_warn() {
+    for (message, level) in [
+        ("storage did not retain the saved session", Level::DEBUG),
+        ("disk is on fire", Level::WARN),
+    ] {
+        let transport = Transport::builder()
+            .store(Some(Arc::new(FailingSaveStore { message })))
+            .build()
+            .expect("builds");
+        let (_guard, logs) = capture_logs();
+        transport
+            .set_session(Some(Session::from_token(TEST_TOKEN)))
+            .expect("the Warn policy swallows the failure");
+
+        assert!(!transport.credentials_persisted(), "{message}");
+        let warned = logs.contains(Level::WARN, "failed to persist session to credential store");
+        let debugged = logs.contains(Level::DEBUG, "credential store did not retain the session");
+        assert_eq!(
+            warned,
+            level == Level::WARN,
+            "{message}: {:?}",
+            logs.records()
+        );
+        assert_eq!(
+            debugged,
+            level == Level::DEBUG,
+            "{message}: {:?}",
+            logs.records()
+        );
+    }
 }

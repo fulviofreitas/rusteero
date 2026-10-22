@@ -51,7 +51,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use reqwest::header::{
     ACCEPT, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, LOCATION, RETRY_AFTER, USER_AGENT,
@@ -68,6 +68,7 @@ use crate::consts;
 use crate::envelope::Envelope;
 use crate::error::{Error, StorageError};
 use crate::errors;
+use crate::links::{self, OriginMismatch};
 use crate::redact;
 use crate::routes::{self, ApiVersion, Nested, Resource};
 use crate::storage::{self, CredentialStore};
@@ -448,7 +449,14 @@ impl Transport {
             Ok(()) => Ok(()),
             Err(err) => match self.storage_failures {
                 StorageFailures::Warn => {
-                    tracing::warn!(error = %err, "failed to persist session to credential store");
+                    if is_not_retained(&err) {
+                        // The store has already logged `eero-api`'s fixed WARN text for a write
+                        // it accepted but could not read back, so a second WARN would duplicate
+                        // it. The failure still sets `credentials_persisted`.
+                        tracing::debug!(error = %err, "credential store did not retain the session");
+                    } else {
+                        tracing::warn!(error = %err, "failed to persist session to credential store");
+                    }
                     Ok(())
                 }
                 StorageFailures::Fatal => Err(err.into()),
@@ -482,9 +490,11 @@ impl Transport {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
-    /// before any network call is made. Returns whatever status-mapped error the request produces
-    /// otherwise, or propagates a refresh failure unmodified if the refresh hook itself errors.
+    /// Returns [`Error::Validation`] on field `"url"`, before any network call, if `url` carries
+    /// userinfo (`user:pass@host`): `reqwest` would send it as HTTP Basic credentials. Returns
+    /// `Error::Authentication("Not authenticated")` if no valid session is configured, before any
+    /// network call is made. Returns whatever status-mapped error the request produces otherwise,
+    /// or propagates a refresh failure unmodified if the refresh hook itself errors.
     pub async fn request(
         &self,
         method: Method,
@@ -514,33 +524,22 @@ impl Transport {
         body: RequestBody,
         timeout: Option<RequestTimeout>,
     ) -> Result<Envelope, Error> {
+        reject_userinfo(&url)?;
         let token = self.current_token().ok_or_else(not_authenticated)?;
-        let exchange = self
-            .execute_with_get_retry(method.clone(), &url, query, &body, Some(&token), timeout)
-            .await?;
+        let first = self
+            .execute_with_get_retry(&method, &url, query, &body, Some(&token), timeout)
+            .await;
 
-        if exchange.status.as_u16() == 401 && refresh_signal_detected(&exchange.body) {
-            let refreshed = self.refresh_session().await?;
-            if refreshed {
-                let retry_token = self.current_token().ok_or_else(not_authenticated)?;
-                let retry = self
-                    .execute_with_get_retry(method, &url, query, &body, Some(&retry_token), timeout)
-                    .await?;
-                return status_to_envelope(
-                    retry.status,
-                    &retry.body,
-                    &retry.url,
-                    retry.retry_after,
-                );
-            }
+        // The server asks for a refresh with a 401 carrying `error.session.refresh`; one
+        // refresh and one replay, then the replay's outcome stands (`base.py:879-932`). A
+        // refresh that does not succeed falls through to the original authentication error.
+        if first.as_ref().err().is_some_and(refresh_requested) && self.refresh_session().await? {
+            let retry_token = self.current_token().ok_or_else(not_authenticated)?;
+            return self
+                .execute_with_get_retry(&method, &url, query, &body, Some(&retry_token), timeout)
+                .await;
         }
-
-        status_to_envelope(
-            exchange.status,
-            &exchange.body,
-            &exchange.url,
-            exchange.retry_after,
-        )
+        first
     }
 
     /// Sends an authenticated request to a [`Resource`]: `route.resolve(self.api_host(),
@@ -643,15 +642,9 @@ impl Transport {
         body: RequestBody,
         token: Option<&SecretString>,
     ) -> Result<Envelope, Error> {
-        let exchange = self
-            .execute_with_get_retry(method, &url, query, &body, token, None)
-            .await?;
-        status_to_envelope(
-            exchange.status,
-            &exchange.body,
-            &exchange.url,
-            exchange.retry_after,
-        )
+        reject_userinfo(&url)?;
+        self.execute_with_get_retry(&method, &url, query, &body, token, None)
+            .await
     }
 
     /// Attempts to refresh the current session, ported from `AuthAPI._do_refresh`
@@ -812,33 +805,29 @@ impl Transport {
         self.persistence.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Whether `url`'s scheme, host, and port (default-normalised) all match this transport's
-    /// configured [`Transport::api_host`].
-    ///
-    /// Ported from `_validate_absolute_url`'s host/scheme comparison (`base.py:394-406`), plus a
-    /// port comparison this crate adds: `eero-api`'s production host never carries a port, so
-    /// Python has no need to compare one, but `TransportBuilder::base_url` (used by every test in
-    /// this crate) legitimately does — two different local mock servers share the loopback
-    /// hostname but differ only by port, and a credential-placement gate that ignored port would
-    /// not actually withhold the credential from a "foreign" mock server in that common case.
-    fn matches_configured_host(&self, url: &Url) -> bool {
-        let scheme_matches = url.scheme().eq_ignore_ascii_case(self.api_host.scheme());
-        let host_matches = matches!(
-            (url.host_str(), self.api_host.host_str()),
-            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)
-        );
-        let port_matches = url.port_or_known_default() == self.api_host.port_or_known_default();
-        scheme_matches && host_matches && port_matches
+    /// Why `url` is not on this transport's configured origin ([`Transport::api_host`]), if it is
+    /// not: the one origin rule of the crate, [`links::origin_mismatch`], applied to the very
+    /// [`Url`] that is about to be sent.
+    fn origin_mismatch(&self, url: &Url) -> Option<OriginMismatch> {
+        links::origin_mismatch(url, &self.api_host)
     }
 
     /// Attaches the session credential to `request`, when `token` is `Some` — ported from
-    /// `_build_credentials` (`base.py:363-417`).
+    /// `_build_credentials` (`base.py:593-639`).
     ///
-    /// Attached only when `url`'s scheme/host/port match this transport's configured API host
-    /// (see [`Transport::matches_configured_host`]): `X-User-Token: <token>` always, plus —
-    /// only if [`TransportBuilder::send_legacy_cookie`] is on (the default) — a
-    /// `Cookie: s=<token>` header. On a mismatch, no credential is attached and a `WARNING` is
-    /// logged with Python's wording, reproduced verbatim (`base.py:407-412`).
+    /// Attached only when `url` is on the configured origin (see
+    /// [`Transport::origin_mismatch`]): same scheme, host and effective port, and no userinfo.
+    /// Then `X-User-Token: <token>` always, plus — only if
+    /// [`TransportBuilder::send_legacy_cookie`] is on (the default) — a `Cookie: s=<token>`
+    /// header. Otherwise no credential is attached and a `WARNING` names the reason and, when
+    /// there is one, `scheme://host` of the offending URL, never the full URL ([`withheld_message`],
+    /// `base.py:625-635`).
+    ///
+    /// The gate never fails and has no parse step of its own to disagree with the HTTP client:
+    /// it judges the same [`Url`] that `reqwest` sends, so the credential goes exactly where the
+    /// request goes. A raw string that could be read two ways never reaches it, because
+    /// [`Url::parse`] has already settled how it reads (a bad port, a backslash that would move the
+    /// host, an unterminated IPv6 literal all fail there).
     fn apply_credentials(
         &self,
         mut request: reqwest::RequestBuilder,
@@ -848,25 +837,8 @@ impl Transport {
         let Some(token) = token else {
             return request;
         };
-        if !self.matches_configured_host(url) {
-            let scheme_matches = url.scheme().eq_ignore_ascii_case(self.api_host.scheme());
-            let host_matches = matches!(
-                (url.host_str(), self.api_host.host_str()),
-                (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)
-            );
-            let reason = if host_matches && !scheme_matches {
-                "non-matching scheme"
-            } else {
-                "foreign host"
-            };
-            tracing::warn!(
-                reason,
-                scheme = url.scheme(),
-                host = url.host_str().unwrap_or(""),
-                "Session header withheld from a request to a {reason}: {}://{}",
-                url.scheme(),
-                url.host_str().unwrap_or("")
-            );
+        if let Some(mismatch) = self.origin_mismatch(url) {
+            tracing::warn!(reason = mismatch.reason, "{}", withheld_message(&mismatch));
             return request;
         }
 
@@ -907,14 +879,15 @@ impl Transport {
         }
     }
 
-    /// Runs [`Transport::execute_once`] with the bounded `GET`-only retry `_request_with_get_retry`
-    /// implements (`base.py:722-767`).
+    /// Runs one classified attempt ([`Transport::execute_once`] then `status_to_envelope`) with
+    /// the bounded `GET`-only retry `_request_with_get_retry` implements (`base.py:994-1039`).
     ///
     /// Writes (`method != GET`) always attempt exactly once, regardless of
     /// [`TransportBuilder::get_retries`]. A `GET` is retried, up to `get_retries` additional
-    /// times, on a transport error ([`Error::Network`]/[`Error::Timeout`]) or a `5xx` status —
-    /// never on a `4xx` (including `429`, which carries its own `Retry-After` semantics a caller
-    /// should honour explicitly rather than have this loop silently retry). A fixed delay
+    /// times, when the *classified* error is transient (see `is_transient_failure`): a network
+    /// error, a timeout, or a server-driven error with a status of `500` or more. A `4xx` is
+    /// never retried, and neither is a rate limit on any status, including a `5xx` that carries
+    /// `error.rate.limit`: the crate never sleeps on, or retries, a `Retry-After`. A fixed delay
     /// ([`consts::GET_RETRY_DELAY`]) separates attempts; each retry is logged at `WARN`.
     ///
     /// `timeout` is applied afresh to every attempt, so each one gets the full budget rather than
@@ -922,26 +895,30 @@ impl Transport {
     /// `_request` call).
     async fn execute_with_get_retry(
         &self,
-        method: Method,
+        method: &Method,
         url: &Url,
         query: &[(&str, String)],
         body: &RequestBody,
         token: Option<&SecretString>,
         timeout: Option<RequestTimeout>,
-    ) -> Result<RawExchange, Error> {
+    ) -> Result<Envelope, Error> {
         let mut attempt: u32 = 0;
         loop {
-            let outcome = self
-                .execute_once(&method, url, query, body, token, timeout)
-                .await;
-            let is_get = method == Method::GET;
-            let retryable = is_get
+            let outcome = match self
+                .execute_once(method, url, query, body, token, timeout)
+                .await
+            {
+                Ok(exchange) => status_to_envelope(
+                    exchange.status,
+                    &exchange.body,
+                    &exchange.url,
+                    exchange.retry_after,
+                ),
+                Err(err) => Err(err),
+            };
+            let retryable = *method == Method::GET
                 && attempt < self.get_retries
-                && match &outcome {
-                    Ok(exchange) => exchange.status.as_u16() >= 500,
-                    Err(Error::Network(_) | Error::Timeout) => true,
-                    Err(_) => false,
-                };
+                && outcome.as_ref().err().is_some_and(is_transient_failure);
             if !retryable {
                 return outcome;
             }
@@ -1135,14 +1112,57 @@ impl Transport {
         }
 
         let retry_after = parse_retry_after(response.headers());
-        let body_text = read_capped_body(response, bounds.read).await?;
+        let bytes = read_capped_body(response, bounds.read).await?;
+        let body = decode_body(status, bytes, &url)?;
 
         Ok(RawExchange {
             status,
-            body: body_text,
+            body,
             retry_after,
             url,
         })
+    }
+}
+
+/// Whether `err` reports a store that accepted a write and could not read it back.
+///
+/// Recognised by the fixed text of that error, `"<backend> storage did not retain the saved
+/// session"`, so that this stays correct without naming the variant that carries it. Once the
+/// storage layer's dedicated `StorageError::NotRetained { .. }` variant is in this crate's base,
+/// `matches!(err, StorageError::NotRetained { .. })` replaces the text check.
+fn is_not_retained(err: &StorageError) -> bool {
+    err.to_string()
+        .ends_with(" storage did not retain the saved session")
+}
+
+/// The `WARNING` text for a request whose credential was withheld (`base.py:625-635`): the
+/// fixed reason and, when the mismatch has one, the offending URL's `scheme://host`. A URL with
+/// userinfo has no target, so a credential embedded in it is never echoed.
+fn withheld_message(mismatch: &OriginMismatch) -> String {
+    match &mismatch.target {
+        Some(target) => format!(
+            "Session header withheld from a request to a {}: {target}",
+            mismatch.reason
+        ),
+        None => format!(
+            "Session header withheld from a request with {}",
+            mismatch.reason
+        ),
+    }
+}
+
+/// Refuses a request URL that carries userinfo (`user@`, `user:pass@`, `:pass@`).
+///
+/// `reqwest` turns userinfo into an `Authorization: Basic` header and strips it from the URL it
+/// sends, which would put a credential on the wire that this crate never chose, and make the
+/// request look like it went to a different URL than the one that was checked. The error names
+/// the field and never repeats the value. (An empty `@` is dropped by the URL parser, so it is
+/// indistinguishable from a URL without userinfo and sends nothing extra.)
+fn reject_userinfo(url: &Url) -> Result<(), Error> {
+    if url.username().is_empty() && url.password().is_none() {
+        Ok(())
+    } else {
+        Err(Error::validation("url", "must not carry userinfo"))
     }
 }
 
@@ -1173,16 +1193,21 @@ fn not_authenticated() -> Error {
     Error::authentication("Not authenticated")
 }
 
-/// Turns a response status and (already fully read) body into an `Envelope` or the matching
-/// `Error`, reproducing `api/base.py`'s status-code chain at `v8.0.4`:
+/// Turns a response status and (already decoded) body into an `Envelope` or the matching
+/// `Error`, reproducing `api/base.py`'s status-code chain at `v8.4.1` (`_request`, `:826-980`):
 ///
 /// - `204`, or any `2xx` with an empty/whitespace-only body, becomes `Envelope::empty()`.
-/// - Any other `2xx` is parsed as JSON; invalid JSON becomes `Error::Api` with message
-///   `"Invalid JSON response ({n} bytes)"` — a byte count only, never body content.
+/// - Any other `2xx` is parsed as JSON. Invalid JSON becomes `Error::Api` with message
+///   `"Invalid JSON response ({n} bytes)"`, and valid JSON that is not an object (a list, string,
+///   number, boolean or null) becomes `Error::Api` with message
+///   `"Unexpected JSON response: expected an object"`. Both carry the response status, no
+///   envelope, and a byte count (and the Python type name) in their `ERROR` log, never body
+///   content. [`Envelope::from_value`] stays permissive as a constructor; only the transport
+///   refuses a non-object response.
 /// - Every other non-`2xx`, non-`3xx` status is classified by [`errors::error_for_response`].
 ///
 /// Every debug log line in this function logs `status` and, for a JSON body, the *redacted*
-/// envelope ([`redact::redact_sensitive`]) — mirroring `_log_error_body` (`base.py:78-105`) —
+/// envelope ([`redact::redact_sensitive`]) — mirroring `_log_error_body` (`base.py:90-117`) —
 /// never the raw body text.
 fn status_to_envelope(
     status: StatusCode,
@@ -1193,18 +1218,43 @@ fn status_to_envelope(
     let code = status.as_u16();
 
     if (200..300).contains(&code) {
-        if status == StatusCode::NO_CONTENT || body.trim().is_empty() {
+        if status == StatusCode::NO_CONTENT || body.chars().all(is_python_whitespace) {
             return Ok(Envelope::empty());
         }
-        return serde_json::from_str::<Value>(body)
-            .map(Envelope::from_value)
-            .map_err(|_| Error::Api {
+        let payload = serde_json::from_str::<Value>(body).map_err(|err| {
+            // The parser's message names a position, never any of the body.
+            tracing::error!(
+                bytes = body.len(),
+                "Error parsing JSON response ({} bytes): {err}",
+                body.len()
+            );
+            Error::Api {
                 status: code,
                 message: format!("Invalid JSON response ({} bytes)", body.len()),
                 envelope: None,
                 error_code: None,
                 url: Some(url.to_string()),
+            }
+        })?;
+        if !payload.is_object() {
+            // Every method returns the response envelope, which is a JSON object: a list,
+            // string, number, boolean or null is not a response to hand back as one. Only the
+            // type and the size are logged, never the content.
+            let kind = python_type_name(&payload, body);
+            tracing::error!(
+                bytes = body.len(),
+                "Unexpected {kind} in JSON response ({} bytes)",
+                body.len()
+            );
+            return Err(Error::Api {
+                status: code,
+                message: "Unexpected JSON response: expected an object".to_owned(),
+                envelope: None,
+                error_code: None,
+                url: Some(url.to_string()),
             });
+        }
+        return Ok(Envelope::from_value(payload));
     }
 
     let envelope = errors::parse_envelope(body);
@@ -1225,12 +1275,39 @@ fn status_to_envelope(
     Err(err)
 }
 
+/// Whether `c` is whitespace to Python's `str.strip()`: Unicode `White_Space` plus the four
+/// information-separator controls U+001C..U+001F, which `str::trim` leaves alone.
+fn is_python_whitespace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The name of the Python type `json.loads` would have produced for a non-object `payload`, for
+/// the `ERROR` line (`type(payload).__name__`, `base.py:851`). `body` is the document the payload
+/// was parsed from: a number is an `int` unless its literal has a fraction or an exponent, which
+/// also keeps an integer beyond `u64` (which `serde_json` reads as a float) an `int`.
+fn python_type_name(payload: &Value, body: &str) -> &'static str {
+    match payload {
+        Value::Array(_) => "list",
+        Value::String(_) => "str",
+        Value::Bool(_) => "bool",
+        Value::Null => "NoneType",
+        Value::Number(_) => {
+            if body.bytes().any(|b| matches!(b, b'.' | b'e' | b'E')) {
+                "float"
+            } else {
+                "int"
+            }
+        }
+        Value::Object(_) => "dict",
+    }
+}
+
 /// Streams `response`'s body with a running size check, allowing `read` (when bounded) for each
-/// chunk to arrive.
+/// chunk to arrive. Returns the raw bytes; [`decode_body`] decides what to make of them.
 async fn read_capped_body(
     mut response: reqwest::Response,
     read: Option<Duration>,
-) -> Result<String, Error> {
+) -> Result<Vec<u8>, Error> {
     let status = response.status();
     let mut buffer: Vec<u8> = Vec::new();
 
@@ -1250,13 +1327,34 @@ async fn read_capped_body(
         buffer.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(buffer).map_err(|err| Error::Api {
-        status: status.as_u16(),
-        message: format!("Response body is not valid UTF-8: {err}"),
-        envelope: None,
-        error_code: None,
-        url: Some(response.url().to_string()),
-    })
+    Ok(buffer)
+}
+
+/// Decodes a response body as UTF-8, as `_request` does (`base.py:802-824`).
+///
+/// A `2xx` body that is not valid UTF-8 is an [`Error::Api`] with the response status and the
+/// fixed message `"Response body is not valid UTF-8"`, logged at `ERROR` with the byte count
+/// only. The decoder error is dropped without being formatted, so neither the message nor the
+/// log carries any of the body's bytes, and the error has no source chain. Any other status is
+/// decoded lossily (each invalid sequence becomes U+FFFD, like Python's `errors="replace"`): the
+/// text only feeds the best-effort envelope parse, so the ordinary status mapping still applies
+/// and an error body with a stray bad byte keeps its envelope.
+fn decode_body(status: StatusCode, bytes: Vec<u8>, url: &Url) -> Result<String, Error> {
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(err) if status.is_success() => {
+            let len = err.as_bytes().len();
+            tracing::error!(bytes = len, "Undecodable response body ({len} bytes)");
+            Err(Error::Api {
+                status: status.as_u16(),
+                message: "Response body is not valid UTF-8".to_owned(),
+                envelope: None,
+                error_code: None,
+                url: Some(url.to_string()),
+            })
+        }
+        Err(err) => Ok(String::from_utf8_lossy(err.as_bytes()).into_owned()),
+    }
 }
 
 /// Reads the next body chunk, failing with [`Error::Timeout`] if `read` is bounded and elapses
@@ -1274,35 +1372,161 @@ async fn next_chunk(
     chunk.map_err(map_reqwest_error)
 }
 
-/// Parses a `Retry-After` header value into a `Duration`, accepting both the delta-seconds form
-/// and the HTTP-date form (RFC 1123). Returns `None` when the header is absent or its value
-/// matches neither form.
+/// Parses a `Retry-After` header value into a `Duration`, ported from `_parse_retry_after`
+/// (`base.py:366-393`). Returns `None` when the header is absent, empty, not visible ASCII, or
+/// matches neither form; see [`parse_retry_after_at`] for the forms and the cap.
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim().to_owned();
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    let now = jiff::tz::TimeZone::UTC.to_datetime(jiff::Timestamp::now());
+    parse_retry_after_at(raw, now)
+}
 
-    if let Ok(seconds) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+/// Parses one `Retry-After` value against `now` (a UTC wall-clock reading).
+///
+/// - **Delta-seconds**: after trimming, ASCII digits only (`+5`, `-5`, `1.5`, `1e3` and non-ASCII
+///   digits are not), so `007` is 7 seconds. A value too long for a `u64` counts as above the cap.
+/// - **HTTP-date**: IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), RFC 850
+///   (`Sunday, 06-Nov-94 08:49:37 GMT`) or asctime (`Sun Nov  6 08:49:37 1994`), read as UTC, as
+///   `email.utils.parsedate_to_datetime` does (`base.py:385-393`). The weekday is ignored, so a
+///   wrong one is not an error. A date that is already past is zero, not `None`.
+///
+/// Either form is capped at [`consts::RETRY_AFTER_MAX`], because the header is server-controlled
+/// input: a far-future date or a very long digit string must not make a caller that sleeps for
+/// the value stall indefinitely.
+fn parse_retry_after_at(raw: &str, now: jiff::civil::DateTime) -> Option<Duration> {
+    let raw = raw.trim();
+    if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+        let cap = consts::RETRY_AFTER_MAX.as_secs();
+        return Some(Duration::from_secs(
+            raw.parse::<u64>().map_or(cap, |s| s.min(cap)),
+        ));
     }
 
-    let naive = jiff::civil::DateTime::strptime("%a, %d %b %Y %H:%M:%S GMT", &raw).ok()?;
-    let zoned = naive.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
-    let target = SystemTime::from(zoned);
-    Some(
-        target
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO),
+    let when = parse_http_date(raw)?;
+    let delay = Duration::try_from(when.duration_since(now)).unwrap_or(Duration::ZERO);
+    Some(delay.min(consts::RETRY_AFTER_MAX))
+}
+
+/// Reads an HTTP-date in any of the three forms RFC 9110 names, ignoring the weekday and treating
+/// the result as UTC. `None` for anything else, including an impossible date or a year that is
+/// not two or four digits.
+fn parse_http_date(raw: &str) -> Option<jiff::civil::DateTime> {
+    let tokens: Vec<&str> = raw.split_ascii_whitespace().collect();
+    let mut rest = tokens.as_slice();
+    // The weekday, when present, is a leading token with a comma (IMF-fixdate, RFC 850) or a
+    // bare day name (asctime); it carries no information the date does not.
+    if let Some((first, tail)) = rest.split_first()
+        && (first.ends_with(',') || is_day_name(first))
+    {
+        rest = tail;
+    }
+
+    let (day, month, year, time) = match *rest {
+        // IMF-fixdate: `06 Nov 1994 08:49:37 GMT`
+        [day, month, year, time, zone] if zone.eq_ignore_ascii_case("GMT") => {
+            (day, month, year, time)
+        }
+        // RFC 850: `06-Nov-94 08:49:37 GMT`
+        [date, time, zone] if zone.eq_ignore_ascii_case("GMT") => {
+            let mut parts = date.split('-');
+            let (day, month, year) = (parts.next()?, parts.next()?, parts.next()?);
+            if parts.next().is_some() {
+                return None;
+            }
+            (day, month, year, time)
+        }
+        // asctime: `Nov  6 08:49:37 1994`
+        [month, day, time, year] => (day, month, year, time),
+        _ => return None,
+    };
+
+    let mut clock = time.split(':');
+    let (hour, minute, second) = (clock.next()?, clock.next()?, clock.next()?);
+    if clock.next().is_some() {
+        return None;
+    }
+    let year = i16::try_from(parse_year(year)?).ok()?;
+    if year < 1 {
+        // Python's `datetime` has no year 0.
+        return None;
+    }
+    jiff::civil::DateTime::new(
+        year,
+        parse_month(month)?,
+        parse_digits(day, 2)?,
+        parse_digits(hour, 2)?,
+        parse_digits(minute, 2)?,
+        parse_digits(second, 2)?,
+        0,
+    )
+    .ok()
+}
+
+/// Whether `token` is the English name of a weekday, full or abbreviated.
+fn is_day_name(token: &str) -> bool {
+    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    token.len() >= 3
+        && token.is_char_boundary(3)
+        && DAYS.iter().any(|day| token[..3].eq_ignore_ascii_case(day))
+        && token.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+/// The month number (1-12) of a three-letter English abbreviation.
+fn parse_month(token: &str) -> Option<i8> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let position = MONTHS
+        .iter()
+        .position(|month| token.eq_ignore_ascii_case(month))?;
+    i8::try_from(position + 1).ok()
+}
+
+/// A one- or two-digit decimal field of a date or time.
+fn parse_digits(token: &str, max_len: usize) -> Option<i8> {
+    if token.is_empty() || token.len() > max_len || !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    token.parse().ok()
+}
+
+/// A two- or four-digit year. Two digits follow `email.utils`: above 68 is 19xx, otherwise 20xx.
+fn parse_year(token: &str) -> Option<i32> {
+    if !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: i32 = token.parse().ok()?;
+    match token.len() {
+        2 => Some(value + if value > 68 { 1900 } else { 2000 }),
+        4 => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether `err` is the server-driven refresh signal: a `401` whose `meta.error` classifies as
+/// [`errors::ErrorGroup::SessionRefresh`] (`base.py:879-880`). The error is the classified
+/// outcome of the response, so a body with a stray invalid byte (decoded lossily) still counts.
+fn refresh_requested(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Authentication { status: Some(401), error_code, .. }
+            if errors::classify_error_code(error_code.as_deref())
+                == Some(errors::ErrorGroup::SessionRefresh)
     )
 }
 
-/// Defensively checks whether a `401` response body carries the server-driven refresh signal
-/// (`classify_error_code(error_code) is ErrorGroup.SESSION_REFRESH`, ported from
-/// `api/base.py:602-680`). Any parse failure degrades silently to `false`.
-fn refresh_signal_detected(body: &str) -> bool {
-    let Some(envelope) = errors::parse_envelope(body) else {
-        return false;
-    };
-    let error_code = errors::error_code_from_envelope(&envelope);
-    errors::classify_error_code(error_code.as_deref()) == Some(errors::ErrorGroup::SessionRefresh)
+/// Whether a failed attempt is worth another `GET` (`base.py:1027-1032`): a network error or a
+/// timeout, or a server-driven error with a status of `500` or more.
+///
+/// The decision is made on the classified error, not the raw status, so it follows the error
+/// catalogue: a rate limit is never retried on any status (`EeroRateLimitException` is not an
+/// `EeroAPIException`), and neither is anything below `500` or without a status.
+fn is_transient_failure(err: &Error) -> bool {
+    match err {
+        Error::Network(_) | Error::Timeout => true,
+        Error::RateLimit { .. } => false,
+        other => other.status().is_some_and(|status| status >= 500),
+    }
 }
 
 thread_local! {
@@ -1401,16 +1625,106 @@ fn log_transport_failure(method: &Method, url: &Url, error: &Error) {
     }
 }
 
-/// Parses a base URL string into a `Url` validated to be usable as a path base, for use by
-/// `TransportBuilder::build`.
+/// The `base_url` problem for an authority that cannot be parsed (`base.py:333`).
+const BASE_URL_UNPARSEABLE: &str = "has an authority that cannot be parsed";
+/// The `base_url` problem for a base that carries userinfo (`base.py:336`).
+const BASE_URL_USERINFO: &str = "must not carry userinfo";
+/// The `base_url` problem for a base with no scheme or no host (`base.py:338`).
+const BASE_URL_NOT_ABSOLUTE: &str = "must be an absolute URL with a scheme and a host";
+
+/// Validates a configured `base_url` the way `_validate_base_url` does (`base.py:310-341`), in
+/// its order: an authority that cannot be parsed, then userinfo, then a missing scheme or host.
+/// The messages are fixed and never repeat the value, which may hold a credential.
+///
+/// Python decides from the raw text, and `url::Url::parse` rewrites that text (a backslash
+/// becomes a slash, `https:host` gains a `//`, an empty `user@` is dropped), so the raw text is
+/// inspected too: the authority is cut out the way `urlsplit` does it, and a backslash or an
+/// `@` in it is judged before the parser can hide it. Differences from Python are all on the
+/// strict side: `url` rejects some authorities `urlsplit` accepts (a space or a `%` in the host,
+/// an out-of-range IPv4 literal), and a scheme with no origin (`file:`, `foo://host`) is not a
+/// base. An empty string, which Python allows as "no base", is rejected here as not absolute.
+fn validate_base_url(raw: &str) -> Result<(), Error> {
+    let problem = |text: &'static str| Err(Error::validation("base_url", text));
+
+    // `urlsplit` drops leading C0 controls and spaces, and tab, CR and LF anywhere.
+    let cleaned: String = raw
+        .trim_start_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\r' | '\n'))
+        .collect();
+    let netloc = python_netloc(&cleaned);
+
+    // 1. An authority that cannot be parsed.
+    if netloc.is_some_and(|netloc| netloc.contains('\\')) {
+        return problem(BASE_URL_UNPARSEABLE);
+    }
+    let parsed = Url::parse(&cleaned);
+    if let Err(err) = &parsed
+        && !matches!(
+            err,
+            url::ParseError::EmptyHost
+                | url::ParseError::RelativeUrlWithoutBase
+                | url::ParseError::RelativeUrlWithCannotBeABaseBase
+                | url::ParseError::SetHostOnCannotBeABaseUrl
+        )
+    {
+        // `ParseError` is non-exhaustive: an error this list does not know fails closed.
+        return problem(BASE_URL_UNPARSEABLE);
+    }
+
+    // 2. Userinfo, including the empty `@` that the parser drops.
+    let parsed_userinfo = parsed
+        .as_ref()
+        .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+    if parsed_userinfo || netloc.is_some_and(|netloc| netloc.contains('@')) {
+        return problem(BASE_URL_USERINFO);
+    }
+
+    // 3. A scheme and a host.
+    match parsed {
+        Ok(url)
+            if netloc.is_some_and(|netloc| !netloc.is_empty())
+                && url.host_str().is_some()
+                && !url.cannot_be_a_base()
+                && url.origin().is_tuple() =>
+        {
+            Ok(())
+        }
+        _ => problem(BASE_URL_NOT_ABSOLUTE),
+    }
+}
+
+/// The authority of `url` as `urllib.parse.urlsplit` reads it: after an optional `scheme:`, it is
+/// there only when a literal `//` follows, and runs to the next `/`, `?` or `#`. `None` when
+/// `urlsplit` would find no authority, so `https:host`, `https:/host` and `https:\\host` have
+/// none although the WHATWG parser would give them a host.
+fn python_netloc(url: &str) -> Option<&str> {
+    let rest = match url.find(':') {
+        Some(i)
+            if i > 0
+                && url.as_bytes()[0].is_ascii_alphabetic()
+                && url.as_bytes()[..i]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) =>
+        {
+            &url[i + 1..]
+        }
+        _ => url,
+    };
+    let authority = rest.strip_prefix("//")?;
+    let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    Some(&authority[..end])
+}
+
+/// Parses an already validated base URL string into a `Url` usable as a path base, for use by
+/// `TransportBuilder::build`. The failures are unreachable for a base that passed
+/// [`validate_base_url`]; they carry the same fixed message rather than the parser's, which
+/// quotes the value.
 fn parse_base(raw: &str) -> Result<Url, Error> {
-    let mut url = Url::parse(raw)
-        .map_err(|err| Error::validation("base_url", format!("not a valid URL: {err}")))?;
+    let mut url =
+        Url::parse(raw).map_err(|_| Error::validation("base_url", BASE_URL_NOT_ABSOLUTE))?;
     if url.path_segments_mut().is_err() {
-        return Err(Error::validation(
-            "base_url",
-            "must be an absolute URL that can be used as a base",
-        ));
+        return Err(Error::validation("base_url", BASE_URL_NOT_ABSOLUTE));
     }
     Ok(url)
 }
@@ -1509,6 +1823,13 @@ impl TransportBuilder {
     /// Overrides the base host for *both* API versions, deriving each from `base_url` by
     /// stripping any trailing `/` and appending `/2.2` or `/2.3` respectively. [`Transport::api_host`]
     /// is derived from this override too. When unset, `build` uses the real hosts.
+    ///
+    /// The base defines the one origin that ever receives the session credential: its scheme,
+    /// host and effective port. It is validated at [`TransportBuilder::build`] time and must be an
+    /// absolute URL with a scheme and a host, no userinfo, and an authority that parses; the
+    /// errors are on field `"base_url"` with fixed messages that never repeat the value.
+    /// `eero-api` accepts an empty base as "no base"; here an empty string is rejected as not
+    /// absolute, and "no override" is not calling this method.
     #[must_use]
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_root = Some(base_url.into());
@@ -1606,8 +1927,9 @@ impl TransportBuilder {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation` if `base_url` was set to a string that does not parse as an
-    /// absolute URL usable as a path base, or if `accept_language`/`user_agent` contains a byte
+    /// Returns `Error::Validation` if `base_url` was set to a string that is not usable as an
+    /// origin (an authority that cannot be parsed, userinfo, or no scheme or host; see
+    /// [`TransportBuilder::base_url`]), or if `accept_language`/`user_agent` contains a byte
     /// outside the printable-ASCII range (or a CR/LF). The field is `"base_url"`,
     /// `"X-Accept-Language"` or `"User-Agent"`, checked in that order, so a call with several bad
     /// values reports the first. Returns `Error::Network` if constructing the underlying
@@ -1622,11 +1944,13 @@ impl TransportBuilder {
         // Both bases are validated here, even though only the 2.2 base's origin is kept
         // (`api_host`, below): a bad `base_url` override must fail at build time regardless of
         // which API version a caller's first request happens to target.
+        if let Some(root) = &self.base_root {
+            validate_base_url(root)?;
+        }
         let (base_22, _base_23) = self.build_bases()?;
         let api_host = {
             let origin = base_22.origin().ascii_serialization();
-            Url::parse(&origin)
-                .map_err(|err| Error::validation("base_url", format!("not a valid URL: {err}")))?
+            Url::parse(&origin).map_err(|_| Error::validation("base_url", BASE_URL_NOT_ABSOLUTE))?
         };
 
         // The header name is the field name and `X-Accept-Language` is checked first, as in
@@ -1708,8 +2032,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        REDACTIONS, RequestTimeout, Transport, parse_retry_after, refresh_signal_detected,
-        status_to_envelope, validate_header_value,
+        REDACTIONS, RequestTimeout, Transport, is_transient_failure, parse_retry_after,
+        parse_retry_after_at, refresh_requested, reject_userinfo, status_to_envelope,
+        validate_header_value, withheld_message,
     };
     use crate::error::Error;
     use crate::routes::{ACCOUNT, ApiVersion, Resource};
@@ -1774,30 +2099,210 @@ mod tests {
         assert_eq!(parse_retry_after(&headers), None);
     }
 
-    // ===================== refresh_signal_detected =====================
+    /// A fixed "now" for the date vectors: Thursday 22 October 2026, 12:00:00 UTC.
+    fn now() -> jiff::civil::DateTime {
+        jiff::civil::datetime(2026, 10, 22, 12, 0, 0, 0)
+    }
+
+    fn at(raw: &str) -> Option<Duration> {
+        parse_retry_after_at(raw, now())
+    }
+
+    #[test]
+    fn retry_after_delta_seconds_are_ascii_digits_only() {
+        assert_eq!(at("0"), Some(Duration::ZERO));
+        assert_eq!(at("120"), Some(Duration::from_secs(120)));
+        assert_eq!(at("  45 "), Some(Duration::from_secs(45)));
+        assert_eq!(at("\t45\t"), Some(Duration::from_secs(45)));
+        assert_eq!(at("007"), Some(Duration::from_secs(7)));
+        for bad in [
+            "+5",
+            "-5",
+            "1.5",
+            "1e3",
+            "12 seconds",
+            "",
+            "   ",
+            "soon",
+            "\u{663}",
+        ] {
+            assert_eq!(at(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn retry_after_is_capped_at_one_day() {
+        let cap = Some(crate::consts::RETRY_AFTER_MAX);
+        assert_eq!(cap, Some(Duration::from_secs(86_400)));
+        // A value at the cap passes through, one second over is capped.
+        assert_eq!(at("86400"), cap);
+        assert_eq!(at("86399"), Some(Duration::from_secs(86_399)));
+        assert_eq!(at("86401"), cap);
+        assert_eq!(at("9999999999"), cap);
+        // A digit string far beyond u64 is the cap, not an unparseable value.
+        assert_eq!(at(&"9".repeat(400)), cap);
+        // So is a date decades away, and the last second of year 9999.
+        assert_eq!(at("Mon, 10 Jan 2059 01:46:40 GMT"), cap);
+        assert_eq!(at("Fri, 31 Dec 9999 23:59:59 GMT"), cap);
+    }
+
+    #[test]
+    fn retry_after_reads_all_three_http_date_forms_as_utc() {
+        let minute = Some(Duration::from_secs(60));
+        // IMF-fixdate, RFC 850 (two-digit year) and asctime (space-padded day), all 60 s ahead.
+        assert_eq!(at("Thu, 22 Oct 2026 12:01:00 GMT"), minute);
+        assert_eq!(at("Thursday, 22-Oct-26 12:01:00 GMT"), minute);
+        assert_eq!(at("Thu Oct 22 12:01:00 2026"), minute);
+        // The weekday is ignored, wrong or missing, and the month is case-insensitive.
+        assert_eq!(at("Mon, 22 Oct 2026 12:01:00 GMT"), minute);
+        assert_eq!(at("22 OCT 2026 12:01:00 GMT"), minute);
+        assert_eq!(at("Fri, 22 oct 2026 12:01:00 gmt"), minute);
+        // A single-digit day, as asctime pads it.
+        assert_eq!(
+            parse_retry_after_at(
+                "Sun Nov  1 12:00:30 2026",
+                jiff::civil::datetime(2026, 11, 1, 6, 0, 0, 0)
+            ),
+            Some(Duration::from_secs(6 * 3600 + 30)),
+        );
+        // `email.utils` windowing for a two-digit year: above 68 is 19xx, otherwise 20xx.
+        assert_eq!(at("Sunday, 06-Nov-94 08:49:37 GMT"), Some(Duration::ZERO));
+        assert_eq!(
+            at("Tuesday, 22-Oct-30 12:00:01 GMT"),
+            Some(crate::consts::RETRY_AFTER_MAX),
+            "22-Oct-30 is 2030, years away, so the cap"
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_in_the_past_is_zero() {
+        assert_eq!(at("Wed, 01 Jan 2003 00:00:00 GMT"), Some(Duration::ZERO));
+        assert_eq!(at("Thu, 22 Oct 2026 11:59:59 GMT"), Some(Duration::ZERO));
+        assert_eq!(at("Thu, 22 Oct 2026 12:00:00 GMT"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_after_impossible_or_malformed_dates_are_none() {
+        for bad in [
+            "Mon, 99 Foo 2999 99:99:99 GMT",
+            "Wed, 01 Jan 99999 00:00:00 GMT",
+            "Thu, 30 Feb 2026 12:00:00 GMT",
+            "Thu, 22 Oct 2026 24:00:00 GMT",
+            "Thu, 22 Oct 2026 12:00:60 GMT",
+            "Thu, 22 Oct 0000 12:00:00 GMT",
+            "Thu, 22 Oct 2026 12:00 GMT",
+            "Thu, 22 Oct 2026 12:00:00 PST",
+            "Thu, 22 Oct 2026 12:00:00",
+            "Thursday, 22-Oct-2026-1 12:00:00 GMT",
+            "Thu, 22 Oct 202 12:00:00 GMT",
+            "Thu 22 Oct 2026",
+        ] {
+            assert_eq!(at(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn retry_after_ignores_non_visible_ascii_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_bytes("\u{663}".as_bytes()).unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    // ===================== refresh_requested =====================
+
+    /// Classifies a `401` carrying `body` the way the transport does.
+    fn refresh_requested_for(body: &str) -> bool {
+        let url = Url::parse("http://mock.test:1234/2.2/account").unwrap();
+        status_to_envelope(reqwest::StatusCode::UNAUTHORIZED, body, &url, None)
+            .err()
+            .as_ref()
+            .is_some_and(refresh_requested)
+    }
 
     #[test]
     fn refresh_signal_detected_on_exact_match() {
-        assert!(refresh_signal_detected(
+        assert!(refresh_requested_for(
             r#"{"meta":{"code":401,"error":"error.session.refresh"}}"#
         ));
     }
 
     #[test]
     fn refresh_signal_not_detected_on_a_different_error_value() {
-        assert!(!refresh_signal_detected(
+        assert!(!refresh_requested_for(
             r#"{"meta":{"code":401,"error":"invalid_credentials"}}"#
         ));
     }
 
     #[test]
     fn refresh_signal_not_detected_when_meta_is_absent() {
-        assert!(!refresh_signal_detected(r#"{"data":{}}"#));
+        assert!(!refresh_requested_for(r#"{"data":{}}"#));
     }
 
     #[test]
     fn refresh_signal_not_detected_on_invalid_json() {
-        assert!(!refresh_signal_detected("not json at all"));
+        assert!(!refresh_requested_for("not json at all"));
+    }
+
+    #[test]
+    fn refresh_signal_needs_a_401() {
+        let url = Url::parse("http://mock.test:1234/2.2/account").unwrap();
+        let body = r#"{"meta":{"code":403,"error":"error.session.refresh"}}"#;
+        let err = status_to_envelope(reqwest::StatusCode::FORBIDDEN, body, &url, None)
+            .expect_err("a 403");
+        assert!(!refresh_requested(&err));
+    }
+
+    // ===================== is_transient_failure =====================
+
+    #[test]
+    fn only_server_side_failures_are_transient() {
+        let url = Url::parse("http://mock.test:1234/2.2/account").unwrap();
+        let classify = |status: u16, body: &str| {
+            status_to_envelope(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body,
+                &url,
+                None,
+            )
+            .expect_err("an error status")
+        };
+        let rate_limited = r#"{"meta":{"code":503,"error":"error.rate.limit"}}"#;
+        let premium = r#"{"meta":{"code":503,"error":"error.premium.user_not_subscribed"}}"#;
+        for (status, body, transient) in [
+            (500, "", true),
+            (502, "garbage", true),
+            (503, r#"{"meta":{"code":503}}"#, true),
+            (599, "", true),
+            // Server-driven errors of the API family keep their status, so they retry too.
+            (503, premium, true),
+            // A rate limit never retries, whatever its status.
+            (429, "", false),
+            (503, rate_limited, false),
+            (500, rate_limited, false),
+            // Client errors never retry.
+            (400, "", false),
+            (401, "", false),
+            (403, "", false),
+            (404, "", false),
+            (409, "", false),
+        ] {
+            let err = classify(status, body);
+            assert_eq!(
+                is_transient_failure(&err),
+                transient,
+                "{status} {body}: {err:?}"
+            );
+        }
+        assert!(is_transient_failure(&Error::Timeout));
+        assert!(!is_transient_failure(&Error::validation(
+            "field", "message"
+        )));
+        assert!(!is_transient_failure(&Error::authentication(
+            "Not authenticated"
+        )));
     }
 
     // ===================== lazy redaction of error bodies =====================
@@ -2042,45 +2547,274 @@ mod tests {
         assert!(matches!(err, Error::Validation { field, .. } if field == "token"));
     }
 
-    // ===================== matches_configured_host =====================
+    // ===================== the credential gate =====================
 
-    #[test]
-    fn matches_configured_host_true_for_the_configured_scheme_host_and_port() {
-        let transport = Transport::builder()
-            .base_url("http://127.0.0.1:9999")
+    fn transport_for_base(base: &str) -> Transport {
+        Transport::builder()
+            .base_url(base)
             .build()
-            .expect("builds with an overridden base");
-        let url = Url::parse("http://127.0.0.1:9999/2.2/account").unwrap();
-        assert!(transport.matches_configured_host(&url));
+            .expect("builds with an overridden base")
+    }
+
+    fn mismatch_reason(transport: &Transport, raw: &str) -> Option<&'static str> {
+        transport
+            .origin_mismatch(&Url::parse(raw).unwrap())
+            .map(|mismatch| mismatch.reason)
     }
 
     #[test]
-    fn matches_configured_host_false_for_a_different_host() {
-        let transport = Transport::builder()
-            .base_url("http://127.0.0.1:9999")
-            .build()
-            .expect("builds with an overridden base");
-        let url = Url::parse("http://evil.example:9999/2.2/account").unwrap();
-        assert!(!transport.matches_configured_host(&url));
+    fn the_gate_accepts_the_configured_scheme_host_and_port() {
+        let transport = transport_for_base("http://mock.test:9999");
+        assert_eq!(
+            mismatch_reason(&transport, "http://mock.test:9999/2.2/account"),
+            None
+        );
+        assert_eq!(
+            mismatch_reason(&transport, "HTTP://MOCK.TEST:9999/2.2/account"),
+            None
+        );
     }
 
     #[test]
-    fn matches_configured_host_false_for_a_different_port() {
-        let transport = Transport::builder()
-            .base_url("http://127.0.0.1:9999")
-            .build()
-            .expect("builds with an overridden base");
-        let url = Url::parse("http://127.0.0.1:8888/2.2/account").unwrap();
-        assert!(!transport.matches_configured_host(&url));
+    fn the_gate_names_the_first_failing_check() {
+        let transport = transport_for_base("http://mock.test:9999");
+        for (raw, reason) in [
+            ("http://evil.example:9999/x", "foreign host"),
+            ("http://mock.test.evil.example:9999/x", "foreign host"),
+            ("https://mock.test:9999/x", "non-matching scheme"),
+            ("http://mock.test:8888/x", "non-matching port"),
+            ("http://mock.test/x", "non-matching port"),
+            ("http://user:pass@mock.test:9999/x", "URL with userinfo"),
+            ("http://mock.test@evil.example:9999/x", "URL with userinfo"),
+        ] {
+            assert_eq!(mismatch_reason(&transport, raw), Some(reason), "{raw}");
+        }
     }
 
     #[test]
-    fn matches_configured_host_false_for_a_different_scheme() {
-        let transport = Transport::builder()
-            .base_url("http://127.0.0.1:9999")
-            .build()
-            .expect("builds with an overridden base");
-        let url = Url::parse("https://127.0.0.1:9999/2.2/account").unwrap();
-        assert!(!transport.matches_configured_host(&url));
+    fn the_gate_treats_an_explicit_default_port_as_none() {
+        let https = transport_for_base("https://mock.test");
+        for raw in [
+            "https://mock.test:443/2.2/account",
+            "https://mock.test:/x",
+            "https://mock.test/x",
+        ] {
+            assert_eq!(mismatch_reason(&https, raw), None, "{raw}");
+        }
+        assert_eq!(
+            mismatch_reason(&https, "https://mock.test:0/x"),
+            Some("non-matching port")
+        );
+        assert_eq!(
+            mismatch_reason(&https, "https://mock.test:80/x"),
+            Some("non-matching port")
+        );
+
+        let explicit = transport_for_base("https://mock.test:443");
+        assert_eq!(mismatch_reason(&explicit, "https://mock.test/x"), None);
+
+        let http = transport_for_base("http://mock.test");
+        assert_eq!(mismatch_reason(&http, "http://mock.test:80/x"), None);
+        assert_eq!(
+            mismatch_reason(&http, "http://mock.test:443/x"),
+            Some("non-matching port")
+        );
+
+        let other_port = transport_for_base("https://mock.test:8443");
+        assert_eq!(
+            mismatch_reason(&other_port, "https://mock.test/x"),
+            Some("non-matching port")
+        );
+        assert_eq!(
+            mismatch_reason(&other_port, "https://mock.test:8443/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn withheld_message_follows_python_without_the_url() {
+        let transport = transport_for_base("https://mock.test");
+        let message = |raw: &str| {
+            withheld_message(
+                &transport
+                    .origin_mismatch(&Url::parse(raw).unwrap())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            message("https://mock.test:8443/endpoint?token=secret"),
+            "Session header withheld from a request to a non-matching port: https://mock.test"
+        );
+        assert_eq!(
+            message("http://mock.test/endpoint"),
+            "Session header withheld from a request to a non-matching scheme: http://mock.test"
+        );
+        assert_eq!(
+            message("https://other.test/endpoint"),
+            "Session header withheld from a request to a foreign host: https://other.test"
+        );
+        let userinfo = message("https://user:pass@mock.test:8443/endpoint");
+        assert_eq!(
+            userinfo,
+            "Session header withheld from a request with URL with userinfo"
+        );
+        assert!(!userinfo.contains("pass") && !userinfo.contains("user:"));
+    }
+
+    #[test]
+    fn urls_the_parser_rejects_never_reach_the_gate() {
+        // The gate judges the `Url` that is sent, so a text that would be read two ways has
+        // already failed (or been settled) in `Url::parse`.
+        for raw in [
+            "http://127.0.0.1:abc/x",
+            "http://127.0.0.1:99999/x",
+            "http://[::1/x",
+            "https://mock.test\u{ff1a}99/x",
+        ] {
+            assert!(Url::parse(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn userinfo_is_rejected_before_a_request() {
+        for raw in [
+            "http://user:pass@mock.test/x",
+            "http://user@mock.test/x",
+            "http://:pass@mock.test/x",
+        ] {
+            let err = reject_userinfo(&Url::parse(raw).unwrap()).expect_err(raw);
+            assert!(
+                matches!(&err, Error::Validation { field, message, .. }
+                    if field == "url" && message == "must not carry userinfo"),
+                "{raw}: {err:?}"
+            );
+            assert!(!err.to_string().contains("pass"));
+        }
+        // The parser drops an empty `@`, so there is nothing left to reject.
+        reject_userinfo(&Url::parse("http://@mock.test/x").unwrap()).expect("no userinfo remains");
+    }
+
+    // ===================== base_url validation =====================
+
+    fn base_url_problem(raw: &str) -> String {
+        match Transport::builder().base_url(raw).build() {
+            Err(Error::Validation { field, message, .. }) => {
+                assert_eq!(field, "base_url", "{raw}");
+                assert!(!message.contains(raw) || raw.is_empty(), "{raw}: {message}");
+                message
+            }
+            Err(other) => panic!("{raw}: unexpected {other:?}"),
+            Ok(_) => panic!("{raw}: unexpectedly built"),
+        }
+    }
+
+    #[test]
+    fn base_url_with_userinfo_is_rejected_at_build_time() {
+        for raw in [
+            "https://user:pass@api.example.com",
+            "https://api.example.com@evil.example",
+            "https://@api.example.com",
+            "https://user@",
+            "https://user:pass@api.example.com:8443/2.2",
+        ] {
+            let message = base_url_problem(raw);
+            assert_eq!(message, "must not carry userinfo", "{raw}");
+            assert!(!message.contains("pass"));
+        }
+    }
+
+    #[test]
+    fn base_url_with_unparseable_authority_is_rejected_at_build_time() {
+        for raw in [
+            "https://api.example.com:abc",
+            "https://api.example.com:99999",
+            "https://api.example.com\\@evil.example",
+            "https://api.example.com\u{ff1a}99",
+            "https://[::1",
+            // Unparseable wins over userinfo, as in Python.
+            "https://user:pass@api.example.com:abc",
+        ] {
+            assert_eq!(
+                base_url_problem(raw),
+                "has an authority that cannot be parsed",
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_without_scheme_or_host_is_rejected_at_build_time() {
+        for raw in [
+            "",
+            "not a url",
+            "api.example.com",
+            "api.example.com:8080",
+            "//api.example.com",
+            "/2.2",
+            "https://",
+            "https:///2.2",
+            "https:api.example.com",
+            "https:/api.example.com",
+            "https:\\\\api.example.com",
+            "mailto:someone",
+            "foo://api.example.com",
+        ] {
+            assert_eq!(
+                base_url_problem(raw),
+                "must be an absolute URL with a scheme and a host",
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn usable_base_urls_still_build() {
+        for (raw, api_host) in [
+            ("https://api.example.com", "https://api.example.com/"),
+            (
+                "https://api.example.com:8443",
+                "https://api.example.com:8443/",
+            ),
+            (
+                "HTTPS://API.Example.COM:443/2.2",
+                "https://api.example.com/",
+            ),
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080/"),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080/"),
+            ("http://[::1]:8080", "http://[::1]:8080/"),
+        ] {
+            let transport = Transport::builder().base_url(raw).build().expect(raw);
+            assert_eq!(transport.api_host().as_str(), api_host, "{raw}");
+        }
+        // A non-default port in the base defines the origin.
+        let transport = transport_for_base("https://api.example.com:8443");
+        assert_eq!(
+            mismatch_reason(&transport, "https://api.example.com/x"),
+            Some("non-matching port")
+        );
+    }
+
+    #[test]
+    fn the_default_base_still_builds_without_an_override() {
+        let transport = Transport::builder().build().expect("the real hosts");
+        assert_eq!(transport.api_host().as_str(), "https://api-user.e2ro.com/");
+    }
+
+    #[test]
+    fn python_netloc_follows_urlsplit() {
+        for (raw, netloc) in [
+            ("https://host/path", Some("host")),
+            ("https://host?x#y", Some("host")),
+            ("https://user@host:1/", Some("user@host:1")),
+            ("//host/x", Some("host")),
+            ("https://", Some("")),
+            ("https:host", None),
+            ("https:/host", None),
+            ("host", None),
+            ("host:8080", None),
+            ("", None),
+        ] {
+            assert_eq!(super::python_netloc(raw), netloc, "{raw:?}");
+        }
     }
 }
