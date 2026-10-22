@@ -12,6 +12,7 @@ mod common;
 use std::sync::Arc;
 
 use rusteero::endpoints::account::AccountApi;
+use rusteero::error::Error;
 use serde_json::json;
 use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -24,6 +25,117 @@ fn account_api(mock: &MockEero) -> AccountApi {
 
 fn ok_envelope() -> serde_json::Value {
     json!({ "meta": { "code": 200 }, "data": {} })
+}
+
+// ===================== get_account =====================
+
+fn account_body() -> serde_json::Value {
+    json!({
+        "meta": {"code": 200},
+        "data": {"networks": {"data": [{"url": "/2.2/networks/1"}]}}
+    })
+}
+
+#[tokio::test]
+async fn get_account_sends_a_get_to_account_and_returns_the_raw_envelope() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(account_body()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let env = account_api(&mock).get_account().await?;
+
+    assert_eq!(env.into_value(), account_body());
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].body.is_empty(), "a read carries no body");
+    assert_eq!(requests[0].url.query(), None, "a read carries no query");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_account_not_authenticated_returns_authentication_error_without_a_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(account_body()))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = AccountApi::new(Arc::new(mock.transport_anonymous()));
+    let err = api.get_account().await.unwrap_err();
+
+    assert!(
+        matches!(err, Error::Authentication { ref message, .. } if message == "Not authenticated"),
+        "{err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_account_session_refresh_signal_refreshes_once_and_replays() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"meta": {"code": 401, "error": "error.session.refresh"}})),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(header("content-type", "application/json"))
+        .and(body_string("\"\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_json(account_body()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let env = account_api(&mock).get_account().await?;
+
+    assert_eq!(env.into_value(), account_body());
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    let sequence: Vec<(String, String)> = requests
+        .iter()
+        .map(|r| (r.method.to_string(), r.url.path().to_owned()))
+        .collect();
+    assert_eq!(
+        sequence,
+        [
+            ("GET".to_owned(), "/2.2/account".to_owned()),
+            ("POST".to_owned(), "/2.2/login/refresh".to_owned()),
+            ("GET".to_owned(), "/2.2/account".to_owned()),
+        ]
+    );
+    Ok(())
 }
 
 // ===================== set_name =====================
