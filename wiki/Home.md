@@ -2,7 +2,7 @@
 
 Welcome! Everything you need to use `rusteero`, the async Rust client for the Eero mesh Wi-Fi
 cloud API — a port of the Python [`eero-api`](https://github.com/fulviofreitas/eero-api)
-library at **v8.0.4**.
+library at **v8.4.1**.
 
 ## 📚 Guides
 
@@ -11,7 +11,7 @@ library at **v8.0.4**.
 | **[📖 Rust API](Rust-API)** | The `Client` → `EeroApi` → `Transport` layers, builder options, every domain accessor, caching, network targeting, errors |
 | **[⚙️ Configuration](Configuration)** | `Session` sources, credential stores and the schema-2 record, transport options, logging |
 | **[🔧 Troubleshooting](Troubleshooting)** | 401s, premium gating, local validation errors, writes that return 200 and change nothing, keyring on headless Linux |
-| **[🔀 Migration](Migration)** | Upgrading from rusteero 1.0.0 to 2.0.0 |
+| **[🔀 Migration](Migration)** | Upgrading from rusteero 2.x to 3.0.0, and from 1.0.0 to 2.0.0 |
 
 ---
 
@@ -19,10 +19,9 @@ library at **v8.0.4**.
 
 ### Install
 
-
 ```toml
 [dependencies]
-rusteero = "2"
+rusteero = "3"
 ```
 
 <details>
@@ -83,7 +82,10 @@ Client            cache + network-id resolution + parent envelopes   (eero-api: 
 * Every resource argument accepts a bare id, an API path or an absolute API-host URL; every
   domain method takes a `parent` envelope so the request follows the link the API published.
 * Errors are classified against the API's closed catalogue of `meta.error` strings; every error
-  carries `error_code()` and `envelope()`.
+  carries `error_code()`, `envelope()` and, when a response produced it, `status()`.
+* Every request carries the current Eero iOS app's `User-Agent`
+  (`eero-ios/2026.8.1 (iPhone; iOS 18.5)`), which the API reads to decide which capabilities to
+  advertise; `consts::LEGACY_USER_AGENT` restores the previous one.
 
 ---
 
@@ -125,12 +127,10 @@ no licence and was consulted as a reference only.
     `eeroctl` works unchanged
 *   Session tokens are `SecretString`s and never appear in `Debug` output, logs or error messages
 *   Storage failures surface as a typed `StorageError` with a `Warn`/`Fatal` policy, instead of
-    being swallowed
-*   `ChainedStore` genuinely falls back when the primary backend fails to save
-*   Rate-limit errors carry `Retry-After` when the server sends it
+    being swallowed; a write the store accepted but did not keep is `StorageError::NotRetained`
 *   Every wire endpoint is a route constant, so upstream API drift is a one-line fix
 *   Path segments and link values are validated before a URL is built, and the credential is
-    withheld from any request that would leave the configured API host
+    withheld from any request that would leave the configured API origin (scheme, host and port)
 
 ---
 
