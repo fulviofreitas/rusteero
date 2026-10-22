@@ -80,12 +80,16 @@ pub const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 ///
 /// Ported from `api/base.py`'s `aiohttp.ClientTimeout(total=30, sock_read=10)`; this is the
 /// `total` half of that pair. See [`READ_TIMEOUT`] for the `sock_read` half. Unchanged at
-/// `v8.0.4`.
+/// `v8.4.1`. The transport enforces it per attempt, and a per-call
+/// [`crate::transport::RequestTimeout`] replaces this pair wholesale for that one request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Per-read timeout applied while streaming a response body.
+/// Per-read timeout: the longest the transport waits for the response head, and then for each
+/// chunk of the response body.
 ///
-/// Ported from `api/base.py`'s `sock_read=10`. Unchanged at `v8.0.4`.
+/// Ported from `api/base.py`'s `sock_read=10`. Unchanged at `v8.4.1`. aiohttp starts `sock_read`
+/// only once the request is written; the wait for the response head here also covers connecting
+/// and writing, since that is the one point the HTTP client exposes.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default time-to-live for cached responses.
