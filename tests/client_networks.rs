@@ -12,12 +12,13 @@
 mod common;
 
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use rusteero::error::Error;
 
 /// Builds a [`Client`] pointed at `mock`, authenticated with [`TEST_TOKEN`], with the crate's
 /// default 60-second cache TTL — plenty long enough that none of these tests can flake on a slow
@@ -29,6 +30,35 @@ async fn client(mock: &MockEero) -> Client {
         .build()
         .await
         .expect("a MockServer's own URI is always a valid base URL")
+}
+
+/// A small, obviously-synthetic success envelope every write test in this file can share.
+fn ok_envelope() -> serde_json::Value {
+    json!({"meta": {"code": 200}, "data": {}})
+}
+
+/// Asserts that the mock server has not received a single request.
+async fn assert_no_requests(mock: &MockEero) {
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
+}
+
+/// Asserts that `err` is `Error::Validation` for `field` with the fixed non-empty-string message.
+fn assert_non_empty_string_error(err: &Error, field: &str) {
+    let Error::Validation {
+        field: got_field,
+        message,
+        ..
+    } = err
+    else {
+        panic!("expected Error::Validation, got {err:?}");
+    };
+    assert_eq!(got_field, field);
+    assert_eq!(message, "must be a non-empty string");
 }
 
 // ===================== The `/account` fallback =====================
@@ -490,5 +520,85 @@ async fn a_password_echoed_under_a_non_sensitive_key_is_suppressed_from_the_erro
         .unwrap_err();
     let rendered = err.to_string();
     assert!(!rendered.contains("hunter2"));
+    Ok(())
+}
+
+// ===================== Wi-Fi password validation (before network resolution) =====================
+
+#[tokio::test]
+async fn password_wrappers_reject_an_empty_password_before_resolving_the_network()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // With no explicit and no preferred network, resolution would fail with `MissingNetworkId`;
+    // the password check has to win. The write mocks prove nothing is sent when an id is given.
+    for resource in ["password", "guestnetwork/password"] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/2.2/networks/network-0001/{resource}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+            .expect(0)
+            .mount(&mock.server)
+            .await;
+    }
+
+    let client = client(&mock).await;
+
+    let err = client
+        .set_network_password("", None)
+        .await
+        .expect_err("an empty password wins over a missing network");
+    assert_non_empty_string_error(&err, "password");
+    let err = client
+        .set_guest_password("", None)
+        .await
+        .expect_err("an empty password wins over a missing network");
+    assert_non_empty_string_error(&err, "password");
+
+    let err = client
+        .set_network_password("", Some("network-0001"))
+        .await
+        .expect_err("an empty password is rejected before any request");
+    assert_non_empty_string_error(&err, "password");
+    let err = client
+        .set_guest_password("", Some("network-0001"))
+        .await
+        .expect_err("an empty password is rejected before any request");
+    assert_non_empty_string_error(&err, "password");
+
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn password_wrappers_forward_padded_and_literal_none_values_unchanged() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/password"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("password=++preserve+spaces++"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork/password"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("password=None"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .set_network_password("  preserve spaces  ", Some("network-0001"))
+        .await?;
+    client
+        .set_guest_password("None", Some("network-0001"))
+        .await?;
     Ok(())
 }

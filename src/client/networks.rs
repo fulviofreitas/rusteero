@@ -10,6 +10,7 @@ use super::Client;
 use crate::cache::CacheKey;
 use crate::envelope::Envelope;
 use crate::error::Error;
+use crate::params::require_non_empty_string;
 
 impl Client {
     /// Gets a network's full object — returns the raw Eero API response.
@@ -109,20 +110,23 @@ impl Client {
 
     /// Sets the guest network's password — returns the raw Eero API response.
     ///
-    /// Ported from `set_guest_password()` (`client.py:1159-1171`). `auto_discover = false`.
-    /// **No `parent=` is passed** — Python's own wrapper calls the domain method with no parent
-    /// kwargs at all (`client.py:1170`, unlike its sibling [`Client::set_guest_network`], which
-    /// does), even though the domain method accepts one; reproduced exactly. On success,
-    /// invalidates `network[nid]`.
+    /// Ported from `set_guest_password()` (`client.py:1430-1444`). `auto_discover = false`.
+    /// `password` is validated first, before the network id is resolved. **No `parent=` is
+    /// passed** — Python's own wrapper calls the domain method with no parent kwargs at all
+    /// (`client.py:1441`, unlike its sibling [`Client::set_guest_network`], which does), even
+    /// though the domain method accepts one; reproduced exactly. On success, invalidates
+    /// `network[nid]`.
     ///
     /// # Errors
     ///
-    /// See [`Client::set_guest_network`].
+    /// Returns [`Error::Validation`] with field `password` if `password` is empty, before the
+    /// network id is resolved and before any request. Otherwise see [`Client::set_guest_network`].
     pub async fn set_guest_password(
         &self,
         password: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
+        require_non_empty_string("password", password)?;
         let network_id = self.ensure_network_id(network_id, false).await?;
         let response = self
             .api
@@ -229,18 +233,20 @@ impl Client {
 
     /// Sets the network's Wi-Fi password — returns the raw Eero API response.
     ///
-    /// Ported from `set_network_password()` (`client.py:531-546`). `auto_discover = false`.
-    /// Passes the cached network envelope as `parent=` (`+net`). On success, invalidates
-    /// `network[nid]`.
+    /// Ported from `set_network_password()` (`client.py:781-796`). `auto_discover = false`.
+    /// `password` is validated first, before the network id is resolved. Passes the cached
+    /// network envelope as `parent=` (`+net`). On success, invalidates `network[nid]`.
     ///
     /// # Errors
     ///
-    /// See [`Client::set_network_name`].
+    /// Returns [`Error::Validation`] with field `password` if `password` is empty, before the
+    /// network id is resolved and before any request. Otherwise see [`Client::set_network_name`].
     pub async fn set_network_password(
         &self,
         password: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
+        require_non_empty_string("password", password)?;
         let network_id = self.ensure_network_id(network_id, false).await?;
         let parent = self.network_parent(network_id.as_str());
         let response = self

@@ -27,7 +27,7 @@ use url::Url;
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::links::warn_uncharacterised_write;
-use crate::params::resolve_network_url;
+use crate::params::{require_non_empty_string, resolve_network_url};
 use crate::routes::{self, ApiVersion};
 use crate::transport::{RequestBody, Transport};
 
@@ -273,21 +273,31 @@ impl NetworksApi {
 
     /// `PUT /2.2/networks/{id}/password` — set the network's Wi-Fi password.
     ///
-    /// Ported from `NetworksAPI.set_network_password` (`networks.py:313-351`). Sends a
+    /// Ported from `NetworksAPI.set_network_password` (`networks.py:316-354`). Sends a
     /// form-encoded body (`password=<value>`) to
     /// [`crate::routes::networks::SET_NETWORK_PASSWORD`], preferring `parent`'s own published
-    /// `password` link. `password` is never logged. Unverified: logs one `WARNING` via
-    /// [`warn_uncharacterised_write`] before issuing the request (`networks.py:348`).
+    /// `password` link. `password` is never logged and is forwarded exactly as given (no
+    /// trimming, so a whitespace-only value is accepted, as in Python). Unverified: logs one
+    /// `WARNING` via [`warn_uncharacterised_write`] before issuing the request
+    /// (`networks.py:353`).
+    ///
+    /// Python also rejects a `password` that is not a `str` (`None`, `False`, `0`, `bytes`, a list,
+    /// a dict); the `&str` parameter makes those unrepresentable here, so only the emptiness half
+    /// of the rule remains.
     ///
     /// # Errors
     ///
-    /// See [`NetworksApi::reboot_network`].
+    /// Returns [`Error::Validation`] with field `password` if `password` is empty. That check is
+    /// the first statement (`networks.py:345`), so it wins over an unresolvable `network_id`, a
+    /// missing session and the uncharacterised-write warning, and nothing is sent. Otherwise see
+    /// [`NetworksApi::reboot_network`].
     pub async fn set_network_password(
         &self,
         network_id: &str,
         password: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        require_non_empty_string("password", password)?;
         let url = routes::networks::SET_NETWORK_PASSWORD.resolve(
             self.transport.api_host(),
             network_id,
@@ -421,20 +431,27 @@ impl NetworksApi {
 
     /// `PUT /2.2/networks/{id}/guestnetwork/password` — set the guest network's password.
     ///
-    /// Ported from `NetworksAPI.set_guest_password` (`networks.py:473-511`). Sends a form-encoded
+    /// Ported from `NetworksAPI.set_guest_password` (`networks.py:483-523`). Sends a form-encoded
     /// body (`password=<value>`), preferring `parent`'s (the guest envelope's) own published
-    /// `password` link — see `NetworksApi::guest_password_url`. `password` is never logged.
-    /// **Live-verified 2026-09-20** — no `warn_uncharacterised_write`.
+    /// `password` link — see `NetworksApi::guest_password_url`. `password` is never logged and is
+    /// forwarded exactly as given. **Live-verified 2026-09-20** — no
+    /// `warn_uncharacterised_write`.
+    ///
+    /// As for [`NetworksApi::set_network_password`], only the emptiness half of Python's
+    /// non-empty-`str` rule applies, because the parameter is a `&str`.
     ///
     /// # Errors
     ///
-    /// See [`NetworksApi::reboot_network`].
+    /// Returns [`Error::Validation`] with field `password` if `password` is empty. That check is
+    /// the first statement (`networks.py:517`), ahead of the URL resolution and the credential
+    /// gate, and nothing is sent. Otherwise see [`NetworksApi::reboot_network`].
     pub async fn set_guest_password(
         &self,
         network_id: &str,
         password: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        require_non_empty_string("password", password)?;
         let url = self.guest_password_url(network_id, parent)?;
         self.transport
             .request(
