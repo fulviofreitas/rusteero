@@ -1,6 +1,6 @@
 //! `dns_policies` routes (`DnsPoliciesAPI`, new in v8.0.0).
 //!
-//! Ported from `eero-api src/eero/api/dns_policies.py` (v8.0.4). Premium (Eero Plus/Secure)
+//! Ported from `eero-api src/eero/api/dns_policies.py` (v8.4.1). Premium (Eero Plus/Secure)
 //! feature family; replaces the removed `ProfilesAPI` content-filter/block-list/blocked-app
 //! writes (`crate::routes::profiles`'s module docs). No `DELETE` verb anywhere in this family —
 //! removal is expressed as `is_delete: true` on a `PUT`.
@@ -120,5 +120,37 @@ pub const DNS_POLICIES_SET_PROFILE_BLOCKED_APPLICATIONS: Nested = Nested {
     version: ApiVersion::V2_2,
     prefix: "dns_policies/profiles",
     suffix: "/applications/blocked",
+    link: None,
+};
+
+/// `POST /2.2/networks/{network_id}/dns_policies/adblock` — switch ad blocking on or off,
+/// network-wide or per profile.
+///
+/// `link: None`: the path is a literal sub-path of the network URL that no envelope publishes
+/// as a link. `DnsPoliciesApi::set_network_ad_block` resolves the network base through
+/// [`crate::params::resolve_network_url`] (the parent's own `url` when supplied, else the
+/// `networks/{id}` template) and appends the text after `{id}` here, so this constant is the
+/// single source of the suffix.
+///
+/// Ported from `eero-api src/eero/api/dns_policies.py:586-649` at `v8.4.1`
+/// (`DnsPoliciesAPI.set_network_ad_block`).
+pub const DNS_POLICIES_SET_NETWORK_AD_BLOCK: Resource = Resource {
+    method: Method::POST,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}/dns_policies/adblock",
+    link: None,
+};
+
+/// `POST /2.2/networks/{network_id}/dns_policies/network` — set one boolean network-level DNS
+/// policy switch (only `block_malware` is accepted).
+///
+/// `link: None`, resolved like [`DNS_POLICIES_SET_NETWORK_AD_BLOCK`].
+///
+/// Ported from `eero-api src/eero/api/dns_policies.py:651-739` at `v8.4.1`
+/// (`DnsPoliciesAPI._set_network_dns_policy` / `set_network_block_malware`).
+pub const DNS_POLICIES_SET_NETWORK_POLICY: Resource = Resource {
+    method: Method::POST,
+    version: ApiVersion::V2_2,
+    template: "networks/{id}/dns_policies/network",
     link: None,
 };
