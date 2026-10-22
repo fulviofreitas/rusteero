@@ -30,10 +30,9 @@ pub const V8_GET_BLACKLIST: Resource = Resource {
 /// `POST /2.2/networks/{id}/blacklist` — add a device (by MAC) to the blacklist, via a
 /// **form-encoded** `mac` field (not JSON).
 ///
-/// Ported from `BlacklistAPI.add_to_blacklist` (`blacklist.py:98-137`): same URL resolution as
-/// [`V8_GET_BLACKLIST`], `data={"mac": mac}` (`blacklist.py:137`). API-Reference.md:852,
-/// unverified write ("a JSON body was verified in the past" — the encoding itself changed to
-/// form in `05a2b07`/v8.0.0, per this crate's `warn_uncharacterised_write` call at the endpoint).
+/// Ported from `BlacklistAPI.add_to_blacklist` (`blacklist.py:98-135` at `v8.4.1`): same URL
+/// resolution as [`V8_GET_BLACKLIST`], `data={"mac": mac}` (`blacklist.py:135`). A verified
+/// write (2026-10-06, form-encoded `mac`): the endpoint logs no uncharacterised-write warning.
 pub const V8_ADD_TO_BLACKLIST: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,

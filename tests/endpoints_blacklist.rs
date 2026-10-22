@@ -10,6 +10,7 @@ use std::sync::Arc;
 use rusteero::endpoints::blacklist::BlacklistApi;
 use rusteero::error::Error;
 use serde_json::json;
+use tracing::Level;
 use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -92,6 +93,40 @@ async fn add_to_blacklist_sends_a_form_encoded_mac_not_json() -> anyhow::Result<
     let api = blacklist_api(&mock);
     api.add_to_blacklist("network-0001", "aa:bb:cc:00:00:01", None)
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_to_blacklist_does_not_log_the_uncharacterised_write_warning() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/blacklist"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("mac=aa%3Abb%3Acc%3A00%3A00%3A01"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = blacklist_api(&mock);
+    let (_guard, logs) = common::capture_logs();
+    api.add_to_blacklist("network-0001", "aa:bb:cc:00:00:01", None)
+        .await?;
+
+    // The write is live-verified, so nothing at WARN level names an uncharacterised write.
+    assert_eq!(logs.count(Level::WARN, "not been fully characterised"), 0);
+    assert!(
+        logs.warnings().is_empty(),
+        "unexpected warnings: {:?}",
+        logs.warnings()
+    );
+
+    // Positive control: the same capture does see the warning when one is emitted, so the
+    // negative assertion above cannot pass vacuously.
+    rusteero::links::warn_uncharacterised_write("probe");
+    assert_eq!(logs.count(Level::WARN, "not been fully characterised"), 1);
     Ok(())
 }
 

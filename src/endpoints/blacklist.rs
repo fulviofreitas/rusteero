@@ -64,12 +64,16 @@ impl BlacklistApi {
 
     /// `POST /2.2/networks/{network_id}/blacklist` — add a device (by MAC) to the blacklist.
     ///
-    /// Ported from `BlacklistAPI.add_to_blacklist` (`blacklist.py:98-137`). Sends a
-    /// **form-encoded** body `mac=<mac>` (`data={"mac": mac}`, `blacklist.py:137`) — **not**
+    /// Ported from `BlacklistAPI.add_to_blacklist` (`blacklist.py:98-135` at `v8.4.1`). Sends a
+    /// **form-encoded** body `mac=<mac>` (`data={"mac": mac}`, `blacklist.py:135`) — **not**
     /// JSON, a breaking encoding change from the pre-8.0.0 shape this crate previously shipped.
     /// `mac` is passed through unchanged — no normalisation of separators or case happens here.
-    /// Logs the fixed uncharacterised-write warning before issuing the request
-    /// (`blacklist.py:135`).
+    ///
+    /// Live-verified 2026-10-06 against API 2.2 with the form-encoded `mac` shape (device
+    /// blocked, then unblocked via [`BlacklistApi::remove_from_blacklist`]; no mesh reboot), so
+    /// no uncharacterised-write warning is logged. Follow the read-compare-skip discipline: call
+    /// [`BlacklistApi::get_blacklist`] after the write to confirm the device was added, and do
+    /// not retry on failure.
     ///
     /// # Errors
     ///
@@ -87,7 +91,6 @@ impl BlacklistApi {
             network_id,
             parent,
         )?;
-        crate::links::warn_uncharacterised_write("add_to_blacklist");
         self.transport
             .request(
                 Method::POST,
