@@ -76,20 +76,24 @@ impl AuthApi {
 
     /// Logs the current session out.
     ///
-    /// Ported from `logout()` (`api/auth.py:293-330`). If no valid session is configured, logs a
-    /// `WARNING` (`"Attempted to logout when not authenticated"`) and returns `Ok(false)` **with
-    /// no network call at all** (`auth.py:307-309`) — unlike every other authenticated call in
+    /// Ported from `logout()` (`api/auth.py:338-377` at `v8.4.1`). If no valid session is
+    /// configured, logs a `WARNING` (`"Attempted to logout when not authenticated"`) and returns
+    /// `Ok(false)` **with no network call at all** — unlike every other authenticated call in
     /// this crate, `logout` never raises `Error::Authentication("Not authenticated")` for this
     /// case, matching Python's own guard exactly. Otherwise, sends `POST` [`routes::LOGOUT`]
     /// authenticated by the current token, with a **form** body whose single field is literally
     /// named [`consts::LOGOUT_COOKIE_FIELD_NAME`] (`"Cookie"`) and whose value is
     /// [`consts::SESSION_COOKIE_PREFIX`] (`"s="`) followed by the token — not the real HTTP
-    /// `Cookie` header, and not JSON (`auth.py:309-314`).
+    /// `Cookie` header, and not JSON (`auth.py:351-356`).
     ///
-    /// Every failure mode from that request — an authentication error, a generic API error, a
-    /// rate limit, a network failure, a timeout — is logged at `WARN` and otherwise ignored
-    /// (`auth.py:315-327`): `logout()` **never propagates a network/API error**. Credentials are
-    /// always destroyed afterward, in memory and in every configured backend
+    /// Every failure mode from that request is ignored: `logout()` **never propagates a
+    /// network/API error**. A `401` means the session is already invalid on the server and is
+    /// logged at `DEBUG` (`"Session already invalid on server, clearing local credentials"`,
+    /// `auth.py:359-361`); every other failure — a generic API error (which includes a `2xx`
+    /// body that is not a JSON object), a network failure, a timeout — is logged at `WARN` as
+    /// `"Logout API call failed: {err}"` (`auth.py:362-370`). A rate limit is swallowed the same
+    /// way, where Python lets `EeroRateLimitException` propagate before it destroys anything.
+    /// Credentials are always destroyed afterward, in memory and in every configured backend
     /// (`CredentialStore::clear`, not a `save` with an emptied session), regardless of the network
     /// outcome, and this then returns `Ok(true)`. The in-memory session is cleared first, in one
     /// synchronous step, and the store clear then runs on the runtime's blocking pool (see
@@ -99,9 +103,9 @@ impl AuthApi {
     /// # Errors
     ///
     /// The only way this returns `Err` past the initial "not authenticated" case is a credential-
-    /// store failure while clearing, under [`crate::transport::StorageFailures::Fatal`] (decision
-    /// D-13, security finding T2): a caller who explicitly opted into "storage failures are
-    /// fatal" can still learn the at-rest copy was not cleared. Under the default
+    /// store failure while clearing, under [`crate::transport::StorageFailures::Fatal`]: a
+    /// caller who explicitly opted into "storage failures are fatal" can still learn the at-rest
+    /// copy was not cleared. Under the default
     /// [`crate::transport::StorageFailures::Warn`], a storage failure here is logged at `WARN`
     /// and this still returns `Ok(true)`. The in-memory session is always cleared regardless of
     /// either outcome.
@@ -123,15 +127,20 @@ impl AuthApi {
             cookie_value,
         )]);
 
-        if let Err(err) = self
+        match self
             .transport
             .request_with_token(Method::POST, url, &[], body, Some(&token))
             .await
         {
-            // Every failure mode is swallowed here, per `auth.py:315-327` — logout never
-            // propagates a network/API error. `error` is this crate's ordinary `Display`, which
-            // never embeds a token or raw body text (see `crate::error::Error`'s own docs).
-            tracing::warn!(error = %err, "logout request failed; credentials are still cleared locally");
+            Ok(_) => tracing::debug!("Logout API call succeeded"),
+            // A 401 means the session is already invalid on the server (`auth.py:359-361`).
+            Err(Error::Authentication { .. }) => {
+                tracing::debug!("Session already invalid on server, clearing local credentials");
+            }
+            // Every other failure mode is swallowed too — logout never propagates a
+            // network/API error. `err` is this crate's ordinary `Display`, which never embeds a
+            // token or raw body text (see `crate::error::Error`'s own docs).
+            Err(err) => tracing::warn!("Logout API call failed: {err}"),
         }
 
         // The in-memory session is cleared first, then the stored record is destroyed on the
@@ -208,11 +217,14 @@ impl AuthApi {
     /// Clears the current session token, in memory and in every configured credential-store
     /// backend.
     ///
-    /// Ported from `clear_session_token()` (`api/auth.py:587-596`): at `v8.0.4` this does the
-    /// **exact same thing** as [`AuthApi::clear_auth_data`] — `_destroy_stored_credentials()`,
-    /// full `clear_all()` plus `storage.clear()` on every backend — since `AuthCredentials` is a
+    /// Ported from `clear_session_token()` (`api/auth.py:587-596` at `v8.4.1`): this does the
+    /// same thing as [`AuthApi::clear_auth_data`] — `_destroy_stored_credentials()`, full
+    /// `clear_all()` plus `storage.clear()` on every backend — since `AuthCredentials` is a
     /// one-field record (`session_id` only) with no `refresh_token`/`session_expiry` left to
-    /// distinguish the two methods by. Kept as a separate method for API parity with Python.
+    /// distinguish the two methods by. The one difference in Python, that `clear_auth_data` also
+    /// resets `_login_in_progress`, has no counterpart here: a pending login lives in
+    /// [`flow::PendingLogin`], never in the `AuthApi`, so there is no flag to reset. Kept as a
+    /// separate method for API parity with Python.
     ///
     /// `async` since `eero-api` 8.1.10: the in-memory session is cleared first, then the store
     /// clear runs on the runtime's blocking pool (see [`Transport::set_session_async`]).
@@ -229,9 +241,10 @@ impl AuthApi {
     /// Clears the current session entirely, in memory and in every configured credential-store
     /// backend.
     ///
-    /// Ported from `clear_auth_data()` (`api/auth.py:549-558`); see
-    /// [`AuthApi::clear_session_token`]'s docs for why the two methods are identical at `v8.0.4`
-    /// and for the `async` contract they share.
+    /// Ported from `clear_auth_data()` (`api/auth.py:549-558` at `v8.4.1`); see
+    /// [`AuthApi::clear_session_token`]'s docs for why the two methods are identical here
+    /// (Python's `clear_auth_data` also resets `_login_in_progress`, which has no counterpart on
+    /// `AuthApi`) and for the `async` contract they share.
     ///
     /// # Errors
     ///
@@ -407,11 +420,11 @@ mod tests {
         assert_eq!(persisted.token().expose_secret(), "stale-token");
     }
 
-    // ===================== logout under StorageFailures::Fatal (security finding T2) =====================
+    // ===================== logout under StorageFailures::Fatal =====================
 
-    /// A [`CredentialStore`] whose `save`/`clear` always fail, for pinning security finding T2:
-    /// `logout()` must surface a `Fatal`-policy storage failure instead of silently returning
-    /// `Ok(true)` while the at-rest copy still holds the old session.
+    /// A [`CredentialStore`] whose `save`/`clear` always fail, for pinning that `logout()` must
+    /// surface a `Fatal`-policy storage failure instead of silently returning `Ok(true)` while
+    /// the at-rest copy still holds the old session.
     #[derive(Debug)]
     struct AlwaysFailingStore;
 
@@ -533,11 +546,12 @@ mod tests {
         );
     }
 
-    // ===================== blocking-task JoinError handling (security finding T3) =====================
+    // ===================== a store that panics on the blocking pool =====================
 
     /// A [`CredentialStore`] whose `save`/`clear` panic with a distinctive, credential-shaped
-    /// payload, isolating the `JoinError` branch of the blocking-pool persist (security finding
-    /// T3) from an ordinary `Err` returned by the store itself.
+    /// payload, isolating the panicked-task branch of the blocking-pool persist (the panic
+    /// payload must never reach a returned error) from an ordinary `Err` returned by the store
+    /// itself.
     #[derive(Debug)]
     struct PanickingStore;
 
@@ -576,7 +590,7 @@ mod tests {
         let debug = format!("{err:?}");
         assert!(
             !display.contains("leaked-secret") && !debug.contains("leaked-secret"),
-            "the join error's own Display/Debug must never reach the returned error (T3): \
+            "the join error's own Display/Debug must never reach the returned error: \
              display={display:?} debug={debug:?}"
         );
 
