@@ -2108,6 +2108,8 @@ async fn a_failed_clear_during_logout_under_warn_logs_exactly_one_warning() -> a
     let mock = MockEero::start().await;
     Mock::given(method("POST"))
         .and(path("/2.2/logout"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&mock.server)
@@ -2432,11 +2434,16 @@ mod without_a_keyring {
             let dir = tempfile::tempdir()?;
             let file = dir.path().join("cookies.json");
             let mock = MockEero::start().await;
-            Mock::given(method("POST"))
-                .and(path("/2.2/logout"))
-                .respond_with(ResponseTemplate::new(200))
-                .mount(&mock.server)
-                .await;
+            if destroy == 2 {
+                Mock::given(method("POST"))
+                    .and(path("/2.2/logout"))
+                    .and(user_token_header())
+                    .and(session_cookie())
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(&mock.server)
+                    .await;
+            }
             let chain = ChainedStore::new(
                 Arc::new(keyring.warn_on_unpersisted(false)),
                 Arc::new(FileStore::new(&file)),

@@ -110,7 +110,7 @@
 //! [`Cache::clear`] removes them.
 //!
 //! With a zero TTL every entry is expired the moment it is written, so [`Cache::get`] removes the
-//! key it is asked for, and the guarded store the `Client` getters use ([`Cache::put_if_current`])
+//! key it is asked for, and the guarded store the `Client` getters use (`Cache::put_if_current`)
 //! stores nothing: a client built with `cache_ttl(Duration::ZERO)` keeps no envelope (the Wi-Fi
 //! password in a `network[..]` response included) in memory after the call that fetched it.
 //! [`Cache::put`] stays unconditional.
