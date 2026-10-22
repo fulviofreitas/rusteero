@@ -9,13 +9,15 @@ mod common;
 
 use reqwest::Method;
 use rusteero::error::Error;
+use rusteero::links::warn_uncharacterised_write;
 use rusteero::routes::{ACCOUNT, ApiVersion, Nested};
 use rusteero::transport::RequestBody;
 use serde_json::json;
+use tracing::Level;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie};
 
 // ===================== transport_with_token: reaches the mock on v2.2 =====================
 
@@ -129,6 +131,93 @@ async fn auth_api_with_token_is_immediately_authenticated() {
     let auth = mock.auth_api_with_token(TEST_TOKEN);
     assert!(auth.is_authenticated());
     assert!(auth.session().is_some());
+}
+
+// ===================== capture_logs: records tracing events for the current thread =====================
+
+#[tokio::test]
+async fn capture_logs_records_the_uncharacterised_write_warning() {
+    let (_guard, logs) = capture_logs();
+    assert!(logs.is_empty());
+
+    warn_uncharacterised_write("x");
+
+    let records = logs.records();
+    assert_eq!(records.len(), 1, "got {records:?}");
+    let (level, target, message) = &records[0];
+    assert_eq!(*level, Level::WARN);
+    assert_eq!(target, "rusteero::links");
+    assert!(
+        message
+            .starts_with("Issuing write (x): its side effects have not been fully characterised"),
+        "got {message:?}"
+    );
+
+    assert_eq!(logs.warnings(), vec![message.clone()]);
+    assert!(logs.errors().is_empty());
+    assert!(logs.contains(Level::WARN, "Issuing write (x)"));
+    assert!(!logs.contains(Level::ERROR, "Issuing write (x)"));
+    assert!(!logs.contains(Level::WARN, "Issuing write (y)"));
+    assert_eq!(logs.count(Level::WARN, "Issuing write"), 1);
+}
+
+#[tokio::test]
+async fn capture_logs_keeps_level_target_and_message_of_every_level() {
+    let (_guard, logs) = capture_logs();
+
+    tracing::error!(target: "smoke::target", "first {}", 1);
+    tracing::info!("second");
+    tracing::debug!(count = 3, "third");
+
+    assert_eq!(
+        logs.records(),
+        vec![
+            (
+                Level::ERROR,
+                "smoke::target".to_owned(),
+                "first 1".to_owned()
+            ),
+            (Level::INFO, module_path!().to_owned(), "second".to_owned()),
+            (Level::DEBUG, module_path!().to_owned(), "third".to_owned()),
+        ]
+    );
+    assert_eq!(logs.errors(), vec!["first 1".to_owned()]);
+    assert!(logs.warnings().is_empty());
+
+    logs.clear();
+    assert!(logs.is_empty());
+}
+
+#[tokio::test]
+async fn capture_logs_sees_events_from_tasks_spawned_on_the_test_runtime() {
+    // `#[tokio::test]` runs a current-thread runtime, so a spawned task executes on the test's own
+    // thread and its events land in the capture.
+    let (_guard, logs) = capture_logs();
+
+    tokio::spawn(async { warn_uncharacterised_write("spawned") })
+        .await
+        .expect("the spawned task does not panic");
+
+    assert!(logs.contains(Level::WARN, "Issuing write (spawned)"));
+}
+
+#[test]
+fn capture_logs_stops_when_its_guard_drops_and_ignores_other_threads() {
+    let (guard, logs) = capture_logs();
+    warn_uncharacterised_write("while captured");
+
+    // Another thread has no subscriber installed: its event is not captured.
+    std::thread::spawn(|| warn_uncharacterised_write("other thread"))
+        .join()
+        .expect("the other thread does not panic");
+
+    drop(guard);
+    warn_uncharacterised_write("after the guard dropped");
+
+    assert_eq!(logs.count(Level::WARN, "Issuing write"), 1);
+    assert!(logs.contains(Level::WARN, "Issuing write (while captured)"));
+    assert!(!logs.contains(Level::WARN, "other thread"));
+    assert!(!logs.contains(Level::WARN, "after the guard dropped"));
 }
 
 // ===================== fixture / fixture_json =====================

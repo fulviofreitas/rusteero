@@ -20,8 +20,13 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use tracing::field::{Field, Visit};
+use tracing::subscriber::DefaultGuard;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::{Layer, registry};
 use wiremock::MockServer;
 use wiremock::matchers::{HeaderExactMatcher, header};
 
@@ -187,4 +192,164 @@ fn fixture_path(name: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(name)
+}
+
+// ===================== log capture =====================
+
+/// One captured `tracing` event: its [`Level`], its target (the emitting module path, e.g.
+/// `rusteero::links`), and its `message` field rendered as text.
+///
+/// Structured fields other than `message` are not part of the record: this crate inlines every
+/// value it logs into the message text, as `eero-api` does, so the message is what a test pins.
+pub type LogRecord = (Level, String, String);
+
+/// Keeps a [`capture_logs`] subscriber installed on the current thread; dropping it restores the
+/// subscriber that was in place before. Bind it to a named variable (`let (_guard, logs) = ...`,
+/// not `_`), or the capture ends immediately.
+pub type LogGuard = DefaultGuard;
+
+/// A handle onto the events [`capture_logs`] recorded on the current thread. Cheap to clone; every
+/// clone sees the same records, and the handle stays readable after its [`LogGuard`] is dropped.
+#[derive(Clone, Default)]
+pub struct LogCapture {
+    records: Arc<Mutex<Vec<LogRecord>>>,
+}
+
+impl LogCapture {
+    /// Every captured event, oldest first.
+    #[must_use]
+    pub fn records(&self) -> Vec<LogRecord> {
+        self.lock().clone()
+    }
+
+    /// The messages of every captured event at exactly `level`, oldest first.
+    #[must_use]
+    pub fn messages(&self, level: Level) -> Vec<String> {
+        self.lock()
+            .iter()
+            .filter(|(record_level, ..)| *record_level == level)
+            .map(|(.., message)| message.clone())
+            .collect()
+    }
+
+    /// The messages of every captured `WARN` event, oldest first.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        self.messages(Level::WARN)
+    }
+
+    /// The messages of every captured `ERROR` event, oldest first.
+    #[must_use]
+    pub fn errors(&self) -> Vec<String> {
+        self.messages(Level::ERROR)
+    }
+
+    /// Whether any captured event at exactly `level` has a message containing `needle`.
+    #[must_use]
+    pub fn contains(&self, level: Level, needle: &str) -> bool {
+        self.lock()
+            .iter()
+            .any(|(record_level, _, message)| *record_level == level && message.contains(needle))
+    }
+
+    /// How many captured events at exactly `level` have a message containing `needle`.
+    #[must_use]
+    pub fn count(&self, level: Level, needle: &str) -> usize {
+        self.lock()
+            .iter()
+            .filter(|(record_level, _, message)| *record_level == level && message.contains(needle))
+            .count()
+    }
+
+    /// Whether nothing at all has been captured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Forgets everything captured so far, e.g. to drop the noise of a test's setup phase before
+    /// the call under test.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<LogRecord>> {
+        // A panic while a test thread held the lock must not hide the records from the
+        // assertion that reports it.
+        self.records.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Collects the `message` field of one event.
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+}
+
+impl Visit for MessageVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            value.clone_into(&mut self.message);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+}
+
+/// The `tracing` layer behind [`capture_logs`]: appends every event, at every level, to a shared
+/// vector.
+struct CaptureLayer {
+    records: Arc<Mutex<Vec<LogRecord>>>,
+}
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        let metadata = event.metadata();
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((
+                *metadata.level(),
+                metadata.target().to_owned(),
+                visitor.message,
+            ));
+    }
+}
+
+/// Installs a capturing `tracing` subscriber for the **current thread** and returns the
+/// [`LogGuard`] that keeps it installed plus the [`LogCapture`] handle to read what was logged.
+///
+/// Use it to pin a changed or new `WARN`/`ERROR` line, or to prove a warning was *not* emitted:
+///
+/// ```ignore
+/// let (_guard, logs) = common::capture_logs();
+/// // ... drive the call under test ...
+/// assert!(logs.contains(tracing::Level::WARN, "Issuing write (set nightlight for eero)"));
+/// ```
+///
+/// Events are captured at every level and from every crate, so filter by level and message text
+/// rather than counting all records.
+///
+/// # Current thread only
+///
+/// The subscriber is installed with `tracing::subscriber::set_default`, which is thread-local.
+/// That is exactly right for `#[tokio::test]`, whose default runtime is current-thread, so every
+/// task the test spawns runs on the test's own thread. Events logged on any other thread — a
+/// `#[tokio::test(flavor = "multi_thread")]` worker, a `std::thread::spawn`ed thread, a
+/// `tokio::task::spawn_blocking` closure, reqwest's connection tasks on a separate runtime — are
+/// **not** captured. The capture is also isolated per test: tests running in parallel on their own
+/// threads never see each other's events.
+#[must_use]
+pub fn capture_logs() -> (LogGuard, LogCapture) {
+    let capture = LogCapture::default();
+    let subscriber = registry().with(CaptureLayer {
+        records: Arc::clone(&capture.records),
+    });
+    (tracing::subscriber::set_default(subscriber), capture)
 }
