@@ -110,9 +110,24 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
     }
 }
 
+/// Registers, once per test binary, an always-live dispatcher that is never installed anywhere.
+///
+/// With it alive, `tracing-core` never decides a callsite's interest against a single thread's
+/// default alone, so a scoped subscriber installed with `set_default`/`with_default` sees every
+/// event it enables even when parallel tests on other threads hit the same callsite first. Call
+/// it before installing any scoped subscriber in a unit test.
+pub(crate) fn register_anchor_dispatcher() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(registry()));
+}
+
 /// Installs a capturing subscriber on the current thread. Bind the guard to a named variable
 /// (`let (_guard, logs) = ...`), or the capture ends immediately.
+///
+/// Registers the anchor dispatcher first ([`register_anchor_dispatcher`]), so a parallel unit
+/// test that hit a store's log line before this capture existed cannot hide it from the capture.
 pub(crate) fn capture_logs() -> (DefaultGuard, LogCapture) {
+    register_anchor_dispatcher();
     let capture = LogCapture::default();
     let subscriber = registry().with(CaptureLayer {
         records: Arc::clone(&capture.records),

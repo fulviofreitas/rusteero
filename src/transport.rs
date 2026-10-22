@@ -2390,6 +2390,7 @@ mod tests {
             .with_max_level(level)
             .with_writer(std::io::sink)
             .finish();
+        crate::storage::test_support::register_anchor_dispatcher();
         REDACTIONS.with(|count| count.set(0));
         tracing::subscriber::with_default(subscriber, || {
             let _ = status_to_envelope(reqwest::StatusCode::BAD_REQUEST, BODY, &url, None);
