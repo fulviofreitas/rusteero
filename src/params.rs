@@ -251,6 +251,8 @@ pub(crate) fn require_schedule_family(url: &Url) -> Result<Url, Error> {
 /// Every id is validated to be `[A-Za-z0-9._:-]+` — the same character class the Python regex
 /// enforces inline.
 mod regex_free_matchers {
+    use crate::links::is_version_segment;
+
     /// Returns `(network, child)` if `path` matches
     /// `/<digits>.<digits>/networks/<network>/<prefix>/<child><suffix>` with both `network` and
     /// `child` being single-segment identifiers (`[A-Za-z0-9._:-]+`), else `None`.
@@ -298,16 +300,6 @@ mod regex_free_matchers {
             return None;
         }
         Some((network, profile, schedule))
-    }
-
-    fn is_version_segment(segment: &str) -> bool {
-        let Some((major, minor)) = segment.split_once('.') else {
-            return false;
-        };
-        !major.is_empty()
-            && !minor.is_empty()
-            && major.chars().all(|c| c.is_ascii_digit())
-            && minor.chars().all(|c| c.is_ascii_digit())
     }
 
     fn is_identifier_segment(segment: &str) -> bool {

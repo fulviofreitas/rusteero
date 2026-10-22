@@ -306,6 +306,84 @@ pub fn sub_resource_url(
     resource_url(host, id_or_url, template, version)
 }
 
+/// Returns `true` when `segment` is a bare API-version path segment: ASCII digits, a single
+/// `.`, ASCII digits (`2.2`, `2.3`, `2.10`).
+///
+/// Ported from `_VERSION_SEGMENT_RE = [0-9]+\.[0-9]+` used with `fullmatch` (`links.py:396`).
+/// `char::is_ascii_digit` rather than `char::is_numeric`, so non-ASCII digits never qualify, and
+/// a second dot (`2.2.2`) is rejected exactly as the anchored regex rejects it. Shared by
+/// [`rewrite_version`] and the nested-family path matchers in [`crate::params`], so the two agree
+/// on what a version segment is.
+pub(crate) fn is_version_segment(segment: &str) -> bool {
+    let Some((major, minor)) = segment.split_once('.') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.chars().all(|c| c.is_ascii_digit())
+        && minor.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Rewrites the API-version segment of an already-resolved absolute URL.
+///
+/// Used where a domain method must pin a specific API version regardless of which version
+/// segment a parent envelope's published link named, because the response shape (or whether a
+/// write takes effect at all) differs by version. Resolve the URL first, rewrite it, then
+/// validate and send it.
+///
+/// Ported from `rewrite_version` (`links.py:399-435`, the parsed form), with its tests.
+///
+/// The version is the **first path segment** of a resolved URL (the configured API host is a bare
+/// origin), and only that segment is replaced: `/2.3/networks/n/2.3/support` pinned to
+/// [`ApiVersion::V2_2`] becomes `/2.2/networks/n/2.3/support`. Everything else is left exactly
+/// as `url` holds it: scheme, host, port, the rest of the path with its percent-escapes, the
+/// query and the fragment.
+///
+/// The function never fails. `url` is returned unchanged (as a clone) when any of these holds:
+///
+/// - the scheme is not `http` or `https` (for example `ftp://host/2.3/x/y`);
+/// - the URL has no host;
+/// - the path has no `/` after its first segment (`/2.3` and the bare `/` are left alone, while
+///   `/2.3/` is rewritten to `/2.2/`, as Python's `path.split("/", 2)` requires three parts);
+/// - the first path segment is not `<digits>.<digits>` in ASCII (`/v2/x`, `/2/x`, `/2.2.2/x`,
+///   `/login/x`).
+///
+/// Python's relative-path case has no counterpart here: a [`Url`] is always absolute. The two
+/// hardening cases upstream tests for need no code either: [`Url::parse`] already lower-cases the
+/// scheme (`HTTPS://` pins like `https://`) and drops tab, carriage return and line feed from the
+/// input, while any other control character in the path is percent-encoded rather than left to
+/// hide the version segment.
+///
+/// # Examples
+///
+/// ```
+/// use rusteero::links::rewrite_version;
+/// use rusteero::routes::ApiVersion;
+/// use url::Url;
+///
+/// let url = Url::parse("http://mock.test:1234/2.3/networks/n1/support?a=1").unwrap();
+/// let pinned = rewrite_version(&url, ApiVersion::V2_2);
+/// assert_eq!(pinned.as_str(), "http://mock.test:1234/2.2/networks/n1/support?a=1");
+/// ```
+#[must_use]
+pub fn rewrite_version(url: &Url, version: crate::routes::ApiVersion) -> Url {
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return url.clone();
+    }
+    let Some((segment, tail)) = url.path().strip_prefix('/').and_then(|p| p.split_once('/')) else {
+        return url.clone();
+    };
+    if !is_version_segment(segment) {
+        return url.clone();
+    }
+    // `set_path` keeps the query and the fragment, and re-parsing a path that `Url` itself
+    // produced neither double-encodes an existing `%xx` escape nor changes dot segments (those
+    // were already resolved when `url` was parsed).
+    let mut rewritten = url.clone();
+    rewritten.set_path(&format!("/{}/{tail}", version.segment()));
+    rewritten
+}
+
 /// Logs exactly one fixed `WARNING` before issuing a write whose side effects have not been
 /// fully characterised against a live network.
 ///
@@ -325,8 +403,8 @@ pub fn warn_uncharacterised_write(operation: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        child_url, join_api_path, resolve_link, resource_url, self_url, sub_resource_url,
-        validate_identifier,
+        child_url, is_version_segment, join_api_path, resolve_link, resource_url, rewrite_version,
+        self_url, sub_resource_url, validate_identifier,
     };
     use crate::error::Error;
     use crate::routes::ApiVersion;
@@ -658,6 +736,258 @@ mod tests {
             url.as_str(),
             "http://mock.test:1234/2.2/networks/100/settings"
         );
+    }
+
+    // ===================== rewrite_version / TestRewriteVersion =====================
+
+    /// Parses `raw`, pins it to `version` and returns the result as a string.
+    fn pinned(raw: &str, version: ApiVersion) -> String {
+        rewrite_version(&Url::parse(raw).unwrap(), version).to_string()
+    }
+
+    #[test]
+    fn rewrite_version_rewrites_23_to_22() {
+        assert_eq!(
+            pinned(
+                "http://mock.test:1234/2.3/networks/network-id-placeholder/support",
+                ApiVersion::V2_2
+            ),
+            "http://mock.test:1234/2.2/networks/network-id-placeholder/support"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_rewrites_22_to_23() {
+        assert_eq!(
+            pinned(
+                "http://mock.test:1234/2.2/networks/n1/devices/x",
+                ApiVersion::V2_3
+            ),
+            "http://mock.test:1234/2.3/networks/n1/devices/x"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_is_a_noop_when_already_on_the_target_version() {
+        let raw = "http://mock.test:1234/2.2/networks/network-id-placeholder/routing";
+        assert_eq!(pinned(raw, ApiVersion::V2_2), raw);
+        let raw = "http://mock.test:1234/2.3/networks/n1/devices/x";
+        assert_eq!(pinned(raw, ApiVersion::V2_3), raw);
+    }
+
+    #[test]
+    fn rewrite_version_leaves_a_url_without_a_version_segment_unchanged() {
+        for raw in [
+            "http://mock.test:1234/login",
+            "http://mock.test:1234/networks/n1",
+            "http://mock.test:1234/",
+            "http://mock.test:1234",
+        ] {
+            assert_eq!(
+                pinned(raw, ApiVersion::V2_2),
+                Url::parse(raw).unwrap().as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_version_needs_a_slash_after_the_version_segment() {
+        // Python's `path.split("/", 2)` must yield three parts: `/2.3` yields two, `/2.3/` three.
+        assert_eq!(
+            pinned("http://mock.test:1234/2.3", ApiVersion::V2_2),
+            "http://mock.test:1234/2.3"
+        );
+        assert_eq!(
+            pinned("http://mock.test:1234/2.3/", ApiVersion::V2_2),
+            "http://mock.test:1234/2.2/"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_only_matches_digits_dot_digits() {
+        for raw in [
+            "http://mock.test:1234/v2/x/y",
+            "http://mock.test:1234/2/x",
+            "http://mock.test:1234/2.2.2/x",
+            "http://mock.test:1234/.2/x",
+            "http://mock.test:1234/2./x",
+            "http://mock.test:1234/2.x/x",
+            "http://mock.test:1234/%32.%33/x",
+            // Arabic-Indic digits are numeric but not `[0-9]`; they are percent-encoded by the
+            // parser, so they can never reach the digit test as digits.
+            "http://mock.test:1234/\u{662}.\u{663}/x",
+        ] {
+            assert_eq!(
+                pinned(raw, ApiVersion::V2_2),
+                Url::parse(raw).unwrap().as_str(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_version_accepts_multi_digit_versions() {
+        assert_eq!(
+            pinned("http://mock.test:1234/2.10/x", ApiVersion::V2_2),
+            "http://mock.test:1234/2.2/x"
+        );
+        assert_eq!(
+            pinned("http://mock.test:1234/10.0/x", ApiVersion::V2_3),
+            "http://mock.test:1234/2.3/x"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_scheme_case_does_not_defeat_the_rewrite() {
+        for scheme in ["HTTPS", "Https", "hTTps"] {
+            assert_eq!(
+                pinned(
+                    &format!(
+                        "{scheme}://mock.test:1234/2.3/networks/network-id-placeholder/support"
+                    ),
+                    ApiVersion::V2_2
+                ),
+                "https://mock.test:1234/2.2/networks/network-id-placeholder/support",
+                "{scheme}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_version_control_character_in_path_does_not_defeat_the_rewrite() {
+        // Tab, CR and LF are dropped by the URL parser and form feed is percent-encoded; in every
+        // case the version segment is still found and replaced.
+        for control in ["\n", "\t", "\r", "\u{c}"] {
+            let raw = format!(
+                "http://mock.test:1234/2.3/networks/network-id{control}placeholder/support"
+            );
+            let rewritten = pinned(&raw, ApiVersion::V2_2);
+            assert!(
+                rewritten.starts_with("http://mock.test:1234/2.2/networks/network-id"),
+                "{rewritten}"
+            );
+            assert!(rewritten.ends_with("placeholder/support"), "{rewritten}");
+            assert!(!rewritten.contains("/2.3/"), "{rewritten}");
+        }
+    }
+
+    #[test]
+    fn rewrite_version_only_the_first_path_segment_is_replaced() {
+        assert_eq!(
+            pinned(
+                "http://mock.test:1234/2.3/networks/network-id-placeholder/2.3/support",
+                ApiVersion::V2_2
+            ),
+            "http://mock.test:1234/2.2/networks/network-id-placeholder/2.3/support"
+        );
+        assert_eq!(
+            pinned("http://mock.test:1234/2.2/networks/2.2/x", ApiVersion::V2_3),
+            "http://mock.test:1234/2.3/networks/2.2/x"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_preserves_query_and_fragment() {
+        assert_eq!(
+            pinned(
+                "http://mock.test:1234/2.3/networks/network-id-placeholder/support?a=1#frag",
+                ApiVersion::V2_2
+            ),
+            "http://mock.test:1234/2.2/networks/network-id-placeholder/support?a=1#frag"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_preserves_percent_escapes_without_double_encoding() {
+        assert_eq!(
+            pinned(
+                "http://mock.test:1234/2.3/networks/a%20b/support",
+                ApiVersion::V2_2
+            ),
+            "http://mock.test:1234/2.2/networks/a%20b/support"
+        );
+        assert_eq!(
+            pinned(
+                "http://mock.test:1234/2.3/networks/a%2Fb/x",
+                ApiVersion::V2_2
+            ),
+            "http://mock.test:1234/2.2/networks/a%2Fb/x"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_preserves_empty_segments_and_trailing_slash() {
+        assert_eq!(
+            pinned("http://mock.test:1234/2.3//x/", ApiVersion::V2_2),
+            "http://mock.test:1234/2.2//x/"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_preserves_scheme_host_and_port() {
+        assert_eq!(
+            pinned("https://mock.test:8443/2.3/x/y", ApiVersion::V2_2),
+            "https://mock.test:8443/2.2/x/y"
+        );
+        assert_eq!(
+            pinned("https://mock.test/2.3/x/y", ApiVersion::V2_2),
+            "https://mock.test/2.2/x/y"
+        );
+        assert_eq!(
+            pinned("http://[::1]:8080/2.3/x/y", ApiVersion::V2_2),
+            "http://[::1]:8080/2.2/x/y"
+        );
+    }
+
+    #[test]
+    fn rewrite_version_leaves_non_http_and_hostless_urls_unchanged() {
+        for raw in [
+            "ftp://mock.test/2.3/x/y",
+            "ws://mock.test/2.3/x/y",
+            "file:///2.3/x/y",
+            "mailto:2.3/x/y",
+            "data:text/plain,2.3/x/y",
+        ] {
+            assert_eq!(
+                pinned(raw, ApiVersion::V2_2),
+                Url::parse(raw).unwrap().as_str(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_version_does_not_modify_its_input() {
+        let url = Url::parse("http://mock.test:1234/2.3/x/y").unwrap();
+        let _ = rewrite_version(&url, ApiVersion::V2_2);
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.3/x/y");
+    }
+
+    #[test]
+    fn rewrite_version_has_no_counterpart_for_a_relative_url() {
+        // Python's "relative-path" case: a `Url` is always absolute, so the input cannot exist.
+        assert!(Url::parse("/2.3/networks/network-id-placeholder/support").is_err());
+    }
+
+    #[test]
+    fn is_version_segment_matches_ascii_digits_dot_digits_only() {
+        for good in ["2.2", "2.3", "2.10", "10.0", "0.0"] {
+            assert!(is_version_segment(good), "{good}");
+        }
+        for bad in [
+            "",
+            "2",
+            "2.",
+            ".2",
+            ".",
+            "2.2.2",
+            "v2.2",
+            "2.2a",
+            "2 .2",
+            "\u{662}.\u{663}",
+        ] {
+            assert!(!is_version_segment(bad), "{bad:?}");
+        }
     }
 
     // ===================== TestReadOnlyMappingParents =====================
