@@ -259,7 +259,7 @@ These keep their signatures, so they compile unchanged and behave differently.
 
 * **No transport `WARN` or `ERROR` line carries a request URL, a path or a query string**, and their
   wording follows `eero-api` (`Request timed out on GET request`, `Network error (connect) on GET
-  request`, `Retrying GET request after transient failure (attempt 1/2)`, …). The path appears
+  request`, `Retrying GET request after transient failure (attempt 2/2)`, …). The path appears
   at `DEBUG` only. Update any alerting that matched the old text. See
   [Configuration — Logging and redaction](Configuration#logging-and-redaction).
 * **`redact_sensitive` walks a top-level array** and replaces anything nested 16 levels deep or
@@ -349,7 +349,7 @@ closed state to re-enter.
 4. The session transport, credential record and refresh flow changed —
    [Session, transport and storage](#session-transport-and-storage).
 5. Fourteen domain modules were added, every resource argument became id-or-URL polymorphic,
-   and every domain method gained `parent` — [Added](#added).
+   and every domain method whose Python counterpart takes `parent=` gained it — [Added](#added).
 
 There is no deprecation window: a removed method is a compile error, not a runtime no-op.
 
@@ -497,8 +497,9 @@ shapes, and a stored 1.0.0 session keeps working after its record is migrated. U
 * **Id-or-URL polymorphism.** Every resource argument also accepts the resource's API path or its
   absolute API-host URL. Existing bare-id calls keep working; a URL on another host is
   `Error::Validation`.
-* **`parent: Option<&Value>`** on every `EeroApi` domain method (last parameter). `Client` passes
-  its cached network / eero / device envelopes automatically — so a network-scoped call made
+* **`parent: Option<&Value>`** (last parameter) on every `EeroApi` domain method whose `eero-api`
+  counterpart takes `parent=`. `Client` passes its cached network / eero / device envelopes
+  automatically — so a network-scoped call made
   while a fresh `get_network()` result is cached goes to the link the API published, which may be
   on a different version than the method's template. (3.0.0 pins a few methods to one version
   whatever the link says; see

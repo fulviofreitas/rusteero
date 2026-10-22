@@ -4,8 +4,9 @@ Full reference for `rusteero`'s public surface, ported from the Python
 [`eero-api`](https://github.com/fulviofreitas/eero-api) library at **v8.4.1**. Method names are
 the Python names verbatim, in `snake_case` (including the `get_` prefix) — deliberate, so a
 method can be searched for across both libraries by name. Every endpoint method returns
-`Result<Envelope, rusteero::Error>` over the raw `{"meta": …, "data": …}` wire payload; nothing
-is transformed on the way through.
+`Result<Envelope, rusteero::Error>` over the raw `{"meta": …, "data": …}` wire payload
+(`clear_profile_schedule` returns one envelope per deleted pause, `Vec<Envelope>`); nothing is
+transformed on the way through.
 
 See [PARITY.md](https://github.com/fulviofreitas/rusteero/blob/master/PARITY.md) in the
 repository for the exhaustive method-by-method table, and the crate's own rustdoc for every
@@ -45,7 +46,7 @@ Client            cache, network-id resolution, cached parent envelopes     (eer
 | Layer | Reach it via | When to use it |
 |---|---|---|
 | `Client` | `Client::builder()` | The default. Optional `network_id`, cached reads, cache invalidation on writes, cached envelopes passed as `parent` for you |
-| `EeroApi` | `client.api()` or `EeroApi::new(transport)` | You already know the network id and want no cache. `network_id: &str` is required and comes first; every method takes `parent: Option<&Value>` |
+| `EeroApi` | `client.api()` or `EeroApi::new(transport)` | You already know the network id and want no cache. Network-scoped methods take `network_id: &str` first; methods whose Python signature has `parent=` take `parent: Option<&Value>` last |
 | `Transport` | `client.api().transport()` or `Transport::builder()` | A raw call to a URL you resolved yourself: `Transport::request(method, url, query, body)` with a `RequestBody`, or `request_with_timeout(method, url, query, body, Some(RequestTimeout))` to replace the default timeout for that one call (`resource_with_timeout` / `nested_with_timeout` do the same for a route constant) |
 
 ```rust
@@ -239,7 +240,9 @@ WAN, DDNS and backup families, and every wrapper new in 3.0.0 — goes straight 
 exceptions, where it comes first because the method has no leading resource argument, are the
 cached list getters (`get_network`, `get_eeros`, `get_devices`, `get_profiles`),
 `get_speed_tests`, `run_diagnostics`, `get_transfer_stats`, `set_power_saving`,
-`create_power_saving_schedule` and (after `schedule_id`) `update_power_saving_schedule`. The
+`create_power_saving_schedule` and (after `schedule_id`) `update_power_saving_schedule`; the
+single-item getters `get_eero`, `get_device` and `get_profile` take
+`(id, network_id, refresh_cache)`. The
 wrappers new in 3.0.0 that mirror a Python method with both arguments take
 `(own args…, network_id, parent)`: `parent: Option<&Value>` comes after `network_id`
 (`add_to_blacklist`, `remove_from_blacklist`, `set_network_ad_block`,
@@ -256,7 +259,11 @@ client.set_upnp(true, Some("<network-id>")).await?;                // value firs
 ```
 
 `EeroApi` has no preferred-network concept: `network_id: &str` is required and comes first on
-every domain method.
+every network-scoped domain method (`update_forward`/`update_reservation` take an optional
+`network` after the item). The eero methods and `set_pppoe` take the eero's id or serial first
+instead, `update_schedule`/`delete_schedule` the pause, `query_invite` the invite code, and the
+account-level methods (`account()`, `get_networks`, `set_push_settings`,
+`get_premium_customer`) no identifier at all.
 
 ---
 
@@ -308,8 +315,10 @@ it, else `Error::Validation { field: "child", .. }` (`must be a path under …` 
 
 ### `parent`: use the link the API published
 
-Every domain method on `EeroApi` takes `parent: Option<&Value>` — the envelope of the resource
-you already hold (a full `{"meta", "data"}` response or just its `data` object). When supplied,
+Every `EeroApi` method whose Python counterpart has `parent=` takes `parent: Option<&Value>`
+(last) — the envelope of the resource you already hold (a full `{"meta", "data"}` response or
+just its `data` object); so do `update_forward`, `update_reservation`, `update_schedule` and
+`delete_schedule`, whose Python versions accept the item's envelope in place of its id. When supplied,
 the URL is resolved from that envelope's published link (`resources.settings`,
 `resources.led_action`, `resources.schedules`, the resource's own `url`, …) instead of a template,
 so the request follows the version the API actually serves the resource on. The envelope is only
@@ -419,7 +428,7 @@ Writes invalidate the entries they affect and nothing else:
 | `reboot_eero`, `set_location`, `set_led`, `set_led_brightness`, `set_nightlight`, `node_action`, `port_action`, `nightlight_override` | `eeros[<nid>]` |
 | Device writes (`set_device_nickname`, `pause_device`, `block_device`, `unblock_device`, `add_to_blacklist`, `remove_from_blacklist`, `set_device_type`, `set_device_labels`, `set_device_secondary_wan_access`) | `devices[<nid>,<did>]` (canonical key) and `devices[<nid>]` |
 | `create_burst_reporter` | `devices[<nid>]` only |
-| `update_device_via_link` | as the device writes, plus every `profiles` entry of the network |
+| `update_device_via_link` | as the device writes, plus every `profiles` entry of the network when `profile` is `Some` |
 | `create_profile`, the per-profile DNS-policy writes | `profiles[<nid>]` |
 | `rename_profile`, `delete_profile`, `pause_profile`, `set_profile_blocked_applications`, `set_weekday_bedtime`, `set_weekend_bedtime` | `profiles[<nid>,<pid>]` and `profiles[<nid>]` |
 | `set_profile_devices` | `profiles[<nid>,<pid>]` and `profiles[<nid>]`, plus each named device's entry and `devices[<nid>]` |
@@ -781,8 +790,10 @@ documented upstream, so you own it; the request is not version-pinned.
 
 ### The `Options` structs
 
-Four writes with many optional fields take an options struct instead of a long argument list.
-All derive `Default` and `Clone`, and a field left `None` is omitted from the request body:
+Four methods with many optional fields (three writes and the `get_channel_utilization` read) take
+an options struct instead of a long argument list. All derive `Default` and `Clone`, and a field
+left `None` is omitted from the request body (from the query string for
+`get_channel_utilization`):
 
 | Struct | Path | Fields |
 |---|---|---|
@@ -809,8 +820,10 @@ client
 ## `EeroApi`: the 37 domain accessors
 
 `client.api()` (or `EeroApi::new(transport)`) exposes one accessor per Python domain module.
-Every method takes `network_id: &str` first (where the resource is network-scoped) and
-`parent: Option<&Value>` last; nothing is cached. A representative method is shown for each.
+Network-scoped methods take `network_id: &str` first (except `forwards().update_forward` and
+`reservations().update_reservation`, which take the item and an optional `network`), and
+`parent: Option<&Value>` last where they accept one; nothing is cached. A representative method
+is shown for each.
 
 | Accessor | Domain | Representative method |
 |---|---|---|
@@ -831,7 +844,7 @@ Every method takes `network_id: &str` first (where the resource is network-scope
 | `entitlements()` | Feature entitlements and upsells | `get_features(network_id)`, `get_premium_customer()` |
 | `events()` | App events, network scan, channel utilisation | `get_app_events(network_id, page_size, timestamp, parent)` |
 | `forwards()` | Port forwards | `get_forwards(network_id, parent)` (pinned to 2.2), `delete_forward(network_id, forward)` |
-| `insights()` | Insights time series | `get_insights(network_id, start, end, insight_type, cadence, ..)` |
+| `insights()` | Insights time series | `get_insights(network_id, start, end, insight_type, cadence)` |
 | `members()` | Network members and invites | `get_members(network_id, parent)`, `create_invite(network_id, role)`, `query_invite(invite_code)` |
 | `networks()` | Networks, guest network, speed tests, 5 GHz hiding | `get_networks()`, `get_network(network_id, parent)`, `reboot_network`, `set_hide_5g(network_id, enabled)`; `get_account()` is deprecated in favour of `account().get_account()` |
 | `notifications()` | Notification settings, history, push | `get_settings(network_id, parent)`, `set_push_settings(settings)` |
@@ -881,12 +894,15 @@ not evidence a write applied. The crate therefore distinguishes:
 * **Every other write** logs one fixed `WARNING` through
   `rusteero::links::warn_uncharacterised_write` after the URL is resolved and the arguments
   validated, immediately before the request. The message never includes a caller-supplied
-  identifier.
+  identifier. DNS writes log it before the URL is resolved, as upstream does, and
+  `set_profile_devices` logs two (`set devices for profile` and `update profile`).
 * **Settings-class writes** say so in their warning — they may reboot every eero, as the DNS write
-  path was confirmed to: every DNS write, `set_sqm`, `set_dhcp`, `set_connection_mode`,
+  path was confirmed to: every DNS write, `set_dhcp`, `set_connection_mode`,
   `set_nat_port_randomization`, `set_mlo_mode`, `set_wpa3`/`set_band_steering`/`set_upnp`/
   `set_ipv6`/`set_ipv6_upstream`/`configure_security`, `set_secondary_wan_config`,
-  `set_device_secondary_wan_access`, and `apply_update` (reboots every node). For `set_dhcp` the
+  `set_device_secondary_wan_access`, and `apply_update` (reboots every node). `set_sqm` is a
+  settings-class write too, but its warning (`set SQM for network`, as upstream) does not say
+  so. For `set_dhcp` the
   restart is confirmed: about eight minutes of outage per write. `reboot_network` restarts every
   eero by design, and `set_hide_5g` disconnects 5 GHz clients.
 * `set_device_labels` was verified upstream to return `200` and change nothing.
@@ -909,8 +925,9 @@ if net.data()["upnp"] != serde_json::json!(true) {
 server-driven variant carries `envelope: Option<Value>` (the raw parsed response) and
 `error_code: Option<String>` (`meta.error`), reachable uniformly through `Error::envelope()`,
 `Error::error_code()` and `Error::status()`. Messages are fixed labels — the recognised catalogue
-string, or `"unrecognised error string"` — never the response body. The one message that names
-the request path is a refused redirect's (below).
+string, or `"unrecognised error string"` — never the response body. A refused redirect's message
+names the request path (below), and an `Error::Network`'s text is reqwest's own, which includes
+the full request URL.
 
 | Variant | Raised when |
 |---|---|
@@ -921,7 +938,7 @@ the request path is a refused redirect's (below).
 | `Api { status, message, envelope, error_code, url }` | Any other non-2xx status, every recognised domain string, an unrecognised string; also client-side, with the response status: a refused redirect (`Redirect not followed: <status> at <path> -> <Location host>`), a body over 10 MiB, invalid JSON on a 2xx (`Invalid JSON response (<n> bytes)`), a 2xx whose JSON is not an object (`Unexpected JSON response: expected an object`), a 2xx body that is not UTF-8 (`Response body is not valid UTF-8`). A non-2xx body is decoded lossily, so a stray invalid byte never hides its status |
 | `AccessDenied { status, message, envelope, error_code }` | HTTP 403 with `error.access.denied`. Not an auth error; credentials kept |
 | `ClientBlocked { .. }` | `error.app.version.blocked` on any status |
-| `NotFound { status, message, envelope, error_code }` | Every HTTP 404, whatever `meta.error` says |
+| `NotFound { status, message, envelope, error_code }` | HTTP 404, unless `meta.error` is in a status-independent group (premium, feature-unavailable, client-blocked, rate-limit) |
 | `PremiumRequired { status: Option<u16>, .. }` | `error.premium.user_not_subscribed` or `error.partner.unavailable` on any status |
 | `FeatureUnavailable { status: Option<u16>, .. }` | `error.eero.offline`, `error.network.unavailable`, `error.eero.not.capable`, … on any status |
 | `Validation { field, message, envelope, error_code }` | Locally, before any request (bad id, a path or URL outside the method's family, off-origin or userinfo URL, invalid IP literal, bad `cadence`/mode/band, empty name, password or token, an hour outside `0..=23`, non-ASCII header, unusable `base_url`); from the API, HTTP 400 with a `VALIDATION` string (`field == "request"`). See [Troubleshooting](Troubleshooting#errorvalidation-before-any-request-was-sent) for the field names |

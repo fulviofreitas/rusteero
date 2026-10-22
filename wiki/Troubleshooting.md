@@ -32,8 +32,8 @@ wrappers carry `status: None`), but two of the catalogue strings mean very diffe
 
 | `error_code()` | What happened | What to do |
 |---|---|---|
-| `error.session.refresh` | The server asked for a refresh. The transport already called `POST login/refresh` with the current token and replayed your request once; you only see this error if that refresh **failed** | Nothing periodic — the crate handles it. If you see it, the refresh endpoint rejected the token: re-seed one or run `LoginFlow` again |
-| `error.session.expired`, `error.session.invalid`, `error.session.revoked` | Terminal. If it came from the refresh endpoint, the stored credential has **already been cleared** (in memory and in every configured store) | Re-seed a token (`set_session_token`, `Session::from_env`) or run the login flow |
+| `error.session.refresh` | The server asked for a refresh. The transport already called `POST login/refresh` with the current token and replayed your request once; you see this error only if that refresh **failed** or the replayed request was refused again. If the refresh endpoint answered with a terminal authentication string (anything but a `Verification` or `error.session.refresh` string), the stored credential has **already been cleared** (in memory and in every configured store) | Nothing periodic — the crate handles it. If you see it, re-seed a token or run `LoginFlow` again |
+| `error.session.expired`, `error.session.invalid`, `error.session.revoked` | Terminal: the server rejected your request's token. The crate clears nothing here; the credential stays in memory and in the store | Re-seed a token (`set_session_token`, `Session::from_env`) or run the login flow |
 | `error.verification.required` and the other `Verification` strings | The account is mid-verification or blocked from completing login; credentials are kept | Finish the one-time-code flow |
 | `None` / free text | A 401 with no recognised string | Treat as terminal; `Error::envelope()` has the API's own body |
 
@@ -43,7 +43,7 @@ use rusteero::{classify_error_code, Error, ErrorGroup};
 if let Err(Error::Authentication { error_code, .. }) = client.get_devices(None, false, None, None).await {
     match classify_error_code(error_code.as_deref()) {
         Some(ErrorGroup::Verification) => { /* finish the OTP flow */ }
-        _ => { /* re-seed a token or re-run LoginFlow; the store is already cleared */ }
+        _ => { /* re-seed a token or re-run LoginFlow; the store may already have been cleared */ }
     }
 }
 ```
@@ -107,8 +107,9 @@ and visible as `credentials_persisted() == false`. Options:
 ### `Error::PremiumRequired` / `Error::FeatureUnavailable`
 
 These are status-independent: the API can carry `error.premium.user_not_subscribed` or
-`error.eero.offline` on a `200`, a `400` or a `500`, and the crate maps the string, not the
-status. `PremiumRequired` means the network is not on Eero Plus/Secure — the DNS-policies
+`error.eero.offline` on a `400` or a `500` (any `4xx`/`5xx` status but `401`), and the crate maps the
+string, not the status; a `2xx` is returned as `Ok` with the string left in `meta.error`.
+`PremiumRequired` means the network is not on Eero Plus/Secure — the DNS-policies
 family (`get_advanced_content_filter`, `block_domain*`, `set_profile_blocked_applications`,
 …) and `get_premium_status`-adjacent features are the usual sources. `FeatureUnavailable`
 covers an offline eero, a node that is not capable of the feature, a deactivated or
@@ -122,7 +123,7 @@ A `Validation { field, .. }` with no `envelope()` came from a local check. The c
 | `field` | Cause |
 |---|---|
 | `"id"` | A bare id that is not a single path segment (`must be a single path segment identifier`): empty, a `/`, `?`, `%`, whitespace or a `..` |
-| `"id_or_url"` | A path you passed: empty (`must be a non-empty string`), not host-relative (`must be a host-relative API path`), `must not contain whitespace or control characters`, `must not carry a query or fragment`, `must not contain dot segments` (a `.`/`..` segment or `%2e`), `must not contain a backslash`, or naming another kind of resource (`must be a path under <family> on the API host`, e.g. `/2.2/account` where a network is expected). An empty resource argument of any kind gets `must be a non-empty string` here too; on `Client` that includes an empty `device_id`/`mac` (`get_device`, `block_device`, `update_device_via_link`, `add_to_blacklist`, …), rejected before any request, while an empty `network_id` means "no network id" and falls back to the preferred network |
+| `"id_or_url"` | A path you passed: empty (`must be a non-empty string`), not host-relative (`must be a host-relative API path`), `must not contain whitespace or control characters`, `must not carry a query or fragment`, `must not contain dot segments` (a `.`/`..` segment or `%2e`), `must not contain a backslash`, or naming another kind of resource (`must be a path under <family> on the API host`, e.g. `/2.2/account` where a network is expected). An empty resource id resolved through a template gets `must be a non-empty string` here too; on `Client` that includes an empty `device_id`/`mac` (`get_device`, `block_device`, `update_device_via_link`, `add_to_blacklist`, …), rejected before any request, while an empty `network_id` means "no network id" and falls back to the preferred network. An empty child id gets field `id` instead (e.g. `remove_from_blacklist("")`) or `child` |
 | `"url"` | An absolute URL you passed: the same shape messages, or off the API origin — `must be an absolute <scheme> URL on <host> with no userinfo and no other port` (another host, scheme or port, userinfo, a `@`/`%`/backslash/non-ASCII authority). `must not carry userinfo` from `Transport::request` |
 | `"link"` | A link the API published in a `parent` envelope that fails the shape rule (shape-checked only, never family-confined) |
 | `"child"` | A child path or URL (profile, MAC, invite, reservation, forward) that is not `/<version>/networks/<network>/<family>/<id>` (`must be a path under …`) or names another network (`must belong to the addressed network`) |
@@ -154,8 +155,9 @@ evidence a write applied. Things to check:
     operation than the one the Python library reverse-engineered. `set_device_labels` is the
     known case — verified upstream to echo the labels back and never apply them.
 2.  **Settings-class writes reboot the mesh.** DNS, DHCP, connection mode, NAT randomisation,
-    MLO, the security setters (including `set_ipv6_upstream`), SQM, secondary WAN and
-    `apply_update` say so in their warning; for DHCP the restart is confirmed, about eight
+    MLO, the security setters (including `set_ipv6_upstream`), secondary WAN and
+    `apply_update` say so in their warning (SQM is settings-class too, but its warning does not
+    say so); for DHCP the restart is confirmed, about eight
     minutes per write. A read-back immediately after may still show the old value while the eeros
     restart; do not retry in a loop.
 3.  **Device writes must go to API 2.3.** `set_device_nickname` and `pause_device` are pinned to
@@ -171,8 +173,9 @@ evidence a write applied. Things to check:
 
 ### `Error::NotFound` — and 2.2 vs 2.3
 
-Every HTTP 404 is `Error::NotFound { status: 404, .. }`, whether or not `meta.error` carries a
-recognised string. Two families 404 by design rather than by mistake:
+Every HTTP 404 is `Error::NotFound { status: 404, .. }` unless `meta.error` is a
+status-independent string (premium, feature-unavailable, client-blocked, rate-limit). Two
+families 404 by design rather than by mistake:
 
 *   `get_multistaticip` (API 2.3) returns `NotFound` on a network without the multi-static-IP
     feature (`error.network.multistaticip_not_found`).
@@ -209,7 +212,7 @@ reads `get_networks(false)`, so a cached empty answer keeps discovery failing fo
 `Error::RateLimit { retry_after, status, .. }` — back off for `retry_after` if the server sent a
 `Retry-After` header (`None` otherwise; capped at 24 hours, `consts::RETRY_AFTER_MAX`). `status`
 is the response's own status: `Some(429)` usually, but `error.rate.limit` is classified as a rate
-limit on any status but `401`. The crate never retries a rate-limited request, and `get_retries`
+limit on any error status (`4xx`/`5xx`) but `401`. The crate never retries a rate-limited request, and `get_retries`
 does not apply to one, whatever its status.
 
 ### Timeouts
@@ -285,7 +288,8 @@ tracing_subscriber::fmt()
 ```
 
 At `DEBUG` the transport logs method, path (never the query string) and status, and an error
-response's envelope after redaction; its `WARN` and `ERROR` lines carry no URL or path at all.
+response's envelope after redaction; its `WARN` and `ERROR` lines carry no path or query (the
+withheld-credential warning names only the target's `scheme://host`).
 Headers, cookies and raw bodies are never logged, and error messages never embed a response body
 — read `Error::envelope()` instead. See
 [Configuration — Logging and redaction](Configuration#logging-and-redaction).

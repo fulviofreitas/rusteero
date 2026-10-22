@@ -108,8 +108,9 @@ let store = ChainedStore::new(
 daemon that is not running), falls through to the fallback and promotes a hit back into the
 primary on a best-effort basis; the fallback copy is cleared only once a read-back shows the
 primary holds it. `save` writes to the primary and reads it back; only a *verified* primary
-write skips the fallback. Otherwise it clears the stale primary entry (best-effort) and writes
-to the fallback, which is read back too: `StorageError::Backend` (`backend: "chained"`) when
+write skips the fallback. Otherwise it clears the primary's record (best effort, and only if it
+is one this instance loaded or wrote; another process's record is left in place) and writes to
+the fallback, which is read back too: `StorageError::Backend` (`backend: "chained"`) when
 both writes failed, `StorageError::NotRetained` (`backend: "chained"`) when no backend was read
 back holding the token. After a verified primary write the chain retires the fallback record,
 but only one it knows is its own (the token it last loaded from, promoted out of, or wrote to
@@ -143,7 +144,8 @@ the OS keyring unless asked. Under `--no-default-features` the keyring rows degr
 
 ### `StorageFailures`
 
-Every Python `eero-api` backend swallows a save/load/clear failure: it logs it (at `DEBUG` to
+Every Python `eero-api` backend swallows a save/load failure and a single backend's clear
+failure (`ChainedStorage.clear` re-raises only when both backends fail): it logs it (at `DEBUG` to
 `ERROR`, depending on the backend) and reports a failed save only through
 `credentials_persisted`. `rusteero` surfaces it as a typed `StorageError` and lets you choose
 what happens next:
@@ -211,7 +213,8 @@ let client = Client::builder()
 If neither `.session(..)` nor `.store(..)` is set, the `Client` starts with no session and no
 persistence — there is no implicit default store. If both are set, the explicit session wins
 and the store is only used for later `set_session_token`/`clear_session_token`/
-`clear_auth_data`/`logout` persistence. `build()` validates `base_url`, `X-Accept-Language` and
+`clear_auth_data`/`logout` persistence, and the credential clear after a refresh that fails
+terminally. `build()` validates `base_url`, `X-Accept-Language` and
 `User-Agent` (in that order) before it reads the store, so a bad configuration fails before a
 keyring prompt or a file read.
 
@@ -246,7 +249,7 @@ transport was built with (`Transport::builder().user_agent(..)`).
 
 | Option | What it does |
 |---|---|
-| `send_legacy_cookie(bool)` | `true` (default) sends `Cookie: s=<token>` alongside the primary `X-User-Token` header; `false` sends the header only. Both are attached only when the request URL has no userinfo and its scheme, host and effective port match the configured API host (an explicit default port counts as none) — a request anywhere else goes out without a credential and logs a `WARN` naming only the reason and the refused `scheme://host` (only the reason for a URL with userinfo) |
+| `send_legacy_cookie(bool)` | `true` (default) sends `Cookie: s=<token>` alongside the primary `X-User-Token` header; `false` sends the header only. Both are attached only when the request URL has no userinfo and its scheme, host and effective port match the configured API host (an explicit default port counts as none) — a request anywhere else goes out without a credential and logs a `WARN` naming only the reason and the refused `scheme://host`. A URL carrying userinfo is refused before sending with `Error::Validation { field: "url" }` |
 | `accept_language(..)` | The `X-Accept-Language` header on every request. Printable ASCII with no CR/LF, checked at `build()` (`field: "X-Accept-Language"`) |
 | `user_agent(Option<String>)` | The `User-Agent` header; `None` sends `consts::DEFAULT_USER_AGENT`. Same validation (`field: "User-Agent"`); read the effective value back with `Transport::user_agent()` |
 | `get_retries(u32)` | Additional attempts for a `GET` that fails with `Error::Network`, `Error::Timeout` or any classified error with status `>= 500` except a rate limit, 500 ms apart, each logged at `WARN`. Writes are never retried; `4xx`, `429` and a 5xx carrying `error.rate.limit` are never retried; the one-shot 401 refresh-and-replay is separate |
@@ -316,8 +319,8 @@ tracing_subscriber::fmt()
     position only, never the body).
 *   `WARN` (transport): a GET retry (`Retrying GET request after transient failure (attempt
     N/M)`), a refused redirect (`Redirect response <status> blocked`), a credential withheld from
-    an off-origin request (`Session header withheld from a request to a <reason>: <scheme://host>`,
-    or `Session header withheld from a request with URL with userinfo`), and, under
+    an off-origin request (`Session header withheld from a request to a <reason>: <scheme://host>`),
+    and, under
     `StorageFailures::Warn`, a failure of a store that does not log its own failures
     (`failed to persist session to credential store` for a save, `failed to clear session from
     credential store` for a clear, with the store's error as a field). The crate's own
@@ -325,7 +328,8 @@ tracing_subscriber::fmt()
     failures themselves (`CredentialStore::reports_failures`), so the transport records those at
     `DEBUG` and each failure appears exactly once (see [`StorageFailures`](#storagefailures)).
 *   `ERROR` (transport): `API error <status> on <method> request` for every non-success status
-    except 401, 404 and 429, once per attempt and with no URL.
+    except a refused 3xx (see the redirect `WARN`), 401, 404 and 429, once per attempt and with no
+    URL.
 *   `WARN` (elsewhere): the stores' own fixed lines for a save that was not kept (see
     [Credential stores](#credential-stores)), a `ChainedStore::clear` that left a backend
     uncleared, a `FileStore` file found group- or other-accessible when read (Unix; the line names
@@ -333,8 +337,8 @@ tracing_subscriber::fmt()
     store that failed its initial load in `ClientBuilder::build()` under `StorageFailures::Warn`
     (`failed to load initial session from credential store`), `logout()` with no session
     (`Attempted to logout when not authenticated`), a failed `logout` request (`Logout API call
-    failed: …`), a legacy-record migration mismatch, the deprecation notice of a non-empty
-    `reporter_data`, and one fixed line before every uncharacterised write (see
+    failed: …`), a legacy-record migration mismatch, the deprecation notice whenever
+    `reporter_data` is `Some` and not JSON `null`, and one fixed line before every uncharacterised write (see
     [Rust API — Writes and safety](Rust-API#writes-and-safety)).
 *   `DEBUG`: method, path and status of every request (the path only, never the query string),
     the path of a timed-out, failed or retried request and the host and path of a refused
@@ -358,9 +362,11 @@ that were current when the store call was made, so a subscriber scoped to the ca
 (`tracing::subscriber::with_default`, a per-task dispatcher) sees them.
 
 Error messages are fixed labels, never built from a response body; `Error::envelope()` holds the
-raw response if you need it. One exception to keep in mind before logging an error's text: a
+raw response if you need it. Two exceptions to keep in mind before logging an error's text: a
 refused redirect's `Error::Api` message names the request path and the `Location` host
-(`Redirect not followed: <status> at <path> -> <host>`). If you log an envelope yourself, pass it
+(`Redirect not followed: <status> at <path> -> <host>`), and an `Error::Network`'s text embeds
+reqwest's own message, which includes the full request URL, query string included (the
+`Logout API call failed: …` warning prints that text for a network failure). If you log an envelope yourself, pass it
 through `redact_sensitive` first — a network envelope carries the Wi-Fi password.
 
 ## Security properties

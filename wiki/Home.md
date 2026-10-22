@@ -76,13 +76,15 @@ Client            cache + network-id resolution + parent envelopes   (eero-api: 
 ```
 
 * Every endpoint returns `Result<Envelope, Error>` over the untouched `{"meta": …, "data": …}`
-  wire payload.
+  wire payload (`clear_profile_schedule` returns one envelope per deleted pause).
 * Method names are the Python names verbatim, in `snake_case`, so a method can be searched for by
   name across both libraries.
-* Every resource argument accepts a bare id, an API path or an absolute API-host URL; every
-  domain method takes a `parent` envelope so the request follows the link the API published.
+* Every resource argument accepts a bare id, an API path or an absolute API-host URL; domain
+  methods take a `parent` envelope wherever the Python method accepts one (`parent=`, or a cached
+  envelope in place of the id), so the request follows the link the API published.
 * Errors are classified against the API's closed catalogue of `meta.error` strings; every error
-  carries `error_code()`, `envelope()` and, when a response produced it, `status()`.
+  carries `error_code()`, `envelope()` and, when a response produced it, `status()` (a
+  server-side `Validation` excepted).
 * Every request carries the current Eero iOS app's `User-Agent`
   (`eero-ios/2026.8.1 (iPhone; iOS 18.5)`), which the API reads to decide which capabilities to
   advertise; `consts::LEGACY_USER_AGENT` restores the previous one.
@@ -123,7 +125,7 @@ no licence and was consulted as a reference only.
 *   Interactive email/SMS code flow separated from the client (`LoginFlow` → `PendingLogin` →
     `Session`), so headless and CI consumers can inject a pre-obtained session token
 *   Pluggable `CredentialStore` trait: system keyring (optional feature), file, memory, chained,
-    or your own; the persisted record is byte-compatible with `eero-api`, so a session created by
+    or your own; the persisted record is the same JSON record as `eero-api`'s, so a session created by
     `eeroctl` works unchanged
 *   Session tokens are `SecretString`s and never appear in `Debug` output, logs or error messages
 *   Storage failures surface as a typed `StorageError` with a `Warn`/`Fatal` policy, instead of

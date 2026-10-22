@@ -22,8 +22,8 @@ _It is a port of the Python [`eero-api`](https://github.com/fulviofreitas/eero-a
 
 - 🚀 **Async-first** — `tokio` + `reqwest` (rustls), no Python runtime
 - 📦 **Raw JSON** — every call returns the exact `{meta, data}` envelope Eero sends, wrapped in a lossless `Envelope`
-- 🔗 **Link-aware** — every resource argument accepts a bare id, an API path or an absolute API-host URL, and every domain method takes a `parent` envelope so the request follows the link the API published
-- 🔐 **Secure** — session tokens are `SecretString`s sent only to the configured API origin (scheme, host and port), redirects are refused, error messages never embed a response body, and warning/error log lines never carry a URL
+- 🔗 **Link-aware** — every resource argument accepts a bare id, an API path or an absolute API-host URL, and domain methods take a `parent` envelope wherever the Python method accepts one (`parent=`, or a cached envelope in place of the id), so the request follows the link the API published
+- 🔐 **Secure** — session tokens are `SecretString`s sent only to the configured API origin (scheme, host and port), redirects are refused, error messages never embed a response body, and the transport's warning/error log lines never carry a request path or query (the withheld-credential warning names only the target's `scheme://host`)
 - 🔁 **Compatible** — the `{"session_id", "schema_version": 2}` credential record is shared with `eero-api`, so a login made by [`eeroctl`](https://github.com/fulviofreitas/eeroctl) works unchanged (legacy records are migrated on first load)
 - 🧩 **Headless-friendly** — the email/SMS code step is separable; inject a pre-obtained token instead
 
@@ -100,10 +100,11 @@ Wherever a method takes a `network_id`, `eero_id`, `device_id` or `profile_id`, 
 bare id, the resource's API path (`/2.2/networks/<id>`) or its absolute URL on the API host;
 anything on another host, scheme or port, carrying userinfo, or naming a different kind of
 resource than the method expects is rejected with `Error::Validation` before a request is sent.
-Every method on the domain modules (`client.api().networks()`, …) also takes
-`parent: Option<&Value>` — the envelope you already hold — and resolves its URL from the link the
-API published on it; `Client` passes its cached network, eero and device envelopes as `parent`
-automatically.
+Every domain-module method (`client.api().networks()`, …) whose Python counterpart has `parent=`
+also takes `parent: Option<&Value>` — the envelope you already hold — and resolves its URL from
+the link the API published on it (as do `update_forward`, `update_reservation`, `update_schedule`
+and `delete_schedule`, whose Python versions take the item's envelope in place of its id);
+`Client` passes its cached network, eero and device envelopes as `parent` automatically.
 
 ### Error handling
 
@@ -130,8 +131,9 @@ match client.get_network(None, false).await {
 
 `Error::error_code()` is `meta.error` as the API sent it; `Error::envelope()` is the raw parsed
 response; `Error::status()` the HTTP status when a response produced the error (`Authentication`
-and `RateLimit` included; `retry_after` is capped at 24 hours). Messages are fixed, leak-safe
-labels.
+and `RateLimit` included, a server-side `Validation` excepted; `retry_after` is capped at 24
+hours). Messages never embed a response body; a `Network` error's text includes the request URL
+and a refused redirect's names the path and the `Location` host.
 
 ## 📄 Raw Response Format
 
@@ -144,7 +146,8 @@ All API methods return the exact JSON from Eero's API, wrapped in a lossless `En
 }
 ```
 
-`env.meta()`, `env.data()`, `env.into_value()` and `env.data_as::<T>()` are the only helpers.
+`env.meta()`, `env.data()`, `env.as_value()`, `env.into_value()` and `env.data_as::<T>()` are the
+accessors; `Envelope::from_value`, `Envelope::empty` and `From<Value>` build one.
 
 ## 🎛️ Features
 
