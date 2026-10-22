@@ -5,10 +5,12 @@ mod common;
 
 use std::sync::Arc;
 
-use rusteero::endpoints::dhcp::DhcpApi;
+use rusteero::endpoints::dhcp::{
+    DHCP_MODE_AUTOMATIC, DHCP_MODE_CUSTOM, DHCP_MODE_MANUAL, DHCP_MODES, DhcpApi,
+};
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{any, body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
@@ -112,14 +114,111 @@ async fn set_dhcp_custom_v2_only_given_keys() -> anyhow::Result<()> {
 #[tokio::test]
 async fn set_dhcp_rejects_invalid_mode() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
+    // Validation is case-sensitive and happens before any request.
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
     let api = dhcp_api(&mock);
 
     let err = api
-        .set_dhcp("network-0001", Some("turbo"), None, None, None)
+        .set_dhcp("network-0001", Some("AUTOMATIC"), None, None, None)
         .await
         .unwrap_err();
 
-    assert!(matches!(err, Error::Validation { field, .. } if field == "mode"));
+    match err {
+        Error::Validation { field, message, .. } => {
+            assert_eq!(field, "mode");
+            assert_eq!(
+                message,
+                "must be one of ['automatic', 'custom', 'manual'], got 'AUTOMATIC'"
+            );
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn the_mode_constants_name_the_three_accepted_modes() {
+    assert_eq!(DHCP_MODE_AUTOMATIC, "automatic");
+    assert_eq!(DHCP_MODE_MANUAL, "manual");
+    assert_eq!(DHCP_MODE_CUSTOM, "custom");
+    assert_eq!(DHCP_MODES, ["automatic", "manual", "custom"]);
+}
+
+#[tokio::test]
+async fn set_dhcp_custom_mode_sends_custom() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(json!({ "dhcp": { "mode": "custom" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    dhcp_api(&mock)
+        .set_dhcp("network-0001", Some("custom"), None, None, None)
+        .await?;
+    Ok(())
+}
+
+/// The API refuses a literal `"manual"` (`dhcp.mode: error.form.enum.invalid`); the caller-facing
+/// mode is kept for compatibility and goes out as `"custom"`.
+#[tokio::test]
+async fn set_dhcp_manual_mode_is_sent_as_custom_on_the_wire() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(json!({ "dhcp": { "mode": "custom" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    dhcp_api(&mock)
+        .set_dhcp("network-0001", Some("manual"), None, None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_dhcp_manual_mode_with_a_lease_range_sends_custom_and_the_range() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let custom = json!({
+        "start_ip": "192.168.4.10",
+        "end_ip": "192.168.4.99",
+        "subnet_ip": "192.168.4.0",
+        "subnet_mask": "255.255.255.0",
+    });
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(
+            json!({ "dhcp": { "mode": "custom", "custom": custom } }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    dhcp_api(&mock)
+        .set_dhcp(
+            "network-0001",
+            Some("manual"),
+            custom.as_object(),
+            None,
+            None,
+        )
+        .await?;
     Ok(())
 }
 

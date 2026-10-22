@@ -3,7 +3,7 @@
 mod common;
 
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, session_cookie};
@@ -204,5 +204,36 @@ async fn set_pppoe_is_not_network_scoped() -> anyhow::Result<()> {
     client
         .set_pppoe("eero-serial-0001", "isp-user", "isp-secret")
         .await?;
+    Ok(())
+}
+
+/// `"manual"` goes out as the wire value `"custom"` through the wrapper too, and the write still
+/// drops the cached network envelope.
+#[tokio::test]
+async fn set_dhcp_manual_mode_is_sent_as_custom_and_invalidates_the_network_bucket()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(body_json(json!({ "dhcp": { "mode": "custom" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .set_dhcp(Some("manual"), None, None, Some("network-0001"))
+        .await?;
+    client.get_network(Some("network-0001"), false).await?;
     Ok(())
 }
