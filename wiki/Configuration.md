@@ -326,13 +326,16 @@ tracing_subscriber::fmt()
     credential store` for a clear, with the store's error as a field). The crate's own
     `FileStore`, `ChainedStore` and `KeyringStore` (with `warn_on_unpersisted` on) report their
     failures themselves (`CredentialStore::reports_failures`), so the transport records those at
-    `DEBUG` and each failure appears exactly once (see [`StorageFailures`](#storagefailures)).
+    `DEBUG` and each failure appears exactly once (see [`StorageFailures`](#storagefailures)). A
+    failure of the blocking store task itself (a store that panicked, a task cancelled at shutdown
+    or one that could not start) never reached the store, so it is always logged at `WARN`.
 *   `ERROR` (transport): `API error <status> on <method> request` for every non-success status
     except a refused 3xx (see the redirect `WARN`), 401, 404 and 429, once per attempt and with no
     URL.
 *   `WARN` (elsewhere): the stores' own fixed lines for a save that was not kept (see
     [Credential stores](#credential-stores)), a `ChainedStore::clear` that left a backend
-    uncleared, a `FileStore` file found group- or other-accessible when read (Unix; the line names
+    uncleared (the chain's fixed line only when the failed backend did not log its own, so one line
+    per failure), a `FileStore` file found group- or other-accessible when read (Unix; the line names
     the file's path), a
     store that failed its initial load in `ClientBuilder::build()` under `StorageFailures::Warn`
     (`failed to load initial session from credential store`), `logout()` with no session
