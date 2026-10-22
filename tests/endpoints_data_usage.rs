@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{
     body_json, method, path, path_regex, query_param, query_param_is_missing,
 };
-use wiremock::{Mock, Request, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate, Times};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
@@ -867,6 +867,34 @@ async fn call_every_method_with_parent(api: &DataUsageApi, parent: &Value) -> Re
     Ok(())
 }
 
+/// Calls every method with a parent whose published `url` is `published_url` and expects each
+/// request on `<base><suffix>`, the bare-id template for the caller's `network_id` never touched.
+async fn assert_every_method_resolves_under(published_url: &str, base: &str) -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let ok = json!({"meta": {"code": 200}, "data": {}});
+    for (verb, suffix) in PUBLISHED_URL_SUFFIXES {
+        Mock::given(method(verb))
+            .and(path(format!("{base}{suffix}")))
+            .and(session_cookie())
+            .and(user_token_header())
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok.clone()))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+    // Nothing may fall back to the template built from the caller's `network_id`.
+    Mock::given(path_regex("^/2\\.2/networks/network-0001/"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    let parent = json!({"url": published_url});
+    call_every_method_with_parent(&api, &parent).await?;
+    Ok(())
+}
+
 /// A parent whose published `url` is not `/<version>/networks/<id>`-shaped still resolves every
 /// method under that url verbatim: `<published url><suffix>`, with the bare-id template for the
 /// caller's `network_id` never touched.
@@ -1012,9 +1040,11 @@ async fn a_caller_supplied_network_outside_the_network_family_is_rejected() -> a
 //
 // Real clock (the crate's timeouts and a paused clock do not mix with a real HTTP round trip):
 // every response is held back 2 s, eight times the 250 ms default these tests configure and
-// well inside the 6 s budget they supply per call. The default is not made shorter than 250 ms:
-// each "must time out" call still has to reach the mock server before it expires, so that the
-// mock's `.expect(1)` holds on a loaded machine.
+// well inside the 6 s budget they supply per call. The "must time out" mocks accept zero or one
+// hit: the client's total deadline also covers connecting and sending, so on a loaded machine a
+// call can expire before its request reaches the mock server. It still returns `Error::Timeout`,
+// which is all those tests assert; that every path is reached, with credentials and query, is
+// pinned by the generous-timeout test.
 
 const SLOW: Duration = Duration::from_millis(2000);
 const SHORT: Duration = Duration::from_millis(250);
@@ -1046,9 +1076,9 @@ const TIME_WINDOWED_PATHS: [&str; 10] = [
     "/2.2/networks/network-0001/data_usage/unprofiled/summary",
 ];
 
-/// Mounts one authenticated, [`SLOW`] `GET` mock per time-windowed path, each expecting exactly
-/// one request carrying `start`/`end` query parameters.
-async fn mount_slow_time_windowed_reads(mock: &MockEero) {
+/// Mounts one authenticated, [`SLOW`] `GET` mock per time-windowed path, each expecting `hits`
+/// requests carrying `start`/`end` query parameters.
+async fn mount_slow_time_windowed_reads(mock: &MockEero, hits: Times) {
     for route in TIME_WINDOWED_PATHS {
         Mock::given(method("GET"))
             .and(path(route))
@@ -1061,7 +1091,7 @@ async fn mount_slow_time_windowed_reads(mock: &MockEero) {
                     .set_body_json(json!({"meta": {"code": 200}, "data": {}}))
                     .set_delay(SLOW),
             )
-            .expect(1)
+            .expect(hits.clone())
             .mount(&mock.server)
             .await;
     }
@@ -1140,7 +1170,7 @@ async fn call_every_time_windowed_read(
 #[tokio::test]
 async fn every_time_windowed_read_honours_a_supplied_timeout() {
     let mock = MockEero::start().await;
-    mount_slow_time_windowed_reads(&mock).await;
+    mount_slow_time_windowed_reads(&mock, Times::from(1)).await;
     let api = short_timeout_api(&mock);
 
     // `total` only: the 250 ms default read bound is replaced too, not merged back in.
@@ -1157,7 +1187,7 @@ async fn every_time_windowed_read_honours_a_supplied_timeout() {
 #[tokio::test]
 async fn every_time_windowed_read_keeps_the_default_without_a_timeout() {
     let mock = MockEero::start().await;
-    mount_slow_time_windowed_reads(&mock).await;
+    mount_slow_time_windowed_reads(&mock, Times::from(0..=1)).await;
     let api = short_timeout_api(&mock);
 
     let results = Box::pin(call_every_time_windowed_read(&api, None)).await;
@@ -1230,21 +1260,40 @@ async fn report_settings_methods_take_no_timeout_and_keep_the_transport_default(
 -> anyhow::Result<()> {
     // `get_report_settings` / `set_report_settings` keep their pre-timeout arity (this file's
     // other tests call them the same way) and run under the transport default.
+    //
+    // Each mock accepts zero or one hit for the reason given above the constants.
     let mock = MockEero::start().await;
-    for verb in ["GET", "PUT"] {
-        Mock::given(method(verb))
-            .and(path(
-                "/2.2/networks/network-0001/data_usage/report_settings",
-            ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({}))
-                    .set_delay(SLOW),
-            )
-            .expect(1)
-            .mount(&mock.server)
-            .await;
-    }
+    Mock::given(method("GET"))
+        .and(path(
+            "/2.2/networks/network-0001/data_usage/report_settings",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(SLOW),
+        )
+        .expect(0..=1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/data_usage/report_settings",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(
+            json!({ "cadence": "daily", "notification_day": "monday" }),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(SLOW),
+        )
+        .expect(0..=1)
+        .mount(&mock.server)
+        .await;
     let api = short_timeout_api(&mock);
 
     let err = api

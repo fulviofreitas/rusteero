@@ -1,4 +1,4 @@
-//! `Client` integration suite for `DataUsageApi`'s pass-throughs at `v8.0.4`.
+//! `Client` integration suite for `DataUsageApi`'s pass-throughs at `v8.4.1`.
 //!
 //! None of these twelve methods is cached; `set_data_usage_report_settings` is the only write
 //! and is the only one that invalidates anything.
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
-use wiremock::{Mock, Request, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate, Times};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 use rusteero::auth::Session;
@@ -324,7 +324,13 @@ async fn get_eeros_data_usage_is_never_cached_and_invalidates_nothing() -> anyho
         .and(path("/2.2/networks/network-0001/data_usage/eeros"))
         .and(session_cookie())
         .and(user_token_header())
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        // A truthy envelope: `Cache::get` never serves a falsy one (an empty object is a miss), so
+        // an empty body would let a regression that cached this response still reach the mock
+        // twice and pass `expect(2)`.
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": {"code": 200},
+            "data": [{"eero": "eero-0001"}],
+        })))
         .expect(2)
         .mount(&mock.server)
         .await;
@@ -429,7 +435,10 @@ async fn get_eeros_data_usage_rejects_an_invalid_cadence_before_any_request() ->
 //
 // Real clock (the crate's timeouts and a paused clock do not mix with a real HTTP round trip).
 // `ClientBuilder` has no timeout setters, so the short default comes from a caller-supplied
-// `reqwest` builder with a 250 ms total timeout; a per-call `RequestTimeout` replaces it.
+// `reqwest` builder with a 250 ms total timeout; a per-call `RequestTimeout` replaces it. The
+// "must time out" mocks accept zero or one hit: the total deadline also covers connecting and
+// sending, so on a loaded machine a call can expire before its request reaches the mock server.
+// It still returns `Error::Timeout`, which is all those tests assert.
 
 const SLOW: Duration = Duration::from_millis(2000);
 const SHORT: Duration = Duration::from_millis(250);
@@ -460,9 +469,9 @@ const TIME_WINDOWED_PATHS: [&str; 10] = [
     "/2.2/networks/network-0001/data_usage/unprofiled/summary",
 ];
 
-/// Mounts one authenticated, [`SLOW`] `GET` mock per time-windowed path, each expecting exactly
-/// one request carrying `start`/`end` query parameters.
-async fn mount_slow_time_windowed_reads(mock: &MockEero) {
+/// Mounts one authenticated, [`SLOW`] `GET` mock per time-windowed path, each expecting `hits`
+/// requests carrying `start`/`end` query parameters.
+async fn mount_slow_time_windowed_reads(mock: &MockEero, hits: Times) {
     for route in TIME_WINDOWED_PATHS {
         Mock::given(method("GET"))
             .and(path(route))
@@ -475,7 +484,7 @@ async fn mount_slow_time_windowed_reads(mock: &MockEero) {
                     .set_body_json(json!({"meta": {"code": 200}, "data": {}}))
                     .set_delay(SLOW),
             )
-            .expect(1)
+            .expect(hits.clone())
             .mount(&mock.server)
             .await;
     }
@@ -528,7 +537,7 @@ async fn call_every_time_windowed_wrapper(
 #[tokio::test]
 async fn every_data_usage_wrapper_forwards_a_supplied_timeout() {
     let mock = MockEero::start().await;
-    mount_slow_time_windowed_reads(&mock).await;
+    mount_slow_time_windowed_reads(&mock, Times::from(1)).await;
     let client = short_timeout_client(&mock).await;
 
     let results = Box::pin(call_every_time_windowed_wrapper(
@@ -544,7 +553,7 @@ async fn every_data_usage_wrapper_forwards_a_supplied_timeout() {
 #[tokio::test]
 async fn every_data_usage_wrapper_defaults_to_the_transport_timeout() {
     let mock = MockEero::start().await;
-    mount_slow_time_windowed_reads(&mock).await;
+    mount_slow_time_windowed_reads(&mock, Times::from(0..=1)).await;
     let client = short_timeout_client(&mock).await;
 
     let results = Box::pin(call_every_time_windowed_wrapper(&client, None)).await;
@@ -590,21 +599,40 @@ async fn report_settings_wrappers_take_no_timeout_and_keep_the_transport_default
 -> anyhow::Result<()> {
     // `get_data_usage_report_settings` / `set_data_usage_report_settings` keep their
     // pre-timeout arity (the tests above call them the same way) and run under the default.
+    //
+    // Each mock accepts zero or one hit for the reason given above the constants.
     let mock = MockEero::start().await;
-    for verb in ["GET", "PUT"] {
-        Mock::given(method(verb))
-            .and(path(
-                "/2.2/networks/network-0001/data_usage/report_settings",
-            ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({}))
-                    .set_delay(SLOW),
-            )
-            .expect(1)
-            .mount(&mock.server)
-            .await;
-    }
+    Mock::given(method("GET"))
+        .and(path(
+            "/2.2/networks/network-0001/data_usage/report_settings",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(SLOW),
+        )
+        .expect(0..=1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(
+            "/2.2/networks/network-0001/data_usage/report_settings",
+        ))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(
+            json!({ "cadence": "daily", "notification_day": "monday" }),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(SLOW),
+        )
+        .expect(0..=1)
+        .mount(&mock.server)
+        .await;
     let client = short_timeout_client(&mock).await;
 
     let err = client
