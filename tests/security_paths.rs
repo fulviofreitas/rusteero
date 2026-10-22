@@ -204,18 +204,26 @@ fn mock_authority(mock: &MockEero) -> String {
     mock.uri().trim_start_matches("http://").to_owned()
 }
 
-/// Asserts `err` is the origin-rule validation error: field `url`, the fixed message, and no echo
-/// of the offending value.
-fn assert_is_origin_error(err: &Error, secret: &str) {
+/// The mock server's port.
+fn mock_port(mock: &MockEero) -> u16 {
+    mock_authority(mock)
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .expect("a MockServer URI ends in its port")
+}
+
+/// The one message the origin rule gives, for the configured host `127.0.0.1`. It is a fixed
+/// string, so a message that echoed any part of the offending URL could not equal it.
+const ORIGIN_MESSAGE: &str =
+    "must be an absolute http URL on 127.0.0.1 with no userinfo and no other port";
+
+/// Asserts `err` is the origin-rule validation error: field `url` and exactly [`ORIGIN_MESSAGE`].
+fn assert_is_origin_error(err: &Error) {
     match err {
         Error::Validation { field, message, .. } => {
             assert_eq!(field, "url");
-            assert!(
-                message.starts_with("must be an absolute http URL on 127.0.0.1")
-                    && message.ends_with("with no userinfo and no other port"),
-                "unexpected origin message {message:?}"
-            );
-            assert!(!message.contains(secret), "the message echoed {secret:?}");
+            assert_eq!(message, ORIGIN_MESSAGE);
         }
         other => panic!("expected Error::Validation, got {other:?}"),
     }
@@ -235,7 +243,7 @@ async fn get_eero_rejects_userinfo_on_the_configured_host_before_any_request() -
             .get_eero(&url, None)
             .await
             .expect_err(&format!("{url:?} must be rejected, not sent to the server"));
-        assert_is_origin_error(&err, "pass");
+        assert_is_origin_error(&err);
     }
     Ok(())
 }
@@ -246,11 +254,7 @@ async fn get_eero_rejects_another_port_on_the_configured_host_before_any_request
     let mock = MockEero::start().await;
     deny_all_requests(&mock).await;
     let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
-    let port: u16 = mock_authority(&mock)
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("a MockServer URI ends in its port");
+    let port = mock_port(&mock);
     let other = port.checked_add(1).unwrap_or(1);
 
     for authority in [
@@ -263,7 +267,7 @@ async fn get_eero_rejects_another_port_on_the_configured_host_before_any_request
             .get_eero(&url, None)
             .await
             .expect_err(&format!("{url:?} must be rejected, not sent to the server"));
-        assert_is_origin_error(&err, "secret");
+        assert_is_origin_error(&err);
     }
     Ok(())
 }
@@ -275,6 +279,7 @@ async fn get_eero_rejects_unparseable_and_rewritten_authorities_before_any_reque
     deny_all_requests(&mock).await;
     let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
     let authority = mock_authority(&mock);
+    let port = mock_port(&mock);
 
     for url in [
         "http://127.0.0.1:abc/2.2/eeros/1".to_owned(),
@@ -285,13 +290,15 @@ async fn get_eero_rejects_unparseable_and_rewritten_authorities_before_any_reque
         format!("http://{authority}\\@evil.example/2.2/eeros/1"),
         format!("http://{authority}\u{ff0f}@evil.example/2.2/eeros/1"),
         format!("http://%31{}/2.2/eeros/1", &authority[1..]),
-        "http://127.1/2.2/eeros/1".to_owned(),
+        // The parser folds IPv4 shorthand into `127.0.0.1`, port included, so only the raw
+        // authority rule can tell this from the configured origin.
+        format!("http://127.1:{port}/2.2/eeros/1"),
     ] {
         let err = api
             .get_eero(&url, None)
             .await
             .expect_err(&format!("{url:?} must be rejected, not sent to the server"));
-        assert_is_origin_error(&err, "secret");
+        assert_is_origin_error(&err);
     }
     Ok(())
 }
