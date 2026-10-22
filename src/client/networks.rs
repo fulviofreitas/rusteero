@@ -62,22 +62,28 @@ impl Client {
 
     /// Enables, disables or reconfigures the guest network — returns the raw Eero API response.
     ///
-    /// Ported from `set_guest_network` (`eero-api src/eero/client.py:1127-1158`). Resolves
-    /// `network_id` with `auto_discover = true`. **`password=` is gone since `v6.2.0`** — split
-    /// into [`Client::set_guest_password`]/[`Client::clear_guest_password`]. Passes the cached
-    /// network envelope as `parent=` (`+net`). On success, invalidates `network[nid]`.
+    /// Ported from `set_guest_network` (`eero-api src/eero/client.py:1391-1428`). Resolves
+    /// `network_id` with `auto_discover = true`. A supplied `name` is validated first, before the
+    /// network id is resolved (`client.py:1414-1415`), so an invalid name never triggers network
+    /// discovery. **`password=` is gone since `v6.2.0`** — split into
+    /// [`Client::set_guest_password`]/[`Client::clear_guest_password`]. Passes the cached network
+    /// envelope as `parent=` (`+net`). On success, invalidates `network[nid]`.
     ///
     /// # Errors
     ///
-    /// [`Error::MissingNetworkId`] if `network_id` is absent and no network can be resolved.
-    /// Otherwise, whatever status-mapped [`Error`] the request produces. The cache is left
-    /// untouched on any `Err`.
+    /// Returns [`Error::Validation`] with field `name` if `name` is `Some("")`, before the network
+    /// id is resolved and before any request. [`Error::MissingNetworkId`] if `network_id` is absent
+    /// and no network can be resolved. Otherwise, whatever status-mapped [`Error`] the request
+    /// produces. The cache is left untouched on any `Err`.
     pub async fn set_guest_network(
         &self,
         enabled: bool,
         name: Option<&str>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
+        if let Some(name) = name {
+            require_non_empty_string("name", name)?;
+        }
         let network_id = self.ensure_network_id(network_id, true).await?;
         let parent = self.network_parent(network_id.as_str());
         let response = self
@@ -205,20 +211,23 @@ impl Client {
 
     /// Sets the network name (SSID) — returns the raw Eero API response.
     ///
-    /// Ported from `set_network_name` (`eero-api src/eero/client.py:522-529`). Resolves
-    /// `network_id` with `auto_discover = false` — see [`Client::get_diagnostics`]. Passes the
-    /// cached network envelope as `parent=` (`+net`). On success, invalidates `network[nid]`.
+    /// Ported from `set_network_name` (`eero-api src/eero/client.py:731-750`). `name` is validated
+    /// first (`client.py:744`), before `network_id` is resolved with `auto_discover = false` — see
+    /// [`Client::get_diagnostics`]. Passes the cached network envelope as `parent=` (`+net`). On
+    /// success, invalidates `network[nid]`.
     ///
     /// # Errors
     ///
-    /// [`Error::MissingNetworkId`] if `network_id` is absent and no preferred network is set —
-    /// auto-discovery is not attempted. Otherwise, whatever status-mapped [`Error`] the request
-    /// produces. The cache is left untouched on any `Err`.
+    /// Returns [`Error::Validation`] with field `name` if `name` is empty, before the network id
+    /// is resolved and before any request. [`Error::MissingNetworkId`] if `network_id` is absent
+    /// and no preferred network is set — auto-discovery is not attempted. Otherwise, whatever
+    /// status-mapped [`Error`] the request produces. The cache is left untouched on any `Err`.
     pub async fn set_network_name(
         &self,
         name: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
+        require_non_empty_string("name", name)?;
         let network_id = self.ensure_network_id(network_id, false).await?;
         let parent = self.network_parent(network_id.as_str());
         let response = self

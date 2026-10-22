@@ -967,3 +967,178 @@ async fn password_setters_forward_padded_and_literal_none_values_unchanged() -> 
     }
     Ok(())
 }
+
+// ============================= Network and guest-network name validation =============================
+
+#[tokio::test]
+async fn set_network_name_rejects_an_empty_name_before_any_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let err = networks_api(&mock)
+        .set_network_name("network-0001", "", None)
+        .await
+        .expect_err("an empty name must be rejected before any request");
+
+    assert_non_empty_string_error(&err, "name");
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_guest_network_rejects_an_empty_supplied_name_before_any_request() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let err = networks_api(&mock)
+        .set_guest_network("network-0001", true, Some(""), None)
+        .await
+        .expect_err("a supplied empty name must be rejected before any request");
+
+    assert_non_empty_string_error(&err, "name");
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn name_validation_precedes_auth_and_url_resolution() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let (_guard, logs) = capture_logs();
+
+    // A missing session: the name check must win over the credential gate.
+    let anonymous = NetworksApi::new(Arc::new(mock.transport_anonymous()));
+    let err = anonymous
+        .set_network_name("network-0001", "", None)
+        .await
+        .expect_err("an empty name wins over a missing session");
+    assert_non_empty_string_error(&err, "name");
+    let err = anonymous
+        .set_guest_network("network-0001", true, Some(""), None)
+        .await
+        .expect_err("an empty name wins over a missing session");
+    assert_non_empty_string_error(&err, "name");
+
+    // An unresolvable network id: the name check must win over URL resolution (`id_or_url`).
+    let api = networks_api(&mock);
+    let err = api
+        .set_network_name("", "", None)
+        .await
+        .expect_err("an empty name wins over an unresolvable network id");
+    assert_non_empty_string_error(&err, "name");
+    let err = api
+        .set_guest_network("", true, Some(""), None)
+        .await
+        .expect_err("an empty name wins over an unresolvable network id");
+    assert_non_empty_string_error(&err, "name");
+
+    assert!(
+        logs.warnings().is_empty(),
+        "an invalid call must log no uncharacterised-write warning: {:?}",
+        logs.warnings()
+    );
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_network_name_still_warns_once_for_a_valid_name() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let (_guard, logs) = capture_logs();
+
+    networks_api(&mock)
+        .set_network_name("network-0001", "My Network", None)
+        .await?;
+
+    assert_eq!(
+        logs.count(
+            tracing::Level::WARN,
+            "Issuing write (set network name for network)"
+        ),
+        1,
+        "got {:?}",
+        logs.warnings()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_guest_network_logs_no_uncharacterised_write_warning() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let (_guard, logs) = capture_logs();
+
+    networks_api(&mock)
+        .set_guest_network("network-0001", true, Some("Guest"), None)
+        .await?;
+
+    assert!(
+        logs.warnings().is_empty(),
+        "the guest network write is live-verified and must not warn: {:?}",
+        logs.warnings()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn name_setters_forward_padded_and_literal_none_values_unchanged() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // (name, `set_network_name` body, `set_guest_network(enabled = false)` body): padding is
+    // preserved (never trimmed) and the text "None" is just text.
+    let cases = [
+        (
+            "My Network",
+            "name=My+Network",
+            "enabled=false&name=My+Network",
+        ),
+        (
+            "  preserve spaces  ",
+            "name=++preserve+spaces++",
+            "enabled=false&name=++preserve+spaces++",
+        ),
+        ("None", "name=None", "enabled=false&name=None"),
+    ];
+    for (_, settings_body, guest_body) in cases {
+        for (resource, body) in [("settings", settings_body), ("guestnetwork", guest_body)] {
+            Mock::given(method("PUT"))
+                .and(path(format!("/2.2/networks/network-0001/{resource}")))
+                .and(session_cookie())
+                .and(user_token_header())
+                .and(header("content-type", "application/x-www-form-urlencoded"))
+                .and(body_string(body))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+                .expect(1)
+                .mount(&mock.server)
+                .await;
+        }
+    }
+
+    let api = networks_api(&mock);
+    for (name, _, _) in cases {
+        api.set_network_name("network-0001", name, None).await?;
+        api.set_guest_network("network-0001", false, Some(name), None)
+            .await?;
+    }
+    Ok(())
+}

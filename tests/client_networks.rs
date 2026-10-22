@@ -602,3 +602,134 @@ async fn password_wrappers_forward_padded_and_literal_none_values_unchanged() ->
         .await?;
     Ok(())
 }
+
+// ===================== Name validation (before network resolution / discovery) =====================
+
+#[tokio::test]
+async fn set_network_name_rejects_an_empty_name_before_resolving_the_network() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+
+    // No explicit and no preferred network: resolution would fail with `MissingNetworkId`.
+    let err = client
+        .set_network_name("", None)
+        .await
+        .expect_err("an empty name wins over a missing network");
+    assert_non_empty_string_error(&err, "name");
+
+    let err = client
+        .set_network_name("", Some("network-0001"))
+        .await
+        .expect_err("an empty name is rejected before any request");
+    assert_non_empty_string_error(&err, "name");
+
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_guest_network_rejects_an_empty_name_without_auto_discovery() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    // `set_guest_network` auto-discovers a missing network id; an invalid name must not cause the
+    // `GET /networks` round trip, and a failing discovery must not mask the validation error.
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let err = client
+        .set_guest_network(true, Some(""), None)
+        .await
+        .expect_err("an empty guest name must be rejected before discovery");
+    assert_non_empty_string_error(&err, "name");
+
+    let err = client
+        .set_guest_network(false, Some(""), Some("network-0001"))
+        .await
+        .expect_err("an empty guest name must be rejected before any request");
+    assert_non_empty_string_error(&err, "name");
+
+    assert_no_requests(&mock).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_guest_network_with_valid_input_still_auto_discovers() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(session_cookie())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"meta": {"code": 200}, "data": [{"id": "network-0001"}]})),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("enabled=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let env = client.set_guest_network(true, None, None).await?;
+    assert_eq!(env.into_value(), ok_envelope());
+    Ok(())
+}
+
+#[tokio::test]
+async fn name_wrappers_forward_valid_names_unchanged() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("name=My+Network"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/guestnetwork"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("enabled=false&name=++preserve+spaces++"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .set_network_name("My Network", Some("network-0001"))
+        .await?;
+    client
+        .set_guest_network(false, Some("  preserve spaces  "), Some("network-0001"))
+        .await?;
+    Ok(())
+}

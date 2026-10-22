@@ -238,23 +238,31 @@ impl NetworksApi {
 
     /// `PUT /2.2/networks/{id}/settings` — set the network name (SSID).
     ///
-    /// Ported from `NetworksAPI.set_network_name` (`networks.py:269-312`). Sends a **form-encoded**
+    /// Ported from `NetworksAPI.set_network_name` (`networks.py:275-314`). Sends a **form-encoded**
     /// body (`name=<value>`, [`RequestBody::Form`]) to
     /// [`crate::routes::networks::NETWORK_SETTINGS_FORM`] — a distinct, form-encoded constant
     /// from the JSON settings routes DNS/security/SQM's own setters PUT onto — preferring
-    /// `parent`'s own published `settings` link. Unverified against a live account in this exact
-    /// (form-encoded) shape: logs one `WARNING` via [`warn_uncharacterised_write`] before issuing
-    /// the request (`networks.py:307`).
+    /// `parent`'s own published `settings` link. `name` is forwarded exactly as given (no
+    /// trimming). Unverified against a live account in this exact (form-encoded) shape: logs one
+    /// `WARNING` via [`warn_uncharacterised_write`] before issuing the request
+    /// (`networks.py:313`).
+    ///
+    /// Python also rejects a `name` that is not a `str`; the `&str` parameter makes that
+    /// unrepresentable here, so only the emptiness half of the rule remains.
     ///
     /// # Errors
     ///
-    /// See [`NetworksApi::reboot_network`].
+    /// Returns [`Error::Validation`] with field `name` if `name` is empty. That check is the first
+    /// statement (`networks.py:305`), so it wins over an unresolvable `network_id`, a missing
+    /// session and the uncharacterised-write warning, and nothing is sent. Otherwise see
+    /// [`NetworksApi::reboot_network`].
     pub async fn set_network_name(
         &self,
         network_id: &str,
         name: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        require_non_empty_string("name", name)?;
         let url = routes::networks::NETWORK_SETTINGS_FORM.resolve(
             self.transport.api_host(),
             network_id,
@@ -372,17 +380,23 @@ impl NetworksApi {
 
     /// `PUT /2.2/networks/{id}/guestnetwork` — enable/disable/rename the guest network.
     ///
-    /// Ported from `NetworksAPI.set_guest_network` (`networks.py:420-471`). Sends a form-encoded
+    /// Ported from `NetworksAPI.set_guest_network` (`networks.py:425-481`). Sends a form-encoded
     /// body: `enabled=<"true"|"false">` always, `+ name=<value>` only when `name` is `Some`
-    /// (never sent, not even empty, when `None`) — preferring `parent`'s own published
-    /// `guestnetwork` link. **`password` is gone** at v8.0.4 (breaking change vs. `v6.2.0`; see
-    /// [`NetworksApi::set_guest_password`]/[`NetworksApi::clear_guest_password`]).
+    /// (omitted entirely when `None`; a supplied name must be non-empty) — preferring `parent`'s
+    /// own published `guestnetwork` link. **`password` is gone** at v8.0.4 (breaking change vs.
+    /// `v6.2.0`; see [`NetworksApi::set_guest_password`]/[`NetworksApi::clear_guest_password`]).
     /// **Live-verified 2026-09-20** (enable/disable read back correctly, name unchanged) — no
     /// `warn_uncharacterised_write`.
     ///
+    /// Python also requires `enabled` to be a real `bool` and a supplied `name` to be a `str`; the
+    /// `bool` and `&str` parameters enforce both at compile time, so only the emptiness check on
+    /// `name` remains at runtime.
+    ///
     /// # Errors
     ///
-    /// See [`NetworksApi::reboot_network`].
+    /// Returns [`Error::Validation`] with field `name` if `name` is `Some("")`
+    /// (`networks.py:465-466`), before the URL is resolved or anything is sent. Otherwise see
+    /// [`NetworksApi::reboot_network`].
     pub async fn set_guest_network(
         &self,
         network_id: &str,
@@ -390,6 +404,9 @@ impl NetworksApi {
         name: Option<&str>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        if let Some(name) = name {
+            require_non_empty_string("name", name)?;
+        }
         let mut pairs = vec![(
             "enabled".to_owned(),
             (if enabled { "true" } else { "false" }).to_owned(),
