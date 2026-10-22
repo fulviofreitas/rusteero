@@ -1157,14 +1157,21 @@ impl ClientBuilder {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Validation` if `base_url` was set to a string that does not parse as an
-    /// absolute URL usable as a path base, or if a header value (`User-Agent`,
-    /// `X-Accept-Language`) is not printable ASCII, and `Error::Network` if constructing the
-    /// underlying `reqwest::Client` fails (see [`crate::transport::TransportBuilder::build`]); all
-    /// of these are raised before the credential store is consulted. Returns `Error::Storage` if
-    /// the initial load fails under [`StorageFailures::Fatal`] (under the default
+    /// Before the credential store is consulted at all (a bad configuration never reaches a
+    /// keyring prompt or a file read, whatever [`ClientBuilder::storage_failures`] says):
+    ///
+    /// - `Error::Validation` if `base_url` was set to a string the transport rejects as a base,
+    ///   with field `base_url` (see [`crate::transport::TransportBuilder::build`] for the rules);
+    /// - `Error::Validation` if a header value is not printable ASCII: the `X-Accept-Language`
+    ///   value set with [`ClientBuilder::accept_language`] or the `User-Agent` value set with
+    ///   [`ClientBuilder::user_agent`].
+    ///
+    /// Then, only when a store is configured and no explicit session was given, `Error::Storage`
+    /// if the initial load fails under [`StorageFailures::Fatal`] (under the default
     /// [`StorageFailures::Warn`], a load failure is logged at `WARN` and this proceeds with no
-    /// initial session instead).
+    /// initial session instead). Last, `Error::Network` if constructing the underlying
+    /// `reqwest::Client` fails; a failure of a caller-supplied [`ClientBuilder::http_builder`]
+    /// is only seen at this point, after the store has been read.
     pub async fn build(self) -> Result<Client, Error> {
         if self.session.is_none() && self.store.is_some() {
             self.validate_configuration()?;

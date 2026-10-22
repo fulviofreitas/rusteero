@@ -1458,13 +1458,23 @@ async fn clear_auth_data_under_fatal_reports_the_store_failure_and_still_resets(
 
 // ===================== Configuration is validated before the store is read =====================
 
-/// A store that only counts how often it is touched.
+/// A store that counts how often it is touched and, when built with
+/// [`CountingStore::failing`], fails every load, so that touching it changes the outcome of
+/// `build` under `StorageFailures::Fatal`.
 #[derive(Debug, Default)]
 struct CountingStore {
     calls: std::sync::atomic::AtomicUsize,
+    fails: bool,
 }
 
 impl CountingStore {
+    fn failing() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fails: true,
+        }
+    }
+
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
@@ -1473,6 +1483,12 @@ impl CountingStore {
 impl CredentialStore for CountingStore {
     fn load(&self) -> Result<Session, StorageError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fails {
+            return Err(StorageError::Backend {
+                backend: "counting".to_owned(),
+                message: "deliberate failure".to_owned(),
+            });
+        }
         Ok(Session::empty())
     }
 
@@ -1534,6 +1550,69 @@ async fn build_rejects_a_bad_configuration_before_reading_the_store() {
         }
         assert_eq!(store.calls(), 0, "{label}: the store must not be touched");
     }
+}
+
+/// Under `Fatal` a store that fails on load would turn `build` into `Error::Storage`; a bad
+/// configuration must win, which only happens if the store is never reached. The field name is
+/// not pinned: the transport's own validation spells it.
+#[tokio::test]
+async fn a_bad_header_under_fatal_is_a_validation_error_and_the_store_is_untouched() {
+    type Configure = fn(rusteero::client::ClientBuilder) -> rusteero::client::ClientBuilder;
+    let cases: [(&str, Configure); 3] = [
+        ("user_agent", |builder| {
+            builder.user_agent(Some("bad\r\nvalue".to_owned()))
+        }),
+        ("accept_language", |builder| {
+            builder.accept_language("bad\r\nvalue")
+        }),
+        ("both", |builder| {
+            builder
+                .user_agent(Some("bad\r\nvalue".to_owned()))
+                .accept_language("bad\r\nvalue")
+        }),
+    ];
+
+    for (label, configure) in cases {
+        let store = Arc::new(CountingStore::failing());
+        let builder = configure(
+            Client::builder()
+                .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+                .storage_failures(StorageFailures::Fatal),
+        );
+
+        let err = builder
+            .build()
+            .await
+            .expect_err("the configuration is invalid");
+
+        assert!(
+            matches!(err, Error::Validation { .. }),
+            "{label}: expected a validation error, got {err:?}"
+        );
+        assert_eq!(store.calls(), 0, "{label}: the store must not be touched");
+    }
+}
+
+/// A `base_url` that smuggles another host through userinfo is rejected by the transport's
+/// `base_url` validation, before the store is reached.
+///
+/// Ignored until that validation rejects userinfo (`https://api.example.com@evil.example`
+/// parses as host `evil.example` with user `api.example.com`): today the base is accepted.
+#[tokio::test]
+#[ignore = "needs base_url userinfo rejection in the transport's base_url validation"]
+async fn a_base_url_with_userinfo_is_rejected_before_the_store_is_read() {
+    let store = Arc::new(CountingStore::failing());
+
+    let err = Client::builder()
+        .base_url("https://api.example.com@evil.example")
+        .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+        .storage_failures(StorageFailures::Fatal)
+        .build()
+        .await
+        .expect_err("userinfo in the base url is rejected");
+
+    assert!(matches!(err, Error::Validation { .. }), "{err:?}");
+    assert_eq!(store.calls(), 0);
 }
 
 #[tokio::test]
