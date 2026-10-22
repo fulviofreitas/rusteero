@@ -491,6 +491,9 @@ async fn transport_set_session_async_rejects_an_invalid_token_before_touching_an
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    // The store already holds the record the transport's session came from, so "writes nothing"
+    // can fail: a rejected session that was saved, or a store that was cleared, changes it.
+    store.save(&Session::from_token("initial-token"))?;
     let transport = mock.transport_with_store("initial-token", Arc::clone(&store));
 
     let err = transport
@@ -505,7 +508,12 @@ async fn transport_set_session_async_rejects_an_invalid_token_before_touching_an
         Some("initial-token".to_owned()),
         "a rejected session leaves the current one in place"
     );
-    assert!(!store.load()?.is_valid(), "and writes nothing");
+    assert_eq!(
+        store.load()?.token().expose_secret(),
+        "initial-token",
+        "and writes nothing"
+    );
+    assert!(transport.credentials_persisted());
     Ok(())
 }
 
@@ -532,8 +540,14 @@ async fn transport_set_session_async_under_fatal_returns_the_error_after_changin
 
 // ===================== Persistence ordering: store always matches memory =====================
 
+/// The longest a parked save waits for [`ParkingStore::open`]. A test that fails while a save is
+/// parked would otherwise wait for it forever: `std::thread::scope` joins every spawned thread
+/// before it lets a panic out.
+const PARK_LIMIT: Duration = Duration::from_secs(10);
+
 /// A [`CredentialStore`] over a [`MemoryStore`] whose `save` of one chosen token parks until
-/// [`ParkingStore::open`], and which yields the CPU inside every call to widen race windows.
+/// [`ParkingStore::open`] (at most [`PARK_LIMIT`], then it fails), and which yields the CPU
+/// inside every call to widen race windows.
 #[derive(Debug)]
 struct ParkingStore {
     inner: MemoryStore,
@@ -559,12 +573,27 @@ impl ParkingStore {
         self.gate_changed.notify_all();
     }
 
+    /// Opens the gate when dropped. Create it *inside* a `std::thread::scope` closure: a panic
+    /// that unwinds out of the closure then releases the parked thread before the scope joins it.
+    fn release_on_drop(self: &Arc<Self>) -> OpenOnDrop {
+        OpenOnDrop(Arc::clone(self))
+    }
+
     fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+}
+
+/// See [`ParkingStore::release_on_drop`].
+struct OpenOnDrop(Arc<ParkingStore>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
     }
 }
 
@@ -576,9 +605,16 @@ impl CredentialStore for ParkingStore {
     fn save(&self, session: &Session) -> Result<(), StorageError> {
         if self.park_token == Some(session.token().expose_secret()) {
             self.parked.store(true, Ordering::SeqCst);
-            let mut open = self.gate_open.lock().expect("gate lock");
-            while !*open {
-                open = self.gate_changed.wait(open).expect("gate wait");
+            let open = self.gate_open.lock().expect("gate lock");
+            let (_open, waited) = self
+                .gate_changed
+                .wait_timeout_while(open, PARK_LIMIT, |open| !*open)
+                .expect("gate wait");
+            if waited.timed_out() {
+                return Err(StorageError::Backend {
+                    backend: "parking".to_owned(),
+                    message: "the gate was never opened".to_owned(),
+                });
             }
         }
         std::thread::yield_now();
@@ -611,6 +647,7 @@ fn a_clear_applied_while_an_earlier_save_is_in_flight_wins_in_memory_and_in_the_
         .build()?;
 
     std::thread::scope(|scope| {
+        let _release = store.release_on_drop();
         let saver = scope.spawn(|| transport.set_session(Some(Session::from_token("slow-token"))));
         ParkingStore::wait_until("the save to park inside the store", || {
             store.parked.load(Ordering::SeqCst)
