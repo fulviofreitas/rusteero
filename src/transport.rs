@@ -12,7 +12,9 @@
 //! [`Transport::request`]/[`Transport::resource`]/[`Transport::nested`] are the request-building
 //! entry points; see `.claude/tasks/briefs/v8/transport-api.md` for a worked example of each.
 //! Every endpoint module builds on `resource`/`nested` (or, for the login handshake and session
-//! refresh, `request`/`request_with_token` directly against a fixed-path [`Resource`]).
+//! refresh, `request`/`request_with_token` directly against a fixed-path [`Resource`]). Each of the
+//! three has a `*_with_timeout` twin taking an optional per-call [`RequestTimeout`] that replaces
+//! the transport's default timeout for that one request.
 //!
 //! # Locking
 //!
@@ -75,6 +77,81 @@ pub enum RequestBody {
     EmptyJsonString,
 }
 
+/// A per-call timeout for one request, mirroring the `aiohttp.ClientTimeout(total=...,
+/// sock_read=...)` that `eero-api`'s transport methods accept as `timeout=`
+/// (`api/base.py:712-716`).
+///
+/// Passed as `Some(timeout)` to [`Transport::request_with_timeout`],
+/// [`Transport::resource_with_timeout`] or [`Transport::nested_with_timeout`], it **replaces the
+/// transport's default wholesale** for that one request, exactly as `aiohttp` uses a supplied
+/// `ClientTimeout` as-is without merging it with the session default: a field left as `None`
+/// means "no limit" for that request and never falls back to the transport default. So
+/// `RequestTimeout::total(Duration::from_secs(120))` is a 120 s total with *no* read bound at
+/// all, and [`RequestTimeout::default`] is unbounded on both axes (like `aiohttp.ClientTimeout()`).
+/// To keep the transport default, pass `None` instead of a `RequestTimeout`. A field set to
+/// [`Duration::ZERO`] is also unbounded, as in `aiohttp`.
+///
+/// - `total` bounds one attempt from the moment the request is sent until its (size-capped)
+///   body has been read in full.
+/// - `read` bounds each wait for activity from the server: the wait for the response head
+///   (which, in `reqwest`, includes connecting and writing the request) and then every wait for
+///   the next chunk of the body.
+///
+/// Elapsed bounds surface as [`Error::Timeout`]. Every attempt of a `GET` retry gets the full
+/// budget (the bounds restart on each attempt), and the one-shot replay after a
+/// `error.session.refresh` `401` keeps the per-call value; the refresh `POST` itself always uses
+/// the transport default.
+///
+/// The crate enforces both bounds itself, so the `reqwest::Client` it builds carries no timeout
+/// of its own; [`TransportBuilder::timeout`] and [`TransportBuilder::read_timeout`] only set the
+/// transport default. With [`TransportBuilder::http_builder`] that default is unbounded and the
+/// caller's builder governs: a supplied `total` replaces a total timeout set on that builder,
+/// but a `read_timeout` set on it applies below this crate and cannot be disabled or replaced
+/// per call.
+///
+/// # Cancellation
+///
+/// A request that times out (or whose future is dropped) closes its connection rather than
+/// returning it to the pool with an unread response, so its response can never be handed to a
+/// later request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestTimeout {
+    /// Upper bound on one whole attempt. `None` or [`Duration::ZERO`] means unbounded.
+    pub total: Option<Duration>,
+    /// Upper bound on each wait for the server (response head, then every body chunk). `None` or
+    /// [`Duration::ZERO`] means unbounded.
+    pub read: Option<Duration>,
+}
+
+impl RequestTimeout {
+    /// A timeout with explicit `total` and `read` bounds; `None` means unbounded.
+    #[must_use]
+    pub const fn new(total: Option<Duration>, read: Option<Duration>) -> Self {
+        Self { total, read }
+    }
+
+    /// A timeout with only a `total` bound and **no** read bound, like
+    /// `aiohttp.ClientTimeout(total=...)`.
+    #[must_use]
+    pub const fn total(total: Duration) -> Self {
+        Self {
+            total: Some(total),
+            read: None,
+        }
+    }
+}
+
+/// The bounds one attempt runs under: a [`RequestTimeout`] resolved against the transport
+/// default, with zero already turned into "unbounded".
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    total: Option<Duration>,
+    read: Option<Duration>,
+    /// Whether a per-call [`RequestTimeout`] was supplied (and so replaces any client-level
+    /// total timeout configured on a caller-supplied `reqwest::ClientBuilder`).
+    per_call: bool,
+}
+
 /// The request core shared by every authenticated and unauthenticated Eero cloud API call.
 ///
 /// Build one with [`Transport::builder`]. See the module docs for the locking discipline and the
@@ -94,6 +171,9 @@ pub struct Transport {
     accept_language: String,
     send_legacy_cookie: bool,
     get_retries: u32,
+    /// The bounds applied to a request that supplies no per-call [`RequestTimeout`]: the
+    /// builder's `timeout`/`read_timeout`, or unbounded under `TransportBuilder::http_builder`.
+    timeout: RequestTimeout,
     /// Single-flight coalescing slot for [`Transport::refresh_session`]: a [`Weak`] reference to
     /// the current leader's broadcast channel, if a refresh is in flight. See
     /// [`Transport::refresh_session`]'s own docs for the self-healing rationale (a dropped/
@@ -215,6 +295,9 @@ impl Transport {
     /// exactly once with a freshly re-read token before giving up. Runs through the same bounded
     /// `GET`-only retry every request in this transport shares (`TransportBuilder::get_retries`).
     ///
+    /// Runs under the transport's default timeout; use [`Transport::request_with_timeout`] to
+    /// replace it for one call.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Authentication("Not authenticated")` if no valid session is configured,
@@ -227,9 +310,31 @@ impl Transport {
         query: &[(&str, String)],
         body: RequestBody,
     ) -> Result<Envelope, Error> {
+        self.request_with_timeout(method, url, query, body, None)
+            .await
+    }
+
+    /// [`Transport::request`] with an optional per-call [`RequestTimeout`].
+    ///
+    /// `Some(timeout)` replaces the transport's default timeout wholesale for this call (see
+    /// [`RequestTimeout`]); `None` keeps the default. The value applies to every attempt of the
+    /// bounded `GET` retry and to the replay after a server-driven refresh, each of which gets
+    /// the full budget; the refresh `POST` itself always runs under the transport default.
+    ///
+    /// # Errors
+    ///
+    /// As [`Transport::request`]; an elapsed bound is [`Error::Timeout`].
+    pub async fn request_with_timeout(
+        &self,
+        method: Method,
+        url: Url,
+        query: &[(&str, String)],
+        body: RequestBody,
+        timeout: Option<RequestTimeout>,
+    ) -> Result<Envelope, Error> {
         let token = self.current_token().ok_or_else(not_authenticated)?;
         let exchange = self
-            .execute_with_get_retry(method.clone(), &url, query, &body, Some(&token))
+            .execute_with_get_retry(method.clone(), &url, query, &body, Some(&token), timeout)
             .await?;
 
         if exchange.status.as_u16() == 401 && refresh_signal_detected(&exchange.body) {
@@ -237,7 +342,7 @@ impl Transport {
             if refreshed {
                 let retry_token = self.current_token().ok_or_else(not_authenticated)?;
                 let retry = self
-                    .execute_with_get_retry(method, &url, query, &body, Some(&retry_token))
+                    .execute_with_get_retry(method, &url, query, &body, Some(&retry_token), timeout)
                     .await?;
                 return status_to_envelope(
                     retry.status,
@@ -270,8 +375,29 @@ impl Transport {
         query: &[(&str, String)],
         body: RequestBody,
     ) -> Result<Envelope, Error> {
+        self.resource_with_timeout(route, id_or_url, parent, query, body, None)
+            .await
+    }
+
+    /// [`Transport::resource`] with an optional per-call [`RequestTimeout`], applied as in
+    /// [`Transport::request_with_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `route.resolve` fails, otherwise as
+    /// [`Transport::request_with_timeout`].
+    pub async fn resource_with_timeout(
+        &self,
+        route: &Resource,
+        id_or_url: &str,
+        parent: Option<&Value>,
+        query: &[(&str, String)],
+        body: RequestBody,
+        timeout: Option<RequestTimeout>,
+    ) -> Result<Envelope, Error> {
         let url = route.resolve(self.api_host(), id_or_url, parent)?;
-        self.request(route.method.clone(), url, query, body).await
+        self.request_with_timeout(route.method.clone(), url, query, body, timeout)
+            .await
     }
 
     /// Sends an authenticated request to a [`Nested`] two-level resource: `route.resolve(
@@ -289,8 +415,31 @@ impl Transport {
         query: &[(&str, String)],
         body: RequestBody,
     ) -> Result<Envelope, Error> {
+        self.nested_with_timeout(route, network, child, parent, query, body, None)
+            .await
+    }
+
+    /// [`Transport::nested`] with an optional per-call [`RequestTimeout`], applied as in
+    /// [`Transport::request_with_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Validation`] if `route.resolve` fails, otherwise as
+    /// [`Transport::request_with_timeout`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn nested_with_timeout(
+        &self,
+        route: &Nested,
+        network: &str,
+        child: &str,
+        parent: Option<&Value>,
+        query: &[(&str, String)],
+        body: RequestBody,
+        timeout: Option<RequestTimeout>,
+    ) -> Result<Envelope, Error> {
         let url = route.resolve(self.api_host(), network, child, parent)?;
-        self.request(route.method.clone(), url, query, body).await
+        self.request_with_timeout(route.method.clone(), url, query, body, timeout)
+            .await
     }
 
     /// Sends a request authenticated with an explicit (or absent) token: no "not authenticated"
@@ -313,7 +462,7 @@ impl Transport {
         token: Option<&SecretString>,
     ) -> Result<Envelope, Error> {
         let exchange = self
-            .execute_with_get_retry(method, &url, query, &body, token)
+            .execute_with_get_retry(method, &url, query, &body, token, None)
             .await?;
         status_to_envelope(
             exchange.status,
@@ -581,6 +730,10 @@ impl Transport {
     /// never on a `4xx` (including `429`, which carries its own `Retry-After` semantics a caller
     /// should honour explicitly rather than have this loop silently retry). A fixed delay
     /// ([`consts::GET_RETRY_DELAY`]) separates attempts; each retry is logged at `WARN`.
+    ///
+    /// `timeout` is applied afresh to every attempt, so each one gets the full budget rather than
+    /// sharing one deadline (`_request_with_get_retry` forwards the same `timeout` kwarg to each
+    /// `_request` call).
     async fn execute_with_get_retry(
         &self,
         method: Method,
@@ -588,11 +741,12 @@ impl Transport {
         query: &[(&str, String)],
         body: &RequestBody,
         token: Option<&SecretString>,
+        timeout: Option<RequestTimeout>,
     ) -> Result<RawExchange, Error> {
         let mut attempt: u32 = 0;
         loop {
             let outcome = self
-                .execute_once(method.clone(), url.clone(), query, body, token)
+                .execute_once(method.clone(), url.clone(), query, body, token, timeout)
                 .await;
             let is_get = method == Method::GET;
             let retryable = is_get
@@ -616,15 +770,13 @@ impl Transport {
         }
     }
 
-    /// Sends one HTTP request and returns its status, body, and any incidental headers this
-    /// crate cares about (`Retry-After`) — everything *before* status-code-specific
-    /// interpretation, which is `status_to_envelope`'s job.
+    /// Sends one HTTP request under the bounds `timeout` (or the transport default) resolves to,
+    /// and returns its status, body, and any incidental headers this crate cares about
+    /// (`Retry-After`) — everything *before* status-code-specific interpretation, which is
+    /// `status_to_envelope`'s job.
     ///
-    /// Builds `Accept: application/json`, `User-Agent`, and `X-Accept-Language` on every request
-    /// (`build_request_headers`, `base.py:124-164`); attaches the session credential via
-    /// [`Transport::apply_credentials`]; applies `body` via [`Transport::apply_body`]; refuses any
-    /// `3xx` redirect immediately, before the body is streamed at all; and streams the body with
-    /// the response-size cap.
+    /// The `total` bound wraps the whole attempt ([`Transport::send_and_read`]: send plus capped
+    /// body read); the `read` bound is applied inside it. Either elapsing is [`Error::Timeout`].
     async fn execute_once(
         &self,
         method: Method,
@@ -632,6 +784,46 @@ impl Transport {
         query: &[(&str, String)],
         body: &RequestBody,
         token: Option<&SecretString>,
+        timeout: Option<RequestTimeout>,
+    ) -> Result<RawExchange, Error> {
+        let bounds = self.bounds_for(timeout);
+        let attempt = self.send_and_read(method, url, query, body, token, bounds);
+        match bounds.total {
+            Some(total) => tokio::time::timeout(total, attempt)
+                .await
+                .unwrap_or_else(|_elapsed| Err(Error::Timeout)),
+            None => attempt.await,
+        }
+    }
+
+    /// Resolves the bounds one attempt runs under: `per_call` replaces the transport default
+    /// wholesale when supplied, and a zero duration means unbounded either way.
+    fn bounds_for(&self, per_call: Option<RequestTimeout>) -> Bounds {
+        let effective = per_call.unwrap_or(self.timeout);
+        Bounds {
+            total: effective.total.filter(|d| !d.is_zero()),
+            read: effective.read.filter(|d| !d.is_zero()),
+            per_call: per_call.is_some(),
+        }
+    }
+
+    /// Builds and sends one request and reads its capped body, with `bounds.read` applied around
+    /// `send()` and around every body-chunk read (the `total` bound is the caller's job, see
+    /// [`Transport::execute_once`]).
+    ///
+    /// Builds `Accept: application/json`, `User-Agent`, and `X-Accept-Language` on every request
+    /// (`build_request_headers`, `base.py:124-164`); attaches the session credential via
+    /// [`Transport::apply_credentials`]; applies `body` via [`Transport::apply_body`]; refuses any
+    /// `3xx` redirect immediately, before the body is streamed at all; and streams the body with
+    /// the response-size cap.
+    async fn send_and_read(
+        &self,
+        method: Method,
+        url: Url,
+        query: &[(&str, String)],
+        body: &RequestBody,
+        token: Option<&SecretString>,
+        bounds: Bounds,
     ) -> Result<RawExchange, Error> {
         // Query parameters are appended directly onto the `Url` via `url`'s own percent-encoding
         // rather than `reqwest::RequestBuilder::query`, which requires reqwest's `query` cargo
@@ -647,8 +839,22 @@ impl Transport {
         request = request.header(x_accept_language_header(), &self.accept_language);
         request = self.apply_credentials(request, &url, token);
         request = Self::apply_body(request, body);
+        if bounds.per_call {
+            // A per-call value replaces any total timeout configured on a caller-supplied
+            // `reqwest::ClientBuilder` too (`RequestBuilder::timeout` overrides the client-level
+            // one). The real total is enforced by `execute_once`, so this only switches the
+            // client-level bound off for the request; `Duration::MAX` is clamped by tokio to a
+            // deadline that never fires.
+            request = request.timeout(Duration::MAX);
+        }
 
-        let response = request.send().await.map_err(map_reqwest_error)?;
+        let response = match bounds.read {
+            Some(read) => tokio::time::timeout(read, request.send())
+                .await
+                .map_err(|_elapsed| Error::Timeout)?,
+            None => request.send().await,
+        }
+        .map_err(map_reqwest_error)?;
         let status = response.status();
 
         // Method, rendered path, and status only — never headers, cookies, or bodies, so a
@@ -715,7 +921,7 @@ impl Transport {
         }
 
         let retry_after = parse_retry_after(response.headers());
-        let body_text = read_capped_body(response).await?;
+        let body_text = read_capped_body(response, bounds.read).await?;
 
         Ok(RawExchange {
             status,
@@ -806,12 +1012,16 @@ fn status_to_envelope(
     Err(err)
 }
 
-/// Streams `response`'s body with a running size check.
-async fn read_capped_body(mut response: reqwest::Response) -> Result<String, Error> {
+/// Streams `response`'s body with a running size check, allowing `read` (when bounded) for each
+/// chunk to arrive.
+async fn read_capped_body(
+    mut response: reqwest::Response,
+    read: Option<Duration>,
+) -> Result<String, Error> {
     let status = response.status();
     let mut buffer: Vec<u8> = Vec::new();
 
-    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+    while let Some(chunk) = next_chunk(&mut response, read).await? {
         if buffer.len() + chunk.len() > consts::MAX_RESPONSE_BYTES {
             return Err(Error::Api {
                 status: status.as_u16(),
@@ -834,6 +1044,21 @@ async fn read_capped_body(mut response: reqwest::Response) -> Result<String, Err
         error_code: None,
         url: Some(response.url().to_string()),
     })
+}
+
+/// Reads the next body chunk, failing with [`Error::Timeout`] if `read` is bounded and elapses
+/// first.
+async fn next_chunk(
+    response: &mut reqwest::Response,
+    read: Option<Duration>,
+) -> Result<Option<bytes::Bytes>, Error> {
+    let chunk = match read {
+        Some(read) => tokio::time::timeout(read, response.chunk())
+            .await
+            .map_err(|_elapsed| Error::Timeout)?,
+        None => response.chunk().await,
+    };
+    chunk.map_err(map_reqwest_error)
 }
 
 /// Parses a `Retry-After` header value into a `Duration`, accepting both the delta-seconds form
@@ -967,10 +1192,14 @@ impl TransportBuilder {
     ///
     /// When set, this crate's own [`TransportBuilder::timeout`]/[`TransportBuilder::read_timeout`]
     /// are **ignored** — `builder` is used exactly as given, aside from the forced redirect
-    /// policy above. Configure timeouts on `builder` itself, or leave both unset entirely (e.g.
-    /// `reqwest::ClientBuilder::new()` with nothing else called) for a test that pairs
-    /// `tokio::time::pause()` with a real HTTP round trip — see `.claude/rules/testing.md`'s
-    /// gotcha for why the crate's own timeouts and a paused clock do not mix.
+    /// policy above, and the transport default is unbounded. Configure timeouts on `builder`
+    /// itself, or leave both unset entirely (e.g. `reqwest::ClientBuilder::new()` with nothing
+    /// else called) for a test that pairs `tokio::time::pause()` with a real HTTP round trip —
+    /// the crate's own timeouts and a paused clock do not mix.
+    ///
+    /// A per-call [`RequestTimeout`] still applies on top of `builder`: its `total` replaces a
+    /// total timeout set on `builder`, but a `read_timeout` set on `builder` applies below this
+    /// crate and keeps capping every request whatever the per-call value says.
     #[must_use]
     pub fn http_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
         self.http_builder = Some(builder);
@@ -1046,16 +1275,18 @@ impl TransportBuilder {
         self
     }
 
-    /// Overrides the overall request timeout. Ignored if [`TransportBuilder::http_builder`] was
-    /// also called.
+    /// Overrides the transport's default overall (total) request timeout — the default for any
+    /// request that supplies no per-call [`RequestTimeout`]. [`Duration::ZERO`] means unbounded.
+    /// Ignored if [`TransportBuilder::http_builder`] was also called.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Overrides the per-read timeout. Ignored if [`TransportBuilder::http_builder`] was also
-    /// called.
+    /// Overrides the transport's default per-read timeout — the default for any request that
+    /// supplies no per-call [`RequestTimeout`]. [`Duration::ZERO`] means unbounded. Ignored if
+    /// [`TransportBuilder::http_builder`] was also called.
     #[must_use]
     pub fn read_timeout(mut self, read_timeout: Duration) -> Self {
         self.read_timeout = read_timeout;
@@ -1096,21 +1327,28 @@ impl TransportBuilder {
             .unwrap_or_else(|| consts::DEFAULT_ACCEPT_LANGUAGE.to_owned());
         validate_header_value("X-Accept-Language", &accept_language)?;
 
-        let http = if let Some(builder) = self.http_builder {
+        // Neither branch puts a timeout on the `reqwest::Client` this crate builds: both bounds
+        // are enforced per attempt in `Transport::execute_once` so a per-call `RequestTimeout`
+        // can replace them (reqwest has no per-request read timeout). A caller-supplied builder
+        // keeps whatever timeouts it carries itself.
+        let (http, timeout) = if let Some(builder) = self.http_builder {
             // Timeouts are deliberately not forced onto a caller-supplied builder — see
             // `TransportBuilder::http_builder`'s own docs. The redirect policy is not
             // negotiable: it always wins, even over a policy `builder` explicitly set.
-            builder
+            let http = builder
                 .redirect(Policy::none())
                 .build()
-                .map_err(Error::Network)?
+                .map_err(Error::Network)?;
+            (http, RequestTimeout::default())
         } else {
-            Client::builder()
-                .timeout(self.timeout)
-                .read_timeout(self.read_timeout)
+            let http = Client::builder()
                 .redirect(Policy::none())
                 .build()
-                .map_err(Error::Network)?
+                .map_err(Error::Network)?;
+            (
+                http,
+                RequestTimeout::new(Some(self.timeout), Some(self.read_timeout)),
+            )
         };
 
         Ok(Transport {
@@ -1123,6 +1361,7 @@ impl TransportBuilder {
             accept_language,
             send_legacy_cookie: self.send_legacy_cookie,
             get_retries: self.get_retries,
+            timeout,
             refresh_slot: tokio::sync::Mutex::new(Weak::new()),
         })
     }
@@ -1153,7 +1392,10 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use url::Url;
 
-    use super::{Transport, parse_retry_after, refresh_signal_detected, validate_header_value};
+    use super::{
+        RequestTimeout, Transport, parse_retry_after, refresh_signal_detected,
+        validate_header_value,
+    };
     use crate::error::Error;
     use crate::routes::{ACCOUNT, ApiVersion, Resource};
 
@@ -1259,6 +1501,80 @@ mod tests {
     #[test]
     fn validate_header_value_accepts_printable_ascii() {
         validate_header_value("x", "eero/3.0 (iPhone; iOS 17.0)").expect("printable ascii ok");
+    }
+
+    // ===================== RequestTimeout / bounds_for =====================
+
+    #[test]
+    fn request_timeout_default_is_unbounded_on_both_axes() {
+        let timeout = RequestTimeout::default();
+        assert_eq!(timeout.total, None);
+        assert_eq!(timeout.read, None);
+    }
+
+    #[test]
+    fn request_timeout_constructors_set_the_documented_fields() {
+        let both = RequestTimeout::new(Some(Duration::from_secs(5)), Some(Duration::from_secs(2)));
+        assert_eq!(both.total, Some(Duration::from_secs(5)));
+        assert_eq!(both.read, Some(Duration::from_secs(2)));
+
+        let total_only = RequestTimeout::total(Duration::from_secs(120));
+        assert_eq!(total_only.total, Some(Duration::from_secs(120)));
+        assert_eq!(total_only.read, None, "total() leaves the read bound unset");
+    }
+
+    #[test]
+    fn bounds_default_to_the_builder_timeouts_when_no_per_call_value_is_supplied() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let bounds = transport.bounds_for(None);
+        assert_eq!(bounds.total, Some(crate::consts::REQUEST_TIMEOUT));
+        assert_eq!(bounds.read, Some(crate::consts::READ_TIMEOUT));
+        assert!(!bounds.per_call);
+    }
+
+    #[test]
+    fn a_per_call_value_replaces_the_default_wholesale() {
+        let transport = Transport::builder().build().expect("builds with defaults");
+        let bounds = transport.bounds_for(Some(RequestTimeout::total(Duration::from_secs(120))));
+        assert_eq!(bounds.total, Some(Duration::from_secs(120)));
+        assert_eq!(
+            bounds.read, None,
+            "the default read bound must not leak back in"
+        );
+        assert!(bounds.per_call);
+
+        let bounds = transport.bounds_for(Some(RequestTimeout::default()));
+        assert_eq!((bounds.total, bounds.read), (None, None));
+    }
+
+    #[test]
+    fn zero_durations_mean_unbounded_for_defaults_and_per_call_values() {
+        let transport = Transport::builder()
+            .timeout(Duration::ZERO)
+            .read_timeout(Duration::ZERO)
+            .build()
+            .expect("builds with zero defaults");
+        let bounds = transport.bounds_for(None);
+        assert_eq!((bounds.total, bounds.read), (None, None));
+
+        let bounds = transport.bounds_for(Some(RequestTimeout::new(
+            Some(Duration::ZERO),
+            Some(Duration::from_secs(1)),
+        )));
+        assert_eq!(bounds.total, None);
+        assert_eq!(bounds.read, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_caller_supplied_http_builder_leaves_the_default_unbounded() {
+        let transport = Transport::builder()
+            .http_builder(reqwest::Client::builder())
+            .timeout(Duration::from_secs(1))
+            .read_timeout(Duration::from_secs(1))
+            .build()
+            .expect("builds with a caller-supplied builder");
+        let bounds = transport.bounds_for(None);
+        assert_eq!((bounds.total, bounds.read), (None, None));
     }
 
     // ===================== Resource::resolve / base selection =====================
