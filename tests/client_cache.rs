@@ -399,17 +399,14 @@ async fn an_unrelated_invalidation_also_blocks_the_fill() {
     assert_inflight_read_is_not_cached_when(Read::Profiles, Write::PauseDevice, &[false]).await;
 }
 
-/// `get_network` and `get_eeros` store through the same guard once `Client::get_network` and
-/// `Client::get_eeros` take the generation before their request. Ignored until those two
-/// wrappers (in `src/client/networks.rs` and `src/client/eeros.rs`) make that change.
+/// `get_network` and `get_eeros` store through the same guard: both take the cache generation
+/// before their request.
 #[tokio::test]
-#[ignore = "needs put_if_current in Client::get_network (src/client/networks.rs)"]
 async fn get_network_overtaken_by_set_network_name_is_not_cached() {
     assert_inflight_read_is_not_cached(Read::Network, Write::SetNetworkName).await;
 }
 
 #[tokio::test]
-#[ignore = "needs put_if_current in Client::get_eeros (src/client/eeros.rs)"]
 async fn get_eeros_overtaken_by_reboot_eero_is_not_cached() {
     assert_inflight_read_is_not_cached(Read::Eeros, Write::RebootEero).await;
 }

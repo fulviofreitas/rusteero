@@ -33,13 +33,14 @@ impl Client {
         if !refresh_cache && let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
+        let generation = self.cache.generation();
         let parent = self.network_parent(&network_id);
         let response = self
             .api
             .eeros()
             .get_eeros(&network_id, parent.as_ref())
             .await?;
-        self.cache.put(key, response.clone());
+        self.cache.put_if_current(key, response.clone(), generation);
         Ok(response)
     }
 

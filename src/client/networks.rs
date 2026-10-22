@@ -33,8 +33,9 @@ impl Client {
         if !refresh_cache && let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
+        let generation = self.cache.generation();
         let response = self.api.networks().get_network(&network_id, None).await?;
-        self.cache.put(key, response.clone());
+        self.cache.put_if_current(key, response.clone(), generation);
         Ok(response)
     }
 
