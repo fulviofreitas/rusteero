@@ -389,8 +389,19 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
 /// carries the caller's dispatcher across (the crate's `storage::*_async` adapters do, so a
 /// credential store's own lines are captured). The capture is also isolated per test: tests running in parallel on their own
 /// threads never see each other's events.
+///
+/// # Parallel tests
+///
+/// `tracing-core` keeps one process-wide interest cache per callsite. While only one dispatcher
+/// exists it decides a newly hit callsite against the *calling* thread's default alone, so a
+/// parallel test thread with no subscriber can cache "never" for a library callsite before this
+/// capture is installed, and the capture then misses that event. An always-live anchor
+/// dispatcher, registered once per test binary, keeps every interest decision consulting all
+/// live dispatchers, this capture included.
 #[must_use]
 pub fn capture_logs() -> (LogGuard, LogCapture) {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(registry()));
     let capture = LogCapture::default();
     let subscriber = registry().with(CaptureLayer {
         records: Arc::clone(&capture.records),

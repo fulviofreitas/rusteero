@@ -32,20 +32,6 @@ async fn client(mock: &MockEero) -> Client {
         .expect("a MockServer's own URI is always a valid base URL")
 }
 
-/// [`common::capture_logs`] plus an always-live second dispatcher.
-///
-/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
-/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
-/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
-/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
-/// capture then misses events nondeterministically. Keeping this anchor registered makes every
-/// rebuild consult all live dispatchers, the capture included.
-fn capture_logs() -> (common::LogGuard, common::LogCapture) {
-    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
-    common::capture_logs()
-}
-
 /// A small, obviously-synthetic success envelope every write test in this file can share.
 fn ok_envelope() -> serde_json::Value {
     json!({"meta": {"code": 200}, "data": {}})
@@ -969,7 +955,7 @@ async fn reboot_network_posts_the_empty_json_string_once() -> anyhow::Result<()>
 async fn reboot_network_warns_once() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     mount_reboot_post(&mock, REBOOT_PATH, 1).await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     client(&mock)
         .await

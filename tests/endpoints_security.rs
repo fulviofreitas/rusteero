@@ -18,20 +18,6 @@ use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 
-/// [`common::capture_logs`] plus an always-live second dispatcher.
-///
-/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
-/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
-/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
-/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
-/// capture then misses events nondeterministically. Keeping this anchor registered makes every
-/// rebuild consult all live dispatchers, the capture included.
-fn capture_logs() -> (common::LogGuard, common::LogCapture) {
-    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
-    common::capture_logs()
-}
-
 /// Builds a [`SecurityApi`] pointed at `mock`, wrapping a `Transport` already authenticated with
 /// [`TEST_TOKEN`].
 fn security_api(mock: &MockEero) -> SecurityApi {
@@ -595,7 +581,7 @@ async fn set_ipv6_upstream_warns_once_with_the_reboot_class_operation() -> anyho
         .expect(2)
         .mount(&mock.server)
         .await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
     let api = security_api(&mock);
 
     api.set_ipv6_upstream("network-0001", true, None).await?;
@@ -627,7 +613,7 @@ async fn set_ipv6_upstream_warns_once_with_the_reboot_class_operation() -> anyho
 async fn set_ipv6_upstream_with_an_unresolvable_id_sends_nothing_and_does_not_warn()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
     let api = security_api(&mock);
 
     for bad_id in ["", "../x"] {

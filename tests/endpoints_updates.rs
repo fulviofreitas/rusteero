@@ -17,20 +17,6 @@ use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
-/// [`common::capture_logs`] plus an always-live second dispatcher.
-///
-/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
-/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
-/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
-/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
-/// capture then misses events nondeterministically. Keeping this anchor registered makes every
-/// rebuild consult all live dispatchers, the capture included.
-fn capture_logs() -> (common::LogGuard, common::LogCapture) {
-    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
-    common::capture_logs()
-}
-
 fn updates_api(mock: &MockEero) -> UpdatesApi {
     UpdatesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
 }
@@ -272,7 +258,7 @@ async fn set_preferred_update_hour_rejects_out_of_range_hours_without_a_request(
 async fn set_preferred_update_hour_validates_the_hour_before_anything_else() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     mount_hour_post_never(&mock).await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     // An invalid network id with an invalid hour: the hour error wins.
     let err = updates_api(&mock)
@@ -309,7 +295,7 @@ async fn set_preferred_update_hour_validates_the_hour_before_anything_else() -> 
 async fn set_preferred_update_hour_warns_once_after_validation() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     mount_hour_post(&mock, 5).await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     updates_api(&mock)
         .set_preferred_update_hour("network-0001", 5)
@@ -330,7 +316,7 @@ async fn set_preferred_update_hour_warns_once_after_validation() -> anyhow::Resu
 async fn set_preferred_update_hour_with_an_unresolvable_id_sends_nothing_and_does_not_warn()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
     let api = updates_api(&mock);
 
     for bad_id in ["", "../x"] {

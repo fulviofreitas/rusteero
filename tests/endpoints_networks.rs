@@ -20,20 +20,6 @@ use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 
-/// [`common::capture_logs`] plus an always-live second dispatcher.
-///
-/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
-/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
-/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
-/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
-/// capture then misses events nondeterministically. Keeping this anchor registered makes every
-/// rebuild consult all live dispatchers, the capture included.
-fn capture_logs() -> (common::LogGuard, common::LogCapture) {
-    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
-    common::capture_logs()
-}
-
 fn networks_api(mock: &MockEero) -> NetworksApi {
     NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
 }
@@ -869,7 +855,7 @@ async fn password_validation_precedes_the_auth_gate() -> anyhow::Result<()> {
 #[tokio::test]
 async fn password_validation_precedes_url_resolution_and_the_warning() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
     let api = networks_api(&mock);
 
     // An empty network id would fail URL resolution with field `id_or_url`; the password check
@@ -904,7 +890,7 @@ async fn set_network_password_still_warns_once_for_a_valid_password() -> anyhow:
         .expect(1)
         .mount(&mock.server)
         .await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     networks_api(&mock)
         .set_network_password("network-0001", "hunter2", None)
@@ -936,7 +922,7 @@ async fn set_guest_password_logs_no_uncharacterised_write_warning() -> anyhow::R
         .expect(1)
         .mount(&mock.server)
         .await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     networks_api(&mock)
         .set_guest_password("network-0001", "guestpass", None)
@@ -1031,7 +1017,7 @@ async fn set_guest_network_rejects_an_empty_supplied_name_before_any_request() -
 #[tokio::test]
 async fn name_validation_precedes_auth_and_url_resolution() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     // A missing session: the name check must win over the credential gate.
     let anonymous = NetworksApi::new(Arc::new(mock.transport_anonymous()));
@@ -1077,7 +1063,7 @@ async fn set_network_name_still_warns_once_for_a_valid_name() -> anyhow::Result<
         .expect(1)
         .mount(&mock.server)
         .await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     networks_api(&mock)
         .set_network_name("network-0001", "My Network", None)
@@ -1104,7 +1090,7 @@ async fn set_guest_network_logs_no_uncharacterised_write_warning() -> anyhow::Re
         .expect(1)
         .mount(&mock.server)
         .await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     networks_api(&mock)
         .set_guest_network("network-0001", true, Some("Guest"), None)
@@ -1277,7 +1263,7 @@ async fn set_hide_5g_accepts_an_absolute_url() -> anyhow::Result<()> {
 async fn set_hide_5g_warns_once_with_a_different_operation_per_branch() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     mount_hide_5g_put(&mock).await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
     let api = networks_api(&mock);
 
     api.set_hide_5g("network-0001", true).await?;
@@ -1316,7 +1302,7 @@ async fn set_hide_5g_warns_once_with_a_different_operation_per_branch() -> anyho
 async fn set_hide_5g_with_an_unresolvable_id_sends_nothing_and_does_not_warn() -> anyhow::Result<()>
 {
     let mock = MockEero::start().await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
     let api = networks_api(&mock);
 
     for enabled in [true, false] {

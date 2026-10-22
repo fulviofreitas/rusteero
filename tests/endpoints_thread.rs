@@ -18,20 +18,6 @@ use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 
-/// [`common::capture_logs`] plus an always-live second dispatcher.
-///
-/// `tracing-core` keeps one process-wide callsite interest cache. While only **one** dispatcher is
-/// registered it re-evaluates a newly registered callsite against the *calling thread's* default
-/// dispatcher alone, so a parallel test thread with no default subscriber caches `never` for a
-/// callsite (the library's warning, hyper's events) before this test's capture can see it, and the
-/// capture then misses events nondeterministically. Keeping this anchor registered makes every
-/// rebuild consult all live dispatchers, the capture included.
-fn capture_logs() -> (common::LogGuard, common::LogCapture) {
-    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
-    common::capture_logs()
-}
-
 /// Builds a [`ThreadApi`] pointed at `mock`, wrapping a `Transport` already authenticated with
 /// [`TEST_TOKEN`].
 fn thread_api(mock: &MockEero) -> ThreadApi {
@@ -142,7 +128,7 @@ async fn set_thread_enabled_logs_the_update_thread_warning() -> anyhow::Result<(
         .expect(1)
         .mount(&mock.server)
         .await;
-    let (_guard, logs) = capture_logs();
+    let (_guard, logs) = common::capture_logs();
 
     thread_api(&mock)
         .set_thread_enabled("network-0001", true, None)
