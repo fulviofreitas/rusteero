@@ -197,7 +197,7 @@ pub const GET_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// server-controlled input: an HTTP-date far in the future, or a very long digit string, would
 /// otherwise make a caller that sleeps for the value stall indefinitely. A parsed delay is capped
 /// at this value before it reaches [`crate::Error::RateLimit`]'s `retry_after`.
-pub const RETRY_AFTER_MAX: Duration = Duration::from_secs(86_400);
+pub const RETRY_AFTER_MAX: Duration = Duration::from_hours(24);
 
 /// Version marker written to every persisted credential record.
 ///
@@ -315,8 +315,8 @@ mod tests {
 
     #[test]
     fn retry_after_max_is_one_day() {
-        assert_eq!(RETRY_AFTER_MAX, Duration::from_secs(86_400));
-        assert_eq!(RETRY_AFTER_MAX, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(RETRY_AFTER_MAX.as_secs(), 86_400);
+        assert_eq!(RETRY_AFTER_MAX, Duration::from_hours(24));
     }
 
     #[test]
