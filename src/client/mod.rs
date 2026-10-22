@@ -347,13 +347,17 @@ impl Client {
     /// that ordering exactly, since a `Validation` failure returns before [`Client::clear_cache`]
     /// is ever called.
     ///
+    /// `async` since `eero-api` 8.1.10: the credential-store write runs on the runtime's blocking
+    /// pool instead of the calling task's thread. The in-memory session changes first, the cache
+    /// is cleared once the store hop has completed.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Validation { field: "token", .. }` if `token` is empty. Returns
     /// `Error::Storage` if a configured credential store failed to persist the new session under
     /// [`StorageFailures::Fatal`] (see [`crate::auth::AuthApi::set_session_token`]'s own docs).
-    pub fn set_session_token(&self, token: &str) -> Result<(), Error> {
-        self.api.auth().set_session_token(token)?;
+    pub async fn set_session_token(&self, token: &str) -> Result<(), Error> {
+        self.api.auth().set_session_token(token).await?;
         self.clear_cache();
         Ok(())
     }
@@ -366,6 +370,9 @@ impl Client {
     /// brief §1.6's table notes this is presumably why this call site, unlike `verify`/`logout`,
     /// is unconditional in Python).
     ///
+    /// `async` since `eero-api` 8.1.10: the in-memory session is cleared first and the
+    /// credential-store clear then runs on the runtime's blocking pool.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Storage` if a configured credential store failed to persist the change
@@ -373,8 +380,8 @@ impl Client {
     /// docs). The in-memory session is cleared regardless; this client's cache is only cleared
     /// after that call returns `Ok`, mirroring Python's sequencing even though Python's own call
     /// can never itself fail.
-    pub fn clear_session_token(&self) -> Result<(), Error> {
-        self.api.auth().clear_session_token()?;
+    pub async fn clear_session_token(&self) -> Result<(), Error> {
+        self.api.auth().clear_session_token().await?;
         self.clear_cache();
         Ok(())
     }

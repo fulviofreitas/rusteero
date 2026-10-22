@@ -23,6 +23,18 @@
 //! comparisons with no `.await` inside — an async lock would only add executor overhead for no
 //! benefit here. No lock guard is ever held across an `.await` point anywhere in this module.
 //!
+//! # Session persistence
+//!
+//! A session change is applied to memory first, in one step that also stamps it with a
+//! per-`Transport` *generation*; only then is the configured [`CredentialStore`] told. The store
+//! calls are blocking, so the async entry points ([`Transport::set_session_async`] and the
+//! credential-destroying branch of [`Transport::refresh_session`]) run them on the runtime's
+//! blocking pool (`tokio::task::spawn_blocking`) and every task that runs during that hop already
+//! sees the new in-memory session. Persists are serialised, and one whose generation has been
+//! overtaken by a newer change before it reaches the store is skipped, so after any interleaving
+//! of concurrent changes the stored record matches the final in-memory session: the last change
+//! applied wins, as in `eero-api` 8.1.10 (`auth_storage.py:199-203`).
+//!
 //! # The refresh-retry divergence (task brief gotcha G1)
 //!
 //! `eero-api`'s 401-triggered refresh retry re-sends the retried request with the *original,
@@ -34,7 +46,8 @@
 //! the retry into another "Not authenticated" precondition failure rather than silently reusing a
 //! since-cleared token).
 
-use std::sync::{Arc, PoisonError, RwLock, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use reqwest::header::{
@@ -50,11 +63,11 @@ use url::Url;
 use crate::auth::Session;
 use crate::consts;
 use crate::envelope::Envelope;
-use crate::error::Error;
+use crate::error::{Error, StorageError};
 use crate::errors;
 use crate::redact;
 use crate::routes::{self, ApiVersion, Nested, Resource};
-use crate::storage::CredentialStore;
+use crate::storage::{self, CredentialStore};
 
 /// The body a request carries, mirroring `eero-api`'s `RequestEncoding`
 /// (`api/base.py:54-75,324-361`).
@@ -166,6 +179,9 @@ pub struct Transport {
     api_host: Url,
     session: RwLock<Option<Session>>,
     store: Option<Arc<dyn CredentialStore>>,
+    /// Generation stamp, store-I/O gate and last-outcome flag for session persistence; shared
+    /// (`Arc`) so a persist can move onto a blocking-pool thread. See the module docs.
+    persistence: Arc<Persistence>,
     storage_failures: StorageFailures,
     user_agent: String,
     accept_language: String,
@@ -186,10 +202,10 @@ pub struct Transport {
 /// How a [`Transport`] treats a failed write to its configured credential store (decision D-13).
 ///
 /// Set via [`TransportBuilder::storage_failures`]; honoured at every credential-store call site
-/// in this module ([`Transport::set_session`], and the credential-clearing branch of
-/// [`Transport::refresh_session`]). This is unrelated to whether the *in-memory* session is
-/// updated: that happens unconditionally and before persistence is even attempted, regardless of
-/// this setting.
+/// in this module ([`Transport::set_session`], [`Transport::set_session_async`], and the
+/// credential-clearing branch of [`Transport::refresh_session`]). This is unrelated to whether
+/// the *in-memory* session is updated: that happens unconditionally and before persistence is
+/// even attempted, regardless of this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageFailures {
     /// Log the failure at `WARN` and proceed as though the operation had succeeded. The default.
@@ -197,6 +213,78 @@ pub enum StorageFailures {
     Warn,
     /// Return [`Error::Storage`] immediately instead of swallowing the failure.
     Fatal,
+}
+
+/// Session-persistence bookkeeping shared between a [`Transport`] and the blocking tasks that
+/// write its credential store (see the module docs, "Session persistence").
+#[derive(Debug)]
+struct Persistence {
+    /// Stamp of the most recent in-memory session change. Bumped by `Transport::replace_session`
+    /// under the session write lock.
+    generation: AtomicU64,
+    /// Serialises "is my stamp still the latest?" plus the store call, so persists reach the
+    /// store one at a time and a skipped one can never overwrite a newer record.
+    io: Mutex<()>,
+}
+
+impl Persistence {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            io: Mutex::new(()),
+        }
+    }
+
+    /// Persists one session change to `store` — `Some` saves, `None` clears — unless a newer
+    /// change has already been applied to memory, in which case the newer change's own persist
+    /// is the one that must reach the store and this returns `Ok(())` without touching it.
+    ///
+    /// Blocking: runs the store call on the calling thread, under the `io` gate.
+    fn persist(
+        &self,
+        store: &dyn CredentialStore,
+        ticket: u64,
+        session: Option<&Session>,
+    ) -> Result<(), StorageError> {
+        // A store that panicked in an earlier persist poisons the gate; the gate guards no data,
+        // so later persists carry on regardless.
+        let _gate = self.io.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.generation.load(Ordering::SeqCst) != ticket {
+            tracing::debug!("session persist skipped: a newer session change supersedes it");
+            return Ok(());
+        }
+        match session {
+            Some(session) => store.save(session),
+            None => store.clear(),
+        }
+    }
+}
+
+/// A [`CredentialStore`] view pinned to one session change, so the shared
+/// [`storage::save_async`]/[`storage::clear_async`] blocking-pool adapters (and their
+/// `JoinError` handling, which never interpolates a panic payload) can run a generation-checked
+/// persist: `save`/`clear` go through [`Persistence::persist`] with this change's stamp.
+#[derive(Debug)]
+struct TicketedStore {
+    store: Arc<dyn CredentialStore>,
+    persistence: Arc<Persistence>,
+    ticket: u64,
+}
+
+impl CredentialStore for TicketedStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.store.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        self.persistence
+            .persist(self.store.as_ref(), self.ticket, Some(session))
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        self.persistence
+            .persist(self.store.as_ref(), self.ticket, None)
+    }
 }
 
 impl Transport {
@@ -224,8 +312,15 @@ impl Transport {
     }
 
     /// Replaces the in-memory session and, if a credential store is configured, persists the
-    /// change: `Some(session)` calls `CredentialStore::save`, `None` calls
+    /// change on the calling thread: `Some(session)` calls `CredentialStore::save`, `None` calls
     /// `CredentialStore::clear`.
+    ///
+    /// # Blocking
+    ///
+    /// The store call runs inline, so a slow or hung backend (a native keyring/Secret Service
+    /// call, a slow `fsync`) blocks the calling thread for as long as it takes. Call this from
+    /// plain threads and tests only; from async code use [`Transport::set_session_async`], which
+    /// moves the store I/O onto the runtime's blocking pool.
     ///
     /// # Errors
     ///
@@ -251,12 +346,57 @@ impl Transport {
             return Ok(());
         };
         let for_store = session.clone();
-        self.replace_session(session);
-        let result = match &for_store {
-            Some(s) => store.save(s),
-            None => store.clear(),
+        let ticket = self.replace_session(session);
+        let outcome = self
+            .persistence
+            .persist(store.as_ref(), ticket, for_store.as_ref());
+        self.apply_storage_policy(outcome)
+    }
+
+    /// Replaces the in-memory session and persists the change without blocking the async
+    /// runtime: the same contract as [`Transport::set_session`], with the credential-store call
+    /// moved onto the blocking pool (`tokio::task::spawn_blocking`).
+    ///
+    /// The validation, the in-memory change and the hand-off to the blocking pool all happen
+    /// synchronously, in the first poll of the returned future and before it first yields, so
+    /// every task that runs during the hop already sees the new session, and dropping the future
+    /// after that point does not cancel the persist (the blocking task runs to completion). When
+    /// several changes are in flight at once the last one applied wins: an older persist that
+    /// reaches the store after a newer in-memory change is skipped, so the stored record always
+    /// ends up matching the final in-memory session (see the module docs). Needs a Tokio
+    /// runtime; works on both the current-thread and the multi-thread flavours.
+    ///
+    /// # Errors
+    ///
+    /// As [`Transport::set_session`]. Under [`StorageFailures::Fatal`] a store task that panics
+    /// (or is cancelled at runtime shutdown) is reported as [`Error::Storage`] with a fixed
+    /// message that never carries the panic payload; under [`StorageFailures::Warn`] it is logged
+    /// at `WARN` and this returns `Ok(())`.
+    pub async fn set_session_async(&self, session: Option<Session>) -> Result<(), Error> {
+        if let Some(ref s) = session {
+            crate::auth::session::validate_token_shape("token", s.expose_token())?;
+        }
+        let Some(store) = &self.store else {
+            self.replace_session(session);
+            return Ok(());
         };
-        match result {
+        let for_store = session.clone();
+        let ticket = self.replace_session(session);
+        let ticketed: Arc<dyn CredentialStore> = Arc::new(TicketedStore {
+            store: Arc::clone(store),
+            persistence: Arc::clone(&self.persistence),
+            ticket,
+        });
+        let outcome = match for_store {
+            Some(s) => storage::save_async(ticketed, s).await,
+            None => storage::clear_async(ticketed).await,
+        };
+        self.apply_storage_policy(outcome)
+    }
+
+    /// Applies this transport's [`StorageFailures`] policy to the outcome of one persist.
+    fn apply_storage_policy(&self, outcome: Result<(), StorageError>) -> Result<(), Error> {
+        match outcome {
             Ok(()) => Ok(()),
             Err(err) => match self.storage_failures {
                 StorageFailures::Warn => {
@@ -277,12 +417,6 @@ impl Transport {
     pub fn is_authenticated(&self) -> bool {
         self.session_snapshot()
             .is_some_and(|session| session.is_valid())
-    }
-
-    /// This transport's configured [`StorageFailures`] policy.
-    #[must_use]
-    pub(crate) fn storage_failures(&self) -> StorageFailures {
-        self.storage_failures
     }
 
     // ============================= v8.0.4 request API =============================
@@ -593,7 +727,7 @@ impl Transport {
                     Some(errors::ErrorGroup::Verification | errors::ErrorGroup::SessionRefresh)
                 );
                 if !retain {
-                    self.set_session(None)?;
+                    self.set_session_async(None).await?;
                 }
                 Ok(false)
             }
@@ -620,10 +754,15 @@ impl Transport {
             .map(|session| session.token().clone())
     }
 
-    /// Overwrites the in-memory session without touching the credential store.
-    fn replace_session(&self, session: Option<Session>) {
+    /// Overwrites the in-memory session without touching the credential store, and returns the
+    /// generation stamp of this change.
+    ///
+    /// The stamp is taken while the write lock is still held, so stamps are issued in exactly
+    /// the order the in-memory changes were applied.
+    fn replace_session(&self, session: Option<Session>) -> u64 {
         let mut guard = self.session.write().unwrap_or_else(PoisonError::into_inner);
         *guard = session;
+        self.persistence.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Whether `url`'s scheme, host, and port (default-normalised) all match this transport's
@@ -1260,8 +1399,9 @@ impl TransportBuilder {
         self
     }
 
-    /// Sets the credential store used by `Transport::set_session` and the credential-clearing
-    /// branch of `Transport::refresh_session`. `None` (the default) means no persistence at all.
+    /// Sets the credential store used by `Transport::set_session`, `Transport::set_session_async`
+    /// and the credential-clearing branch of `Transport::refresh_session`. `None` (the default)
+    /// means no persistence at all.
     #[must_use]
     pub fn store(mut self, store: Option<Arc<dyn CredentialStore>>) -> Self {
         self.store = store;
@@ -1356,6 +1496,7 @@ impl TransportBuilder {
             api_host,
             session: RwLock::new(self.session),
             store: self.store,
+            persistence: Arc::new(Persistence::new()),
             storage_failures: self.storage_failures,
             user_agent,
             accept_language,

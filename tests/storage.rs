@@ -10,7 +10,9 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -453,5 +455,213 @@ async fn transport_refresh_session_terminal_failure_clears_the_store() -> anyhow
     let refreshed = transport.refresh_session().await?;
     assert!(!refreshed);
     assert!(!store.load()?.is_valid());
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_set_session_async_persists_the_new_session_and_clear() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    let transport = mock.transport_with_store("initial-token", Arc::clone(&store));
+
+    transport
+        .set_session_async(Some(Session::from_token("rotated-token")))
+        .await?;
+    assert_eq!(store.load()?.token().expose_secret(), "rotated-token");
+    assert_eq!(
+        transport
+            .session()
+            .map(|s| s.token().expose_secret().to_owned()),
+        Some("rotated-token".to_owned())
+    );
+
+    transport.set_session_async(None).await?;
+    assert!(transport.session().is_none());
+    assert!(!store.load()?.is_valid());
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_set_session_async_rejects_an_invalid_token_before_touching_anything()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    let transport = mock.transport_with_store("initial-token", Arc::clone(&store));
+
+    let err = transport
+        .set_session_async(Some(Session::from_token("")))
+        .await
+        .expect_err("an empty token is rejected");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "token"));
+    assert_eq!(
+        transport
+            .session()
+            .map(|s| s.token().expose_secret().to_owned()),
+        Some("initial-token".to_owned()),
+        "a rejected session leaves the current one in place"
+    );
+    assert!(!store.load()?.is_valid(), "and writes nothing");
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_set_session_async_under_fatal_returns_the_error_after_changing_memory() {
+    let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailsStore);
+    let transport = Transport::builder()
+        .store(Some(store))
+        .storage_failures(StorageFailures::Fatal)
+        .build()
+        .expect("builds");
+
+    let err = transport
+        .set_session_async(Some(Session::from_token("fresh-token")))
+        .await
+        .expect_err("the store always fails");
+    assert!(matches!(err, Error::Storage(_)));
+    assert!(
+        transport.is_authenticated(),
+        "memory changed before the store was called"
+    );
+}
+
+// ===================== Persistence ordering: store always matches memory =====================
+
+/// A [`CredentialStore`] over a [`MemoryStore`] whose `save` of one chosen token parks until
+/// [`ParkingStore::open`], and which yields the CPU inside every call to widen race windows.
+#[derive(Debug)]
+struct ParkingStore {
+    inner: MemoryStore,
+    park_token: Option<&'static str>,
+    gate_open: Mutex<bool>,
+    gate_changed: Condvar,
+    parked: AtomicBool,
+}
+
+impl ParkingStore {
+    fn new(park_token: Option<&'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryStore::new(),
+            park_token,
+            gate_open: Mutex::new(false),
+            gate_changed: Condvar::new(),
+            parked: AtomicBool::new(false),
+        })
+    }
+
+    fn open(&self) {
+        *self.gate_open.lock().expect("gate lock") = true;
+        self.gate_changed.notify_all();
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl CredentialStore for ParkingStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        if self.park_token == Some(session.token().expose_secret()) {
+            self.parked.store(true, Ordering::SeqCst);
+            let mut open = self.gate_open.lock().expect("gate lock");
+            while !*open {
+                open = self.gate_changed.wait(open).expect("gate wait");
+            }
+        }
+        std::thread::yield_now();
+        self.inner.save(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        std::thread::yield_now();
+        self.inner.clear()
+    }
+}
+
+fn token_of(session: Option<Session>) -> Option<String> {
+    session.map(|s| s.token().expose_secret().to_owned())
+}
+
+fn stored_token_of(store: &ParkingStore) -> Option<String> {
+    let loaded = store.load().expect("in-memory load cannot fail");
+    loaded
+        .is_valid()
+        .then(|| loaded.token().expose_secret().to_owned())
+}
+
+#[test]
+fn a_clear_applied_while_an_earlier_save_is_in_flight_wins_in_memory_and_in_the_store()
+-> anyhow::Result<()> {
+    let store = ParkingStore::new(Some("slow-token"));
+    let transport = Transport::builder()
+        .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+        .build()?;
+
+    std::thread::scope(|scope| {
+        let saver = scope.spawn(|| transport.set_session(Some(Session::from_token("slow-token"))));
+        ParkingStore::wait_until("the save to park inside the store", || {
+            store.parked.load(Ordering::SeqCst)
+        });
+
+        let clearer = scope.spawn(|| transport.set_session(None));
+        // The clear is applied to memory immediately, then waits behind the parked save.
+        ParkingStore::wait_until("the clear to reach memory", || {
+            transport.session().is_none()
+        });
+
+        store.open();
+        saver.join().expect("saver thread").expect("save ok");
+        clearer.join().expect("clearer thread").expect("clear ok");
+    });
+
+    assert!(transport.session().is_none());
+    assert_eq!(
+        stored_token_of(&store),
+        None,
+        "the older save must not resurrect the cleared session"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_set_session_calls_leave_store_matching_memory() -> anyhow::Result<()> {
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 200;
+
+    let store = ParkingStore::new(None);
+    let transport = Transport::builder()
+        .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+        .build()?;
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let transport = &transport;
+            scope.spawn(move || {
+                for iteration in 0..ITERATIONS {
+                    let session = if (thread + iteration) % 3 == 0 {
+                        None
+                    } else {
+                        Some(Session::from_token(format!("t{thread}-i{iteration}")))
+                    };
+                    transport
+                        .set_session(session)
+                        .expect("a working store never fails");
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        token_of(transport.session()),
+        stored_token_of(&store),
+        "after every call has returned, the stored record matches the in-memory session"
+    );
     Ok(())
 }

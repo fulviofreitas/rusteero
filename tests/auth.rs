@@ -5,19 +5,25 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
+use std::time::Duration;
 
 use secrecy::ExposeSecret;
 use serde_json::json;
 use wiremock::matchers::{body_json, body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header_for};
+use common::{
+    MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header,
+    user_token_header_for,
+};
 use rusteero::auth::flow::PendingLogin;
 use rusteero::auth::{AuthApi, Session};
-use rusteero::error::Error;
+use rusteero::error::{Error, StorageError};
 use rusteero::storage::{CredentialStore, MemoryStore};
-use rusteero::transport::Transport;
+use rusteero::transport::{RequestBody, StorageFailures, Transport};
 
 /// The `data.user_token` value baked into `fixtures/login.json`.
 fn login_fixture_token() -> String {
@@ -296,6 +302,7 @@ async fn auth_api_set_session_token_empty_is_validation_error_with_no_requests()
 
     let err = auth
         .set_session_token("")
+        .await
         .expect_err("an empty token must be rejected before any request");
     assert!(matches!(
         err,
@@ -317,7 +324,7 @@ async fn auth_api_set_session_token_installs_a_session_and_persists_it_to_the_st
     let auth = AuthApi::new(transport);
     assert!(!auth.is_authenticated());
 
-    auth.set_session_token("t")?;
+    auth.set_session_token("t").await?;
 
     assert!(auth.is_authenticated());
     let persisted = store.load()?;
@@ -328,7 +335,7 @@ async fn auth_api_set_session_token_installs_a_session_and_persists_it_to_the_st
 // ===================== AuthApi::clear_session_token / clear_auth_data: now identical =====================
 
 async fn assert_clear_scope_clears_everything(
-    clear: fn(&AuthApi) -> Result<(), Error>,
+    clear: impl AsyncFn(&AuthApi) -> Result<(), Error>,
 ) -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
@@ -340,7 +347,7 @@ async fn assert_clear_scope_clears_everything(
         .expect("a `MockServer`'s own URI is always a valid base URL");
     let auth = AuthApi::new(transport);
 
-    clear(&auth)?;
+    clear(&auth).await?;
 
     assert!(!auth.is_authenticated());
     assert!(auth.session().is_none());
@@ -482,5 +489,607 @@ async fn auth_api_logout_swallows_a_network_error_and_still_clears_session_and_s
     assert!(result);
     assert!(!auth.is_authenticated());
     assert!(store.load()?.token().expose_secret().is_empty());
+    Ok(())
+}
+
+// ===================== Session persistence: async setters and last-awaited-wins =====================
+
+/// Which store call a [`ProbeStore`] parks (on a blocking-pool thread) until [`ProbeStore::open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkOn {
+    Never,
+    AnySave,
+    SaveOf(&'static str),
+    AnyClear,
+}
+
+/// A [`CredentialStore`] test double over a [`MemoryStore`]: records every call and the thread it
+/// ran on, can be told to fail, and can park a chosen call until it is opened.
+///
+/// Integration-test binaries cannot share code except through `tests/common`, so
+/// `tests/client_core.rs` carries its own trimmed copy.
+#[derive(Debug)]
+struct ProbeStore {
+    inner: MemoryStore,
+    park_on: ParkOn,
+    gate_open: Mutex<bool>,
+    gate_changed: Condvar,
+    parked: AtomicBool,
+    failing: AtomicBool,
+    saves: Mutex<Vec<String>>,
+    clears: AtomicUsize,
+    threads: Mutex<Vec<ThreadId>>,
+}
+
+impl ProbeStore {
+    fn new(park_on: ParkOn) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryStore::new(),
+            park_on,
+            gate_open: Mutex::new(false),
+            gate_changed: Condvar::new(),
+            parked: AtomicBool::new(false),
+            failing: AtomicBool::new(false),
+            saves: Mutex::new(Vec::new()),
+            clears: AtomicUsize::new(0),
+            threads: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Makes every later `save`/`clear` return `Err` (after any parking) when `failing`.
+    fn set_failing(&self, failing: bool) {
+        self.failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// Seeds the record behind the double without recording a call.
+    fn seed(&self, token: &str) {
+        self.inner
+            .save(&Session::from_token(token))
+            .expect("seeding the in-memory record cannot fail");
+    }
+
+    /// Releases every parked call, and lets later ones through.
+    fn open(&self) {
+        *self.gate_open.lock().expect("gate lock") = true;
+        self.gate_changed.notify_all();
+    }
+
+    /// Waits (up to 5 s) until some call is parked inside the store.
+    async fn wait_parked(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !self.parked.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a store call should have reached the parking gate");
+    }
+
+    fn saved_tokens(&self) -> Vec<String> {
+        self.saves.lock().expect("saves lock").clone()
+    }
+
+    fn clear_count(&self) -> usize {
+        self.clears.load(Ordering::SeqCst)
+    }
+
+    fn call_threads(&self) -> Vec<ThreadId> {
+        self.threads.lock().expect("threads lock").clone()
+    }
+
+    /// The token currently held by the underlying record (empty string when cleared).
+    fn stored_token(&self) -> String {
+        self.inner
+            .load()
+            .expect("in-memory load cannot fail")
+            .token()
+            .expose_secret()
+            .to_owned()
+    }
+
+    fn park(&self) {
+        self.parked.store(true, Ordering::SeqCst);
+        let mut open = self.gate_open.lock().expect("gate lock");
+        while !*open {
+            open = self.gate_changed.wait(open).expect("gate wait");
+        }
+    }
+
+    fn failure(&self) -> Result<(), StorageError> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(StorageError::Backend {
+                backend: "probe".to_owned(),
+                message: "deliberate failure".to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CredentialStore for ProbeStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        let token = session.token().expose_secret().to_owned();
+        self.saves.lock().expect("saves lock").push(token.clone());
+        self.threads
+            .lock()
+            .expect("threads lock")
+            .push(std::thread::current().id());
+        let parks = match self.park_on {
+            ParkOn::AnySave => true,
+            ParkOn::SaveOf(only) => only == token,
+            ParkOn::Never | ParkOn::AnyClear => false,
+        };
+        if parks {
+            self.park();
+        }
+        self.failure()?;
+        self.inner.save(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        self.clears.fetch_add(1, Ordering::SeqCst);
+        self.threads
+            .lock()
+            .expect("threads lock")
+            .push(std::thread::current().id());
+        if self.park_on == ParkOn::AnyClear {
+            self.park();
+        }
+        self.failure()?;
+        self.inner.clear()
+    }
+}
+
+/// Ten 5 ms timer ticks under a 5 s cap. They can only complete if the runtime keeps polling
+/// other tasks, which a store call running inline on the runtime thread would prevent.
+async fn heartbeat() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the runtime keeps making progress while a store call is parked");
+}
+
+/// Polls (up to 5 s) until the in-memory session carries `token` (`None`: no session).
+async fn wait_for_session_token(auth: &AuthApi, token: Option<&str>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = auth
+                .session()
+                .map(|session| session.token().expose_secret().to_owned());
+            if current.as_deref() == token {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the in-memory session should reach the expected state");
+}
+
+fn auth_with_store(store: &Arc<ProbeStore>, policy: StorageFailures) -> Arc<AuthApi> {
+    let store: Arc<dyn CredentialStore> = Arc::clone(store) as Arc<dyn CredentialStore>;
+    let transport = Transport::builder()
+        .store(Some(store))
+        .storage_failures(policy)
+        .build()
+        .expect("a transport with defaults and a store builds");
+    Arc::new(AuthApi::new(transport))
+}
+
+fn refresh_rejected(code: &str) -> ResponseTemplate {
+    ResponseTemplate::new(401)
+        .set_body_string(format!(r#"{{"meta":{{"code":401,"error":"{code}"}}}}"#))
+}
+
+// ----- the setters persist through the store, off the test thread -----
+
+#[tokio::test]
+async fn async_setters_persist_through_the_store_on_a_blocking_thread() -> anyhow::Result<()> {
+    let probe = ProbeStore::new(ParkOn::Never);
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+
+    auth.set_session_token("first-token").await?;
+    assert_eq!(probe.saved_tokens(), ["first-token"]);
+    assert_eq!(probe.stored_token(), "first-token");
+    assert_eq!(probe.clear_count(), 0);
+
+    auth.clear_session_token().await?;
+    assert_eq!(probe.clear_count(), 1);
+    assert!(probe.stored_token().is_empty());
+
+    auth.set_session_token("second-token").await?;
+    auth.clear_auth_data().await?;
+    assert_eq!(probe.clear_count(), 2);
+    assert!(probe.stored_token().is_empty());
+    assert!(!auth.is_authenticated());
+
+    let test_thread = std::thread::current().id();
+    let threads = probe.call_threads();
+    assert_eq!(threads.len(), 4, "two saves and two clears");
+    assert!(
+        threads.iter().all(|thread| *thread != test_thread),
+        "every store call runs on a blocking-pool thread, never on the runtime thread"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_session_token_with_an_invalid_token_never_reaches_the_store() {
+    let probe = ProbeStore::new(ParkOn::Never);
+    let auth = auth_with_store(&probe, StorageFailures::Fatal);
+
+    for bad in ["", "tok\r\nX-Evil: 1"] {
+        let err = auth
+            .set_session_token(bad)
+            .await
+            .expect_err("an invalid token is rejected before anything changes");
+        assert!(matches!(err, Error::Validation { ref field, .. } if field == "token"));
+    }
+    assert!(probe.saved_tokens().is_empty());
+    assert_eq!(probe.clear_count(), 0);
+    assert!(!auth.is_authenticated());
+}
+
+#[tokio::test]
+async fn auth_api_set_session_token_store_write_does_not_block_the_runtime() -> anyhow::Result<()> {
+    let probe = ProbeStore::new(ParkOn::AnySave);
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+
+    let task = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.set_session_token("injected-token").await }
+    });
+    probe.wait_parked().await;
+
+    assert!(
+        auth.is_authenticated(),
+        "the in-memory session is installed before the store write finishes"
+    );
+    heartbeat().await;
+    assert!(
+        !task.is_finished(),
+        "the setter waits for the parked store write"
+    );
+    assert!(
+        probe.stored_token().is_empty(),
+        "nothing is persisted until released"
+    );
+
+    probe.open();
+    task.await??;
+    assert_eq!(probe.stored_token(), "injected-token");
+    assert_ne!(probe.call_threads()[0], std::thread::current().id());
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_api_clear_session_token_store_clear_does_not_block_the_runtime() -> anyhow::Result<()>
+{
+    let probe = ProbeStore::new(ParkOn::AnyClear);
+    probe.seed("stored-token");
+    let transport = Transport::builder()
+        .session(Some(Session::from_token("stored-token")))
+        .store(Some(Arc::clone(&probe) as Arc<dyn CredentialStore>))
+        .build()?;
+    let auth = Arc::new(AuthApi::new(transport));
+
+    let task = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.clear_session_token().await }
+    });
+    probe.wait_parked().await;
+
+    assert!(
+        !auth.is_authenticated(),
+        "the in-memory session is cleared before the store clear finishes"
+    );
+    heartbeat().await;
+    assert!(
+        !task.is_finished(),
+        "the call waits for the parked store clear"
+    );
+    assert_eq!(
+        probe.stored_token(),
+        "stored-token",
+        "still persisted until released"
+    );
+
+    probe.open();
+    task.await??;
+    assert!(probe.stored_token().is_empty());
+    assert_ne!(probe.call_threads()[0], std::thread::current().id());
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_api_logout_store_clear_does_not_block_the_runtime() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string(format!("Cookie=s%3D{TEST_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let probe = ProbeStore::new(ParkOn::AnyClear);
+    probe.seed(TEST_TOKEN);
+    let store: Arc<dyn CredentialStore> = Arc::clone(&probe) as Arc<dyn CredentialStore>;
+    let auth = Arc::new(AuthApi::new(mock.transport_with_store(TEST_TOKEN, store)));
+
+    let task = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.logout().await }
+    });
+    probe.wait_parked().await;
+
+    assert!(
+        !auth.is_authenticated(),
+        "logout clears the in-memory session before the store clear finishes"
+    );
+    heartbeat().await;
+    assert!(
+        !task.is_finished(),
+        "logout waits for the parked store clear"
+    );
+    assert_eq!(probe.stored_token(), TEST_TOKEN);
+
+    probe.open();
+    assert!(task.await??, "logout reports success");
+    assert!(probe.stored_token().is_empty());
+    assert_eq!(probe.clear_count(), 1);
+    assert_ne!(probe.call_threads()[0], std::thread::current().id());
+    Ok(())
+}
+
+// ----- terminal refresh: credential destruction goes through the same async path -----
+
+#[tokio::test]
+async fn refresh_session_terminal_clear_runs_off_the_runtime_thread() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(body_string("\"\""))
+        .respond_with(refresh_rejected("error.session.expired"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let probe = ProbeStore::new(ParkOn::AnyClear);
+    probe.seed(TEST_TOKEN);
+    let store: Arc<dyn CredentialStore> = Arc::clone(&probe) as Arc<dyn CredentialStore>;
+    let auth = Arc::new(AuthApi::new(mock.transport_with_store(TEST_TOKEN, store)));
+
+    let task = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.refresh_session().await }
+    });
+    probe.wait_parked().await;
+
+    assert!(
+        !auth.is_authenticated(),
+        "the terminal clear empties memory before the store clear finishes"
+    );
+    heartbeat().await;
+    assert!(
+        !task.is_finished(),
+        "the refresh waits for the parked store clear"
+    );
+
+    probe.open();
+    assert!(!task.await??, "a terminal refresh failure is Ok(false)");
+    assert!(probe.stored_token().is_empty());
+    assert_eq!(probe.clear_count(), 1);
+    assert_ne!(probe.call_threads()[0], std::thread::current().id());
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_session_terminal_clear_under_fatal_policy_returns_a_storage_error()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(refresh_rejected("error.session.revoked"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.seed(TEST_TOKEN);
+    probe.set_failing(true);
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .store(Some(Arc::clone(&probe) as Arc<dyn CredentialStore>))
+        .storage_failures(StorageFailures::Fatal)
+        .build()?;
+    let auth = AuthApi::new(transport);
+
+    let err = auth
+        .refresh_session()
+        .await
+        .expect_err("Fatal policy surfaces the failed credential destruction");
+    assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+    assert!(
+        !auth.is_authenticated(),
+        "the in-memory session is destroyed even though the store clear failed"
+    );
+    assert_eq!(probe.clear_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_terminal_refresh_failure_clears_the_store_and_surfaces_the_original_401()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(refresh_rejected("error.session.refresh"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(body_string("\"\""))
+        .respond_with(refresh_rejected("error.session.expired"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.seed(TEST_TOKEN);
+    let store: Arc<dyn CredentialStore> = Arc::clone(&probe) as Arc<dyn CredentialStore>;
+    let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, store));
+
+    let url = url::Url::parse(&format!("{}/2.2/account", mock.uri()))?;
+    let err = auth
+        .transport()
+        .request(reqwest::Method::GET, url, &[], RequestBody::None)
+        .await
+        .expect_err("the original 401 surfaces once the refresh fails terminally");
+    match err {
+        Error::Authentication { error_code, .. } => {
+            assert_eq!(error_code.as_deref(), Some("error.session.refresh"));
+        }
+        other => panic!("expected Error::Authentication, got {other:?}"),
+    }
+    assert!(!auth.is_authenticated());
+    assert!(probe.stored_token().is_empty());
+    assert_eq!(probe.clear_count(), 1);
+    assert_ne!(probe.call_threads()[0], std::thread::current().id());
+    Ok(())
+}
+
+// ----- last awaited wins (concurrent session changes) -----
+
+#[tokio::test]
+async fn concurrent_setters_leave_the_last_one_in_memory_and_in_the_store() -> anyhow::Result<()> {
+    // "zero" parks inside the store, holding the persistence gate, while "first" and then
+    // "second" are applied to memory; their persists queue behind it.
+    let probe = ProbeStore::new(ParkOn::SaveOf("zero"));
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+
+    let zero = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.set_session_token("zero").await }
+    });
+    probe.wait_parked().await;
+
+    let first = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.set_session_token("first").await }
+    });
+    wait_for_session_token(&auth, Some("first")).await;
+    let second = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.set_session_token("second").await }
+    });
+    wait_for_session_token(&auth, Some("second")).await;
+    heartbeat().await;
+
+    probe.open();
+    zero.await??;
+    first.await??;
+    second.await??;
+
+    let session = auth
+        .session()
+        .expect("the last setter's session is installed");
+    assert_eq!(session.token().expose_secret(), "second");
+    assert_eq!(probe.stored_token(), "second");
+    let mut saved = probe.saved_tokens();
+    saved.sort();
+    assert_eq!(
+        saved,
+        ["second", "zero"],
+        "the superseded \"first\" persist is skipped, not replayed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_clear_issued_after_a_save_is_never_overtaken_by_it() -> anyhow::Result<()> {
+    let probe = ProbeStore::new(ParkOn::SaveOf("doomed"));
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+
+    let save = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.set_session_token("doomed").await }
+    });
+    probe.wait_parked().await;
+
+    let clear = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.clear_session_token().await }
+    });
+    wait_for_session_token(&auth, None).await;
+
+    probe.open();
+    save.await??;
+    clear.await??;
+
+    assert!(!auth.is_authenticated());
+    assert!(
+        probe.stored_token().is_empty(),
+        "the save that started first must not resurrect the cleared session"
+    );
+    assert_eq!(probe.clear_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_save_issued_after_a_clear_is_never_overtaken_by_it() -> anyhow::Result<()> {
+    let probe = ProbeStore::new(ParkOn::AnyClear);
+    probe.seed("old-token");
+    let transport = Transport::builder()
+        .session(Some(Session::from_token("old-token")))
+        .store(Some(Arc::clone(&probe) as Arc<dyn CredentialStore>))
+        .build()?;
+    let auth = Arc::new(AuthApi::new(transport));
+
+    let clear = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.clear_auth_data().await }
+    });
+    probe.wait_parked().await;
+
+    let save = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.set_session_token("new-token").await }
+    });
+    wait_for_session_token(&auth, Some("new-token")).await;
+
+    probe.open();
+    clear.await??;
+    save.await??;
+
+    assert_eq!(
+        auth.session()
+            .expect("the later save is installed")
+            .token()
+            .expose_secret(),
+        "new-token"
+    );
+    assert_eq!(probe.stored_token(), "new-token");
     Ok(())
 }
