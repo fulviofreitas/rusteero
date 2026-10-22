@@ -188,7 +188,8 @@ impl AuthApi {
     /// (its messages are unchanged), the in-memory session is installed before the store is
     /// touched, and the store write runs on the runtime's blocking pool (see
     /// [`Transport::set_session_async`]). When calls overlap, the last one applied wins in memory
-    /// and in the store.
+    /// and in the store. [`AuthApi::credentials_persisted`] reports whether the store accepted
+    /// the write.
     ///
     /// # Errors
     ///
@@ -239,6 +240,21 @@ impl AuthApi {
     /// regardless (see [`Transport::set_session_async`]'s docs).
     pub async fn clear_auth_data(&self) -> Result<(), Error> {
         self.transport.set_session_async(None).await
+    }
+
+    /// Whether the most recent attempt to persist the session to the configured credential store
+    /// succeeded.
+    ///
+    /// Ported from the `credentials_persisted` property (`api/auth.py:126-142` at `v8.4.1`):
+    /// `true` until a save fails, and `true` again after a later successful save, a clear, or
+    /// when no store is configured. Under the default
+    /// [`crate::transport::StorageFailures::Warn`] policy a failed save is otherwise only a log
+    /// line, and [`AuthApi::set_session_token`] still returns `Ok(())` with a session that works
+    /// for this process but will not survive a restart; this is how a caller finds out. A thin
+    /// wrapper over [`Transport::credentials_persisted`].
+    #[must_use]
+    pub fn credentials_persisted(&self) -> bool {
+        self.transport.credentials_persisted()
     }
 }
 
@@ -585,6 +601,43 @@ mod tests {
             .expect("the default Warn policy swallows the panicked task and returns Ok");
 
         assert!(!auth.is_authenticated());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_save_reads_as_unpersisted_and_does_not_leak_its_payload() {
+        let store: Arc<dyn CredentialStore> = Arc::new(PanickingStore);
+        let transport = Transport::builder()
+            .store(Some(store))
+            .storage_failures(StorageFailures::Fatal)
+            .build()
+            .expect("builds with a panicking store");
+        let auth = AuthApi::new(transport);
+
+        let err = auth
+            .set_session_token("tok-123")
+            .await
+            .expect_err("Fatal policy surfaces the panicked task as an error");
+        assert!(matches!(err, Error::Storage(_)));
+        let rendered = format!("{err} {err:?}");
+        assert!(
+            !rendered.contains("leaked-secret"),
+            "payload leaked: {rendered}"
+        );
+
+        assert!(
+            auth.is_authenticated(),
+            "the session is installed in memory regardless"
+        );
+        assert!(
+            !auth.credentials_persisted(),
+            "a save that panicked did not persist"
+        );
+
+        // The gate the panicking store poisoned does not wedge later persists.
+        auth.clear_session_token()
+            .await
+            .expect_err("the clear panics too under Fatal");
+        assert!(auth.credentials_persisted(), "a clear resets the flag");
     }
 
     // ===================== logout: memory is cleared before the blocking hop =====================

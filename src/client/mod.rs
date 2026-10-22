@@ -349,7 +349,8 @@ impl Client {
     ///
     /// `async` since `eero-api` 8.1.10: the credential-store write runs on the runtime's blocking
     /// pool instead of the calling task's thread. The in-memory session changes first, the cache
-    /// is cleared once the store hop has completed.
+    /// is cleared once the store hop has completed, and [`Client::credentials_persisted`] reports
+    /// whether the store accepted the write.
     ///
     /// # Errors
     ///
@@ -384,6 +385,17 @@ impl Client {
         self.api.auth().clear_session_token().await?;
         self.clear_cache();
         Ok(())
+    }
+
+    /// Whether the most recent attempt to persist the session to the configured credential store
+    /// succeeded (`client.py:151-160` at `v8.4.1`, the `credentials_persisted` property).
+    ///
+    /// A pure delegation to [`EeroApi::credentials_persisted`]; see
+    /// [`crate::auth::AuthApi::credentials_persisted`] for the exact semantics. `true` for a
+    /// client with no credential store.
+    #[must_use]
+    pub fn credentials_persisted(&self) -> bool {
+        self.api.credentials_persisted()
     }
 
     // ============================= Cached getters (the eight) =============================

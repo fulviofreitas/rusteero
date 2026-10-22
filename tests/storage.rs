@@ -474,6 +474,7 @@ async fn transport_set_session_async_persists_the_new_session_and_clear() -> any
             .map(|s| s.token().expose_secret().to_owned()),
         Some("rotated-token".to_owned())
     );
+    assert!(transport.credentials_persisted());
 
     transport.set_session_async(None).await?;
     assert!(transport.session().is_none());
@@ -522,6 +523,7 @@ async fn transport_set_session_async_under_fatal_returns_the_error_after_changin
         transport.is_authenticated(),
         "memory changed before the store was called"
     );
+    assert!(!transport.credentials_persisted());
 }
 
 // ===================== Persistence ordering: store always matches memory =====================
@@ -663,5 +665,6 @@ fn concurrent_set_session_calls_leave_store_matching_memory() -> anyhow::Result<
         stored_token_of(&store),
         "after every call has returned, the stored record matches the in-memory session"
     );
+    assert!(transport.credentials_persisted());
     Ok(())
 }

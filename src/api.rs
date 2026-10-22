@@ -214,6 +214,17 @@ impl EeroApi {
         self.auth.is_authenticated()
     }
 
+    /// Whether the most recent attempt to persist the session to the configured credential store
+    /// succeeded (`api/__init__.py:158-161` at `v8.4.1`, the `credentials_persisted`
+    /// property: `return self.auth.credentials_persisted`).
+    ///
+    /// Delegates to [`EeroApi::auth`]'s own [`AuthApi::credentials_persisted`]; see that method
+    /// for the exact semantics.
+    #[must_use]
+    pub fn credentials_persisted(&self) -> bool {
+        self.auth.credentials_persisted()
+    }
+
     /// Logs out (`api/__init__.py:116-122`, `return await self.auth.logout()`).
     ///
     /// Delegates to [`EeroApi::auth`]'s own `logout`, which clears the session

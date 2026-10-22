@@ -34,6 +34,8 @@
 //! overtaken by a newer change before it reaches the store is skipped, so after any interleaving
 //! of concurrent changes the stored record matches the final in-memory session: the last change
 //! applied wins, as in `eero-api` 8.1.10 (`auth_storage.py:199-203`).
+//! [`Transport::credentials_persisted`] reports the outcome of the most recent persist that
+//! actually reached the store.
 //!
 //! # The refresh-retry divergence (task brief gotcha G1)
 //!
@@ -46,7 +48,8 @@
 //! the retry into another "Not authenticated" precondition failure rather than silently reusing a
 //! since-cleared token).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -225,6 +228,8 @@ struct Persistence {
     /// Serialises "is my stamp still the latest?" plus the store call, so persists reach the
     /// store one at a time and a skipped one can never overwrite a newer record.
     io: Mutex<()>,
+    /// The value behind [`Transport::credentials_persisted`].
+    last_ok: AtomicBool,
 }
 
 impl Persistence {
@@ -232,6 +237,7 @@ impl Persistence {
         Self {
             generation: AtomicU64::new(0),
             io: Mutex::new(()),
+            last_ok: AtomicBool::new(true),
         }
     }
 
@@ -253,9 +259,21 @@ impl Persistence {
             tracing::debug!("session persist skipped: a newer session change supersedes it");
             return Ok(());
         }
-        match session {
-            Some(session) => store.save(session),
-            None => store.clear(),
+        let Some(session) = session else {
+            // Reset before the store is called, so a failing clear still reads as persisted.
+            self.last_ok.store(true, Ordering::SeqCst);
+            return store.clear();
+        };
+        // A panicking store counts as a failed save before the panic carries on.
+        match std::panic::catch_unwind(AssertUnwindSafe(|| store.save(session))) {
+            Ok(result) => {
+                self.last_ok.store(result.is_ok(), Ordering::SeqCst);
+                result
+            }
+            Err(payload) => {
+                self.last_ok.store(false, Ordering::SeqCst);
+                std::panic::resume_unwind(payload)
+            }
         }
     }
 }
@@ -327,7 +345,8 @@ impl Transport {
     /// Returns [`Error::Validation`] if `session` is `Some` and its token is empty or contains a
     /// byte outside the printable-ASCII range (or a CR/LF) — the same shape check
     /// `AuthApi::set_session_token` applies, reproduced here since this is the one place every
-    /// session change ultimately funnels through.
+    /// session change ultimately funnels through. Nothing changes in that case, including
+    /// [`Transport::credentials_persisted`].
     ///
     /// Otherwise honours this transport's [`StorageFailures`] policy: under the default
     /// [`StorageFailures::Warn`], a configured credential store failing to persist the change is
@@ -392,6 +411,25 @@ impl Transport {
             None => storage::clear_async(ticketed).await,
         };
         self.apply_storage_policy(outcome)
+    }
+
+    /// Whether the most recent attempt to persist a session change to the configured credential
+    /// store succeeded.
+    ///
+    /// `true` initially, and always `true` when no store is configured. Each persist that reaches
+    /// the store sets it from its outcome: a save sets it to whether the store accepted the
+    /// session, so an `Err` from the store makes it `false` even under [`StorageFailures::Warn`],
+    /// where the failure is otherwise only a log line. A clear resets it to `true` before the
+    /// store is called, so it is `true` after a clear even if that clear failed (the credential
+    /// being destroyed is no longer one that needs to survive a restart). A persist skipped
+    /// because a newer session change overtook it leaves the value untouched, as does a rejected
+    /// (invalid) session.
+    ///
+    /// The flag only says that the process-exit survival of the *current* session is at risk; it
+    /// never affects whether the session works in memory.
+    #[must_use]
+    pub fn credentials_persisted(&self) -> bool {
+        self.persistence.last_ok.load(Ordering::SeqCst)
     }
 
     /// Applies this transport's [`StorageFailures`] policy to the outcome of one persist.

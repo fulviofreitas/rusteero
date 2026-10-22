@@ -897,6 +897,43 @@ async fn client_set_session_token_failing_under_fatal_leaves_the_cache_alone() -
 }
 
 #[tokio::test]
+async fn client_credentials_persisted_delegates_through_the_facades() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store = GateStore::new(false, true);
+    let client = client_with_store(&mock, &store, StorageFailures::Warn).await;
+
+    assert!(client.credentials_persisted());
+    assert!(client.api().credentials_persisted());
+    assert!(client.api().auth().credentials_persisted());
+
+    client.set_session_token("replacement-token").await?;
+    assert!(
+        client.is_authenticated(),
+        "Warn keeps the session usable in memory"
+    );
+    assert!(!client.credentials_persisted());
+    assert!(!client.api().credentials_persisted());
+    assert!(!client.api().auth().credentials_persisted());
+
+    client.clear_session_token().await?;
+    assert!(client.credentials_persisted());
+    assert!(client.api().credentials_persisted());
+    assert!(client.api().auth().credentials_persisted());
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_without_a_store_reports_credentials_persisted() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+
+    assert!(client.credentials_persisted());
+    client.set_session_token("replacement-token").await?;
+    assert!(client.credentials_persisted());
+    Ok(())
+}
+
+#[tokio::test]
 async fn client_build_initial_store_load_does_not_block_the_runtime() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let store = GateStore::parking_loads(TEST_TOKEN);
@@ -929,6 +966,10 @@ async fn client_build_initial_store_load_does_not_block_the_runtime() -> anyhow:
             .token()
             .expose_secret(),
         TEST_TOKEN
+    );
+    assert!(
+        client.credentials_persisted(),
+        "a freshly loaded record reads as persisted"
     );
     let load_threads = store
         .load_threads

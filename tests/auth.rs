@@ -19,6 +19,7 @@ use common::{
     MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header,
     user_token_header_for,
 };
+use rusteero::api::EeroApi;
 use rusteero::auth::flow::PendingLogin;
 use rusteero::auth::{AuthApi, Session};
 use rusteero::error::{Error, StorageError};
@@ -492,7 +493,7 @@ async fn auth_api_logout_swallows_a_network_error_and_still_clears_session_and_s
     Ok(())
 }
 
-// ===================== Session persistence: async setters and last-awaited-wins =====================
+// ===================== Session persistence: async setters, last-awaited-wins, credentials_persisted =====================
 
 /// Which store call a [`ProbeStore`] parks (on a blocking-pool thread) until [`ProbeStore::open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1091,5 +1092,152 @@ async fn a_save_issued_after_a_clear_is_never_overtaken_by_it() -> anyhow::Resul
         "new-token"
     );
     assert_eq!(probe.stored_token(), "new-token");
+    Ok(())
+}
+
+// ----- credentials_persisted -----
+
+#[tokio::test]
+async fn credentials_persisted_defaults_to_true_with_and_without_a_store() {
+    let mock = MockEero::start().await;
+    let anonymous = AuthApi::new(mock.transport_anonymous());
+    assert!(anonymous.credentials_persisted());
+    assert!(anonymous.transport().credentials_persisted());
+
+    let probe = ProbeStore::new(ParkOn::Never);
+    let stored = auth_with_store(&probe, StorageFailures::Warn);
+    assert!(stored.credentials_persisted());
+
+    let api = EeroApi::new(mock.transport_anonymous());
+    assert!(api.credentials_persisted());
+}
+
+#[tokio::test]
+async fn without_a_store_every_session_change_reads_as_persisted() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let auth = AuthApi::new(mock.transport_anonymous());
+
+    auth.set_session_token("memory-only").await?;
+    assert!(auth.is_authenticated());
+    assert!(auth.credentials_persisted());
+    auth.clear_session_token().await?;
+    assert!(auth.credentials_persisted());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_memory_store_reads_as_persisted() -> anyhow::Result<()> {
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    let transport = Transport::builder().store(Some(store)).build()?;
+    let auth = AuthApi::new(transport);
+
+    auth.set_session_token("kept").await?;
+    assert!(auth.credentials_persisted());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_session_token_under_warn_reports_a_failed_save() -> anyhow::Result<()> {
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.set_failing(true);
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+
+    auth.set_session_token("injected_token").await?;
+    assert!(auth.is_authenticated(), "the session works in memory");
+    assert!(
+        !auth.credentials_persisted(),
+        "but it will not survive a restart"
+    );
+
+    // A later success flips it back.
+    probe.set_failing(false);
+    auth.set_session_token("injected_token_2").await?;
+    assert!(auth.credentials_persisted());
+    assert_eq!(probe.stored_token(), "injected_token_2");
+
+    // Fail again, then destroy the credential: the clear resets the flag even when it fails.
+    probe.set_failing(true);
+    auth.set_session_token("injected_token_3").await?;
+    assert!(!auth.credentials_persisted());
+    auth.clear_session_token().await?;
+    assert!(auth.credentials_persisted());
+    assert!(!auth.is_authenticated());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_session_token_under_fatal_returns_the_error_after_installing_the_session() {
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.set_failing(true);
+    let auth = auth_with_store(&probe, StorageFailures::Fatal);
+
+    let err = auth
+        .set_session_token("injected_token")
+        .await
+        .expect_err("Fatal policy surfaces the failed save");
+    assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+    assert_eq!(
+        auth.session()
+            .expect("installed before persisting")
+            .token()
+            .expose_secret(),
+        "injected_token"
+    );
+    assert!(!auth.credentials_persisted());
+}
+
+#[tokio::test]
+async fn a_rejected_token_leaves_credentials_persisted_unchanged() {
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.set_failing(true);
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+    auth.set_session_token("injected_token")
+        .await
+        .expect("Warn swallows the store failure");
+    assert!(!auth.credentials_persisted());
+
+    auth.set_session_token("")
+        .await
+        .expect_err("an empty token is rejected");
+    assert!(
+        !auth.credentials_persisted(),
+        "the rejection changes nothing"
+    );
+    assert_eq!(
+        probe.saved_tokens(),
+        ["injected_token"],
+        "and never reaches the store"
+    );
+    assert_eq!(
+        auth.session()
+            .expect("the earlier session is untouched")
+            .token()
+            .expose_secret(),
+        "injected_token"
+    );
+}
+
+#[tokio::test]
+async fn logout_resets_credentials_persisted_even_when_the_store_clear_fails() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.set_failing(true);
+    let store: Arc<dyn CredentialStore> = Arc::clone(&probe) as Arc<dyn CredentialStore>;
+    let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, store));
+    auth.set_session_token(TEST_TOKEN).await?;
+    assert!(!auth.credentials_persisted());
+
+    assert!(auth.logout().await?);
+    assert!(auth.credentials_persisted());
     Ok(())
 }
