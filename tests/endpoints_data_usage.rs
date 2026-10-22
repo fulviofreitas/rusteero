@@ -902,35 +902,22 @@ async fn assert_every_method_resolves_under(published_url: &str, base: &str) -> 
 #[case::account("/2.2/account", "/2.2/account")]
 #[case::another_family("/2.3/networks/other/eeros", "/2.3/networks/other/eeros")]
 #[case::unknown_shape("/2.4/some/other/shape", "/2.4/some/other/shape")]
-#[case::trailing_slash("/2.4/some/other/shape/", "/2.4/some/other/shape")]
 #[tokio::test]
 async fn every_method_resolves_a_non_network_shaped_published_url_verbatim(
     #[case] published_url: &str,
     #[case] base: &str,
 ) -> anyhow::Result<()> {
-    let mock = MockEero::start().await;
-    let ok = json!({"meta": {"code": 200}, "data": {}});
-    for (verb, suffix) in PUBLISHED_URL_SUFFIXES {
-        Mock::given(method(verb))
-            .and(path(format!("{base}{suffix}")))
-            .and(session_cookie())
-            .and(user_token_header())
-            .respond_with(ResponseTemplate::new(200).set_body_json(ok.clone()))
-            .expect(1)
-            .mount(&mock.server)
-            .await;
-    }
-    // Nothing may fall back to the template built from the caller's `network_id`.
-    Mock::given(path_regex("^/2\\.2/networks/network-0001/"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&mock.server)
-        .await;
+    assert_every_method_resolves_under(published_url, base).await
+}
 
-    let api = data_usage_api(&mock);
-    let parent = json!({"url": published_url});
-    call_every_method_with_parent(&api, &parent).await?;
-    Ok(())
+/// Deliberate divergence from Python: `data_usage.py:157` joins `f"{base_url}/data_usage"` onto
+/// the published url exactly as `self_url` returned it, and `self_url` keeps a trailing slash, so
+/// `/2.4/some/other/shape/` yields `/2.4/some/other/shape//data_usage` there. This crate drops the
+/// trailing slash before joining the suffix, so no request ever carries a doubled slash.
+#[tokio::test]
+async fn every_method_drops_a_trailing_slash_from_a_published_url_before_the_suffix()
+-> anyhow::Result<()> {
+    assert_every_method_resolves_under("/2.4/some/other/shape/", "/2.4/some/other/shape").await
 }
 
 /// The query string and the JSON body are exactly what they are for a network-shaped parent.

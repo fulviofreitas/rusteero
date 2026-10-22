@@ -802,6 +802,30 @@ async fn set_network_ad_block_uses_a_non_network_shaped_parent_url_verbatim() ->
     )
     .await;
 
+    let parent = json!({"data": {"url": "/2.4/some/other/shape"}, "meta": {"code": 200}});
+    let api = dns_policies_api(&mock);
+    api.set_network_ad_block("network-0001", false, None, Some(&parent))
+        .await?;
+    Ok(())
+}
+
+/// Deliberate divergence from Python: `dns_policies.py:647` joins `f"{base_url}/dns_policies/..."`
+/// onto the published url exactly as `self_url` returned it, and `self_url` keeps a trailing
+/// slash, so `/2.4/some/other/shape/` yields `/2.4/some/other/shape//dns_policies/adblock` there.
+/// This crate drops the trailing slash before joining the suffix, so the request never carries a
+/// doubled slash.
+#[tokio::test]
+async fn set_network_ad_block_drops_a_trailing_slash_from_the_parent_url_before_the_suffix()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_switch_post(
+        &mock,
+        "/2.4/some/other/shape/dns_policies/adblock",
+        json!({ "enable": false }),
+        1,
+    )
+    .await;
+
     let parent = json!({"data": {"url": "/2.4/some/other/shape/"}, "meta": {"code": 200}});
     let api = dns_policies_api(&mock);
     api.set_network_ad_block("network-0001", false, None, Some(&parent))
