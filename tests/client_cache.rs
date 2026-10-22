@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -25,8 +25,15 @@ use rusteero::error::Error;
 
 const NETWORK: &str = "network-0001";
 
-/// How long the held-open read waits before its response is released.
+/// How long the held-open read waits before its response is released when the invalidating call
+/// sends nothing (`clear_cache`, `set_session_token`).
 const HOLD: Duration = Duration::from_millis(300);
+
+/// As [`HOLD`], for an invalidating call that makes its own request. That request needs a loopback
+/// round trip of its own while the read is held, and on a starved runner it can take longer than
+/// 300 ms; the test also checks that the call finished first (see
+/// [`assert_inflight_read_is_not_cached_when`]).
+const NETWORK_HOLD: Duration = Duration::from_millis(1500);
 
 async fn client(mock: &MockEero) -> Client {
     Client::builder()
@@ -106,12 +113,12 @@ impl Read {
         }
     }
 
-    /// Mounts one answer carrying `marker` for this read, optionally held open for `HOLD`.
+    /// Mounts one answer carrying `marker` for this read, optionally held open for `hold`.
     /// Mounts are consumed in order: each one answers a single request, except `unbounded`.
-    async fn mount(self, mock: &MockEero, marker: &str, hold: bool, unbounded: bool) {
+    async fn mount(self, mock: &MockEero, marker: &str, hold: Option<Duration>, unbounded: bool) {
         let mut response = ResponseTemplate::new(200).set_body_json(self.body(marker));
-        if hold {
-            response = response.set_delay(HOLD);
+        if let Some(hold) = hold {
+            response = response.set_delay(hold);
         }
         let mut mock_builder = Mock::given(method("GET"))
             .and(path(self.path()))
@@ -177,6 +184,8 @@ impl Write {
         if let Some((verb, endpoint)) = self.endpoint() {
             Mock::given(method(verb))
                 .and(path(endpoint))
+                .and(user_token_header())
+                .and(session_cookie())
                 .respond_with(ResponseTemplate::new(200).set_body_json(ok()))
                 .expect(1)
                 .mount(&mock.server)
@@ -243,6 +252,15 @@ impl Write {
     fn drops_the_session(self) -> bool {
         matches!(self, Self::Logout)
     }
+
+    /// How long a read has to be held open for this write to overtake it.
+    fn hold(self) -> Duration {
+        if self.endpoint().is_some() {
+            NETWORK_HOLD
+        } else {
+            HOLD
+        }
+    }
 }
 
 /// Polls until `count` `GET`s to `target` have reached the server.
@@ -282,10 +300,10 @@ async fn assert_inflight_read_is_not_cached_when(read: Read, write: Write, cache
         let client = client(&mock).await;
 
         if cached_before {
-            read.mount(&mock, "old", false, false).await;
+            read.mount(&mock, "old", None, false).await;
         }
-        read.mount(&mock, "stale", true, false).await;
-        read.mount(&mock, "fresh", false, true).await;
+        read.mount(&mock, "stale", Some(write.hold()), false).await;
+        read.mount(&mock, "fresh", None, true).await;
         write.mount(&mock).await;
 
         if cached_before {
@@ -294,13 +312,26 @@ async fn assert_inflight_read_is_not_cached_when(read: Read, write: Write, cache
         }
 
         // Without a cached entry a plain read goes to the network; with one it must be forced.
-        let in_flight = read.run(&client, cached_before);
+        let in_flight = async {
+            let answer = read.run(&client, cached_before).await;
+            (answer, Instant::now())
+        };
         let invalidate = async {
             wait_for_gets(&mock, &read.path(), if cached_before { 2 } else { 1 }).await;
-            write.run(&client).await
+            let outcome = write.run(&client).await;
+            (outcome, Instant::now())
         };
-        let (stale, written) = tokio::join!(in_flight, invalidate);
+        let ((stale, read_returned), (written, write_returned)) =
+            tokio::join!(in_flight, invalidate);
 
+        // If the write only finished after the held read had returned, it did not overtake it,
+        // and the assertions below would pass without testing the generation guard at all.
+        assert!(
+            write_returned <= read_returned,
+            "{label}: the invalidating call finished {:?} after the held read returned, so it \
+             did not overtake it",
+            write_returned.duration_since(read_returned)
+        );
         written.unwrap_or_else(|err| panic!("{label}: the invalidating call failed: {err:?}"));
         let stale = stale.unwrap_or_else(|err| panic!("{label}: the held read failed: {err:?}"));
         assert_eq!(
@@ -432,10 +463,10 @@ async fn a_read_in_flight_across_clear_auth_data_is_not_cached() -> anyhow::Resu
         let mock = MockEero::start().await;
         let client = client(&mock).await;
         if cached_before {
-            Read::Devices.mount(&mock, "old", false, false).await;
+            Read::Devices.mount(&mock, "old", None, false).await;
         }
-        Read::Devices.mount(&mock, "stale", true, false).await;
-        Read::Devices.mount(&mock, "fresh", false, true).await;
+        Read::Devices.mount(&mock, "stale", Some(HOLD), false).await;
+        Read::Devices.mount(&mock, "fresh", None, true).await;
 
         if cached_before {
             Read::Devices.run(&client, false).await?;
@@ -844,6 +875,8 @@ async fn every_device_write_drops_the_entry_read_under_another_spelling() -> any
         let (verb, target) = write.endpoint();
         Mock::given(method(verb))
             .and(path(target))
+            .and(user_token_header())
+            .and(session_cookie())
             .respond_with(ResponseTemplate::new(200).set_body_json(ok()))
             .expect(1)
             .mount(&mock.server)
@@ -884,6 +917,8 @@ async fn a_device_write_leaves_other_devices_cached() -> anyhow::Result<()> {
     .await;
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_json(ok()))
         .expect(1)
         .mount(&mock.server)
@@ -998,6 +1033,8 @@ async fn read_for_set_profile_devices(client: &Client) {
 async fn mount_profile_put(mock: &MockEero, status: u16) {
     Mock::given(method("PUT"))
         .and(path(PROFILE_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
         .respond_with(ResponseTemplate::new(status).set_body_json(ok()))
         .expect(1)
         .mount(&mock.server)
