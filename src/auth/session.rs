@@ -440,6 +440,16 @@ mod tests {
     }
 
     #[test]
+    fn debug_has_the_exact_redacted_shape() {
+        // `repr(AuthCredentials(session_id=...)) == "AuthCredentials()"` in Python
+        // (`auth_storage.py:42-53`): the token never shows in `repr`, `str`, an f-string or a
+        // traceback. Pinned exactly so a new field cannot start printing it.
+        let session = Session::from_token("s_CANARY-repr-7e1");
+        assert_eq!(format!("{session:?}"), "Session { token: \"[REDACTED]\" }");
+        assert!(!format!("{session:#?}").contains("CANARY"));
+    }
+
+    #[test]
     fn display_never_prints_the_token() {
         let session = Session::from_token("super-secret-token");
         let display = format!("{session}");

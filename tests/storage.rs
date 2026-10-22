@@ -187,6 +187,10 @@ fn chained_store_load_falls_back_and_migrates_into_a_real_primary_file() -> anyh
     assert!(primary_path.exists());
     let migrated = primary_file.load()?;
     assert_eq!(migrated.token().expose_secret(), "fallback-token");
+    assert!(
+        !fallback_path.exists(),
+        "a verified promotion retires the fallback copy"
+    );
     Ok(())
 }
 
@@ -666,5 +670,251 @@ fn concurrent_set_session_calls_leave_store_matching_memory() -> anyhow::Result<
         "after every call has returned, the stored record matches the in-memory session"
     );
     assert!(transport.credentials_persisted());
+    Ok(())
+}
+
+// ===================== ChainedStore: verified saves and fallback ownership, on real files =====================
+
+/// Accepts every write and retains nothing, like a keyring backend that silently drops writes.
+#[derive(Debug, Default)]
+struct NullStore;
+
+impl CredentialStore for NullStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        Ok(Session::empty())
+    }
+
+    fn save(&self, _session: &Session) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_primary_that_drops_writes_leaves_the_record_in_the_file_fallback() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cookies.json");
+    let chained = ChainedStore::new(
+        Arc::new(NullStore) as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(&path)) as Arc<dyn CredentialStore>,
+    );
+
+    chained.save(&Session::from_token("fresh_token"))?;
+
+    let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(on_disk["session_id"], "fresh_token");
+    assert_eq!(chained.load()?.token().expose_secret(), "fresh_token");
+    Ok(())
+}
+
+#[test]
+fn a_chain_where_nothing_retains_the_record_reports_it() {
+    let chained = ChainedStore::new(
+        Arc::new(NullStore) as Arc<dyn CredentialStore>,
+        Arc::new(NullStore) as Arc<dyn CredentialStore>,
+    );
+
+    let err = chained
+        .save(&Session::from_token("live_token"))
+        .expect_err("no backend holds the record");
+
+    assert!(
+        matches!(&err, StorageError::NotRetained { backend } if backend == "chained"),
+        "got {err:?}"
+    );
+    assert!(!err.to_string().contains("live_token"));
+}
+
+/// A [`MemoryStore`] whose saves can be switched off, standing in for a keyring that is down.
+#[derive(Debug, Default)]
+struct TogglePrimary {
+    inner: MemoryStore,
+    fail_saves: AtomicBool,
+}
+
+impl CredentialStore for TogglePrimary {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        if self.fail_saves.load(Ordering::SeqCst) {
+            return Err(StorageError::Backend {
+                backend: "toggle".to_owned(),
+                message: "the keyring is down".to_owned(),
+            });
+        }
+        self.inner.save(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        self.inner.clear()
+    }
+}
+
+#[test]
+fn fallback_this_instance_wrote_is_retired_after_the_primary_recovers() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fallback_path = dir.path().join("cookies.json");
+    let primary = Arc::new(TogglePrimary::default());
+    primary.fail_saves.store(true, Ordering::SeqCst);
+    let chained = ChainedStore::new(
+        Arc::clone(&primary) as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(&fallback_path)) as Arc<dyn CredentialStore>,
+    );
+
+    chained.save(&Session::from_token("first_token"))?;
+    assert!(fallback_path.exists(), "the file fallback took the record");
+
+    primary.fail_saves.store(false, Ordering::SeqCst);
+    chained.save(&Session::from_token("second_token"))?;
+    assert!(
+        !fallback_path.exists(),
+        "the record this instance wrote to the fallback is retired once the primary holds the new one"
+    );
+
+    // With the fallback gone, wiping the primary cannot resurrect the old session.
+    primary.clear()?;
+    assert!(!chained.load()?.is_valid());
+    Ok(())
+}
+
+#[test]
+fn a_session_another_process_left_in_the_cookie_file_is_not_deleted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fallback_path = dir.path().join("cookies.json");
+    let other_process = FileStore::new(&fallback_path);
+    other_process.save(&Session::from_token("other_process_token"))?;
+    let chained = ChainedStore::new(
+        Arc::new(MemoryStore::new()) as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(&fallback_path)) as Arc<dyn CredentialStore>,
+    );
+
+    chained.save(&Session::from_token("my_token"))?;
+
+    assert_eq!(
+        other_process.load()?.token().expose_secret(),
+        "other_process_token",
+        "a record this instance never loaded or wrote is not its to delete"
+    );
+    Ok(())
+}
+
+// ===================== FileStore: one instance serialises its operations =====================
+
+fn leftover_temp_files(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect()
+}
+
+#[test]
+fn filestore_concurrent_save_and_clear_never_fail_or_leave_temp_files() -> anyhow::Result<()> {
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 25;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cookies.json");
+    let store = Arc::new(FileStore::new(&path));
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let store = &store;
+            scope.spawn(move || {
+                for iteration in 0..ITERATIONS {
+                    if (thread + iteration) % 2 == 0 {
+                        store
+                            .save(&Session::from_token(format!("t{thread}-i{iteration}")))
+                            .expect("a save never fails because of a concurrent clear");
+                    } else {
+                        store.clear().expect("a clear never fails");
+                    }
+                }
+            });
+        }
+    });
+
+    assert_eq!(leftover_temp_files(dir.path()), Vec::<String>::new());
+    let names: Vec<String> = std::fs::read_dir(dir.path())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    if !names.is_empty() {
+        assert_eq!(names, ["cookies.json"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let token = store.load()?.token().expose_secret().to_owned();
+        let written: std::collections::HashSet<String> = (0..THREADS)
+            .flat_map(|thread| {
+                (0..ITERATIONS)
+                    .filter(move |iteration| (thread + iteration) % 2 == 0)
+                    .map(move |iteration| format!("t{thread}-i{iteration}"))
+            })
+            .collect();
+        assert!(
+            written.contains(&token),
+            "the file holds a record some save wrote"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_chain_over_two_file_stores_leaves_no_temp_files_under_concurrent_use() -> anyhow::Result<()> {
+    const THREADS: usize = 6;
+    const ITERATIONS: usize = 15;
+
+    let primary_dir = tempfile::tempdir()?;
+    let fallback_dir = tempfile::tempdir()?;
+    let chained = Arc::new(ChainedStore::new(
+        Arc::new(FileStore::new(primary_dir.path().join("cookies.json")))
+            as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(fallback_dir.path().join("cookies.json")))
+            as Arc<dyn CredentialStore>,
+    ));
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let chained = &chained;
+            scope.spawn(move || {
+                for iteration in 0..ITERATIONS {
+                    // The chain is not atomic across its two backends, so a save racing a clear
+                    // may legitimately report that the record was not retained; only the
+                    // absence of leftovers is pinned here.
+                    match (thread + iteration) % 3 {
+                        0 => {
+                            let _ = chained
+                                .save(&Session::from_token(format!("t{thread}-i{iteration}")));
+                        }
+                        1 => {
+                            let _ = chained.clear();
+                        }
+                        _ => {
+                            let _ = chained.load();
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        leftover_temp_files(primary_dir.path()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        leftover_temp_files(fallback_dir.path()),
+        Vec::<String>::new()
+    );
     Ok(())
 }

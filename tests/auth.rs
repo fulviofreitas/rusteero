@@ -10,20 +10,22 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::Duration;
 
+use rstest::rstest;
 use secrecy::ExposeSecret;
 use serde_json::json;
+use tracing::Level;
 use wiremock::matchers::{body_json, body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{
-    MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header,
+    MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie, user_token_header,
     user_token_header_for,
 };
 use rusteero::api::EeroApi;
-use rusteero::auth::flow::PendingLogin;
+use rusteero::auth::flow::{LoginFlow, PendingLogin};
 use rusteero::auth::{AuthApi, Session};
 use rusteero::error::{Error, StorageError};
-use rusteero::storage::{CredentialStore, MemoryStore};
+use rusteero::storage::{ChainedStore, CredentialStore, FileStore, MemoryStore};
 use rusteero::transport::{RequestBody, StorageFailures, Transport};
 
 /// The `data.user_token` value baked into `fixtures/login.json`.
@@ -906,6 +908,7 @@ async fn refresh_session_terminal_clear_under_fatal_policy_returns_a_storage_err
         .and(path("/2.2/login/refresh"))
         .and(user_token_header())
         .and(session_cookie())
+        .and(body_string("\"\""))
         .respond_with(refresh_rejected("error.session.revoked"))
         .expect(1)
         .mount(&mock.server)
@@ -1239,5 +1242,966 @@ async fn logout_resets_credentials_persisted_even_when_the_store_clear_fails() -
 
     assert!(auth.logout().await?);
     assert!(auth.credentials_persisted());
+    Ok(())
+}
+
+// ===================== Login handshake: the stored session is only replaced by a verified one =====================
+
+/// A temp dir whose `cookies.json` holds a saved session, plus its exact bytes.
+struct StoredSession {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    store: Arc<FileStore>,
+    before: Vec<u8>,
+}
+
+impl StoredSession {
+    const TOKEN: &'static str = "stored-token";
+
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        let store = Arc::new(FileStore::new(&path));
+        store
+            .save(&Session::from_token(Self::TOKEN))
+            .expect("seeding the file store succeeds");
+        let before = std::fs::read(&path).expect("the seeded file exists");
+        Self {
+            _dir: dir,
+            path,
+            store,
+            before,
+        }
+    }
+
+    /// A fresh `LoginFlow` whose transport carries this stored session and store.
+    fn login_flow(&self, mock: &MockEero) -> LoginFlow {
+        LoginFlow::with_transport(
+            mock.transport_with_store(Self::TOKEN, Arc::clone(&self.store) as _),
+        )
+    }
+
+    /// Asserts the file is byte-identical and a second store instance still loads the token.
+    fn assert_untouched(&self) {
+        assert_eq!(
+            std::fs::read(&self.path).expect("the file still exists"),
+            self.before,
+            "the stored credential file is byte-identical"
+        );
+        let reloaded = FileStore::new(&self.path).load().expect("load succeeds");
+        assert_eq!(reloaded.token().expose_secret(), Self::TOKEN);
+    }
+}
+
+#[tokio::test]
+async fn login_flow_start_never_touches_a_configured_store() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("login=you%40example.com"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("login.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let stored = StoredSession::new();
+
+    let _pending = stored.login_flow(&mock).start("you@example.com").await?;
+
+    stored.assert_untouched();
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("recording is on");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].headers.get("x-user-token").is_none(),
+        "the login request is unauthenticated even though the transport holds a session"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rejected_login_leaves_the_store_byte_identical() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                r#"{"meta":{"code":400,"error":"error.form.invalid.identifier"}}"#,
+            ),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let stored = StoredSession::new();
+
+    let err = stored
+        .login_flow(&mock)
+        .start("nobody")
+        .await
+        .expect_err("the identifier is rejected");
+
+    assert!(
+        matches!(&err, Error::Authentication { message, .. } if message.starts_with("Login failed: ")),
+        "got {err:?}"
+    );
+    stored.assert_untouched();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_login_over_a_dead_connection_leaves_the_store_byte_identical() -> anyhow::Result<()> {
+    let stored = StoredSession::new();
+    let transport = Transport::builder()
+        // No listener at all on this port.
+        .base_url("http://127.0.0.1:1")
+        .session(Some(Session::from_token(StoredSession::TOKEN)))
+        .store(Some(Arc::clone(&stored.store) as Arc<dyn CredentialStore>))
+        .build()?;
+
+    let err = LoginFlow::with_transport(transport)
+        .start("you@example.com")
+        .await
+        .expect_err("nothing is listening");
+
+    assert!(matches!(err, Error::Network(_)), "got {err:?}");
+    stored.assert_untouched();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_tokenless_login_leaves_the_store_byte_identical() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(json!({ "meta": { "code": 200 }, "data": {} }).to_string()),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let stored = StoredSession::new();
+
+    let err = stored
+        .login_flow(&mock)
+        .start("you@example.com")
+        .await
+        .expect_err("no user token came back");
+
+    assert!(
+        matches!(&err, Error::Authentication { message, .. } if message == "Login failed: No user token received"),
+        "got {err:?}"
+    );
+    stored.assert_untouched();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_login_leaves_the_store_byte_identical() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture("login.json"))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&mock.server)
+        .await;
+    let stored = StoredSession::new();
+
+    let flow = stored.login_flow(&mock);
+    let outcome =
+        tokio::time::timeout(Duration::from_millis(50), flow.start("you@example.com")).await;
+
+    assert!(outcome.is_err(), "the login was cancelled while in flight");
+    stored.assert_untouched();
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_a_successful_verify_can_replace_the_stored_session() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("login.json")))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/verify"))
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string("code=000000"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(r#"{"meta":{"code":401,"error":"error.verification.invalid"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/verify"))
+        .and(body_string("code=123456"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("verify.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let stored = StoredSession::new();
+
+    // A wrong code: the verification fails and the store is exactly as it was.
+    let first = stored.login_flow(&mock).start("you@example.com").await?;
+    let err = first
+        .verify("000000")
+        .await
+        .expect_err("a wrong code is rejected");
+    assert!(matches!(err, Error::Authentication { .. }), "got {err:?}");
+    stored.assert_untouched();
+
+    // A right code yields the verified session; installing it is what replaces the stored one.
+    let second = stored.login_flow(&mock).start("you@example.com").await?;
+    let session = second.verify("123456").await?;
+    stored.assert_untouched();
+    let auth = AuthApi::new(
+        mock.transport_with_store(StoredSession::TOKEN, Arc::clone(&stored.store) as _),
+    );
+    auth.transport().set_session_async(Some(session)).await?;
+    assert_eq!(
+        FileStore::new(&stored.path).load()?.token().expose_secret(),
+        login_fixture_token()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_login_never_becomes_the_active_session() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    store.save(&Session::from_token(TEST_TOKEN))?;
+    let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, Arc::clone(&store)));
+
+    let (_pending, login_token) = start_pending_login(&mock).await?;
+
+    assert_ne!(login_token, TEST_TOKEN);
+    assert!(auth.is_authenticated());
+    assert_eq!(
+        auth.session()
+            .expect("the installed session")
+            .token()
+            .expose_secret(),
+        TEST_TOKEN,
+        "the unverified login token is never the in-memory session"
+    );
+    assert_eq!(store.load()?.token().expose_secret(), TEST_TOKEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_login_on_another_transport_leaves_credentials_persisted_alone() -> anyhow::Result<()> {
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.set_failing(true);
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+    auth.set_session_token("injected_token").await?;
+    assert!(!auth.credentials_persisted());
+
+    let mock = MockEero::start().await;
+    let _ = start_pending_login(&mock).await?;
+
+    assert!(
+        !auth.credentials_persisted(),
+        "the flag keeps describing the last session that was actually saved"
+    );
+    Ok(())
+}
+
+// ===================== Errors the login flow re-wraps carry no status; a real 401 keeps its own =====================
+
+#[tokio::test]
+async fn a_rewrapped_login_error_carries_no_status() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_string(r#"{"meta":{"code":400,"error":"error.form.email.malformed"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let err = mock
+        .login_flow()
+        .start("not-an-email")
+        .await
+        .expect_err("the identifier is rejected");
+
+    match err {
+        Error::Authentication {
+            message,
+            envelope,
+            error_code,
+            status,
+        } => {
+            assert!(message.starts_with("Login failed: "), "{message}");
+            assert_eq!(
+                status, None,
+                "the re-wrapped exception is a new one, with no status"
+            );
+            assert_eq!(error_code.as_deref(), Some("error.form.email.malformed"));
+            assert!(envelope.is_some(), "the envelope is carried over");
+        }
+        other => panic!("expected Error::Authentication, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rewrapped_login_api_error_carries_no_status() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let err = mock
+        .login_flow()
+        .start("you@example.com")
+        .await
+        .expect_err("a 500 fails the login");
+
+    match err {
+        Error::Authentication {
+            message, status, ..
+        } => {
+            assert!(
+                message.starts_with("Login failed: API error 500"),
+                "{message}"
+            );
+            assert_eq!(status, None);
+        }
+        other => panic!("expected Error::Authentication, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rewrapped_verification_error_carries_no_status() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let (pending, _) = start_pending_login(&mock).await?;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/verify"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let err = pending
+        .verify("123456")
+        .await
+        .expect_err("a 500 fails the verification");
+
+    match err {
+        Error::Authentication {
+            message, status, ..
+        } => {
+            assert!(
+                message.starts_with("Verification failed: API error 500"),
+                "{message}"
+            );
+            assert_eq!(status, None);
+        }
+        other => panic!("expected Error::Authentication, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_real_401_through_login_keeps_its_status() -> anyhow::Result<()> {
+    // Python's `login` only catches `EeroAPIException` and `EeroValidationException`, so a 401
+    // propagates as the exception the transport raised, status included.
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(r#"{"meta":{"code":401,"error":"error.session.invalid"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let err = mock
+        .login_flow()
+        .start("you@example.com")
+        .await
+        .expect_err("a 401 fails the login");
+
+    assert!(
+        matches!(
+            &err,
+            Error::Authentication {
+                status: Some(401),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_real_401_through_verify_keeps_its_status() -> anyhow::Result<()> {
+    // `verify` re-raises `EeroAuthenticationException` unchanged (`auth.py:296-302`).
+    let mock = MockEero::start().await;
+    let (pending, _) = start_pending_login(&mock).await?;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/verify"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(r#"{"meta":{"code":401,"error":"error.verification.invalid"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let err = pending
+        .verify("000000")
+        .await
+        .expect_err("a wrong code is rejected");
+
+    assert!(
+        matches!(
+            &err,
+            Error::Authentication {
+                status: Some(401),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rate_limit_through_login_is_not_rewrapped() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let err = mock
+        .login_flow()
+        .start("you@example.com")
+        .await
+        .expect_err("rate limited");
+
+    assert!(
+        matches!(
+            &err,
+            Error::RateLimit {
+                status: Some(429),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    Ok(())
+}
+
+// ===================== A 2xx body that is not a JSON object =====================
+//
+// Once the transport rejects such a body as `Error::Api { status, "Unexpected JSON response:
+// expected an object" }`, the flow's existing re-wrapping gives Python's outcomes and messages
+// (`auth.py:186-336`). Every test in this module needs that transport rejection to pass.
+
+mod needs_transport_non_object_rejection {
+    use super::*;
+
+    const UNEXPECTED: &str = "API error 200: Unexpected JSON response: expected an object";
+
+    #[rstest]
+    #[case::array("[]")]
+    #[case::string("\"ok\"")]
+    #[case::null("null")]
+    #[tokio::test]
+    async fn login_with_a_non_object_body_fails_as_an_authentication_error(#[case] body: &str) {
+        let mock = MockEero::start().await;
+        Mock::given(method("POST"))
+            .and(path("/2.2/login"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string("login=user%40example.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let err = mock
+            .login_flow()
+            .start("user@example.test")
+            .await
+            .expect_err("a non-object body is not a login");
+
+        match err {
+            Error::Authentication {
+                message,
+                envelope,
+                error_code,
+                status,
+            } => {
+                assert_eq!(message, format!("Login failed: {UNEXPECTED}"));
+                assert!(envelope.is_none());
+                assert!(error_code.is_none());
+                assert_eq!(status, None);
+            }
+            other => panic!("expected Error::Authentication, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::array("[]")]
+    #[case::string("\"ok\"")]
+    #[case::null("null")]
+    #[tokio::test]
+    async fn verify_with_a_non_object_body_fails_as_an_authentication_error(#[case] body: &str) {
+        let mock = MockEero::start().await;
+        let (pending, login_token) = start_pending_login(&mock).await.expect("login works");
+        Mock::given(method("POST"))
+            .and(path("/2.2/login/verify"))
+            .and(user_token_header_for(&login_token))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string("code=123456"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let err = pending
+            .verify("123456")
+            .await
+            .expect_err("a non-object body is not a verification");
+
+        match err {
+            Error::Authentication {
+                message,
+                envelope,
+                status,
+                ..
+            } => {
+                assert_eq!(message, format!("Verification failed: {UNEXPECTED}"));
+                assert!(envelope.is_none());
+                assert_eq!(status, None);
+            }
+            other => panic!("expected Error::Authentication, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::array("[]")]
+    #[case::string("\"ok\"")]
+    #[case::null("null")]
+    #[tokio::test]
+    async fn resend_with_a_non_object_body_is_an_api_error(#[case] body: &str) {
+        let mock = MockEero::start().await;
+        let (pending, login_token) = start_pending_login(&mock).await.expect("login works");
+        Mock::given(method("POST"))
+            .and(path("/2.2/login/resend"))
+            .and(user_token_header_for(&login_token))
+            .and(body_json(json!({})))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let err = pending
+            .resend()
+            .await
+            .expect_err("a non-object body is an API-level failure");
+
+        match err {
+            Error::Api {
+                status,
+                message,
+                envelope,
+                ..
+            } => {
+                assert_eq!(status, 200);
+                assert_eq!(message, "Unexpected JSON response: expected an object");
+                assert!(envelope.is_none());
+            }
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::array("[]")]
+    #[case::string("\"ok\"")]
+    #[case::null("null")]
+    #[tokio::test]
+    async fn logout_with_a_non_object_body_warns_once_and_still_clears_everything(
+        #[case] body: &str,
+    ) {
+        let (_guard, logs) = capture_logs();
+        let mock = MockEero::start().await;
+        Mock::given(method("POST"))
+            .and(path("/2.2/logout"))
+            .and(user_token_header())
+            .and(session_cookie())
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string(format!("Cookie=s%3D{TEST_TOKEN}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+        let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+        store
+            .save(&Session::from_token(TEST_TOKEN))
+            .expect("seed the store");
+        let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, Arc::clone(&store)));
+
+        let outcome = auth.logout().await.expect("logout never raises for this");
+
+        assert!(outcome, "logout reports success");
+        assert!(auth.session().is_none());
+        assert!(!store.load().expect("load succeeds").is_valid());
+        assert_eq!(
+            logs.warnings(),
+            vec![format!("Logout API call failed: {UNEXPECTED}")]
+        );
+    }
+}
+
+// ===================== What logout logs =====================
+
+#[tokio::test]
+async fn logout_logs_a_401_at_debug_and_nothing_at_warn() -> anyhow::Result<()> {
+    let (_guard, logs) = capture_logs();
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(r#"{"meta":{"code":401,"error":"error.session.expired"}}"#),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let auth = AuthApi::new(mock.transport_with_token(TEST_TOKEN));
+
+    assert!(auth.logout().await?);
+
+    assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+    assert!(logs.contains(
+        Level::DEBUG,
+        "Session already invalid on server, clearing local credentials"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn logout_logs_any_other_failed_call_at_warn_with_the_error() -> anyhow::Result<()> {
+    let (_guard, logs) = capture_logs();
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let auth = AuthApi::new(mock.transport_with_token(TEST_TOKEN));
+
+    assert!(auth.logout().await?);
+
+    let warnings = logs.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("Logout API call failed: API error 500"),
+        "{warnings:?}"
+    );
+    assert!(!auth.is_authenticated());
+    Ok(())
+}
+
+// ===================== Store failures under the Warn policy: exactly one warning =====================
+
+/// A store that logs its own `WARN` from inside every `save` and `clear`, on whatever
+/// blocking-pool thread runs it.
+#[derive(Debug, Default)]
+struct WarningStore {
+    inner: MemoryStore,
+}
+
+impl CredentialStore for WarningStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        tracing::warn!("store says: saving");
+        self.inner.save(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        tracing::warn!("store says: clearing");
+        self.inner.clear()
+    }
+}
+
+#[tokio::test]
+async fn a_store_warning_logged_on_the_blocking_pool_reaches_the_callers_subscriber()
+-> anyhow::Result<()> {
+    let (_guard, logs) = capture_logs();
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let store: Arc<dyn CredentialStore> = Arc::new(WarningStore::default());
+    let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, store));
+
+    auth.set_session_token("injected_token").await?;
+    assert_eq!(logs.count(Level::WARN, "store says: saving"), 1);
+
+    assert!(auth.logout().await?);
+    assert_eq!(logs.count(Level::WARN, "store says: clearing"), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_save_under_warn_logs_exactly_one_warning() -> anyhow::Result<()> {
+    let (_guard, logs) = capture_logs();
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.set_failing(true);
+    let auth = auth_with_store(&probe, StorageFailures::Warn);
+
+    auth.set_session_token("injected_token").await?;
+
+    let warnings = logs.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("failed to persist session to credential store"));
+    assert!(!auth.credentials_persisted());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_clear_during_logout_under_warn_logs_exactly_one_warning() -> anyhow::Result<()> {
+    let (_guard, logs) = capture_logs();
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let probe = ProbeStore::new(ParkOn::Never);
+    probe.set_failing(true);
+    let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, Arc::clone(&probe) as _));
+
+    assert!(auth.logout().await?);
+
+    let warnings = logs.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("failed to persist session to credential store"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_successful_persist_logs_no_warning() -> anyhow::Result<()> {
+    let (_guard, logs) = capture_logs();
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let probe = ProbeStore::new(ParkOn::Never);
+    let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, Arc::clone(&probe) as _));
+
+    auth.set_session_token("injected_token").await?;
+    assert!(auth.logout().await?);
+
+    assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+    assert!(logs.errors().is_empty());
+    Ok(())
+}
+
+/// A store that behaves like the shipped ones when a write is accepted and not retained: it logs
+/// the one fixed `WARN` itself and returns [`StorageError::NotRetained`].
+#[derive(Debug, Default)]
+struct UnretainingStore;
+
+impl CredentialStore for UnretainingStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        Ok(Session::empty())
+    }
+
+    fn save(&self, _session: &Session) -> Result<(), StorageError> {
+        tracing::warn!("Keyring did not retain the session");
+        Err(StorageError::NotRetained {
+            backend: "keyring".to_owned(),
+        })
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+/// Needs the transport to log a `NotRetained` failure at `DEBUG` rather than `WARN`: the store
+/// has already logged the one fixed `WARN`, and a second one would be a duplicate.
+mod needs_transport_not_retained_at_debug {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unretained_save_under_warn_logs_only_the_stores_own_warning() -> anyhow::Result<()>
+    {
+        let (_guard, logs) = capture_logs();
+        let transport = Transport::builder()
+            .store(Some(Arc::new(UnretainingStore) as Arc<dyn CredentialStore>))
+            .build()?;
+        let auth = AuthApi::new(transport);
+
+        auth.set_session_token("injected_token").await?;
+
+        assert_eq!(
+            logs.warnings(),
+            vec!["Keyring did not retain the session".to_owned()]
+        );
+        assert!(auth.is_authenticated(), "the session works in memory");
+        assert!(!auth.credentials_persisted());
+        Ok(())
+    }
+}
+
+// ===================== Destroying credentials survives a failing backend =====================
+
+/// A backend whose `clear` always fails, over a [`MemoryStore`] it otherwise delegates to.
+#[derive(Debug, Default)]
+struct ClearFailsStore {
+    inner: MemoryStore,
+}
+
+impl CredentialStore for ClearFailsStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        self.inner.save(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        Err(StorageError::Backend {
+            backend: "clear-fails".to_owned(),
+            message: "deliberate failure".to_owned(),
+        })
+    }
+}
+
+fn chain_with_failing_primary_clear() -> (Arc<ChainedStore>, Arc<MemoryStore>) {
+    let fallback = Arc::new(MemoryStore::new());
+    fallback
+        .save(&Session::from_token(TEST_TOKEN))
+        .expect("seed the fallback");
+    let chained = Arc::new(ChainedStore::new(
+        Arc::new(ClearFailsStore::default()),
+        Arc::clone(&fallback) as _,
+    ));
+    (chained, fallback)
+}
+
+#[tokio::test]
+async fn logout_survives_a_failing_primary_clear() -> anyhow::Result<()> {
+    let (_guard, logs) = capture_logs();
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/logout"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string(format!("Cookie=s%3D{TEST_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let (chained, fallback) = chain_with_failing_primary_clear();
+    let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, chained));
+
+    assert!(auth.logout().await?);
+
+    assert!(!auth.is_authenticated());
+    assert!(
+        !fallback.load()?.is_valid(),
+        "the fallback was still cleared"
+    );
+    assert_eq!(
+        logs.count(
+            Level::WARN,
+            "Could not clear every credential storage backend; a stored session may remain in \
+             the one that failed"
+        ),
+        1,
+        "the chain logs its fixed warning once: {:?}",
+        logs.warnings()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_session_token_and_clear_auth_data_survive_a_failing_primary_clear()
+-> anyhow::Result<()> {
+    for destroy in [0, 1] {
+        let mock = MockEero::start().await;
+        let (chained, fallback) = chain_with_failing_primary_clear();
+        let auth = AuthApi::new(mock.transport_with_store(TEST_TOKEN, chained));
+
+        if destroy == 0 {
+            auth.clear_session_token().await?;
+        } else {
+            auth.clear_auth_data().await?;
+        }
+
+        assert!(!auth.is_authenticated());
+        assert!(!fallback.load()?.is_valid());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_single_failing_backend_under_fatal_names_the_backend_that_kept_a_copy()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let (chained, fallback) = chain_with_failing_primary_clear();
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .store(Some(chained as Arc<dyn CredentialStore>))
+        .storage_failures(StorageFailures::Fatal)
+        .build()?;
+    let auth = AuthApi::new(transport);
+
+    let err = auth
+        .clear_session_token()
+        .await
+        .expect_err("Fatal surfaces the surviving copy");
+
+    assert!(
+        matches!(
+            &err,
+            Error::Storage(StorageError::Backend { backend, .. }) if backend == "chained-primary"
+        ),
+        "got {err:?}"
+    );
+    assert!(!auth.is_authenticated(), "memory is cleared regardless");
+    assert!(!fallback.load()?.is_valid());
     Ok(())
 }
