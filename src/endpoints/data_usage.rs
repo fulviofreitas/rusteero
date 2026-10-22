@@ -577,6 +577,10 @@ impl DataUsageApi {
     /// `f"{base_url}/data_usage/{path}"`), so the suffix comes from [`Resource::template`], the
     /// single source of each path, as the text after `{id}`.
     ///
+    /// One deliberate difference: a trailing `/` on the base is dropped before the suffix is
+    /// appended, where Python's f-string doubles it (`…//data_usage`) for a published url that
+    /// ends in `/`; see `PARITY.md`.
+    ///
     /// A published `url` is returned by `resolve_network_url` after a plain shape check only
     /// (field `link`), and must stay that way: handing it back to [`Resource::resolve`] as if it
     /// were a caller-typed `id_or_url` would subject it to the caller-path family check, which

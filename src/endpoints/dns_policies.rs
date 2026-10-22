@@ -61,7 +61,7 @@ fn validate_network_dns_policy_key(key: &str) -> Result<(), Error> {
 
 /// Builds a request body from required fields plus only the supplied optional ones.
 ///
-/// Ported from `_payload` (`dns_policies.py:55-81`).
+/// Ported from `_payload` (`dns_policies.py:55-70`).
 fn payload(required: &[(&str, Value)], optional: &[(&str, Option<Value>)]) -> Value {
     let mut map = Map::new();
     for (key, value) in required {
@@ -115,6 +115,10 @@ impl DnsPoliciesApi {
     /// publishes as a link (`dns_policies.py:646-647,691-692`: `f"{base_url}/dns_policies/.."`),
     /// so the parent's `url` is used as the base, never fed back through [`Resource::resolve`]
     /// as if a caller had typed it.
+    ///
+    /// One deliberate difference: a trailing `/` on the base is dropped before the suffix is
+    /// appended, where Python's f-string doubles it (`…//dns_policies/..`) for a published url
+    /// that ends in `/`; see `PARITY.md`.
     fn network_route_url(
         &self,
         route: &Resource,

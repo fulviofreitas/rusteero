@@ -1141,7 +1141,9 @@ impl ClientBuilder {
 
     /// Sets the cache TTL used by every cached getter (`consts::DEFAULT_CACHE_TTL`, 60 seconds,
     /// by default — matching `client.py:41`'s `cache_timeout: int = 60`).
-    /// [`Duration::ZERO`] disables reads without disabling writes; see [`Cache`]'s own docs.
+    /// [`Duration::ZERO`] caches nothing: every read misses and the responses the getters fetch
+    /// are not kept in memory either (`Cache::put` still stores, for direct users of [`Cache`]);
+    /// see [`Cache`]'s own docs.
     #[must_use]
     pub fn cache_ttl(mut self, cache_ttl: Duration) -> Self {
         self.cache_ttl = cache_ttl;
@@ -1280,8 +1282,8 @@ mod tests {
         test_client_with_ttl(Duration::from_secs(60))
     }
 
-    /// As [`test_client`], with an explicit cache TTL (`Duration::ZERO` disables reads without
-    /// disabling writes).
+    /// As [`test_client`], with an explicit cache TTL (`Duration::ZERO` caches nothing: reads
+    /// miss and the getters' guarded stores keep no response).
     fn test_client_with_ttl(ttl: Duration) -> Client {
         let transport = Transport::builder()
             .build()

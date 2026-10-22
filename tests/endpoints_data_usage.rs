@@ -1,8 +1,11 @@
-//! HTTP integration tests for `DataUsageApi` (`src/endpoints/data_usage.rs`) at `v8.0.4`.
+//! HTTP integration tests for `DataUsageApi` (`src/endpoints/data_usage.rs`) at `v8.4.1`.
 //!
-//! Every method in this family sends `start`/`end`/`cadence`/`timezone` as *query* parameters,
-//! never a request body — proven both by `query_param` matchers and, on the two-path tests, an
-//! `.expect(0)` mock on the sibling path so a bug that renders the wrong path fails loudly.
+//! Each of the eleven reads sends whichever of `start`/`end`/`cadence`/`timezone` it takes as
+//! *query* parameters (`get_report_settings` takes none), never a request body — proven both by
+//! `query_param` matchers and, on the two-path tests, an `.expect(0)` mock on the sibling path so
+//! a bug that renders the wrong path fails loudly. `set_report_settings` is the one write, and
+//! sends a JSON body. The time-windowed reads also take a per-call timeout, pinned in the last
+//! section.
 
 mod common;
 

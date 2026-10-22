@@ -678,15 +678,6 @@ async fn accept_language_is_forwarded_to_the_transport() -> anyhow::Result<()> {
 /// forever, and the runtime's drop would wait for it without end.
 const PARK_LIMIT: Duration = Duration::from_secs(10);
 
-/// A [`CredentialStore`] test double over a [`MemoryStore`] whose `save`, `load` or `clear` can be
-/// parked on a blocking-pool thread until [`GateStore::open`], and whose `save` and `clear` can be
-/// made to fail. Trimmed copy of the one in `tests/auth.rs`: integration-test binaries cannot
-/// share code except through `tests/common`.
-///
-/// A parked call never outlives [`PARK_LIMIT`] (it then fails with a [`StorageError`]), and one
-/// that arrives on the thread that built the store, which is the thread driving a
-/// `#[tokio::test]` runtime, panics instead of parking: a store call that ran inline on the
-/// runtime would otherwise block the very runtime whose timeouts are meant to report it.
 /// Which `GateStore` operation parks until the gate opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Parks {
@@ -696,6 +687,15 @@ enum Parks {
     Clears,
 }
 
+/// A [`CredentialStore`] test double over a [`MemoryStore`] whose `save`, `load` or `clear` can be
+/// parked on a blocking-pool thread until [`GateStore::open`], and whose `save` and `clear` can be
+/// made to fail. Trimmed copy of the one in `tests/auth.rs`: integration-test binaries cannot
+/// share code except through `tests/common`.
+///
+/// A parked call never outlives [`PARK_LIMIT`] (it then fails with a [`StorageError`]), and one
+/// that arrives on the thread that built the store, which is the thread driving a
+/// `#[tokio::test]` runtime, panics instead of parking: a store call that ran inline on the
+/// runtime would otherwise block the very runtime whose timeouts are meant to report it.
 #[derive(Debug)]
 struct GateStore {
     inner: MemoryStore,
@@ -722,13 +722,14 @@ impl GateStore {
         }
     }
 
-    fn new(parks_saves: bool, failing: bool) -> Arc<Self> {
-        let parks = if parks_saves {
-            Parks::Saves
-        } else {
-            Parks::Nothing
-        };
-        Arc::new(Self::make(parks, failing))
+    /// A store that parks every `save` until opened.
+    fn parking_saves() -> Arc<Self> {
+        Arc::new(Self::make(Parks::Saves, false))
+    }
+
+    /// A store whose `save` and `clear` fail at once, without parking.
+    fn failing() -> Arc<Self> {
+        Arc::new(Self::make(Parks::Nothing, true))
     }
 
     /// A store that parks every `clear` until opened.
@@ -871,7 +872,7 @@ async fn client_set_session_token_offloads_the_store_write_and_resets_the_cache_
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     mount_devices(&mock, 2).await;
-    let store = GateStore::new(true, false);
+    let store = GateStore::parking_saves();
     let _release = store.release_on_drop();
     let client = Arc::new(client_with_store(&mock, &store, StorageFailures::Warn).await);
 
@@ -938,7 +939,7 @@ async fn dropping_set_session_token_during_the_store_hop_still_resets_the_facade
     let mock = MockEero::start().await;
     mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
     mount_devices_of(&mock, "network-0001", 2).await;
-    let store = GateStore::new(true, false);
+    let store = GateStore::parking_saves();
     let _release = store.release_on_drop();
     let client = Arc::new(client_with_store(&mock, &store, StorageFailures::Warn).await);
 
@@ -1112,7 +1113,7 @@ async fn client_set_session_token_failing_under_fatal_still_resets_the_cache() -
 {
     let mock = MockEero::start().await;
     mount_devices(&mock, 2).await;
-    let store = GateStore::new(false, true);
+    let store = GateStore::failing();
     let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
 
     client
@@ -1145,7 +1146,7 @@ async fn client_set_session_token_failing_under_fatal_still_resets_the_cache() -
 #[tokio::test]
 async fn client_credentials_persisted_delegates_through_the_facades() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let store = GateStore::new(false, true);
+    let store = GateStore::failing();
     let client = client_with_store(&mock, &store, StorageFailures::Warn).await;
 
     assert!(client.credentials_persisted());
@@ -1548,7 +1549,7 @@ async fn a_failed_store_write_under_fatal_still_forgets_the_discovered_network()
     mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
     mount_networks_once(&mock, json!([{"id": "network-0002"}])).await;
     mount_devices_of(&mock, "network-0002", 1).await;
-    let store = GateStore::new(false, true);
+    let store = GateStore::failing();
     let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
 
     client.get_networks(false).await?;
@@ -1577,7 +1578,7 @@ async fn a_failed_store_clear_under_fatal_still_forgets_the_discovered_network()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
-    let store = GateStore::new(false, true);
+    let store = GateStore::failing();
     let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
 
     client.get_networks(false).await?;
@@ -1682,7 +1683,7 @@ async fn clear_auth_data_removes_the_stored_record() -> anyhow::Result<()> {
 async fn clear_auth_data_under_fatal_reports_the_store_failure_and_still_resets()
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let store = GateStore::new(false, true);
+    let store = GateStore::failing();
     let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
     client.set_preferred_network("network-0001");
 
