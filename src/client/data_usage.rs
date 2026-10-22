@@ -8,8 +8,9 @@
 //!
 //! The ten time-windowed reads take `timeout: Option<RequestTimeout>` immediately before the
 //! trailing `network_id` and forward it unchanged to the matching `DataUsageApi` read
-//! (`client.py:2056,2077` at `v8.4.1`); `get_data_usage_report_settings` and
-//! `set_data_usage_report_settings` do not.
+//! (`client.py:2056,2077`); `get_data_usage_report_settings` and
+//! `set_data_usage_report_settings` do not. Every `client.py` citation in this file is to
+//! `v8.4.1`.
 
 use super::Client;
 use crate::cache::CacheKey;
@@ -20,7 +21,7 @@ use crate::transport::RequestTimeout;
 impl Client {
     /// Gets network-wide data-usage statistics — returns the raw Eero API response.
     ///
-    /// Ported from `get_data_usage()` (`eero-api src/eero/client.py:1580-1606` at `v8.0.4`).
+    /// Ported from `get_data_usage()` (`eero-api src/eero/client.py:2048-2078` at `v8.4.1`).
     /// **Breaking shape change** from the pre-8.0.0 port this crate previously shipped: the old
     /// `payload`/`resource` parameters are gone, replaced by required `start`/`end`/`cadence` and
     /// optional `timezone`. `auto_discover = false`.
@@ -50,7 +51,7 @@ impl Client {
 
     /// Gets a data-usage breakdown by category — returns the raw Eero API response.
     ///
-    /// Ported from `get_data_usage_breakdown()` (`eero-api src/eero/client.py:1607-1625`).
+    /// Ported from `get_data_usage_breakdown()` (`eero-api src/eero/client.py:2080-2098`).
     /// `auto_discover = false`. `cadence` is optional.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -79,7 +80,7 @@ impl Client {
     /// Gets data-usage statistics for every device on a network — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `get_devices_data_usage()` (`eero-api src/eero/client.py:1626-1650`).
+    /// Ported from `get_devices_data_usage()` (`eero-api src/eero/client.py:2100-2125`).
     /// `auto_discover = false`. `cadence`/`profile_id` are optional.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -117,7 +118,7 @@ impl Client {
 
     /// Gets data-usage statistics for a single device — returns the raw Eero API response.
     ///
-    /// Ported from `get_device_data_usage()` (`eero-api src/eero/client.py:1651-1670`).
+    /// Ported from `get_device_data_usage()` (`eero-api src/eero/client.py:2127-2152`).
     /// `auto_discover = false`. `cadence` is required.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -156,7 +157,7 @@ impl Client {
     /// Gets an aggregated data-usage summary across every eero on a network — returns the raw
     /// Eero API response.
     ///
-    /// Ported from `get_eeros_data_usage_summary()` (`eero-api src/eero/client.py:1671-1689`).
+    /// Ported from `get_eeros_data_usage_summary()` (`eero-api src/eero/client.py:2174-2192`).
     /// `auto_discover = false`. `cadence` is required.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -217,7 +218,7 @@ impl Client {
 
     /// Gets data-usage statistics for a single eero — returns the raw Eero API response.
     ///
-    /// Ported from `get_eero_data_usage()` (`eero-api src/eero/client.py:1690-1709`).
+    /// Ported from `get_eero_data_usage()` (`eero-api src/eero/client.py:2194-2219`).
     /// `auto_discover = false`. `cadence` is required.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -255,7 +256,7 @@ impl Client {
 
     /// Gets data-usage statistics for a single profile — returns the raw Eero API response.
     ///
-    /// Ported from `get_profile_data_usage()` (`eero-api src/eero/client.py:1710-1729`).
+    /// Ported from `get_profile_data_usage()` (`eero-api src/eero/client.py:2221-2246`).
     /// `auto_discover = false`. `cadence` is required.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -294,7 +295,7 @@ impl Client {
     /// Gets data-usage statistics for devices with no profile — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `get_unprofiled_devices_data_usage()` (`eero-api src/eero/client.py:1730-1748`).
+    /// Ported from `get_unprofiled_devices_data_usage()` (`eero-api src/eero/client.py:2248-2266`).
     /// `auto_discover = false`. `cadence` is optional.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -323,7 +324,7 @@ impl Client {
     /// Gets an aggregated data-usage summary for unprofiled devices — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `get_unprofiled_data_usage_summary()` (`eero-api src/eero/client.py:1749-1767`).
+    /// Ported from `get_unprofiled_data_usage_summary()` (`eero-api src/eero/client.py:2268-2286`).
     /// `auto_discover = false`. `cadence` is required.
     ///
     /// `timeout`, when `Some`, replaces the transport default for this request only (see
@@ -351,7 +352,7 @@ impl Client {
 
     /// Gets the network's data-usage report settings — returns the raw Eero API response.
     ///
-    /// Ported from `get_data_usage_report_settings()` (`eero-api src/eero/client.py:1768-1777`).
+    /// Ported from `get_data_usage_report_settings()` (`eero-api src/eero/client.py:2288-2296`).
     /// `auto_discover = false`. No query parameters at all.
     ///
     /// # Errors
@@ -370,7 +371,7 @@ impl Client {
 
     /// Sets the network's data-usage report settings — returns the raw Eero API response.
     ///
-    /// Ported from `set_data_usage_report_settings()` (`eero-api src/eero/client.py:1778-1799`),
+    /// Ported from `set_data_usage_report_settings()` (`eero-api src/eero/client.py:2298-2318`),
     /// the only write in this family. `auto_discover = false`. On success, invalidates
     /// `network[{nid}]`.
     ///
