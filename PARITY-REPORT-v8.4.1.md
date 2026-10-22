@@ -6,7 +6,7 @@ This report records the port of `eero-api` **v8.0.5 through v8.4.1** into rustee
 |---|---|
 | Previous baseline | `eero-api` v8.0.4, commit `ac7358f` (2026-09-24) |
 | New baseline | `eero-api` v8.4.1, commit `c0e76cf` (2026-10-20), the latest tag on the day of the port |
-| Branch | `feat/eero-api-8.4.1-parity` (121 commits on `master` `dfa5b34`) |
+| Branch | `feat/eero-api-8.4.1-parity` (123 commits on `master` `dfa5b34`) |
 | Pull request | [#8](https://github.com/fulviofreitas/rusteero/pull/8), `feat!: port eero-api 8.4.1 (transport hardening, storage read-back, 8.4.0 Client wrappers)`, open, not merged |
 | Release impact | breaking: the next release from this branch is a major (3.0.0) |
 
@@ -329,15 +329,15 @@ Columns: the upstream change, the Python symbols it touches, the Rust files that
 
 ## 3. Files touched
 
-162 files changed, 34312 insertions(+), 3431 deletions(-) (against `origin/master`).
+164 files changed, 34797 insertions(+), 3432 deletions(-) (against `origin/master`).
 
 **Library (`src/`)** (100): `src/api.rs`, `src/auth/flow.rs`, `src/auth/mod.rs`, `src/auth/session.rs`, `src/cache.rs`, `src/client/account.rs`, `src/client/blacklist.rs`, `src/client/burst_reporters.rs`, `src/client/data_usage.rs`, `src/client/devices.rs`, `src/client/dhcp.rs`, `src/client/diagnostics.rs`, `src/client/dns_policies.rs`, `src/client/eeros.rs`, `src/client/entitlements.rs`, `src/client/events.rs`, `src/client/forwards.rs`, `src/client/insights.rs`, `src/client/members.rs`, `src/client/mod.rs`, `src/client/networks.rs`, `src/client/notifications.rs`, `src/client/power_saving.rs`, `src/client/profiles.rs`, `src/client/reservations.rs`, `src/client/routing.rs`, `src/client/schedule.rs`, `src/client/security.rs`, `src/client/support.rs`, `src/client/thread.rs`, `src/client/updates.rs`, `src/client/wan.rs`, `src/consts.rs`, `src/endpoints/account.rs`, `src/endpoints/backup.rs`, `src/endpoints/backup_access_points.rs`, `src/endpoints/blacklist.rs`, `src/endpoints/burst_reporters.rs`, `src/endpoints/data_usage.rs`, `src/endpoints/devices.rs`, `src/endpoints/dhcp.rs`, `src/endpoints/dns.rs`, `src/endpoints/dns_policies.rs`, `src/endpoints/eeros.rs`, `src/endpoints/events.rs`, `src/endpoints/forwards.rs`, `src/endpoints/insights.rs`, `src/endpoints/members.rs`, `src/endpoints/mod.rs`, `src/endpoints/networks.rs`, `src/endpoints/power_saving.rs`, `src/endpoints/profiles.rs`, `src/endpoints/routing.rs`, `src/endpoints/schedule.rs`, `src/endpoints/security.rs`, `src/endpoints/sqm.rs`, `src/endpoints/subnets.rs`, `src/endpoints/support.rs`, `src/endpoints/thread.rs`, `src/endpoints/updates.rs`, `src/endpoints/wan.rs`, `src/endpoints/wpa3.rs`, `src/envelope.rs`, `src/error.rs`, `src/errors.rs`, `src/lib.rs`, `src/links.rs`, `src/params.rs`, `src/redact.rs`, `src/routes/account.rs`, `src/routes/backup.rs`, `src/routes/backup_access_points.rs`, `src/routes/blacklist.rs`, `src/routes/burst_reporters.rs`, `src/routes/data_usage.rs`, `src/routes/devices.rs`, `src/routes/dhcp.rs`, `src/routes/dns_policies.rs`, `src/routes/events.rs`, `src/routes/forwards.rs`, `src/routes/insights.rs`, `src/routes/members.rs`, `src/routes/mod.rs`, `src/routes/networks.rs`, `src/routes/ouicheck.rs`, `src/routes/routing.rs`, `src/routes/security.rs`, `src/routes/subnets.rs`, `src/routes/support.rs`, `src/routes/thread.rs`, `src/routes/updates.rs`, `src/routes/wan.rs`, `src/storage/chained.rs`, `src/storage/file.rs`, `src/storage/keyring.rs`, `src/storage/memory.rs`, `src/storage/mod.rs`, added `src/storage/test_support.rs`, `src/transport.rs`, `src/util.rs`
 
 **Tests (`tests/`)** (52): `tests/auth.rs`, `tests/client_account.rs`, `tests/client_blacklist.rs`, added `tests/client_burst_reporters.rs`, added `tests/client_cache.rs`, `tests/client_core.rs`, `tests/client_data_usage.rs`, `tests/client_devices.rs`, `tests/client_dhcp.rs`, `tests/client_dns.rs`, `tests/client_dns_policies.rs`, `tests/client_eeros.rs`, `tests/client_forwards.rs`, `tests/client_networks.rs`, `tests/client_profiles.rs`, `tests/client_reservations.rs`, `tests/client_routing.rs`, `tests/client_schedule.rs`, `tests/client_security.rs`, `tests/client_support.rs`, `tests/client_thread.rs`, `tests/client_updates.rs`, `tests/client_wan.rs`, `tests/common/mod.rs`, `tests/endpoints_account.rs`, `tests/endpoints_blacklist.rs`, `tests/endpoints_burst_reporters.rs`, `tests/endpoints_data_usage.rs`, `tests/endpoints_devices.rs`, `tests/endpoints_dhcp.rs`, `tests/endpoints_dns.rs`, `tests/endpoints_dns_policies.rs`, `tests/endpoints_eeros.rs`, `tests/endpoints_forwards.rs`, `tests/endpoints_networks.rs`, `tests/endpoints_routing.rs`, `tests/endpoints_schedule.rs`, `tests/endpoints_security.rs`, `tests/endpoints_subnets.rs`, `tests/endpoints_support.rs`, `tests/endpoints_thread.rs`, `tests/endpoints_updates.rs`, `tests/endpoints_wan.rs`, added `tests/facade_parity.rs`, added `tests/fixtures/network_with_write_links.json`, `tests/harness_smoke.rs`, `tests/live.rs`, `tests/path_safety.rs`, `tests/security_paths.rs`, `tests/storage.rs`, `tests/transport.rs`, added `tests/write_warnings.rs`
 
-**Docs** (7): `PARITY.md`, `README.md`, `wiki/Configuration.md`, `wiki/Home.md`, `wiki/Migration.md`, `wiki/Rust-API.md`, `wiki/Troubleshooting.md`
+**Docs** (8): added `PARITY-REPORT-v8.4.1.md`, `PARITY.md`, `README.md`, `wiki/Configuration.md`, `wiki/Home.md`, `wiki/Migration.md`, `wiki/Rust-API.md`, `wiki/Troubleshooting.md`
 
-**Build and CI** (3): `.github/workflows/ci.yml`, `Cargo.lock`, `deny.toml`
+**Build and CI** (4): `.github/workflows/ci.yml`, `Cargo.lock`, `Cargo.toml`, `deny.toml`
 
 ## 4. Commands run and local check results
 
@@ -430,7 +430,7 @@ Range `ee8c27c..f8e556d`, 59 files: **1 high, 11 low**. All 12 were fixed.
 | P2-S3-11 | low | `tests/endpoints_data_usage.rs` | Stale module doc (v8.0.4, "never a body") | fixed: `446aa93` |
 | P2-S3-12 | low | `tests/transport.rs` | The log-hygiene helper checked messages but not structured fields | fixed: `39c4a26` |
 
-**Pass 3**, range `f8e556d..446aa93`, 12 files: **2 low**. The warning scanner did not end a test-only struct field, enum variant or match arm at its comma, and a hygiene-helper exemption had no positive control. Both were fixed in `9e4589f`. **Pass 4**, range `9c0621f..9e4589f`, 2 files: **no findings**. The review is clean, and no finding was left open or merely justified.
+**Pass 3**, range `f8e556d..446aa93`, 12 files: **2 low**. The warning scanner did not end a test-only struct field, enum variant or match arm at its comma, and a hygiene-helper exemption had no positive control. Both were fixed in `9e4589f`. **Pass 4**, range `9c0621f..9e4589f`, 2 files: **no findings**. The review is clean, and no finding was left open or merely justified. The two CI-driven fixes made after the PR was opened (`09f4da6`: a doc link and a platform-gated test import; `58f7a87`: the test log-capture anchor) were each run through `ocr delegate preview` and reviewed under the same rules, with no findings.
 
 ## 6. Pull request, CI and Codacy
 
@@ -443,7 +443,8 @@ Range `ee8c27c..f8e556d`, 59 files: **1 high, 11 low**. All 12 were fixed.
 - **Second CI run (`09f4da6`): all green.** 📝 Commit Lint, 🧹 Format & Lint (fmt, clippy with all features and with no default features), 🧪 Test on ubuntu-latest (both feature sets plus coverage), macos-latest and windows-latest (both feature sets plus the real-keyring round trip), 📚 Docs, 🛡️ Supply chain, 🧱 MSRV and ✅ CI Success.
 - **Codacy:** on both pushes, the "Codacy Static Code Analysis" check passed, and Codacy's PR comment reported "Up to standards", **0 new issues**. There were no inline annotations and no review comments, so nothing needed fixing, dismissing or ignoring. No Codacy suppression or ignore rule was added.
 - **Advisory ignores (`cargo deny`, not Codacy):** the only ignore rules added are the three `cargo deny` advisory ignores in `deny.toml` (RUSTSEC-2026-0370..0372: zvariant, zbus_names and zvariant_derive flagged as unmaintained). These are maintenance notices, not vulnerabilities: zbus 6 folded these crates in, and `keyring`'s secret-service chain has no release on zbus 6 yet. Each ignore records that reason.
-- **This file's commit:** it adds this report and lists it in `Cargo.toml`'s package `exclude`. Its CI run is linked on the PR.
+- **Third CI run (`8605b3b`, this report):** everything passed except **🧪 Test (macos-latest)**. One storage unit test, `a_primary_record_this_instance_never_saw_is_left_alone_after_a_failed_save`, missed a DEBUG line it asserts on. The cause is the parallel-test log-capture race already fixed for the integration suite: while only one tracing dispatcher exists, a callsite first hit by a test thread with no subscriber caches "never". The in-crate capture helper, and the transport's lazy-redaction test, did not yet register the anchor dispatcher. `58f7a87` adds it to both, and five consecutive runs of the 661 lib unit tests passed locally. That fix touches only test helpers; I reviewed it myself as OCR's delegated reviewer and found nothing.
+- **Final head:** this report is updated in the same push as `58f7a87`; the result of that run is on the PR.
 
 ## 7. Left out or outstanding
 
