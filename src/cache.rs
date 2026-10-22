@@ -108,6 +108,12 @@
 //! (`client.py:162-196` at `v8.4.1`), so a long-lived client does not accumulate devices and
 //! profiles it will never serve again. Entries that are never read again stay until a write or
 //! [`Cache::clear`] removes them.
+//!
+//! With a zero TTL every entry is expired the moment it is written, so [`Cache::get`] removes the
+//! key it is asked for, and the guarded store the `Client` getters use ([`Cache::put_if_current`])
+//! stores nothing: a client built with `cache_ttl(Duration::ZERO)` keeps no envelope (the Wi-Fi
+//! password in a `network[..]` response included) in memory after the call that fetched it.
+//! [`Cache::put`] stays unconditional.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -381,8 +387,9 @@ pub struct Cache {
 impl Cache {
     /// Creates an empty cache with the given TTL.
     ///
-    /// `ttl = Duration::ZERO` disables reads entirely (see the module-level docs); it does not
-    /// disable writes.
+    /// `ttl = Duration::ZERO` disables reads entirely (see the module-level docs), and
+    /// [`Cache::get`] then removes whatever it is asked for. [`Cache::put`] still stores, but the
+    /// guarded store the `Client` getters use does not.
     #[must_use]
     pub fn new(ttl: Duration) -> Self {
         Self {
@@ -423,12 +430,13 @@ impl Cache {
     /// does not advance the invalidation counter: it removes nothing a reader could still be
     /// served.
     ///
-    /// Always `None` when this cache's TTL is [`Duration::ZERO`], without taking the lock and
-    /// without pruning: a zero-TTL cache never serves a read, and its entries are replaced by the
-    /// next write to the same key.
+    /// Always `None` when this cache's TTL is [`Duration::ZERO`]: a zero-TTL cache never serves a
+    /// read, because every entry is already expired (`_is_cache_valid` finds each one so and
+    /// deletes it, `client.py:188-196`), so the entry under `key`, if any, is removed.
     #[must_use]
     pub fn get(&self, key: &CacheKey) -> Option<Envelope> {
         if self.ttl.is_zero() {
+            self.write().entries.remove(key);
             return None;
         }
 
@@ -461,7 +469,8 @@ impl Cache {
     /// with no `epoch=`), which every cached getter calls after a live fetch regardless of
     /// `refresh_cache` or `cache_timeout`. A caller implementing `refresh_cache` semantics simply
     /// skips calling [`Cache::get`] for that one call while still calling `put` — `Cache` has no
-    /// `refresh_cache` parameter of its own. It does not advance the invalidation counter.
+    /// `refresh_cache` parameter of its own. It does not advance the invalidation counter. With a
+    /// zero TTL the entry is never served, and the next [`Cache::get`] of the key removes it.
     ///
     /// The `Client` getters use `Cache::put_if_current` instead, so a response fetched before an
     /// invalidation cannot be stored after it.
@@ -491,12 +500,18 @@ impl Cache {
     /// The comparison and the insert happen under one write lock. A rejected store is silent:
     /// the caller still hands its response to its own caller, and later readers miss and fetch
     /// fresh data (`_update_cache(.., epoch=)`, `client.py:219-220` at `v8.4.1`).
+    ///
+    /// With a zero TTL nothing is stored, and this returns `false`: every read would find the
+    /// entry expired, so it would only keep the response in memory.
     pub(crate) fn put_if_current(
         &self,
         key: CacheKey,
         value: Envelope,
         generation: CacheGeneration,
     ) -> bool {
+        if self.ttl.is_zero() {
+            return false;
+        }
         let mut inner = self.write();
         if inner.generation != generation.0 {
             return false;
@@ -791,9 +806,44 @@ mod tests {
     fn zero_ttl_disables_reads_but_not_writes() {
         let cache = Cache::new(Duration::ZERO);
         cache.put(CacheKey::Account, non_empty());
+        assert_eq!(cache.len(), 1, "the write must still have happened");
 
         assert!(cache.get(&CacheKey::Account).is_none());
-        assert_eq!(cache.len(), 1, "the write must still have happened");
+    }
+
+    #[test]
+    fn zero_ttl_read_removes_the_entry_it_is_asked_for() {
+        let cache = Cache::new(Duration::ZERO);
+        cache.put(CacheKey::Account, non_empty());
+        cache.put(CacheKey::Networks, non_empty());
+
+        assert!(cache.get(&CacheKey::Account).is_none());
+
+        assert_eq!(cache.len(), 1, "only the key that was read is pruned");
+        assert!(cache.get(&CacheKey::Networks).is_none());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn zero_ttl_guarded_store_keeps_nothing() {
+        let cache = Cache::new(Duration::ZERO);
+        let generation = cache.generation();
+
+        let stored = cache.put_if_current(CacheKey::Account, non_empty(), generation);
+
+        assert!(!stored);
+        assert_eq!(cache.len(), 0, "an entry no read could serve is not kept");
+    }
+
+    #[test]
+    fn zero_ttl_does_not_prune_by_advancing_the_invalidation_counter() {
+        let cache = Cache::new(Duration::ZERO);
+        let generation = cache.generation();
+        cache.put(CacheKey::Account, non_empty());
+
+        let _ = cache.get(&CacheKey::Account);
+
+        assert_eq!(cache.generation(), generation);
     }
 
     // ===================== key/bucket shapes =====================
