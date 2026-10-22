@@ -40,49 +40,53 @@
 //! whatever session it will use ([`ClientBuilder::session`], or one loaded from a configured
 //! [`crate::storage::CredentialStore`] — see [`ClientBuilder::build`]), matching
 //! the architecture notes' own request-flow sketch, `Client::builder().session(s)
-//! .store(st).build()`. The brief's instruction to "wire `clear_cache` into the places Python
-//! calls it: after verify, logout, `set_session_token` and `clear_session_token`" is honoured for
-//! the three of those four that exist on this `Client` ([`Client::logout`],
-//! [`Client::set_session_token`], [`Client::clear_session_token`]); there is no `Client::verify`
-//! to wire it into, and no gap this leaves in practice — a freshly built `Client`'s cache is
-//! already empty, so there is nothing a post-verify `clear_cache()` could ever have removed.
+//! .store(st).build()`. Python clears the cache and forgets an auto-discovered network after
+//! `verify` and forgets the network after `login` (`client.py:472-503` at `v8.4.1`); a login flow
+//! here cannot change any `Client`'s session behind its back, so there is nothing to wire that
+//! to. The ways into a new session — a freshly built `Client` (empty cache, no preferred
+//! network) or [`Client::set_session_token`] — reset that state themselves. Any future
+//! `Client`-level login helper must forget a discovered network on success, and any
+//! verification helper must do what [`Client::set_session_token`] does.
 //!
-//! # `get_account` does not share Python's refresh-hook gap (brief gotcha G12)
+//! # Session changes reset the cache and a discovered network
 //!
-//! The brief's G12 documents that Python's `get_account()` cannot self-heal a server-driven
-//! session refresh, because it calls the bare `AuthAPI.get()` directly rather than a module with
-//! `AuthenticatedAPI`'s `_refresh_hook` wired. This is **not** true of this port:
-//! [`crate::endpoints::NetworksApi::get_account`] (where the equivalent Rust call lives — see
-//! that method's own docs for why) sends its request through the ordinary
-//! [`crate::transport::Transport::resource`], the exact same one-shot-refresh-and-retry path
-//! every other cached getter in this file uses. That decision was already made at the endpoints layer
-//! before this phase started; [`Client::get_account`] simply inherits it. Recorded here, and in
-//! `PARITY.md`, as a deliberate behavioural improvement over Python, not an oversight.
+//! [`Client::set_session_token`], [`Client::clear_session_token`] and [`Client::logout`] empty
+//! the cache and forget a preferred network that auto-discovery chose (`_reset_session_state`,
+//! `client.py:457-470` at `v8.4.1`); a network the caller chose with
+//! [`Client::set_preferred_network`] survives. [`Client::clear_auth_data`] drops even that.
+//! The next call without a `network_id` then rediscovers the new account's network instead of
+//! targeting the previous account's. A read that was already in flight when the session changed
+//! is handed to its caller but cannot refill the cache (see the module docs of
+//! [`crate::cache`]), and cannot latch the previous account's network as the new preferred one.
 //!
-//! # The `/account` fallback: two deliberate divergences (brief gotchas G1, G6)
+//! # `get_account` goes through `AccountApi` (parity with `v8.4.1`)
 //!
-//! [`Client::get_networks`] reproduces Python's `/account` fallback (brief §4) with two
-//! decisions the brief explicitly calls out as needing a deliberate choice:
+//! [`Client::get_account`] calls [`crate::endpoints::account::AccountApi::get_account`], as
+//! `EeroClient.get_account` calls `self._api.account.get_account()` (`client.py:581-598` at
+//! `v8.4.1`). That request takes the ordinary [`crate::transport::Transport::resource`] path, so
+//! a `401 error.session.refresh` is refreshed once and replayed, the replayed envelope is the one
+//! that gets cached, and a client with no session fails with `Not authenticated` before any
+//! request and caches nothing.
 //!
-//! - **G1 (synthesised envelope)**: when the fallback succeeds, this crate — like Python —
-//!   returns an envelope whose `data` was never actually returned by a single server response
-//!   (`meta` comes from the original `/networks` call, `data.networks` comes from `/account`).
-//!   This contradicts the crate's usual "never transform the wire payload" rule, but is ported
-//!   anyway: downstream tools rely on `get_networks()` returning a non-empty list whenever the
-//!   account actually has networks, and Python's own behaviour is the only precedent for what
-//!   that synthesised shape should look like. This is the **one** documented exception to "every
-//!   endpoint method returns the envelope unmodified" in this crate.
-//! - **G6 (silent exception swallowing) — NOT reproduced.** Python wraps the entire fallback
-//!   attempt in `except Exception: _LOGGER.debug(...)` (`client.py:462-465`), so an
-//!   authentication failure, timeout, or any other error while fetching `/account` is invisible
-//!   to the caller — `get_networks()`
-//!   just returns the original, still-empty `/networks` envelope. This crate instead propagates
-//!   that error with `?`: if the `/networks` list is empty and the `/account` fallback itself
-//!   fails, [`Client::get_networks`] returns that `Err` rather than a silently-degraded `Ok`.
-//!   A `Result`-returning API hiding a real failure behind a successful-looking empty list is
-//!   exactly the kind of thing this port has fixed elsewhere (e.g. `transport.rs`'s refresh-retry
-//!   divergence); reproducing it here would be inconsistent with that precedent. Flagged for
-//!   `PARITY.md` as a deliberate divergence, not an oversight.
+//! # The `/account` fallback
+//!
+//! [`Client::get_networks`] reproduces Python's `/account` fallback (`client.py:602-695` at
+//! `v8.4.1`):
+//!
+//! - **Synthesised envelope**: when the fallback succeeds and finds networks, this crate — like
+//!   Python — returns an envelope whose `data` was never actually returned by a single server
+//!   response (`meta` comes from the original `/networks` call, `data.networks` comes from
+//!   `/account`). This contradicts the crate's usual "never transform the wire payload" rule, but
+//!   is ported anyway: downstream tools rely on `get_networks()` returning a non-empty list
+//!   whenever the account actually has networks, and Python's own behaviour is the only
+//!   precedent for what that synthesised shape should look like. This is the **one** documented
+//!   exception to "every endpoint method returns the envelope unmodified" in this crate.
+//! - **A failing fallback propagates.** If the `/networks` list is empty and the `/account`
+//!   read itself fails (authentication, rate limit, timeout, network or API error),
+//!   [`Client::get_networks`] returns that `Err`, caches nothing in either the networks or the
+//!   account entry, and selects no preferred network; the next call tries again. Only a
+//!   *successful* fallback that finds no networks yields a cacheable empty result. Python
+//!   swallowed the failure up to `v8.1.8`.
 //!
 //! # `get_profile_devices` keeps Python's `auto_discover=True` (brief gotcha G5)
 //!
@@ -128,7 +132,7 @@
 // without any `pub(crate)`/`pub(super)` change, because they are descendants of this module.
 // `crate::client::{Client, ClientBuilder}` keeps resolving exactly as before either way.
 
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -194,9 +198,29 @@ mod wpa3;
 pub struct Client {
     api: EeroApi,
     cache: Cache,
-    /// `eero-api`'s `_preferred_network_id` (`client.py:53`): in-memory only, lost on restart,
-    /// never synced with any API-layer state (brief §5) — see [`Client::set_preferred_network`].
-    preferred_network_id: RwLock<Option<String>>,
+    /// `eero-api`'s `_preferred_network_id` and `_preferred_network_explicit`
+    /// (`client.py:114-117` at `v8.4.1`): in-memory only, lost on restart, never synced with any
+    /// API-layer state — see [`Client::set_preferred_network`].
+    preferred: RwLock<PreferredNetwork>,
+}
+
+/// The preferred network, where it came from, and how many session changes have happened.
+///
+/// One lock guards all three so the check-and-set done by auto-discovery cannot interleave with
+/// an explicit choice or a session change.
+#[derive(Debug, Default)]
+struct PreferredNetwork {
+    /// The preferred network id, if any.
+    id: Option<String>,
+    /// `true` only after [`Client::set_preferred_network`]; a value found by auto-discovery
+    /// leaves this untouched. Only a discovered network is forgotten when the session changes.
+    explicit: bool,
+    /// How many times the session has changed under this client. Advanced by
+    /// `Client::forget_discovered_network` and `Client::clear_auth_data` — never by cache
+    /// invalidation, so an ordinary write cannot stop auto-discovery — so that a
+    /// `/networks` read sent under the previous session cannot latch that account's first
+    /// network as the new session's preferred one. Wraps on overflow; only inequality matters.
+    session_changes: u64,
 }
 
 impl Client {
@@ -244,37 +268,77 @@ impl Client {
     }
 
     /// Sets the preferred network id used by `Client::ensure_network_id` when no explicit id
-    /// is given.
+    /// is given, and marks it as an explicit choice.
     ///
-    /// Ported from `set_preferred_network` (`client.py:791-800`): in-memory only. "For
-    /// persistent storage, the CLI application should manage its own configuration file"
-    /// (`client.py:794-795`) — lost on process restart, never written to disk, never synced with
-    /// any API-layer state (brief §5).
+    /// Ported from `set_preferred_network` (`client.py:1585-1607` at `v8.4.1`): in-memory only.
+    /// "For persistent storage, the CLI application should manage its own configuration file" —
+    /// lost on process restart, never written to disk, never synced with any API-layer state.
+    /// Python accepts an `int` and stores `str(network_id)`; a Rust caller passes
+    /// `id.to_string()`, since the stored type is always a string.
+    ///
+    /// An explicit choice survives a session change ([`Client::set_session_token`],
+    /// [`Client::clear_session_token`], [`Client::logout`]) and also replaces a network found by
+    /// auto-discovery: setting it after a discovery makes the value explicit. Only
+    /// [`Client::clear_auth_data`] drops it. A network that [`Client::get_networks`] discovers
+    /// is forgotten on a session change instead, so the next call without a `network_id`
+    /// rediscovers the new account's network.
     pub fn set_preferred_network(&self, network_id: impl Into<String>) {
-        let mut guard = self
-            .preferred_network_id
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        *guard = Some(network_id.into());
+        let mut guard = self.preferred_write();
+        guard.id = Some(network_id.into());
+        guard.explicit = true;
     }
 
     /// Returns the currently preferred network id, if one has been set explicitly (via
     /// [`Client::set_preferred_network`]) or derived automatically (the one-shot side effect of
     /// [`Client::get_networks`] — see that method's docs).
     ///
-    /// Ported from the `preferred_network_id` property (`client.py:802-805`).
+    /// Ported from the `preferred_network_id` property (`client.py:1609-1612` at `v8.4.1`).
     #[must_use]
     pub fn preferred_network_id(&self) -> Option<String> {
-        self.preferred_network_id
+        self.preferred_read().id.clone()
+    }
+
+    fn preferred_read(&self) -> RwLockReadGuard<'_, PreferredNetwork> {
+        self.preferred
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    }
+
+    fn preferred_write(&self) -> RwLockWriteGuard<'_, PreferredNetwork> {
+        self.preferred
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Drops the preferred network when auto-discovery chose it; a network chosen with
+    /// [`Client::set_preferred_network`] is kept. Counts as a session change either way.
+    ///
+    /// Ported from `_forget_discovered_network` (`client.py:457-465` at `v8.4.1`).
+    fn forget_discovered_network(&self) {
+        let mut guard = self.preferred_write();
+        guard.session_changes = guard.session_changes.wrapping_add(1);
+        if !guard.explicit {
+            guard.id = None;
+        }
+    }
+
+    /// Empties the cache and forgets a discovered preferred network, after a session change.
+    ///
+    /// Ported from `_reset_session_state` (`client.py:467-470` at `v8.4.1`).
+    fn reset_session_state(&self) {
+        self.clear_cache();
+        self.forget_discovered_network();
+    }
+
+    /// How many session changes this client has seen; see [`PreferredNetwork::session_changes`].
+    fn session_changes(&self) -> u64 {
+        self.preferred_read().session_changes
     }
 
     /// Resolves a network id: explicit `network_id` → [`Client::preferred_network_id`] → (if
     /// `auto_discover`) the first network from [`Client::get_networks`] → [`Error::MissingNetworkId`].
     ///
-    /// Ported from `_ensure_network_id` (`client.py:128-168`, brief §3):
+    /// Ported from `_ensure_network_id` (`client.py:261-304` at `v8.4.1`):
     ///
     /// 1. `network_id`, but only if non-empty — an explicit empty string is treated exactly like
     ///    `None` (brief gotcha G10: Python's `network_id or self._preferred_network_id` is a
@@ -285,8 +349,10 @@ impl Client {
     ///    response can leave auto-discovery failing for a full TTL window; this port reproduces
     ///    that known quirk rather than silently fixing it here) — and takes the first entry's
     ///    `id`, falling back to the trailing path segment of its `url` via
-    ///    [`crate::util::id_from_url`] if `id` is absent or empty.
-    /// 4. Otherwise, [`Error::MissingNetworkId`] (`client.py:168`'s bare `EeroException`).
+    ///    [`crate::util::id_from_url`] if `id` is absent, empty or `0`. A JSON integer `id`
+    ///    becomes its decimal string, as Python's `str(net_id)` does for accounts whose API
+    ///    returns the id as a number (`client.py:302` at `v8.4.1`).
+    /// 4. Otherwise, [`Error::MissingNetworkId`] (`client.py:304`'s bare `EeroException`).
     ///
     /// # Errors
     ///
@@ -314,21 +380,29 @@ impl Client {
         Err(Error::MissingNetworkId)
     }
 
-    /// Logs the current session out and unconditionally clears this client's cache.
+    /// Logs the current session out, unconditionally clears this client's cache, and forgets a
+    /// preferred network that auto-discovery chose.
     ///
-    /// Ported from `logout()` (`client.py:197-206`, `result = await self._api.logout(); if
-    /// result: self.clear_cache()`), but **deliberately diverges** from that `if result:` gate
-    /// (security review finding F1): [`EeroApi::logout`] already clears the in-memory session
-    /// and the credential store unconditionally, on every outcome — see that method's own docs
-    /// — precisely because the session is gone either way, win or lose, on the wire. A `Client`
-    /// that only dropped its cache when the network call happened to succeed left every cached
-    /// getter (`get_account`, `get_network`, `get_devices`, `get_profiles`, ...) free to keep
-    /// serving the previous session's data for the rest of the TTL after a failed logout (a
-    /// `429`, a `5xx`, a timeout), with `is_authenticated()` already `false` and no auth check of
-    /// its own gating any of those reads. Clearing the cache unconditionally here — before either
-    /// return arm — closes that gap and matches [`EeroApi::logout`]'s own contract: the cache and
-    /// the session become stale at exactly the same moment, regardless of whether the request
-    /// itself succeeded.
+    /// Ported from `logout()` (`client.py:505-514` at `v8.4.1`, `result = await
+    /// self._api.logout(); if result: self._reset_session_state()`), but **deliberately diverges**
+    /// from that `if result:` gate for the cache (security review finding F1):
+    /// [`EeroApi::logout`] already clears the in-memory session and the credential store
+    /// unconditionally, on every outcome — see that method's own docs — precisely because the
+    /// session is gone either way, win or lose, on the wire. A `Client` that only dropped its
+    /// cache when the network call happened to succeed left every cached getter (`get_account`,
+    /// `get_network`, `get_devices`, `get_profiles`, ...) free to keep serving the previous
+    /// session's data for the rest of the TTL after a failed logout (a `429`, a `5xx`, a
+    /// timeout), with `is_authenticated()` already `false` and no auth check of its own gating
+    /// any of those reads. Clearing the cache unconditionally here — before either return arm —
+    /// closes that gap and matches [`EeroApi::logout`]'s own contract: the cache and the session
+    /// become stale at exactly the same moment, regardless of whether the request itself
+    /// succeeded.
+    ///
+    /// The discovered network follows Python: it is forgotten when the session was actually
+    /// logged out (`Ok(true)`), and also on `Err`, because the in-memory session is cleared
+    /// before the store clear that failed. It is kept on `Ok(false)`, which reports that there
+    /// was no session to log out of. A network chosen with [`Client::set_preferred_network`]
+    /// always survives.
     ///
     /// # Errors
     ///
@@ -336,16 +410,19 @@ impl Client {
     pub async fn logout(&self) -> Result<bool, Error> {
         let result = self.api.logout().await;
         self.clear_cache();
+        if !matches!(result, Ok(false)) {
+            self.forget_discovered_network();
+        }
         result
     }
 
-    /// Seeds the active session with a pre-existing session token and clears this client's
-    /// cache.
+    /// Seeds the active session with a pre-existing session token, clears this client's cache
+    /// and forgets a preferred network that auto-discovery chose.
     ///
-    /// Ported from `set_session_token()` (`client.py:208-225`): the cache is only cleared "if
-    /// `auth.set_session_token` did not raise" (brief §1.6's table) — the `?` below reproduces
-    /// that ordering exactly, since a `Validation` failure returns before [`Client::clear_cache`]
-    /// is ever called.
+    /// Ported from `set_session_token()` (`client.py:516-534` at `v8.4.1`): the reset runs once
+    /// the auth call has accepted the token, so a `Validation` failure — which returns before
+    /// anything changes — leaves the cache and the discovered network alone. A network chosen
+    /// with [`Client::set_preferred_network`] survives.
     ///
     /// `async` since `eero-api` 8.1.10: the credential-store write runs on the runtime's blocking
     /// pool instead of the calling task's thread. The in-memory session changes first, the cache
@@ -357,19 +434,23 @@ impl Client {
     /// Returns `Error::Validation { field: "token", .. }` if `token` is empty. Returns
     /// `Error::Storage` if a configured credential store failed to persist the new session under
     /// [`StorageFailures::Fatal`] (see [`crate::auth::AuthApi::set_session_token`]'s own docs).
+    /// The new session is already in place when that error is returned, so — unlike Python,
+    /// which skips its reset when the auth call raises — the cache and the discovered network are
+    /// reset in that case too: nothing cached under the previous session may be served to the
+    /// new one.
     pub async fn set_session_token(&self, token: &str) -> Result<(), Error> {
-        self.api.auth().set_session_token(token).await?;
-        self.clear_cache();
-        Ok(())
+        let result = self.api.auth().set_session_token(token).await;
+        if session_changed(&result) {
+            self.reset_session_state();
+        }
+        result
     }
 
-    /// Clears the active session token (keeping any refresh token) and clears this client's
-    /// cache.
+    /// Clears the active session token (keeping any refresh token), clears this client's cache
+    /// and forgets a preferred network that auto-discovery chose.
     ///
-    /// Ported from `clear_session_token()` (`client.py:227-234`), which clears the cache
-    /// unconditionally (`AuthAPI.clear_session_token` returns `None`, not a boolean to gate on —
-    /// brief §1.6's table notes this is presumably why this call site, unlike `verify`/`logout`,
-    /// is unconditional in Python).
+    /// Ported from `clear_session_token()` (`client.py:536-545` at `v8.4.1`). A network chosen
+    /// with [`Client::set_preferred_network`] survives; [`Client::clear_auth_data`] drops it.
     ///
     /// `async` since `eero-api` 8.1.10: the in-memory session is cleared first and the
     /// credential-store clear then runs on the runtime's blocking pool.
@@ -378,13 +459,43 @@ impl Client {
     ///
     /// Returns `Error::Storage` if a configured credential store failed to persist the change
     /// under [`StorageFailures::Fatal`] (see [`crate::auth::AuthApi::clear_session_token`]'s own
-    /// docs). The in-memory session is cleared regardless; this client's cache is only cleared
-    /// after that call returns `Ok`, mirroring Python's sequencing even though Python's own call
-    /// can never itself fail.
+    /// docs). The in-memory session is cleared regardless, so this client's cache and discovered
+    /// network are reset in that case as well.
     pub async fn clear_session_token(&self) -> Result<(), Error> {
-        self.api.auth().clear_session_token().await?;
+        let result = self.api.auth().clear_session_token().await;
+        if session_changed(&result) {
+            self.reset_session_state();
+        }
+        result
+    }
+
+    /// Removes every stored credential record without contacting the API, then resets this
+    /// client's preferred network — **including one set with [`Client::set_preferred_network`]**
+    /// — and empties its cache.
+    ///
+    /// Ported from `EeroClient.clear_auth_data()` (`client.py:563-578` at `v8.4.1`). Unlike
+    /// [`Client::clear_session_token`] and [`Client::logout`], which keep an explicit preferred
+    /// network, nothing cached or chosen is attributable to a session any more afterwards, so
+    /// everything is dropped; [`Client::is_authenticated`] is `false`. The steps run in
+    /// Python's order: the auth layer first (see [`crate::auth::AuthApi::clear_auth_data`]),
+    /// then the preferred network, then the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Storage` if a configured credential store failed to clear its entry under
+    /// [`StorageFailures::Fatal`]. Python skips the facade reset when the auth layer raises. The
+    /// in-memory session is already gone by then, so this resets the preferred network and the
+    /// cache regardless, as [`Client::logout`] does.
+    pub async fn clear_auth_data(&self) -> Result<(), Error> {
+        let result = self.api.auth().clear_auth_data().await;
+        {
+            let mut guard = self.preferred_write();
+            guard.id = None;
+            guard.explicit = false;
+            guard.session_changes = guard.session_changes.wrapping_add(1);
+        }
         self.clear_cache();
-        Ok(())
+        result
     }
 
     /// Whether the most recent attempt to persist the session to the configured credential store
@@ -400,17 +511,24 @@ impl Client {
 
     // ============================= Cached getters (the eight) =============================
     //
-    // Brief §1.4, §6: these are the *only* eight `EeroClient` methods that ever consult the
-    // cache. Every one of them follows the exact two-part read guard [`Cache::get`] already
-    // implements (TTL plus the falsy-value rule) and writes back unconditionally via
-    // [`Cache::put`], regardless of whether the read was skipped by `refresh_cache`.
+    // These are the *only* eight `EeroClient` methods that ever consult the cache. Every one of
+    // them follows the same shape: the two-part read guard [`Cache::get`] implements (TTL plus
+    // the falsy-value rule), unless `refresh_cache` skips it; then a snapshot of the cache's
+    // invalidation counter, taken after the cache check and immediately before the request; then
+    // a store through `Cache::put_if_current`, which refuses the response if an invalidation ran
+    // while the request was in flight. The caller always gets the response, so a read that was
+    // overtaken by a write hands back its (possibly pre-write) answer without caching it for
+    // everyone else. A rejected store is not an error.
 
     /// Gets account information — returns the raw Eero API response.
     ///
-    /// Ported from `get_account()` (`client.py:238-256`). Unlike Python (brief gotcha G12 — see
-    /// the module docs), the underlying call
-    /// ([`crate::endpoints::NetworksApi::get_account`]) already benefits from this crate's
-    /// ordinary one-shot refresh-and-retry on a `401 error.session.refresh`.
+    /// Ported from `get_account()` (`client.py:581-598` at `v8.4.1`). The request goes through
+    /// [`crate::endpoints::account::AccountApi::get_account`], so a `401 error.session.refresh`
+    /// is refreshed and replayed once and the replayed envelope is the one cached, and a client
+    /// with no session fails before any request with nothing cached.
+    ///
+    /// The envelope is stored only if no cache invalidation ran while the request was in flight
+    /// (see the module docs of [`crate::cache`]).
     ///
     /// # Errors
     ///
@@ -420,36 +538,48 @@ impl Client {
         if !refresh_cache && let Some(cached) = self.cache.get(&CacheKey::Account) {
             return Ok(cached);
         }
-        let response = self.api.networks().get_account().await?;
-        self.cache.put(CacheKey::Account, response.clone());
+        let generation = self.cache.generation();
+        let response = self.api.account().get_account().await?;
+        self.cache
+            .put_if_current(CacheKey::Account, response.clone(), generation);
         Ok(response)
     }
 
     /// Gets the list of networks on the account — returns the raw Eero API response.
     ///
-    /// Ported from `get_networks()` (`client.py:260-331`, brief §4). See the module docs for the
-    /// two deliberate divergences in the `/account` fallback this method implements (the
-    /// synthesised envelope is reproduced; the fallback's own failure is **not** silently
-    /// swallowed) and for why this method's own call to [`Client::get_networks`] — via
-    /// `Client::ensure_network_id`'s auto-discovery path — never passes `refresh_cache = true`
-    /// (brief gotcha G2, reproduced faithfully).
+    /// Ported from `get_networks()` (`client.py:602-675` at `v8.4.1`). See the module docs for
+    /// the `/account` fallback this method implements (the synthesised envelope is reproduced;
+    /// a failing fallback propagates and caches nothing) and for why this method's own call to
+    /// [`Client::get_networks`] — via `Client::ensure_network_id`'s auto-discovery path — never
+    /// passes `refresh_cache = true` (a cached "zero networks" response keeps auto-discovery
+    /// failing for a full TTL window, as in Python).
     ///
-    /// The one-shot `_preferred_network_id` side effect (`client.py:313-329`) is reproduced
-    /// exactly: it only runs when [`Client::preferred_network_id`] is currently unset, and it is
+    /// The one-shot `_preferred_network_id` side effect (`client.py:654-673`) is reproduced
+    /// exactly: it only runs when [`Client::preferred_network_id`] is currently unset, it is
     /// derived from the *final* (possibly synthesised) response, not the original `/networks`
-    /// one.
+    /// one, and it never marks the value as an explicit choice (see
+    /// [`Client::set_preferred_network`]). A first entry whose `id` is a JSON integer yields that
+    /// integer's decimal string.
+    ///
+    /// The networks entry is stored only if no cache invalidation ran while the request was in
+    /// flight, but the preferred network is still selected from the response in that case, as
+    /// Python does (`client.py:652-673`). The one exception is a session change: a response that
+    /// was requested under the previous session never selects a preferred network, so it cannot
+    /// leave the new session targeting the previous account's network.
     ///
     /// # Errors
     ///
-    /// Returns whatever status-mapped [`Error`] the initial `/networks` request produces.
-    /// Returns whatever [`Client::get_account`] produces if the `/networks` list came back empty
-    /// and the `/account` fallback itself fails (see the module docs — this is a deliberate
-    /// divergence from Python, which swallows that failure).
+    /// Returns whatever status-mapped [`Error`] the initial `/networks` request produces (a 2xx
+    /// body that is not a JSON object included, before any `/account` request is made and
+    /// before anything is cached). Returns whatever [`Client::get_account`] produces if the
+    /// `/networks` list came back empty and the `/account` fallback itself fails.
     pub async fn get_networks(&self, refresh_cache: bool) -> Result<Envelope, Error> {
         if !refresh_cache && let Some(cached) = self.cache.get(&CacheKey::Networks) {
             return Ok(cached);
         }
 
+        let generation = self.cache.generation();
+        let session_changes = self.session_changes();
         let response = self.api.networks().get_networks().await?;
         let networks = extract_networks_list(response.data());
 
@@ -459,29 +589,29 @@ impl Client {
             response
         };
 
-        self.cache.put(CacheKey::Networks, response.clone());
-        self.derive_preferred_network_id(&response);
+        self.cache
+            .put_if_current(CacheKey::Networks, response.clone(), generation);
+        // Not gated on the store above: a rejected cache fill still selects the network.
+        self.derive_preferred_network_id(&response, session_changes);
 
         Ok(response)
     }
 
-    /// Implements the `/account` fallback half of [`Client::get_networks`] (`client.py:289-309`).
+    /// Implements the `/account` fallback half of [`Client::get_networks`] (`client.py:640-652`
+    /// at `v8.4.1`).
     ///
     /// Called only when the `/networks` response's own network list came back empty. Forces a
-    /// live `/account` fetch (`refresh_cache = true`, matching `client.py:292` exactly — this
-    /// also refreshes the `account` cache bucket as a side effect, regardless of whether the
-    /// caller needed it). If the account-derived list is non-empty, returns a synthesised
-    /// envelope combining `original`'s `meta` with the account-derived `data.networks`
-    /// (`client.py:302-307`, brief gotcha G1); otherwise returns `original` unchanged
-    /// (`client.py:308-309`'s "no synthesis" path, reached whether the account list is also
-    /// empty or — divergence from Python — propagated as an `Err` instead of silently continuing
-    /// with `original` on a fetch failure).
+    /// live `/account` fetch (`refresh_cache = true` — this also refreshes the `account` cache
+    /// entry as a side effect, regardless of whether the caller needed it, and with its own
+    /// invalidation snapshot). If the account-derived list is non-empty, returns a synthesised
+    /// envelope combining `original`'s `meta` with the account-derived `data.networks`;
+    /// otherwise returns `original` unchanged, which the caller caches as an empty result.
     ///
     /// # Errors
     ///
-    /// Propagates whatever [`Client::get_account`] returns on failure. See the module docs'
-    /// "brief gotchas G1, G6" section for why this is a deliberate divergence from Python, which
-    /// never returns an `Err` from this path at all.
+    /// Propagates whatever [`Client::get_account`] returns on failure: the failure of the
+    /// fallback means the account could not be consulted, which is not the same as the account
+    /// having no networks.
     async fn apply_account_fallback(&self, original: Envelope) -> Result<Envelope, Error> {
         let account_response = self.get_account(true).await?;
         let account_networks = extract_account_networks(account_response.data());
@@ -500,48 +630,53 @@ impl Client {
     }
 
     /// Implements the one-shot `_preferred_network_id` side effect of [`Client::get_networks`]
-    /// (`client.py:313-329`): a no-op if a preferred network is already set, otherwise derives
-    /// one from `response`'s (possibly synthesised) network list, using the same `id`-or-`url`
-    /// extraction `Client::ensure_network_id`'s auto-discovery path uses. Silently leaves the
-    /// preferred network unset if extraction yields nothing, exactly like Python.
-    fn derive_preferred_network_id(&self, response: &Envelope) {
-        if self.preferred_network_id().is_some() {
+    /// (`client.py:654-673` at `v8.4.1`): a no-op if a preferred network is already set,
+    /// otherwise derives one from `response`'s (possibly synthesised) network list, using the
+    /// same `id`-or-`url` extraction `Client::ensure_network_id`'s auto-discovery path uses.
+    /// Silently leaves the preferred network unset if extraction yields nothing, exactly like
+    /// Python.
+    ///
+    /// The check and the set happen under one lock. The explicit-choice flag is left alone, so a
+    /// derived value never counts as an explicit one. Nothing is set if the session changed since
+    /// `session_changes` was read, i.e. if `response` was requested under the previous session.
+    fn derive_preferred_network_id(&self, response: &Envelope, session_changes: u64) {
+        let networks = extract_networks_list(response.data());
+        let Some(id) = networks.first().and_then(extract_network_id) else {
+            return;
+        };
+        let mut guard = self.preferred_write();
+        if guard.session_changes != session_changes {
             return;
         }
-        let networks = extract_networks_list(response.data());
-        if let Some(id) = networks.first().and_then(extract_network_id) {
-            self.set_preferred_network(id);
+        if guard.id.as_deref().is_none_or(str::is_empty) {
+            guard.id = Some(id);
         }
     }
 
     // ============================= Parent-resolution helpers =============================
     //
-    // Ported from `eero-api`'s four read-only, side-effect-free `_..._parent(_kwargs)` helpers
-    // (`client.py:230-322`, `.claude/tasks/briefs/v8/client.md` §3.3): each looks up an already
-    // cached envelope and hands it back unchanged for use as a domain method's `parent=`
-    // argument, so a phase-G domain wrapper can prefer the server's own published `resources`
-    // link over a hand-built template without an extra round trip. None of these mutate the
-    // cache or trigger a network call; a miss (nothing cached, or a cached entry that is no
-    // longer fresh) is simply `None`, mirroring Python's own `{}`-kwargs-omitted shape (this
-    // port returns `Option<Value>` instead — the caller passes it straight through as
-    // `parent: Option<&Value>`, the shape `crate::routes::Resource::resolve`/`Nested::resolve`
-    // already expect).
-    //
-    // No call site yet within this crate as of this round: every phase-G domain wrapper that
-    // will call these is still unwritten (see `.claude/tasks/briefs/v8/g*.md`). Exercised
-    // directly by this module's own `#[cfg(test)] mod tests` in the meantime.
+    // Ported from `eero-api`'s read-only, side-effect-free `_..._parent(_kwargs)` helpers
+    // (`client.py:316-452` at `v8.4.1`): each looks up an already cached envelope and hands it
+    // back unchanged for use as a domain method's `parent=` argument, so a wrapper can prefer
+    // the server's own published `resources` link over a hand-built template without an extra
+    // round trip. None of these mutate the cache or trigger a network call; a miss (nothing
+    // cached, or a cached entry that is no longer fresh) is simply `None`, mirroring Python's
+    // `{}`-kwargs-omitted shape (this port returns `Option<Value>` instead — the caller passes
+    // it straight through as `parent: Option<&Value>`, the shape `crate::routes::Resource::resolve`
+    // and `Nested::resolve` already expect). `Client::eero_parent` and `Client::find_by_id_or_url`
+    // have no call site yet; every other helper below does, and all of them are exercised
+    // directly by this module's own `#[cfg(test)] mod tests`.
 
     /// Returns the cached network envelope for `network_id`, if a fresh entry exists.
     ///
-    /// Ported from `_network_parent` (`eero-api src/eero/client.py:230-241`): looks up
-    /// [`CacheKey::network`] and returns the whole cached envelope (`{"meta": .., "data": ..}`,
+    /// Ported from `_network_parent` (`eero-api src/eero/client.py:316-328` at `v8.4.1`): looks
+    /// up [`CacheKey::network`] and returns the whole cached envelope (`{"meta": .., "data": ..}`,
     /// not just its `data`) exactly when [`Cache::get`] still considers it fresh — never mutates
     /// the cache, never triggers a network call. Python additionally wraps this in
     /// `_network_parent_kwargs`, which turns `Some`/`None` into a `{"parent": ..}`/`{}` kwargs
     /// dict for `**kwargs`-unpacking into a domain call; this port has no keyword-unpacking
     /// equivalent, so callers pass this method's `Option<Value>` straight through as
     /// `parent: Option<&Value>` instead.
-    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
     fn network_parent(&self, network_id: &str) -> Option<Value> {
         self.cache
             .get(&CacheKey::network(network_id))
@@ -552,8 +687,10 @@ impl Client {
     /// network envelope for `network_id` (see [`Client::network_parent`]).
     ///
     /// Ported from `_network_parent_kwargs_or` (`eero-api src/eero/client.py:345-362` at
-    /// `v8.4.1`): the caller's envelope is forwarded unchanged and wins over the cache.
-    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    /// `v8.4.1`): the caller's envelope is forwarded unchanged and wins over the cache, and an
+    /// empty object still counts as supplied. The cache lookup is keyed by the *resolved*
+    /// `network_id`, so an explicit network with nothing cached yields no parent.
+    #[allow(dead_code)] // the wrappers that need it are added next to it; see the banner above
     fn network_parent_or(&self, network_id: &str, parent: Option<&Value>) -> Option<Value> {
         parent.cloned().or_else(|| self.network_parent(network_id))
     }
@@ -562,14 +699,14 @@ impl Client {
     /// segment, matches `resource_id` exactly.
     ///
     /// Ported from the `@staticmethod` `_find_by_id_or_url`
-    /// (`eero-api src/eero/client.py:259-282`). `resource_id` is compared verbatim against each
-    /// entry's `id` field first; on a miss, against the trailing path segment of that entry's own
-    /// `url` field, extracted via [`crate::util::id_from_url`] — a `url` for which `id_from_url`
-    /// itself errors (e.g. empty, or composed entirely of slashes) is simply never a match,
-    /// exactly like Python's own `isinstance(url, str)` guard skips a non-string `url`. Entries
-    /// that are not JSON objects are skipped, mirroring Python's `isinstance(entry, dict)` guard.
-    /// Never mutates `envelopes`; returns a clone of the matching entry, if any.
-    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    /// (`eero-api src/eero/client.py:364-387` at `v8.4.1`). `resource_id` is compared verbatim
+    /// against each entry's `id` field first; on a miss, against the trailing path segment of that
+    /// entry's own `url` field, extracted via [`crate::util::id_from_url`] — a `url` for which
+    /// `id_from_url` itself errors (e.g. empty, or composed entirely of slashes) is simply never
+    /// a match, exactly like Python's own `isinstance(url, str)` guard skips a non-string `url`.
+    /// Entries that are not JSON objects are skipped, mirroring Python's `isinstance(entry,
+    /// dict)` guard. Never mutates `envelopes`; returns a clone of the matching entry, if any.
+    #[allow(dead_code)] // see the banner above
     fn find_by_id_or_url(envelopes: &[Value], resource_id: &str) -> Option<Value> {
         envelopes
             .iter()
@@ -590,59 +727,101 @@ impl Client {
 
     /// Returns the cached eero entry for `eero_id` within `network_id`'s eeros list, if fresh.
     ///
-    /// Ported from `_eero_parent_kwargs` (`eero-api src/eero/client.py:284-305`): looks up
-    /// [`CacheKey::eeros`] for `network_id`, and — only when that entry is still fresh — reads
-    /// its envelope's `data` field as a JSON array (a non-array `data`, like Python's own
+    /// Ported from `_eero_parent_kwargs` (`eero-api src/eero/client.py:389-410` at `v8.4.1`):
+    /// looks up [`CacheKey::eeros`] for `network_id`, and — only when that entry is still fresh —
+    /// reads its envelope's `data` field as a JSON array (a non-array `data`, like Python's own
     /// `isinstance(cached, dict)`/list check, yields `None` rather than a match) and searches it
     /// via [`Client::find_by_id_or_url`].
-    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
+    #[allow(dead_code)] // see the banner above
     fn eero_parent(&self, network_id: &str, eero_id: &str) -> Option<Value> {
         let cached = self.cache.get(&CacheKey::eeros(network_id))?;
         let data = cached.data().as_array()?;
         Self::find_by_id_or_url(data, eero_id)
     }
 
-    /// Returns the cached single-device envelope for `device_id` within `network_id`, if fresh.
+    /// Builds the cache key of one device, identical for every spelling of its id.
     ///
-    /// Ported from `_device_parent_kwargs` (`eero-api src/eero/client.py:307-322`): looks up
-    /// [`CacheKey::device`] and returns the whole cached envelope — not just its `data` — exactly
-    /// when it is still fresh.
-    #[allow(dead_code)] // see the "Parent-resolution helpers" banner above
-    fn device_parent(&self, network_id: &str, device_id: &str) -> Option<Value> {
-        self.cache
-            .get(&CacheKey::device(network_id, device_id))
-            .map(Envelope::into_value)
+    /// Ported from `_device_cache_key` (`eero-api src/eero/client.py:412-436` at `v8.4.1`). Takes
+    /// the last path segment of `device_id` through [`crate::util::id_from_url`], so a bare id,
+    /// an API-returned path and an absolute URL agree. When that segment is a 12-hex-digit MAC in
+    /// any spelling (colons, dashes, dots or none, any case) it is reduced to lowercase hex
+    /// without separators; any other id is kept as written. Only the cache key is canonicalised:
+    /// requests still carry the caller's own spelling.
+    ///
+    /// Unlike Python, whose keys are flat strings (`get_device("devices")` lands on the device
+    /// list's `{nid}_devices` key), the key is a structured [`CacheKey::Device`], so a device
+    /// can never collide with the list.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Validation`] with `field: "id_or_url"` and `must be a non-empty string` when
+    /// `device_id` is empty. A `device_id` made only of slashes is rejected too, with
+    /// `resolves to an empty path segment` (see [`crate::util::id_from_url`]); Python derives the
+    /// key `{nid}_` for it and fails later in the domain layer.
+    fn device_cache_key(network_id: &str, device_id: &str) -> Result<CacheKey, Error> {
+        let segment = crate::util::id_from_url(device_id)?;
+        let mac: String = segment
+            .chars()
+            .filter(|c| !matches!(c, ':' | '-' | '.'))
+            .collect();
+        let canonical = if mac.len() == 12 && mac.bytes().all(|b| b.is_ascii_hexdigit()) {
+            mac.to_ascii_lowercase()
+        } else {
+            segment
+        };
+        Ok(CacheKey::device(network_id, canonical))
+    }
+
+    /// Returns the cached single-device envelope for `device_id` within `network_id`, if fresh,
+    /// looked up through the canonical key (see [`Client::device_cache_key`]), so a device cached
+    /// under one spelling is found under any other.
+    ///
+    /// Ported from `_device_parent_kwargs` (`eero-api src/eero/client.py:438-452` at `v8.4.1`):
+    /// returns the whole cached envelope — not just its `data` — exactly when it is still fresh.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::device_cache_key`]: an empty `device_id` fails before any lookup.
+    fn device_parent(&self, network_id: &str, device_id: &str) -> Result<Option<Value>, Error> {
+        let key = Self::device_cache_key(network_id, device_id)?;
+        Ok(self.cache.get(&key).map(Envelope::into_value))
     }
 
     // ============================= Cache-invalidation helpers =============================
     //
-    // Mirror Python's own private helpers (`client.py:567-575, 659-667, 669-673`) exactly: each
-    // drops precisely the keys Python drops, no more. Where a deliberate `network[nid]`/
-    // `eeros[{nid}_eeros]` drop is added on top of Python (the two documented improvements above),
-    // that extra call is made directly at the write site rather than folded into a helper here —
-    // there is no Python helper for it to mirror.
+    // Mirror Python's own private helpers (`client.py:1173-1185, 1273-1300, 2731-2739` at
+    // `v8.4.1`): each drops precisely the keys Python drops, no more. Where a deliberate
+    // `network[nid]`/`eeros[{nid}_eeros]` drop is added on top of Python (the two documented
+    // improvements in [`crate::cache`]), that extra call is made directly at the write site
+    // rather than folded into a helper here — there is no Python helper for it to mirror. Every
+    // invalidation, through a helper or not, advances the cache's invalidation counter (see
+    // [`crate::cache`]), which is what rejects the store of a read that was in flight.
+
+    /// Drops the cached account after a write to it, and so rejects the store of a
+    /// `get_account` that was already in flight.
+    ///
+    /// Mirrors `_invalidate_account_cache` (`client.py:3441-3448` at `v8.4.1`).
+    fn invalidate_account_cache(&self) {
+        self.cache.invalidate(&CacheKey::Account);
+    }
 
     /// Drops `network[{nid}]` for one network.
     ///
-    /// No single Python helper mirrors this one — `client.py` deletes
-    /// `self._cache["network"][network_id]` inline at each setter call site — but it is added
-    /// here for the same reason [`Client::invalidate_device_cache`] exists: a single call site
-    /// for every phase-G network-scoped setter to invalidate through, instead of each one
+    /// Mirrors `_invalidate_network_cache` (`client.py:2731-2739` at `v8.4.1`): a single call
+    /// site for every network-scoped setter to invalidate through, instead of each one
     /// repeating `self.cache.invalidate(&CacheKey::network(..))` by hand.
-    #[allow(dead_code)] // no call site yet; see the "Parent-resolution helpers" banner above
     fn invalidate_network_cache(&self, network_id: &str) {
         self.cache.invalidate(&CacheKey::network(network_id));
     }
 
     /// Drops `eeros[{nid}_eeros]` for one network.
     ///
-    /// No single Python helper mirrors this one either — every `client.py` eeros setter deletes
-    /// `self._cache["eeros"][f"{network_id}_eeros"]` inline — added for the same reason as
-    /// [`Client::invalidate_network_cache`] just above. [`Client::reboot_eero`]/
+    /// Mirrors `_invalidate_eeros_cache` (`client.py:891-896` at `v8.4.1`) — added for the same
+    /// reason as [`Client::invalidate_network_cache`] just above. [`Client::reboot_eero`]/
     /// [`Client::set_led`]/[`Client::set_led_brightness`]/[`Client::set_nightlight`] etc.
     /// currently call `self.cache.invalidate(&CacheKey::eeros(..))` inline rather than through
-    /// this helper; a future cleanup pass may switch them over, but that is out of scope here.
-    #[allow(dead_code)] // no call site yet; see the "Parent-resolution helpers" banner above
+    /// this helper; either spelling has the same effect.
+    #[allow(dead_code)] // the network-wide reboot wrapper that uses it is added next to it
     fn invalidate_eeros_cache(&self, network_id: &str) {
         self.cache.invalidate(&CacheKey::eeros(network_id));
     }
@@ -652,21 +831,28 @@ impl Client {
     /// Mirrors `_invalidate_device_cache(network_id, *device_ids)` (`eero-api
     /// src/eero/client.py:1173-1185` at `v8.4.1`): zero or more devices, and the network's device
     /// list is always dropped — a write that touches no single device (a network reboot, say)
-    /// passes an empty slice.
+    /// passes an empty slice. Each id is reduced to its canonical key (see
+    /// [`Client::device_cache_key`]), so a write under any spelling drops the entry that was read
+    /// under another.
+    ///
+    /// An id that has no key (an empty id or one made only of slashes) is skipped: such an id
+    /// can never have been cached, and the write this runs after has already succeeded. Python
+    /// would raise there, after the write, leaving the device list in place.
     fn invalidate_device_cache(&self, network_id: &str, device_ids: &[&str]) {
         for &device_id in device_ids {
-            self.cache
-                .invalidate(&CacheKey::device(network_id, device_id));
+            if let Ok(key) = Self::device_cache_key(network_id, device_id) {
+                self.cache.invalidate(&key);
+            }
         }
         self.cache.invalidate(&CacheKey::devices(network_id));
     }
 
     /// Drops both `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]` for one profile.
     ///
-    /// Mirrors `_invalidate_profile_cache` (`eero-api src/eero/client.py:659-667`), which already
-    /// drops both keys itself — see `Client::rename_profile`'s docs for why call sites that call
-    /// both `_invalidate_profile_cache` and `_invalidate_profiles_list_cache` in Python only need
-    /// this one helper here.
+    /// Mirrors `_invalidate_profile_cache` (`eero-api src/eero/client.py:1273-1300` at `v8.4.1`),
+    /// which already drops both keys itself — see `Client::rename_profile`'s docs for why call
+    /// sites that call both `_invalidate_profile_cache` and `_invalidate_profiles_list_cache` in
+    /// Python only need this one helper here.
     fn invalidate_profile_cache(&self, network_id: &str, profile_id: &str) {
         self.cache
             .invalidate(&CacheKey::profile(network_id, profile_id));
@@ -676,18 +862,29 @@ impl Client {
     /// Drops only `profiles[{nid}_profiles]` — used by `Client::create_profile`, the one write
     /// with no single-profile key to also drop yet.
     ///
-    /// Mirrors `_invalidate_profiles_list_cache` (`eero-api src/eero/client.py:669-673`).
+    /// Mirrors `_invalidate_profiles_list_cache` (`eero-api src/eero/client.py:1273-1300` at
+    /// `v8.4.1`).
     fn invalidate_profiles_list_cache(&self, network_id: &str) {
         self.cache.invalidate(&CacheKey::profiles(network_id));
     }
+}
+
+/// Whether the outcome of a session setter means the in-memory session changed.
+///
+/// `Ok` obviously does. `Error::Storage` does too: the setters install the new session in memory
+/// before they touch the credential store, so a store failure reported under
+/// [`StorageFailures::Fatal`] arrives after the change. Anything else (the token-shape
+/// `Validation` error) is raised before anything changes.
+fn session_changed<T>(result: &Result<T, Error>) -> bool {
+    matches!(result, Ok(_) | Err(Error::Storage(_)))
 }
 
 /// Extracts a JSON array of network entries from a `{meta, data}` envelope's `data` value.
 ///
 /// Shared by [`Client::get_networks`] (the initial `/networks` response), `Client::ensure_network_id`'s
 /// auto-discovery step, and [`Client::derive_preferred_network_id`] — the same extraction
-/// pattern Python duplicates verbatim at three call sites (`client.py:151-157`, `:281-286`,
-/// `:316-321`; brief gotcha G11). If `data` is itself a JSON array, it is used directly; if
+/// pattern Python duplicates verbatim at three call sites (`client.py:285-290`, `:633-638`,
+/// `:657-662` at `v8.4.1`). If `data` is itself a JSON array, it is used directly; if
 /// `data` is a JSON object, its `networks` key is preferred when it holds a non-empty array,
 /// falling back to its `data` key under the same condition (mirroring Python's `data.get(
 /// "networks") or data.get("data") or []`, a truthiness `or` chain — an empty array is treated
@@ -713,12 +910,18 @@ fn truthy_array(value: Option<&Value>) -> Option<&Vec<Value>> {
     }
 }
 
-/// Extracts a network entry's id: prefers a non-empty `id` field, falling back to the trailing
+/// Extracts a network entry's id: prefers a usable `id` field, falling back to the trailing
 /// path segment of a non-empty `url` field via [`crate::util::id_from_url`].
+///
+/// A usable `id` is a non-empty JSON string, or a non-zero JSON integer rendered as its decimal
+/// string. Some accounts' API returns the id as a JSON number, and Python coerces it with
+/// `str(net_id)` (`client.py:302` and `:673` at `v8.4.1`). Python's truthiness rule applies:
+/// `0` counts as absent, so the `url` is consulted instead. A float, a boolean or a negative
+/// number is not an id.
 ///
 /// Shared by `Client::ensure_network_id`'s auto-discovery step and
 /// [`Client::derive_preferred_network_id`] — the same four-line pattern Python duplicates at two
-/// call sites (`client.py:161-166`, `:324-329`; brief gotcha G11). Built on
+/// call sites (`client.py:295-302`, `:666-673` at `v8.4.1`). Built on
 /// [`crate::util::id_from_url`] rather than re-deriving the trailing-segment logic a third time,
 /// unlike Python, which has no shared helper for it at all.
 ///
@@ -733,13 +936,16 @@ fn truthy_array(value: Option<&Value>) -> Option<&Vec<Value>> {
 /// every call after this one. Applies to both extraction paths, not just the `url` fallback:
 /// nothing stops a malicious `id` field from carrying the same value directly.
 fn extract_network_id(entry: &Value) -> Option<String> {
-    if let Some(id) = entry
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .filter(|id| crate::routes::validate_segment(id).is_ok())
-    {
-        return Some(id.to_owned());
+    let id = match entry.get("id") {
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .filter(|&id| id != 0)
+            .map(|id| id.to_string()),
+        _ => None,
+    };
+    if let Some(id) = id.filter(|id| crate::routes::validate_segment(id).is_ok()) {
+        return Some(id);
     }
     let url = entry
         .get("url")
@@ -753,10 +959,13 @@ fn extract_network_id(entry: &Value) -> Option<String> {
 /// Extracts the network list from a [`Client::get_account`] envelope's `data.networks` field.
 ///
 /// Distinct from [`extract_networks_list`] (which handles the `/networks` endpoint's own
-/// response shape): mirrors `client.py:293-300`'s account-specific extraction exactly —
-/// `data.networks` may itself be a JSON object whose own `data` key holds the array, or may be
-/// the array directly. No truthiness `or`-chain here; Python uses plain `isinstance` checks with
-/// no fallback between the two shapes.
+/// response shape): mirrors `_networks_from_account` (`client.py:677-695` at `v8.4.1`)
+/// exactly — `data.networks` may itself be a JSON object whose own `data` key holds the array, or
+/// may be the array directly. Anything else (a missing key, `null`, a string, a number, a wrapped
+/// `data` that is not a list, or an `account` envelope that is not an object at all, for which
+/// [`Envelope::data`] is `null`) yields an empty list instead of an error. No truthiness
+/// `or`-chain here; Python uses plain `isinstance` checks with no fallback between the two
+/// shapes.
 fn extract_account_networks(data: &Value) -> Vec<Value> {
     let Some(account_data) = data.as_object() else {
         return Vec::new();
@@ -842,8 +1051,13 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the `User-Agent` header reqwest sends. Forwarded to
-    /// [`crate::transport::TransportBuilder::user_agent`].
+    /// Sets the `User-Agent` header sent on every request — login, verify and refresh as well
+    /// as every domain call, since the whole client shares one transport. `None` (the default)
+    /// sends [`crate::consts::DEFAULT_USER_AGENT`]. The Eero cloud reads this string as the
+    /// client's app version and decides which capabilities to advertise from it; pass
+    /// [`crate::consts::LEGACY_USER_AGENT`] to reproduce the previous, lower-capability
+    /// behaviour. Forwarded to [`crate::transport::TransportBuilder::user_agent`], which
+    /// validates the value when the client is built.
     #[must_use]
     pub fn user_agent(mut self, user_agent: Option<String>) -> Self {
         self.user_agent = user_agent;
@@ -937,17 +1151,25 @@ impl ClientBuilder {
     /// configured, this performs the one-time credential load Python's `AuthAPI.__aenter__`
     /// performs (`auth.py:63-77`) — via the same `spawn_blocking`-backed
     /// `storage::load_async` adapter [`crate::transport::Transport`]'s own persistence
-    /// paths use — before the underlying [`Transport`] is constructed.
+    /// paths use — before the underlying [`Transport`] is constructed. The header values and
+    /// `base_url` are validated first, so a bad configuration fails before the store (a keyring
+    /// prompt, a file read) is touched at all.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Storage` if that initial load fails under
-    /// [`StorageFailures::Fatal`] (under the default [`StorageFailures::Warn`], a load failure
-    /// is logged at `WARN` and this proceeds with no initial session instead). Returns
-    /// `Error::Validation` if `base_url` was set to a string that does not parse as an absolute
-    /// URL usable as a path base, or `Error::Network` if constructing the underlying
-    /// `reqwest::Client` fails (see [`crate::transport::TransportBuilder::build`]).
+    /// Returns `Error::Validation` if `base_url` was set to a string that does not parse as an
+    /// absolute URL usable as a path base, or if a header value (`User-Agent`,
+    /// `X-Accept-Language`) is not printable ASCII, and `Error::Network` if constructing the
+    /// underlying `reqwest::Client` fails (see [`crate::transport::TransportBuilder::build`]); all
+    /// of these are raised before the credential store is consulted. Returns `Error::Storage` if
+    /// the initial load fails under [`StorageFailures::Fatal`] (under the default
+    /// [`StorageFailures::Warn`], a load failure is logged at `WARN` and this proceeds with no
+    /// initial session instead).
     pub async fn build(self) -> Result<Client, Error> {
+        if self.session.is_none() && self.store.is_some() {
+            self.validate_configuration()?;
+        }
+
         let session = match self.session {
             Some(session) => Some(session),
             None => match &self.store {
@@ -996,8 +1218,25 @@ impl ClientBuilder {
         Ok(Client {
             api,
             cache: Cache::new(self.cache_ttl),
-            preferred_network_id: RwLock::new(None),
+            preferred: RwLock::new(PreferredNetwork::default()),
         })
+    }
+
+    /// Runs the header and `base_url` validation [`Transport`]'s builder applies, on a throwaway
+    /// transport that carries no session and no store, so that [`ClientBuilder::build`] can fail
+    /// on a bad configuration before it reads the credential store. Using the transport's own
+    /// builder keeps the checks, their order and their messages identical to the ones the real
+    /// build applies; a caller-supplied `reqwest::ClientBuilder` is not part of the probe (it is
+    /// consumed by the real build).
+    fn validate_configuration(&self) -> Result<(), Error> {
+        let mut probe = Transport::builder().user_agent(self.user_agent.clone());
+        if let Some(base_url) = &self.base_url {
+            probe = probe.base_url(base_url.clone());
+        }
+        if let Some(accept_language) = &self.accept_language {
+            probe = probe.accept_language(accept_language.clone());
+        }
+        probe.build().map(drop)
     }
 }
 
@@ -1015,8 +1254,8 @@ mod tests {
     //! is covered by `tests/client_core.rs`, per the crate's testing conventions.
 
     use super::{
-        Cache, CacheKey, Client, EeroApi, Envelope, extract_account_networks, extract_network_id,
-        extract_networks_list, non_empty,
+        Cache, CacheKey, Client, EeroApi, Envelope, Error, PreferredNetwork,
+        extract_account_networks, extract_network_id, extract_networks_list, non_empty,
     };
     use crate::transport::Transport;
     use serde_json::json;
@@ -1028,13 +1267,19 @@ mod tests {
     /// network. A test populates the cache directly via `client.cache.put(..)` before calling the
     /// helper under test.
     fn test_client() -> Client {
+        test_client_with_ttl(Duration::from_secs(60))
+    }
+
+    /// As [`test_client`], with an explicit cache TTL (`Duration::ZERO` disables reads without
+    /// disabling writes).
+    fn test_client_with_ttl(ttl: Duration) -> Client {
         let transport = Transport::builder()
             .build()
             .expect("default transport configuration (no overrides) always builds successfully");
         Client {
             api: EeroApi::new(transport),
-            cache: Cache::new(Duration::from_secs(60)),
-            preferred_network_id: RwLock::new(None),
+            cache: Cache::new(ttl),
+            preferred: RwLock::new(PreferredNetwork::default()),
         }
     }
 
@@ -1107,6 +1352,52 @@ mod tests {
         assert!(extract_network_id(&json!({"id": "", "url": ""})).is_none());
     }
 
+    // ===================== extract_network_id: integer ids =====================
+    //
+    // Some accounts' API returns the network id as a JSON number; Python coerces it with
+    // `str(net_id)` and treats `0` as absent.
+
+    #[test]
+    fn extract_network_id_coerces_an_integer_id_without_a_url() {
+        assert_eq!(
+            extract_network_id(&json!({"id": 12_345_678})).as_deref(),
+            Some("12345678")
+        );
+    }
+
+    #[test]
+    fn extract_network_id_prefers_an_integer_id_over_a_mismatching_url() {
+        let entry = json!({"id": 123, "url": "/2.2/networks/other"});
+        assert_eq!(extract_network_id(&entry).as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn extract_network_id_treats_a_zero_id_as_absent() {
+        let entry = json!({"id": 0, "url": "/2.2/networks/abc"});
+        assert_eq!(extract_network_id(&entry).as_deref(), Some("abc"));
+        assert!(extract_network_id(&json!({"id": 0})).is_none());
+    }
+
+    #[test]
+    fn extract_network_id_does_not_take_floats_bools_or_negative_numbers_as_ids() {
+        for id in [
+            json!(1.5),
+            json!(7.0),
+            json!(true),
+            json!(-5),
+            json!(null),
+            json!([1]),
+        ] {
+            let entry = json!({"id": id, "url": "/2.2/networks/from-url"});
+            assert_eq!(
+                extract_network_id(&entry).as_deref(),
+                Some("from-url"),
+                "{id} must not be taken as an id"
+            );
+            assert!(extract_network_id(&json!({"id": id})).is_none(), "{id}");
+        }
+    }
+
     // ===================== extract_network_id: security finding F3 =====================
     //
     // A hostile or buggy `/networks` response must not hand back a `".."`/`"."`/empty network
@@ -1160,6 +1451,11 @@ mod tests {
         assert!(extract_account_networks(&json!({"networks": null})).is_empty());
         assert!(extract_account_networks(&json!({"networks": {}})).is_empty());
         assert!(extract_account_networks(&json!(null)).is_empty());
+        assert!(extract_account_networks(&json!({"networks": "unexpected"})).is_empty());
+        assert!(extract_account_networks(&json!({"networks": {"data": "unexpected"}})).is_empty());
+        assert!(extract_account_networks(&json!({"networks": {"data": null}})).is_empty());
+        assert!(extract_account_networks(&json!({"networks": 7})).is_empty());
+        assert!(extract_account_networks(&json!([])).is_empty());
     }
 
     // ===================== non_empty =====================
@@ -1195,15 +1491,7 @@ mod tests {
 
     #[test]
     fn network_parent_is_none_once_the_entry_has_expired() {
-        let client = Client {
-            api: EeroApi::new(
-                Transport::builder()
-                    .build()
-                    .expect("default transport configuration always builds successfully"),
-            ),
-            cache: Cache::new(Duration::ZERO), // ZERO disables reads without disabling writes
-            preferred_network_id: RwLock::new(None),
-        };
+        let client = test_client_with_ttl(Duration::ZERO);
         client.cache.put(
             CacheKey::network("net1"),
             Envelope::from_value(json!({"meta": {"code": 200}, "data": {"name": "Home"}})),
@@ -1312,15 +1600,7 @@ mod tests {
 
     #[test]
     fn eero_parent_is_none_once_the_entry_has_expired() {
-        let client = Client {
-            api: EeroApi::new(
-                Transport::builder()
-                    .build()
-                    .expect("default transport configuration always builds successfully"),
-            ),
-            cache: Cache::new(Duration::ZERO),
-            preferred_network_id: RwLock::new(None),
-        };
+        let client = test_client_with_ttl(Duration::ZERO);
         client.cache.put(
             CacheKey::eeros("net1"),
             Envelope::from_value(json!({"meta": {"code": 200}, "data": [{"id": "eero1"}]})),
@@ -1333,7 +1613,7 @@ mod tests {
     #[test]
     fn device_parent_is_none_on_an_empty_cache() {
         let client = test_client();
-        assert_eq!(client.device_parent("net1", "dev1"), None);
+        assert_eq!(client.device_parent("net1", "dev1").unwrap(), None);
     }
 
     #[test]
@@ -1344,7 +1624,10 @@ mod tests {
             CacheKey::device("net1", "dev1"),
             Envelope::from_value(envelope.clone()),
         );
-        assert_eq!(client.device_parent("net1", "dev1"), Some(envelope));
+        assert_eq!(
+            client.device_parent("net1", "dev1").unwrap(),
+            Some(envelope)
+        );
     }
 
     #[test]
@@ -1354,25 +1637,269 @@ mod tests {
             CacheKey::device("net1", "dev1"),
             Envelope::from_value(json!({"meta": {"code": 200}, "data": {"mac": "dev1"}})),
         );
-        assert_eq!(client.device_parent("net1", "dev2"), None);
+        assert_eq!(client.device_parent("net1", "dev2").unwrap(), None);
     }
 
     #[test]
     fn device_parent_is_none_once_the_entry_has_expired() {
-        let client = Client {
-            api: EeroApi::new(
-                Transport::builder()
-                    .build()
-                    .expect("default transport configuration always builds successfully"),
-            ),
-            cache: Cache::new(Duration::ZERO),
-            preferred_network_id: RwLock::new(None),
-        };
+        let client = test_client_with_ttl(Duration::ZERO);
         client.cache.put(
             CacheKey::device("net1", "dev1"),
             Envelope::from_value(json!({"meta": {"code": 200}, "data": {"mac": "dev1"}})),
         );
-        assert_eq!(client.device_parent("net1", "dev1"), None);
+        assert_eq!(client.device_parent("net1", "dev1").unwrap(), None);
+    }
+
+    #[test]
+    fn device_parent_finds_an_entry_cached_under_another_spelling() {
+        let client = test_client();
+        let envelope = json!({"meta": {"code": 200}, "data": {"mac": "aa:bb:cc:dd:ee:ff"}});
+        client.cache.put(
+            CacheKey::device("net1", "aabbccddeeff"),
+            Envelope::from_value(envelope.clone()),
+        );
+        assert_eq!(
+            client.device_parent("net1", "AA:BB:CC:DD:EE:FF").unwrap(),
+            Some(envelope)
+        );
+    }
+
+    #[test]
+    fn device_parent_rejects_an_empty_device_id() {
+        let client = test_client();
+        assert_empty_id_error(client.device_parent("net1", ""));
+    }
+
+    // ===================== device_cache_key =====================
+    //
+    // Mirrors `tests/api/test_client.py::TestDeviceCacheKeys` (`MAC_SPELLINGS`, v8.4.1). The
+    // absolute form uses a host that is not the production one.
+
+    const MAC_SPELLINGS: [&str; 7] = [
+        "aabbccddeeff",
+        "AA:BB:CC:DD:EE:FF",
+        "aa-bb-cc-dd-ee-ff",
+        "aabb.ccdd.eeff",
+        "/2.2/networks/n1/devices/aabbccddeeff",
+        "/2.2/networks/n1/devices/AA:BB:CC:DD:EE:FF/",
+        "http://mock.test:1234/2.2/networks/n1/devices/aabbccddeeff",
+    ];
+
+    fn assert_empty_id_error<T: std::fmt::Debug>(result: Result<T, Error>) {
+        match result {
+            Err(Error::Validation { field, message, .. }) => {
+                assert_eq!(field, "id_or_url");
+                assert_eq!(message, "must be a non-empty string");
+            }
+            other => panic!("expected the id_or_url validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_cache_key_maps_every_mac_spelling_to_one_key() {
+        for spelling in MAC_SPELLINGS {
+            assert_eq!(
+                Client::device_cache_key("n1", spelling).unwrap(),
+                CacheKey::device("n1", "aabbccddeeff"),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_cache_key_keeps_other_ids_as_written() {
+        for (spelling, segment) in [
+            ("d1", "d1"),
+            ("/2.2/networks/n1/devices/D1", "D1"),
+            ("ABC-123", "ABC-123"),
+            ("zz:bb:cc:dd:ee:ff", "zz:bb:cc:dd:ee:ff"),
+            ("aa:bb:cc:dd:ee:ff:00", "aa:bb:cc:dd:ee:ff:00"),
+            ("devices", "devices"),
+        ] {
+            assert_eq!(
+                Client::device_cache_key("n1", spelling).unwrap(),
+                CacheKey::device("n1", segment),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_cache_key_is_scoped_to_the_network() {
+        assert_ne!(
+            Client::device_cache_key("n1", "aabbccddeeff").unwrap(),
+            Client::device_cache_key("n2", "aabbccddeeff").unwrap()
+        );
+    }
+
+    #[test]
+    fn device_cache_key_rejects_an_empty_id_with_the_id_or_url_error() {
+        assert_empty_id_error(Client::device_cache_key("n1", ""));
+    }
+
+    #[test]
+    fn device_cache_key_rejects_a_slash_only_id() {
+        // Python derives the key `n1_` for `/`; the shared `id_from_url` helper refuses it.
+        assert!(matches!(
+            Client::device_cache_key("n1", "/"),
+            Err(Error::Validation { ref field, .. }) if field == "id_or_url"
+        ));
+    }
+
+    // ===================== invalidate_device_cache =====================
+
+    fn seed_device_entries(client: &Client) {
+        client.cache.put(
+            CacheKey::device("n1", "aabbccddeeff"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {"mac": "x"}})),
+        );
+        client.cache.put(
+            CacheKey::devices("n1"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": [{"mac": "x"}]})),
+        );
+    }
+
+    #[test]
+    fn invalidate_device_cache_drops_the_entry_and_the_list_for_every_spelling() {
+        for spelling in MAC_SPELLINGS {
+            let client = test_client();
+            seed_device_entries(&client);
+
+            client.invalidate_device_cache("n1", &[spelling]);
+
+            assert!(
+                client
+                    .cache
+                    .get(&CacheKey::device("n1", "aabbccddeeff"))
+                    .is_none(),
+                "the single-device entry survived a write under {spelling}"
+            );
+            assert!(
+                client.cache.get(&CacheKey::devices("n1")).is_none(),
+                "the device list survived a write under {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalidate_device_cache_with_no_ids_drops_only_the_list() {
+        let client = test_client();
+        seed_device_entries(&client);
+
+        client.invalidate_device_cache("n1", &[]);
+
+        assert!(client.cache.get(&CacheKey::devices("n1")).is_none());
+        assert!(
+            client
+                .cache
+                .get(&CacheKey::device("n1", "aabbccddeeff"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn invalidate_device_cache_skips_an_id_without_a_key_but_still_drops_the_list() {
+        let client = test_client();
+        seed_device_entries(&client);
+
+        client.invalidate_device_cache("n1", &["", "/", "aabbccddeeff"]);
+
+        assert!(client.cache.get(&CacheKey::devices("n1")).is_none());
+        assert!(
+            client
+                .cache
+                .get(&CacheKey::device("n1", "aabbccddeeff"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalidate_device_cache_leaves_other_devices_and_networks_alone() {
+        let client = test_client();
+        seed_device_entries(&client);
+        client.cache.put(
+            CacheKey::device("n1", "other"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {"mac": "other"}})),
+        );
+        client.cache.put(
+            CacheKey::device("n2", "aabbccddeeff"),
+            Envelope::from_value(json!({"meta": {"code": 200}, "data": {"mac": "y"}})),
+        );
+
+        client.invalidate_device_cache("n1", &["AA:BB:CC:DD:EE:FF"]);
+
+        assert!(client.cache.get(&CacheKey::device("n1", "other")).is_some());
+        assert!(
+            client
+                .cache
+                .get(&CacheKey::device("n2", "aabbccddeeff"))
+                .is_some()
+        );
+    }
+
+    // ===================== network_parent_or =====================
+    //
+    // Mirrors `tests/api/test_client.py::TestNetworkParentKwargsOr` (v8.4.1).
+
+    fn seed_network(client: &Client, network_id: &str) -> serde_json::Value {
+        let cached = json!({"meta": {"code": 200}, "data": {"name": network_id}});
+        client.cache.put(
+            CacheKey::network(network_id),
+            Envelope::from_value(cached.clone()),
+        );
+        cached
+    }
+
+    #[test]
+    fn network_parent_or_prefers_the_caller_parent_over_a_fresh_cache() {
+        let client = test_client();
+        seed_network(&client, "net1");
+        let caller = json!({"meta": {"code": 200}, "data": {"name": "caller"}});
+
+        assert_eq!(
+            client.network_parent_or("net1", Some(&caller)),
+            Some(caller)
+        );
+    }
+
+    #[test]
+    fn network_parent_or_treats_an_empty_object_as_supplied() {
+        let client = test_client();
+        seed_network(&client, "net1");
+
+        assert_eq!(
+            client.network_parent_or("net1", Some(&json!({}))),
+            Some(json!({}))
+        );
+    }
+
+    #[test]
+    fn network_parent_or_falls_back_to_the_fresh_cached_envelope() {
+        let client = test_client();
+        let cached = seed_network(&client, "net1");
+
+        assert_eq!(client.network_parent_or("net1", None), Some(cached));
+    }
+
+    #[test]
+    fn network_parent_or_is_none_on_an_empty_cache() {
+        assert_eq!(test_client().network_parent_or("net1", None), None);
+    }
+
+    #[test]
+    fn network_parent_or_is_none_once_the_cached_entry_expired() {
+        let client = test_client_with_ttl(Duration::ZERO);
+        seed_network(&client, "net1");
+
+        assert_eq!(client.network_parent_or("net1", None), None);
+    }
+
+    #[test]
+    fn network_parent_or_is_scoped_to_the_given_network_id() {
+        let client = test_client();
+        seed_network(&client, "network-0001");
+
+        assert_eq!(client.network_parent_or("network-0002", None), None);
     }
 
     // ===================== invalidate_network_cache / invalidate_eeros_cache =====================

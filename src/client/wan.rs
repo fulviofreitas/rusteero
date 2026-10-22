@@ -80,11 +80,12 @@ impl Client {
     /// Allows or denies a single device's secondary-WAN access — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `set_device_secondary_wan_access` (`eero-api src/eero/client.py:3063-3070`).
-    /// `auto_discover = false`. Invalidates the **device** cache (`Dev{nid,mac}` +
-    /// `DevList{nid}`, via `Client::invalidate_device_cache`) after the write, not the network
-    /// cache — matches Python's `self._invalidate_device_cache(network_id, mac)` exactly, even
-    /// though the domain call lives on `WanApi`.
+    /// Ported from `set_device_secondary_wan_access` (`eero-api src/eero/client.py:3871-3878` at
+    /// `v8.4.1`). `auto_discover = false`. Invalidates the **device** cache (the device's entry
+    /// through its canonical key, so `mac` may be spelled with colons, dashes, dots or none, plus
+    /// the network's device list, via `Client::invalidate_device_cache`) after the write, not the
+    /// network cache — matches Python's `self._invalidate_device_cache(network_id, mac)` exactly,
+    /// even though the domain call lives on `WanApi`.
     ///
     /// # Errors
     ///

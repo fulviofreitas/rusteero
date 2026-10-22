@@ -8,15 +8,16 @@ use crate::error::Error;
 impl Client {
     /// Gets the list of connected devices — returns the raw Eero API response.
     ///
-    /// Ported from `get_devices()` (`eero-api src/eero/client.py:674-715` at `v8.0.4`);
+    /// Ported from `get_devices()` (`eero-api src/eero/client.py:927-969` at `v8.4.1`);
     /// `auto_discover = true` — see [`Client::get_network`] for the shared note. Passes the
     /// cached network envelope as `parent=` (`+net`, `_network_parent_kwargs`).
     ///
     /// `thread`/`proxied_node` are new since v6.2.0: `filtered = thread.is_some() ||
-    /// proxied_node.is_some()` gates **both** cache directions (`client.py:696-715`) — a
-    /// filtered call never reads the `devices[{nid}_devices]` cache, even if fresh, and never
-    /// writes it either, so a filtered response can never silently overwrite the unfiltered
-    /// cached list the next unfiltered call would otherwise read.
+    /// proxied_node.is_some()` gates **both** cache directions — a filtered call never reads the
+    /// `devices[{nid}_devices]` cache, even if fresh, and never writes it either, so a filtered
+    /// response can never silently overwrite the unfiltered cached list the next unfiltered call
+    /// would otherwise read. An unfiltered response is stored only if no cache invalidation ran
+    /// while the request was in flight.
     ///
     /// # Errors
     ///
@@ -37,6 +38,7 @@ impl Client {
         {
             return Ok(cached);
         }
+        let generation = self.cache.generation();
         let parent = self.network_parent(network_id.as_str());
         let response = self
             .api
@@ -44,22 +46,30 @@ impl Client {
             .get_devices(&network_id, thread, proxied_node, parent.as_ref())
             .await?;
         if !filtered {
-            self.cache.put(key, response.clone());
+            self.cache.put_if_current(key, response.clone(), generation);
         }
         Ok(response)
     }
 
     /// Gets a single device's full object — returns the raw Eero API response.
     ///
-    /// Ported from `get_device()` (`client.py:717-747`); see [`Client::get_network`] for the
-    /// shared `auto_discover = true` note. Note the parameter order: `device_id` (required)
-    /// comes first, `network_id` (optional) second — matching every cached getter that takes an
-    /// item id (brief §6). This call never passes `parent=` itself — it *populates* the cache
+    /// Ported from `get_device()` (`client.py:971-1001` at `v8.4.1`); see [`Client::get_network`]
+    /// for the shared `auto_discover = true` note. Note the parameter order: `device_id`
+    /// (required) comes first, `network_id` (optional) second — matching every cached getter that
+    /// takes an item id. This call never passes `parent=` itself — it *populates* the cache
     /// `Client::device_parent` later reads from.
+    ///
+    /// The entry is cached under a canonical key: the last path segment of `device_id`, and, when
+    /// that is a MAC address in any spelling (`aabbccddeeff`, `AA:BB:CC:DD:EE:FF`,
+    /// `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff`), its lowercase hex digits. A bare id, a path
+    /// and an absolute URL for the same device therefore share one entry, while the request
+    /// itself still carries `device_id` exactly as written. The response is stored only if no
+    /// cache invalidation ran while the request was in flight.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_network`].
+    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before any
+    /// request. Otherwise see [`Client::get_network`].
     pub async fn get_device(
         &self,
         device_id: &str,
@@ -67,16 +77,17 @@ impl Client {
         refresh_cache: bool,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, true).await?;
-        let key = CacheKey::device(network_id.as_str(), device_id);
+        let key = Self::device_cache_key(network_id.as_str(), device_id)?;
         if !refresh_cache && let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
+        let generation = self.cache.generation();
         let response = self
             .api
             .devices()
             .get_device(&network_id, device_id, None)
             .await?;
-        self.cache.put(key, response.clone());
+        self.cache.put_if_current(key, response.clone(), generation);
         Ok(response)
     }
 
@@ -112,8 +123,9 @@ impl Client {
 
     /// Sets a nickname for a device — returns the raw Eero API response.
     ///
-    /// Ported from `set_device_nickname` (`eero-api src/eero/client.py:748-769`).
-    /// `auto_discover = true`. On success, invalidates both `devices[{nid}_{did}]` and
+    /// Ported from `set_device_nickname` (`eero-api src/eero/client.py:1003-1023` at `v8.4.1`).
+    /// `auto_discover = true`. On success, invalidates both the device's entry (through its
+    /// canonical key, so a write under any spelling drops the entry read under another) and
     /// `devices[{nid}_devices]` via `Client::invalidate_device_cache`. No `parent=`.
     ///
     /// # Errors
@@ -137,21 +149,30 @@ impl Client {
 
     /// Blocks a device via the `/blacklist` resource — returns the raw Eero API response.
     ///
-    /// Ported from `block_device` (`eero-api src/eero/client.py:770-789`). `auto_discover =
-    /// true`. **Breaking shape change**: the pre-8.0.0 `blocked: bool` parameter this crate
-    /// previously shipped is gone — unblocking is [`Client::unblock_device`], a separate method.
-    /// On success, invalidates both `devices[{nid}_{did}]` and `devices[{nid}_devices]`
-    /// (`client.py:786-787`). No `parent=`.
+    /// Ported from `block_device` (`eero-api src/eero/client.py:1025-1043` at `v8.4.1`).
+    /// `auto_discover = true`. **Breaking shape change**: the pre-8.0.0 `blocked: bool`
+    /// parameter this crate previously shipped is gone — unblocking is
+    /// [`Client::unblock_device`], a separate method. On success, invalidates both the device's
+    /// entry (through its canonical key) and `devices[{nid}_devices]`. No `parent=`.
+    ///
+    /// An empty `device_id` is rejected before the request is sent. Python's block write has no
+    /// check of its own: it posts `mac=`, and only afterwards fails to derive the cache key,
+    /// reporting a validation error for a write the server accepted and leaving the device list
+    /// cached. Failing first reports the same error without sending anything.
     ///
     /// # Errors
     ///
-    /// See [`Client::get_network`]. The cache is left untouched on any `Err`.
+    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before any
+    /// request. Otherwise see [`Client::get_network`]. The cache is left untouched on any `Err`.
     pub async fn block_device(
         &self,
         device_id: &str,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, true).await?;
+        // The cache key is derived up front: an id that has none (an empty one) is rejected here,
+        // before the write goes out.
+        Self::device_cache_key(network_id.as_str(), device_id)?;
         let response = self
             .api
             .devices()
@@ -163,10 +184,11 @@ impl Client {
 
     /// Unblocks a device via the `/blacklist` resource — returns the raw Eero API response.
     ///
-    /// Ported from `unblock_device` (`eero-api src/eero/client.py:790-809`). New since v6.2.0
-    /// (the pre-8.0.0 port folded this into `block_device(blocked: false)`). `auto_discover =
-    /// true`. On success, invalidates both `devices[{nid}_{did}]` and `devices[{nid}_devices]`,
-    /// same as [`Client::block_device`]. No `parent=`.
+    /// Ported from `unblock_device` (`eero-api src/eero/client.py:1045-1063` at `v8.4.1`). New
+    /// since v6.2.0 (the pre-8.0.0 port folded this into `block_device(blocked: false)`).
+    /// `auto_discover = true`. On success, invalidates both the device's entry (through its
+    /// canonical key) and `devices[{nid}_devices]`, same as [`Client::block_device`]. No
+    /// `parent=`.
     ///
     /// # Errors
     ///
@@ -188,9 +210,9 @@ impl Client {
 
     /// Pauses or unpauses internet access for a device — returns the raw Eero API response.
     ///
-    /// Ported from `pause_device` (`eero-api src/eero/client.py:810-831`). `auto_discover =
-    /// true`. On success, invalidates both `devices[{nid}_{did}]` and `devices[{nid}_devices]`.
-    /// No `parent=`.
+    /// Ported from `pause_device` (`eero-api src/eero/client.py:1065-1085` at `v8.4.1`).
+    /// `auto_discover = true`. On success, invalidates both the device's entry (through its
+    /// canonical key) and `devices[{nid}_devices]`. No `parent=`.
     ///
     /// # Errors
     ///
@@ -214,19 +236,21 @@ impl Client {
     /// Updates a device's nickname/paused/profile via its own published URL — returns the raw
     /// Eero API response.
     ///
-    /// Ported from `update_device_via_link` (`eero-api src/eero/client.py:832-867`).
-    /// `auto_discover = true`. Passes the cached single-device envelope as `parent=` (`+dev`,
-    /// `_device_parent_kwargs`). On success, invalidates both `devices[{nid}_{did}]` and
-    /// `devices[{nid}_devices]`, **and**, only when `profile` is `Some`, every cached profile
-    /// entry of this network (`Cache::invalidate_bucket(Bucket::Profiles, ..)`,
-    /// `client.py:1028-1038`'s `_invalidate_all_profile_caches` — a device's profile membership
-    /// changed, so nothing single-profile can be trusted any more).
+    /// Ported from `update_device_via_link` (`eero-api src/eero/client.py:1087-1121` at
+    /// `v8.4.1`). `auto_discover = true`. Passes the cached single-device envelope as `parent=`
+    /// (`+dev`, `_device_parent_kwargs`), found through the canonical key, so an envelope cached
+    /// under any spelling of the device is reused. On success, invalidates both the device's
+    /// entry (through its canonical key) and `devices[{nid}_devices]`, **and**, only when
+    /// `profile` is `Some`, every cached profile entry of this network
+    /// (`Cache::invalidate_bucket(Bucket::Profiles, ..)`, `_invalidate_all_profile_caches` — a
+    /// device's profile membership changed, so nothing single-profile can be trusted any more).
     ///
     /// # Errors
     ///
-    /// See [`Client::get_network`]. Also returns [`Error::Validation`] with `field: "device"` if
-    /// `nickname`, `paused` and `profile` are all `None`, before any request is sent. The cache
-    /// is left untouched on any `Err`.
+    /// [`Error::Validation`] with `field: "id_or_url"` if `device_id` is empty, before any
+    /// request and ahead of the check below. Otherwise see [`Client::get_network`]. Also returns
+    /// [`Error::Validation`] with `field: "device"` if `nickname`, `paused` and `profile` are all
+    /// `None`, before any request is sent. The cache is left untouched on any `Err`.
     pub async fn update_device_via_link(
         &self,
         device_id: &str,
@@ -236,7 +260,7 @@ impl Client {
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, true).await?;
-        let parent = self.device_parent(network_id.as_str(), device_id);
+        let parent = self.device_parent(network_id.as_str(), device_id)?;
         let response = self
             .api
             .devices()
@@ -259,9 +283,9 @@ impl Client {
 
     /// Sets a device's type — returns the raw Eero API response.
     ///
-    /// Ported from `set_device_type` (`eero-api src/eero/client.py:868-880`). `auto_discover =
-    /// true`. On success, invalidates both `devices[{nid}_{did}]` and `devices[{nid}_devices]`.
-    /// No `parent=`.
+    /// Ported from `set_device_type` (`eero-api src/eero/client.py:1123-1134` at `v8.4.1`).
+    /// `auto_discover = true`. On success, invalidates both the device's entry (through its
+    /// canonical key) and `devices[{nid}_devices]`. No `parent=`.
     ///
     /// # Errors
     ///
@@ -304,11 +328,12 @@ impl Client {
 
     /// Sets a device's labels — returns the raw Eero API response.
     ///
-    /// Ported from `set_device_labels` (`eero-api src/eero/client.py:888-...`). `auto_discover =
-    /// true`. Confirmed server-side **no-op** as of 2026-09-20 (ported for parity, documented as
-    /// such — see [`crate::endpoints::devices::DevicesApi::set_device_labels`]). On success,
-    /// invalidates both `devices[{nid}_{did}]` and `devices[{nid}_devices]` regardless, matching
-    /// every other device write in this file.
+    /// Ported from `set_device_labels` (`eero-api src/eero/client.py:1143-1171` at `v8.4.1`).
+    /// `auto_discover = true`. Confirmed server-side **no-op** as of 2026-09-20 (ported for
+    /// parity, documented as such — see
+    /// [`crate::endpoints::devices::DevicesApi::set_device_labels`]). On success, invalidates both
+    /// the device's entry (through its canonical key) and `devices[{nid}_devices]` regardless,
+    /// matching every other device write in this file.
     ///
     /// # Errors
     ///
