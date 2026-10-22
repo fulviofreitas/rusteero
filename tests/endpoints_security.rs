@@ -315,7 +315,16 @@ async fn set_mlo_mode_rejects_an_invalid_mode_with_no_requests() -> anyhow::Resu
         .set_mlo_mode("network-0001", "DISABLED", None)
         .await
         .expect_err("an unrecognised mode must be rejected before any request");
-    assert!(matches!(err, Error::Validation { ref field, .. } if field == "mode"));
+    // Python's `repr()` of the sorted vocabulary and of the offending value.
+    assert!(
+        matches!(
+            &err,
+            Error::Validation { field, message, .. }
+                if field == "mode"
+                    && message == "must be one of ['disabled', 'multi', 'single'], got 'DISABLED'"
+        ),
+        "{err:?}"
+    );
 
     let requests = mock
         .server

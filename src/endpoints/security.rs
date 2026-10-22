@@ -25,7 +25,7 @@ use serde_json::{Map, Value, json};
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::links::warn_uncharacterised_write;
-use crate::params::resolve_network_url;
+use crate::params::{py_list, py_quote, resolve_network_url};
 use crate::routes;
 use crate::routes::ApiVersion;
 use crate::transport::{RequestBody, Transport};
@@ -286,7 +286,9 @@ impl SecurityApi {
     /// # Errors
     ///
     /// Returns `Error::Validation { field: "mode", .. }` if `mode` is not one of
-    /// [`MLO_MODES`] (`security.py:476-479`), before any request is sent. Otherwise see
+    /// [`MLO_MODES`] (`security.py:476-479`), before any request is sent; the message is
+    /// Python's `repr()` rendering (`must be one of ['disabled', 'multi', 'single'], got 'x'`).
+    /// Otherwise see
     /// [`SecurityApi::get_security_settings`].
     pub async fn set_mlo_mode(
         &self,
@@ -297,7 +299,11 @@ impl SecurityApi {
         if !MLO_MODES.contains(&mode) {
             return Err(Error::validation(
                 "mode",
-                format!("must be one of {MLO_MODES:?}, got {mode:?}"),
+                format!(
+                    "must be one of {}, got {}",
+                    py_list(MLO_MODES),
+                    py_quote(mode)
+                ),
             ));
         }
         let url = routes::security::SET_MLO_MODE.resolve(
