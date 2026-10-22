@@ -47,7 +47,7 @@ use rusteero::transport::Transport;
 use rusteero::{Envelope, Error};
 use serde_json::{Value, json};
 use tracing::Level;
-use wiremock::matchers::{any, body_bytes, body_json, body_string, header, method, path};
+use wiremock::matchers::{body_bytes, body_json, body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{LogCapture, MockEero, TEST_TOKEN, capture_logs, session_cookie, user_token_header};
@@ -360,7 +360,8 @@ const VERIFIED_WRITES: &[(&str, &str, Option<&str>, &str)] = &[
 struct SourceFile {
     /// Path relative to `src/`, always `/`-separated.
     path: String,
-    /// The code before the first top-level `#[cfg(test)]`, with every comment blanked out.
+    /// The production code: line endings normalised, every `#[cfg(test)]` item and every comment
+    /// blanked out.
     code: String,
 }
 
@@ -542,7 +543,7 @@ fn split_top_level(text: &str) -> Vec<&str> {
 }
 
 /// The value of the string literal that `text` starts with, escapes decoded (a backslash before a
-/// newline swallows the newline and the indentation after it, as in Rust source).
+/// newline, `\n` or `\r\n`, swallows the newline and the indentation after it, as in Rust source).
 fn decode_literal(text: &str) -> String {
     let rest = text
         .strip_prefix('"')
@@ -560,9 +561,11 @@ fn decode_literal(text: &str) -> String {
                 '\\' => out.push('\\'),
                 '"' => out.push('"'),
                 '\'' => out.push('\''),
-                '\n' => {
-                    let skipped = chars.as_str().len() - chars.as_str().trim_start().len();
-                    chars = chars.as_str()[skipped..].chars();
+                '\n' => chars = chars.as_str().trim_start().chars(),
+                // A checkout with CRLF line endings (Git for Windows with `core.autocrlf`): rustc
+                // reads `\` + CRLF as the same continuation. A lone `\r` stays an error.
+                '\r' if chars.as_str().starts_with('\n') => {
+                    chars = chars.as_str().trim_start().chars();
                 }
                 'u' => {
                     let digits: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
@@ -575,6 +578,67 @@ fn decode_literal(text: &str) -> String {
         }
     }
     panic!("unterminated string literal: {text:?}");
+}
+
+/// The index just past the item whose text starts at `from` (after its `#[cfg(test)]`): the end of
+/// its brace block or its terminating `;`, whichever comes first outside any parentheses or
+/// brackets.
+fn item_end(code: &str, from: usize) -> usize {
+    let bytes = code.as_bytes();
+    let mut depth = 0_usize;
+    let mut at = from;
+    while at < bytes.len() {
+        if let Some(end) = literal_end(bytes, at) {
+            at = end;
+            continue;
+        }
+        match bytes[at] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => return at + 1,
+            b'{' if depth == 0 => return matching_close(code, at) + 1,
+            _ => {}
+        }
+        at += 1;
+    }
+    bytes.len()
+}
+
+/// `code` with every `#[cfg(test)]` item (attribute included) replaced by spaces, newlines kept.
+/// The item is blanked, not everything after it: `src/storage/mod.rs` declares its test support
+/// module on line 42 and carries its production code on the lines below. `code` has no comments
+/// (see [`blank_comments`]), so a bracket in one cannot confuse the item's end.
+fn blank_test_items(code: &str) -> String {
+    const TEST_ATTRIBUTE: &[u8] = b"#[cfg(test)]";
+    let bytes = code.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some(end) = literal_end(bytes, at) {
+            at = end;
+        } else if bytes[at..].starts_with(TEST_ATTRIBUTE) {
+            let end = item_end(code, at + TEST_ATTRIBUTE.len());
+            for byte in &mut out[at..end] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    String::from_utf8(out).expect("only whole items are replaced, and by ASCII spaces")
+}
+
+/// The production code of a source file, ready to scan: with line endings normalised, every test
+/// item and every comment blanked.
+///
+/// A Windows checkout with `core.autocrlf` has CRLF line endings. rustc normalises them before
+/// lexing, so the crate builds, and the scan must read the text the same way: a `\` + CRLF line
+/// continuation in a string literal is the same continuation as with LF.
+fn production_code(text: &str) -> String {
+    blank_test_items(&blank_comments(&text.replace("\r\n", "\n")))
 }
 
 /// Reads every `.rs` file under `dir` (sorted, recursively).
@@ -590,9 +654,6 @@ fn read_sources(dir: &Path, root: &Path, files: &mut Vec<SourceFile>) {
         } else if entry.extension().is_some_and(|ext| ext == "rs") {
             let text = fs::read_to_string(&entry)
                 .unwrap_or_else(|err| panic!("cannot read {}: {err}", entry.display()));
-            let production = text
-                .find("\n#[cfg(test)]")
-                .map_or(text.as_str(), |cut| &text[..cut]);
             let relative = entry
                 .strip_prefix(root)
                 .expect("a file under the root")
@@ -602,7 +663,7 @@ fn read_sources(dir: &Path, root: &Path, files: &mut Vec<SourceFile>) {
                 .join("/");
             files.push(SourceFile {
                 path: relative,
-                code: blank_comments(production),
+                code: production_code(&text),
             });
         }
     }
@@ -946,6 +1007,99 @@ fn the_helper_is_defined_once_and_called_only_from_endpoint_modules() {
     );
 }
 
+/// The scan reads the production code that follows a test-only declaration. `src/storage/mod.rs`
+/// declares its `#[cfg(test)]` support module near the top and carries the credential-store
+/// trait, `create_storage` and the async adapters below it: a warning call (or a second
+/// definition of the helper) added there must be seen.
+#[test]
+fn production_code_after_a_test_only_item_is_scanned() {
+    let code = production_code(concat!(
+        "pub fn before() {}\n",
+        "#[cfg(test)]\n",
+        "pub(crate) mod test_support;\n",
+        "pub fn after() {\n",
+        "    warn_uncharacterised_write(\"kept\");\n",
+        "}\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn gone() { warn_uncharacterised_write(\"dropped\"); }\n",
+        "}\n",
+        "pub fn last() {}\n",
+    ));
+    for kept in ["fn before", "fn after", "fn last"] {
+        assert!(code.contains(kept), "{kept} was blanked out: {code}");
+    }
+    for dropped in ["test_support", "fn gone", "cfg(test)"] {
+        assert!(!code.contains(dropped), "{dropped} was kept: {code}");
+    }
+    assert_eq!(call_opens(&code, WARN_FN).len(), 1);
+
+    let files = sources();
+    let storage = files
+        .iter()
+        .find(|file| file.path == "storage/mod.rs")
+        .expect("src/storage/mod.rs");
+    for kept in ["fn create_storage", "fn save_async", "fn clear_async"] {
+        assert!(
+            storage.code.contains(kept),
+            "the scan of src/storage/mod.rs lost `{kept}`"
+        );
+    }
+    for file in &files {
+        assert!(
+            !file.code.contains("cfg(test)"),
+            "src/{} still has a test-only item in its scanned code",
+            file.path
+        );
+    }
+}
+
+/// A Windows checkout has CRLF line endings (`core.autocrlf`), which rustc normalises before
+/// lexing and the scan must too: `\` followed by CRLF is a line continuation, as with LF.
+#[test]
+fn decode_literal_accepts_a_crlf_line_continuation() {
+    let lf = "\"set DHCP \\\n            configuration\" tail";
+    let crlf = lf.replace('\n', "\r\n");
+    assert!(
+        crlf.contains("\\\r\n"),
+        "the CRLF form must keep the backslash"
+    );
+    assert_eq!(decode_literal(lf), "set DHCP configuration");
+    assert_eq!(decode_literal(&crlf), "set DHCP configuration");
+}
+
+/// Only `\` + CRLF is a continuation; a backslash before a lone `\r` is no escape rustc knows.
+#[test]
+#[should_panic(expected = "unsupported escape")]
+fn decode_literal_rejects_a_backslash_before_a_lone_carriage_return() {
+    decode_literal("\"set \\\rconfiguration\"");
+}
+
+/// Every call site that resolves through a line continuation resolves to the same text when its
+/// file is checked out with CRLF line endings.
+#[test]
+fn a_crlf_checkout_resolves_the_same_operations_as_an_lf_one() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/endpoints");
+    for module in ["dhcp", "wan", "eeros"] {
+        let text = fs::read_to_string(root.join(format!("{module}.rs")))
+            .unwrap_or_else(|err| panic!("cannot read src/endpoints/{module}.rs: {err}"))
+            .replace("\r\n", "\n");
+        assert!(
+            text.contains("\\\n"),
+            "{module}.rs has no line continuation: pick another file for this check"
+        );
+        let scanned = |text: &str| {
+            actual_operations(&[SourceFile {
+                path: format!("endpoints/{module}.rs"),
+                code: production_code(text),
+            }])
+        };
+        let from_lf = scanned(&text);
+        assert!(!from_lf.is_empty(), "{module}.rs resolved no operation");
+        assert_eq!(scanned(&text.replace('\n', "\r\n")), from_lf);
+    }
+}
+
 /// The warnings the Rust sources can log are exactly eero-api v8.4.1's, plus the recorded
 /// differences.
 #[test]
@@ -1020,8 +1174,10 @@ fn operations_never_interpolate_a_caller_supplied_identifier() {
     }
 }
 
-/// The live-verified writes issue no warning from their own bodies, and the two device wrappers
-/// still delegate to the blacklist writes they inherit that from.
+/// The live-verified writes issue no warning, neither from their own bodies nor through a private
+/// helper or sibling method they call (the transitive set [`warning_functions`] computes, the one
+/// `every_write_shaped_method_warns_or_is_verified` relies on for the opposite check), and the two
+/// device wrappers still delegate to the blacklist writes they inherit that from.
 #[test]
 fn verified_writes_have_no_warning_call() {
     let files = sources();
@@ -1031,6 +1187,11 @@ fn verified_writes_have_no_warning_call() {
         assert!(
             call_opens(body, WARN_FN).is_empty(),
             "{module}::{function} is documented as live-verified ({evidence}) but calls {WARN_FN}"
+        );
+        assert!(
+            !warning_functions(&file.code).contains(function),
+            "{module}::{function} is documented as live-verified ({evidence}) but reaches \
+             {WARN_FN} through a helper or sibling method it calls"
         );
         if let Some(delegate) = delegate {
             assert!(
@@ -1467,20 +1628,17 @@ fn warned_operations(logs: &LogCapture) -> Vec<String> {
         .collect()
 }
 
-/// Mounts a catch-all mock that accepts any request once.
-async fn mount_any(mock: &MockEero) {
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
-        .expect(1)
-        .mount(&mock.server)
-        .await;
-}
-
 /// The deprecated non-empty body is the one case where `create_burst_reporter` warns.
 #[tokio::test]
 async fn create_burst_reporter_with_a_deprecated_body_warns_once() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    mount_any(&mock).await;
+    mount_write(
+        &mock,
+        "POST",
+        "/2.2/networks/network-0001/burst_reporters",
+        Wire::Json(json!({ "type": "burst" })),
+    )
+    .await;
     let (_guard, logs) = capture_logs();
     BurstReportersApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
         .create_burst_reporter("network-0001", Some(json!({ "type": "burst" })), None)
@@ -1497,7 +1655,13 @@ async fn create_burst_reporter_with_a_deprecated_body_warns_once() -> anyhow::Re
 #[tokio::test]
 async fn a_helper_operation_logs_the_expanded_text() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    mount_any(&mock).await;
+    mount_write(
+        &mock,
+        "PUT",
+        "/2.2/networks/network-0001/settings",
+        Wire::Json(json!({ "wpa3": true })),
+    )
+    .await;
     let (_guard, logs) = capture_logs();
     SecurityApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
         .set_wpa3("network-0001", true, None)
@@ -1520,7 +1684,13 @@ async fn a_helper_operation_logs_the_expanded_text() -> anyhow::Result<()> {
 #[tokio::test]
 async fn a_format_operation_logs_the_action_and_not_the_eero_id() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    mount_any(&mock).await;
+    mount_write(
+        &mock,
+        "POST",
+        "/2.2/eeros/eero-0001/action",
+        Wire::Json(json!({ "action": "POWER_CYCLE_ALL_PORTS" })),
+    )
+    .await;
     let (_guard, logs) = capture_logs();
     EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
         .node_action("eero-0001", "POWER_CYCLE_ALL_PORTS", None)
@@ -1544,7 +1714,13 @@ async fn a_format_operation_logs_the_action_and_not_the_eero_id() -> anyhow::Res
 #[tokio::test]
 async fn set_profile_devices_warns_twice() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    mount_any(&mock).await;
+    mount_write(
+        &mock,
+        "PUT",
+        "/2.2/networks/network-0001/profiles/profile-0001",
+        Wire::Json(json!({ "devices": [] })),
+    )
+    .await;
     let (_guard, logs) = capture_logs();
     ProfilesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
         .set_profile_devices("network-0001", "profile-0001", &[], None)

@@ -599,6 +599,13 @@ fn matching_brace(code: &str, open: usize) -> usize {
 fn production_code(path: &Path) -> String {
     let text = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+    production_text(&text)
+}
+
+/// The masked production code of a source file's `text`, with line endings normalised the way
+/// rustc normalises them before lexing: a Windows checkout with `core.autocrlf` has CRLF.
+fn production_text(text: &str) -> String {
+    let text = text.replace("\r\n", "\n");
     let production = text
         .find("\n#[cfg(test)]")
         .map_or(text.as_str(), |cut| &text[..cut]);
@@ -953,6 +960,41 @@ fn the_scanners_read_a_synthetic_client() {
     );
     assert_eq!(chained_calls(&found[0].text), [("things", "get_thing")]);
     assert_eq!(chained_calls(&found[1].text), [("things", "get_private")]);
+}
+
+/// A Windows checkout has CRLF line endings (`core.autocrlf`); the scan must read a file the way
+/// rustc does, as if they were LF: same functions, same cut at the test module.
+#[test]
+fn the_scanners_read_crlf_source_like_lf_source() {
+    let lf = concat!(
+        "impl Client {\n",
+        "    pub async fn get_thing(&self) -> Result<Envelope, Error> {\n",
+        "        let text = \"first \\\n            second\";\n",
+        "        self.api\n",
+        "            .things()\n",
+        "            .get_thing(&text)\n",
+        "            .await\n",
+        "    }\n",
+        "}\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn only_in_tests() {}\n",
+        "}\n",
+    );
+    let crlf = lf.replace('\n', "\r\n");
+    assert!(
+        crlf.contains("\\\r\n"),
+        "the CRLF form must keep its continuation"
+    );
+    let from_lf = production_text(lf);
+    let from_crlf = production_text(&crlf);
+    assert_eq!(from_crlf, from_lf);
+    assert!(!from_crlf.contains('\r'));
+    assert!(!from_crlf.contains("only_in_tests"));
+    let found = functions(&from_crlf);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].name, "get_thing");
+    assert_eq!(chained_calls(&found[0].text), [("things", "get_thing")]);
 }
 
 // ===================== runtime: the deprecated shim is the wrapper's resource =====================
