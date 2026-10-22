@@ -184,6 +184,25 @@ async fn capture_logs_keeps_structured_fields_next_to_the_message() {
     assert_eq!(logs.warnings(), vec!["Retrying GET request", "second"]);
 }
 
+/// `mentions` is for leak assertions, so it must see a value that reaches the log through a
+/// structured field as well as one in the message.
+#[tokio::test]
+async fn capture_logs_mentions_scans_messages_and_field_values() {
+    let (_guard, logs) = capture_logs();
+
+    tracing::warn!("in the message: msg_canary");
+    tracing::debug!(token = "str_canary", "plain");
+    tracing::debug!(error = %"display_canary", "plain");
+    tracing::debug!(count = 4242, "plain");
+
+    for needle in ["msg_canary", "str_canary", "display_canary", "4242"] {
+        assert!(logs.mentions(needle), "{needle}");
+    }
+    assert!(!logs.mentions("absent_canary"));
+    // Field names are not values.
+    assert!(!logs.mentions("token"));
+}
+
 #[tokio::test]
 async fn capture_logs_keeps_level_target_and_message_of_every_level() {
     let (_guard, logs) = capture_logs();
