@@ -323,6 +323,16 @@ impl Transport {
         &self.api_host
     }
 
+    /// The `User-Agent` this transport sends on every request: [`consts::DEFAULT_USER_AGENT`]
+    /// unless [`TransportBuilder::user_agent`] overrode it.
+    ///
+    /// Ported from `BaseAPI.user_agent` (`base.py:516-519`). The value is fixed when the
+    /// transport is built (and validated then), so reading it never fails and never changes.
+    #[must_use]
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
     /// Returns a snapshot of the currently configured session, if any.
     #[must_use]
     pub fn session(&self) -> Option<Session> {
@@ -1393,8 +1403,12 @@ impl TransportBuilder {
     }
 
     /// Sets the `User-Agent` header sent on every request. `None` (the default) sends
-    /// [`consts::DEFAULT_USER_AGENT`] — decision D-7 is superseded at `v8.0.4`, where this header
-    /// is genuinely sent.
+    /// [`consts::DEFAULT_USER_AGENT`]; [`consts::LEGACY_USER_AGENT`] reproduces the previous
+    /// client version's capability set.
+    ///
+    /// Validated at [`TransportBuilder::build`] time (printable ASCII, no CR/LF); a bad value is
+    /// an [`Error::Validation`] on field `"User-Agent"`. Read the effective value back with
+    /// [`Transport::user_agent`].
     #[must_use]
     pub fn user_agent(mut self, user_agent: Option<String>) -> Self {
         self.user_agent = user_agent;
@@ -1404,8 +1418,8 @@ impl TransportBuilder {
     /// Sets the `X-Accept-Language` header sent on every request. `None` (the default) sends
     /// [`consts::DEFAULT_ACCEPT_LANGUAGE`].
     ///
-    /// Validated at [`TransportBuilder::build`] time (printable ASCII, no CR/LF); see
-    /// `validate_header_value`.
+    /// Validated at [`TransportBuilder::build`] time (printable ASCII, no CR/LF); a bad value is
+    /// an [`Error::Validation`] on field `"X-Accept-Language"`.
     #[must_use]
     pub fn accept_language(mut self, accept_language: impl Into<String>) -> Self {
         self.accept_language = Some(accept_language.into());
@@ -1477,8 +1491,10 @@ impl TransportBuilder {
     ///
     /// Returns `Error::Validation` if `base_url` was set to a string that does not parse as an
     /// absolute URL usable as a path base, or if `accept_language`/`user_agent` contains a byte
-    /// outside the printable-ASCII range (or a CR/LF). Returns `Error::Network` if constructing
-    /// the underlying `reqwest::Client` fails.
+    /// outside the printable-ASCII range (or a CR/LF). The field is `"base_url"`,
+    /// `"X-Accept-Language"` or `"User-Agent"`, checked in that order, so a call with several bad
+    /// values reports the first. Returns `Error::Network` if constructing the underlying
+    /// `reqwest::Client` fails.
     ///
     /// # Security (finding F4)
     ///
@@ -1496,14 +1512,17 @@ impl TransportBuilder {
                 .map_err(|err| Error::validation("base_url", format!("not a valid URL: {err}")))?
         };
 
-        let user_agent = self
-            .user_agent
-            .unwrap_or_else(|| consts::DEFAULT_USER_AGENT.to_owned());
-        validate_header_value("user_agent", &user_agent)?;
+        // The header name is the field name and `X-Accept-Language` is checked first, as in
+        // `BaseAPI.__init__` (`base.py:474-478`), so a caller who got both wrong sees the same
+        // error `eero-api` raises.
         let accept_language = self
             .accept_language
             .unwrap_or_else(|| consts::DEFAULT_ACCEPT_LANGUAGE.to_owned());
         validate_header_value("X-Accept-Language", &accept_language)?;
+        let user_agent = self
+            .user_agent
+            .unwrap_or_else(|| consts::DEFAULT_USER_AGENT.to_owned());
+        validate_header_value("User-Agent", &user_agent)?;
 
         // Neither branch puts a timeout on the `reqwest::Client` this crate builds: both bounds
         // are enforced per attempt in `Transport::execute_once` so a per-call `RequestTimeout`

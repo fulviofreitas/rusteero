@@ -770,6 +770,97 @@ fn invalid_accept_language_is_rejected_at_build_time() {
     assert!(matches!(err, Error::Validation { field, .. } if field == "X-Accept-Language"));
 }
 
+const HEADER_VALUE_MESSAGE: &str = "header value must be printable ASCII with no CR/LF";
+
+#[test]
+fn invalid_user_agent_is_rejected_at_build_time() {
+    for bad in [
+        "bad\r\nvalue",
+        "bad\nvalue",
+        "tab\tvalue",
+        "caf\u{e9}",
+        "trailing-lf\n",
+    ] {
+        let err = Transport::builder()
+            .user_agent(Some(bad.to_owned()))
+            .build()
+            .expect_err("a User-Agent outside printable ASCII must be rejected");
+        assert!(
+            matches!(
+                &err,
+                Error::Validation { field, message, .. }
+                    if field == "User-Agent" && message == HEADER_VALUE_MESSAGE
+            ),
+            "{bad:?} gave {err:?}"
+        );
+        assert!(!err.to_string().contains(bad), "the value is never echoed");
+    }
+}
+
+#[test]
+fn an_empty_user_agent_is_accepted_like_the_python_pattern() {
+    let transport = Transport::builder()
+        .user_agent(Some(String::new()))
+        .build()
+        .expect("the header pattern is `*`, so an empty value passes");
+    assert_eq!(transport.user_agent(), "");
+}
+
+#[test]
+fn accept_language_is_validated_before_user_agent() {
+    let err = Transport::builder()
+        .accept_language("bad\r\nlanguage")
+        .user_agent(Some("bad\r\nagent".to_owned()))
+        .build()
+        .expect_err("both headers are invalid");
+    assert!(
+        matches!(&err, Error::Validation { field, .. } if field == "X-Accept-Language"),
+        "{err:?}"
+    );
+
+    // With only the User-Agent wrong, it is the one reported.
+    let err = Transport::builder()
+        .accept_language("fr-FR")
+        .user_agent(Some("bad\r\nagent".to_owned()))
+        .build()
+        .expect_err("the User-Agent is invalid");
+    assert!(
+        matches!(&err, Error::Validation { field, .. } if field == "User-Agent"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn base_url_is_validated_before_either_header() {
+    let err = Transport::builder()
+        .base_url("not a url")
+        .accept_language("bad\r\nlanguage")
+        .user_agent(Some("bad\r\nagent".to_owned()))
+        .build()
+        .expect_err("everything is invalid");
+    assert!(
+        matches!(&err, Error::Validation { field, .. } if field == "base_url"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn user_agent_reports_the_default_and_an_override() -> anyhow::Result<()> {
+    let transport = Transport::builder().build()?;
+    assert_eq!(transport.user_agent(), rusteero::consts::DEFAULT_USER_AGENT);
+
+    let transport = Transport::builder()
+        .user_agent(Some(LEGACY_USER_AGENT.to_owned()))
+        .build()?;
+    assert_eq!(transport.user_agent(), LEGACY_USER_AGENT);
+
+    let transport = Transport::builder()
+        .user_agent(Some("custom-agent/1.0".to_owned()))
+        .build()?;
+    assert_eq!(transport.user_agent(), "custom-agent/1.0");
+    Ok(())
+}
+
 // ===================== credential placement =====================
 
 #[tokio::test]
