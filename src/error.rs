@@ -589,6 +589,21 @@ pub enum StorageError {
         message: String,
     },
 
+    /// A backend accepted a save but a read-back did not find the saved session, so nothing was
+    /// persisted: the write call itself reported no error, yet reading the store back showed no
+    /// record, a different token, or an unparseable one.
+    ///
+    /// Ported from the `False` that `eero-api`'s `CredentialStorage.save()` returns when its
+    /// read-back finds nothing (`auth_storage.py:141-161` at `v8.4.1`). The shipped `KeyringStore`,
+    /// `FileStore` and `ChainedStore` verify every save this way, so a keyring that accepts writes
+    /// and retains nothing is reported here instead of as success. The text carries the backend
+    /// name only, never the token.
+    #[error("{backend} storage did not retain the saved session")]
+    NotRetained {
+        /// The name of the backend that did not retain the session, e.g. `"keyring"`.
+        backend: String,
+    },
+
     /// Nothing has been stored yet.
     #[error("no credentials stored")]
     NotFound,
@@ -787,6 +802,35 @@ mod tests {
             StorageError::Empty.to_string(),
             "stored credentials are empty"
         );
+    }
+
+    #[test]
+    fn not_retained_names_the_backend_and_never_carries_a_token() {
+        let err = StorageError::NotRetained {
+            backend: "keyring".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "keyring storage did not retain the saved session"
+        );
+        assert_eq!(
+            format!("{err:?}"),
+            "NotRetained { backend: \"keyring\" }",
+            "Debug shows the backend and nothing else"
+        );
+
+        let wrapped: Error = err.into();
+        assert!(matches!(
+            wrapped,
+            Error::Storage(StorageError::NotRetained { ref backend }) if backend == "keyring"
+        ));
+        assert_eq!(
+            wrapped.to_string(),
+            "keyring storage did not retain the saved session",
+            "Error::Storage is transparent over the storage error"
+        );
+        assert!(!wrapped.is_auth_error());
+        assert_eq!(wrapped.status(), None);
     }
 
     // ===================== accessors =====================

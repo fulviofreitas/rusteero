@@ -1,39 +1,57 @@
 //! Filesystem credential store.
 //!
-//! Ported from `FileStorage` (`eero-api`'s `src/eero/api/auth_storage.py:169-237`). See
-//! the const behaviour notes §5 for the full behaviour brief this module
-//! implements, and `security-review.md`'s rule for this repo for the one deliberate improvement
-//! over the Python original (atomic, mode-on-create file permissions instead of a
-//! write-then-`chmod` sequence).
+//! Ported from `FileStorage` (`eero-api`'s `src/eero/api/auth_storage.py:425-606` at `v8.4.1`),
+//! with one deliberate improvement over the Python original: atomic, mode-on-create file
+//! permissions instead of a write-then-`chmod` sequence.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::auth::Session;
 use crate::error::StorageError;
 
 use super::CredentialStore;
 
+/// The backend name carried by this module's [`StorageError::NotRetained`].
+const BACKEND_NAME: &str = "file";
+
 /// A [`CredentialStore`] backed by a single JSON file on disk.
 ///
-/// Mirrors `FileStorage` (`auth_storage.py:169-237`): the file holds exactly the JSON object
+/// Mirrors `FileStorage` (`auth_storage.py:425-606`): the file holds exactly the JSON object
 /// `Session::to_json`/[`Session::from_json`] produce/consume (`session_id`, `schema_version`,
 /// plus the legacy `user_token` read alias) — the same shape a Python `eero-api` install reads
-/// and writes at `v8.0.4`, per decision D-5. There is deliberately no default
+/// and writes, so the two libraries can share one cookie file. There is deliberately no default
 /// path: like `FileStorage.__init__`, which always requires an explicit `file_path`, choosing
 /// *where* the file lives is left entirely to the caller (in `eero-api`'s ecosystem, that
 /// choice belongs to the CLI layer, not this library).
 ///
+/// # Verified saves
+///
+/// [`FileStore::save`] reads the file back after the atomic rename and parses it like a load
+/// would; it returns `Ok(())` only if the stored token is the one that was saved. If the file is
+/// missing, unparseable or holds another token (the destination was swapped or overwritten
+/// between the rename and the read-back), it logs a fixed `WARN` — `Credential file did not
+/// retain the saved session`, never the token — and returns [`StorageError::NotRetained`]
+/// (`auth_storage.py:582-586`).
+///
+/// # Concurrency
+///
+/// Every `load`, `save` and `clear` on one `FileStore` runs under an internal lock held for the
+/// whole operation (the read-back and a legacy-record migration included), so a `save` and a
+/// `clear` cannot interleave: call order decides the outcome, and a `clear` can no longer remove a
+/// concurrent `save`'s temporary file. Two `FileStore` values on the same path are *not*
+/// coordinated with each other, exactly as in `eero-api` (`auth_storage.py:190-235`).
+///
 /// # Security: atomic `0600` creation, not `chmod` after the fact
 ///
-/// Python's `FileStorage.save()` writes the file at the process' default mode first and only
-/// restricts it to owner-only (`0600`) with a separate `os.chmod()` call afterwards
-/// (`auth_storage.py:220-224`) — a real, if narrow, window during which the file is readable by
-/// anyone who can read the containing directory. This port closes that window: [`FileStore::save`]
-/// writes to a temporary file in the same directory, created with `0600` permissions *atomically*
-/// as part of the file-creation syscall (via [`std::os::unix::fs::OpenOptionsExt::mode`]), then
+/// Python's `FileStorage.save()` creates the temporary file with `tempfile.mkstemp` (mode `0600`)
+/// and re-asserts `0600` with a trailing `os.chmod()` as defense in depth
+/// (`auth_storage.py:555-569`). This port needs no such second step: [`FileStore::save`] writes
+/// to a temporary file in the same directory, created with `0600` permissions *atomically* as
+/// part of the file-creation syscall (via [`std::os::unix::fs::OpenOptionsExt::mode`]), then
 /// renames it into place. A crash between the write and the rename leaves either the old file or
 /// nothing at all — never a partially-written or loosely-permissioned target file.
 ///
@@ -43,10 +61,10 @@ use super::CredentialStore;
 /// Callers on Windows should not rely on the stored file being owner-only — treat the containing
 /// directory's own ACLs as the real access boundary there.
 ///
-/// # Security: writing through a symlink at the final path (v8.0.4 parity note)
+/// # Security: writing through a symlink at the final path
 ///
 /// Python's `FileStorage.save()` refuses to write when the *final* path is a symlink
-/// (`os.path.islink` check before opening the temp file, `auth_storage.py:299-301`) — a defence
+/// (`os.path.islink` check before opening the temp file, `auth_storage.py:548-551`) — a defence
 /// against a symlink planted at the cookie-file path being used to redirect a credential write
 /// onto an attacker-chosen target. This port does not reproduce that check as a separate
 /// precondition, and does not need to: the final step of [`FileStore::save`] is [`fs::rename`],
@@ -56,7 +74,7 @@ use super::CredentialStore;
 /// verified by `save_replaces_a_symlink_at_the_destination_rather_than_following_it` below rather
 /// than merely asserted in this comment.
 ///
-/// # Security: no orphaned plaintext credential (phase-2 storage review, finding S3)
+/// # Security: no orphaned plaintext credential
 ///
 /// The temporary file above is given a name that is unique for the lifetime of this process
 /// (see `unique_temp_path`), and every error path in the create/write/sync/rename sequence
@@ -64,92 +82,159 @@ use super::CredentialStore;
 /// steps is the only way a temp file can survive, and [`FileStore::clear`] proactively removes
 /// any such orphan for `path` (see `remove_orphaned_temp_files`), so a stale, fully-valid
 /// plaintext credential can never outlive an explicit `clear()` call.
-#[derive(Debug)]
 pub struct FileStore {
     path: PathBuf,
+    /// Serialises every operation on this instance; see the type's "Concurrency" docs. Guards no
+    /// data, so a panic while it is held does not poison anything that matters.
+    op_lock: Mutex<()>,
+}
+
+impl std::fmt::Debug for FileStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileStore {
     /// Creates a store backed by `path`, which need not exist yet.
     ///
-    /// Unlike `FileStorage.__init__` (`auth_storage.py:172-178`), which eagerly expands `~` and
+    /// Unlike `FileStorage.__init__` (`auth_storage.py:432-440`), which eagerly expands `~` and
     /// absolutizes the path at construction time, `path` is stored exactly as given — this port
-    /// has no path-expansion dependency available (decision: no new dependencies, per the phase
-    /// brief) and resolving `~`/relative paths is left to the caller, consistent with there
-    /// being no default path anywhere in this crate.
+    /// has no path-expansion dependency available and resolving `~`/relative paths is left to
+    /// the caller, consistent with there being no default path anywhere in this crate.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            op_lock: Mutex::new(()),
+        }
     }
 
     /// The path this store reads from and writes to.
     ///
-    /// Mirrors the read-only `file_path` property (`auth_storage.py:180-183`).
+    /// Mirrors the read-only `file_path` property (`auth_storage.py:442-444`).
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
 
-impl CredentialStore for FileStore {
-    fn load(&self) -> Result<Session, StorageError> {
+    /// Takes this instance's operation lock. A poisoned lock (a panic while it was held) is
+    /// recovered: it guards no data, and a later operation must still be able to run.
+    fn lock_operations(&self) -> MutexGuard<'_, ()> {
+        self.op_lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The body of [`CredentialStore::load`]; the caller holds the operation lock.
+    fn load_unlocked(&self) -> Result<Session, StorageError> {
         match fs::read_to_string(&self.path) {
-            // Mirrors the "file does not exist" branch (`auth_storage.py:188-190`): this is the
+            // Mirrors the "file does not exist" branch (`auth_storage.py:464-466`): this is the
             // expected "never logged in" state, not an error.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Session::empty()),
             Err(err) => Err(StorageError::Io(err)),
             Ok(contents) => {
-                // Security fix (phase-security-review, finding 8): a credential file with any
-                // group/other permission bit set (e.g. one this crate did not itself create —
-                // hand-placed, copied in from a backup, or written by an older/foreign tool) is
-                // readable by more than its owner. Never fails the read — this is a diagnostic,
-                // not an enforced precondition — but it must not go unnoticed either.
+                // A credential file with any group/other permission bit set (e.g. one this
+                // crate did not itself create — hand-placed, copied in from a backup, or
+                // written by an older/foreign tool) is readable by more than its owner. Never
+                // fails the read — this is a diagnostic, not an enforced precondition — but it
+                // must not go unnoticed either.
                 warn_if_permissions_are_loose(&self.path);
                 let (session, migrated) = Session::from_json_migrating(&contents)?;
                 if migrated {
                     // Best-effort: never fails this read, see `migrate_and_verify`'s own docs.
-                    super::migrate_and_verify(self, &session, "file");
+                    // The unlocked save keeps the migration inside this operation's lock.
+                    super::migrate_and_verify(&session, BACKEND_NAME, |migrated| {
+                        self.save_unlocked(migrated)
+                    });
                 }
                 Ok(session)
             }
         }
     }
 
-    fn save(&self, session: &Session) -> Result<(), StorageError> {
-        // Mirrors `os.makedirs(cookie_dir, exist_ok=True)` (`auth_storage.py:215-217`); an empty
+    /// The body of [`CredentialStore::save`]; the caller holds the operation lock.
+    fn save_unlocked(&self, session: &Session) -> Result<(), StorageError> {
+        // Mirrors `os.makedirs(cookie_dir, exist_ok=True)` (`auth_storage.py:545-546`); an empty
         // parent (a bare file name with no directory component) has nothing to create.
         //
-        // Security fix (phase-security-review, finding 8): every directory this call creates is
-        // created with owner-only (`0700`) permissions from the moment it is created, on Unix —
-        // matching the atomic 0600-on-create discipline `create_private_file` already applies to
-        // the file itself, rather than relying on the process umask (which a caller could have
-        // widened, e.g. `umask 022`, leaving a group/other-readable directory the credential file
-        // then inherits its own looser default permissions from on some platforms/filesystems).
+        // Every directory this call creates is created with owner-only (`0700`) permissions from
+        // the moment it is created, on Unix — matching the atomic 0600-on-create discipline
+        // `create_private_file` already applies to the file itself, rather than relying on the
+        // process umask (which a caller could have widened, e.g. `umask 022`, leaving a
+        // group/other-readable directory the credential file then inherits its own looser
+        // default permissions from on some platforms/filesystems).
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
             create_private_dir_all(parent)?;
         }
         let json = session.to_json()?;
-        write_private_atomically(&self.path, json.as_bytes())
+        write_private_atomically(&self.path, json.as_bytes())?;
+        verify_file_retains(&self.path, session)?;
+        tracing::debug!("Saved authentication data to {}", self.path.display());
+        Ok(())
     }
 
-    fn clear(&self) -> Result<(), StorageError> {
+    /// The body of [`CredentialStore::clear`]; the caller holds the operation lock.
+    fn clear_unlocked(&self) -> Result<(), StorageError> {
         let result = match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             // Mirrors the tolerant `os.path.exists(...)` guard before `os.remove`
-            // (`auth_storage.py:230-237`): removing an entry that was never there is not an
+            // (`auth_storage.py:601-604`): removing an entry that was never there is not an
             // error.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(StorageError::Io(err)),
         };
-        // Security fix (phase-2 storage review, finding S3(a)): also remove any temporary file
-        // `write_private_atomically` may have left behind after a crash between creating it and
-        // renaming it into place — otherwise a full plaintext credential can survive at a
-        // predictable path even after `clear()` reports success. Best-effort: a missing (or
-        // already-removed) orphan is not an error, matching the tolerance above.
+        // Also remove any temporary file `write_private_atomically` may have left behind after a
+        // crash between creating it and renaming it into place — otherwise a full plaintext
+        // credential can survive at a predictable path even after `clear()` reports success.
+        // Best-effort: a missing (or already-removed) orphan is not an error, matching the
+        // tolerance above. Held under the operation lock, so it can never delete the in-flight
+        // temporary file of a concurrent `save` on this instance.
         remove_orphaned_temp_files(&self.path);
         result
+    }
+}
+
+impl CredentialStore for FileStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        let _guard = self.lock_operations();
+        self.load_unlocked()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        let _guard = self.lock_operations();
+        self.save_unlocked(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        let _guard = self.lock_operations();
+        self.clear_unlocked()
+    }
+}
+
+/// Reads `path` back and checks it holds `saved`'s token, like a load would parse it.
+///
+/// Mirrors the read-back at the end of `FileStorage._save_sync` (`auth_storage.py:582-586`). A
+/// file that is missing, no longer parses, or carries a different token was not retained: that
+/// logs the fixed `WARN` below (never the token) and returns [`StorageError::NotRetained`]. Any
+/// other read failure is an I/O error and is returned as such.
+fn verify_file_retains(path: &Path, saved: &Session) -> Result<(), StorageError> {
+    let retained = match fs::read_to_string(path) {
+        // No migration and no loose-permission warning: this is the file this save just wrote.
+        Ok(contents) => Session::from_json(&contents)
+            .is_ok_and(|stored| stored.expose_token() == saved.expose_token()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(StorageError::Io(err)),
+    };
+    if retained {
+        Ok(())
+    } else {
+        tracing::warn!("Credential file did not retain the saved session");
+        Err(StorageError::NotRetained {
+            backend: BACKEND_NAME.to_owned(),
+        })
     }
 }
 
@@ -347,10 +432,18 @@ fn warn_if_permissions_are_loose(_path: &Path) {}
 mod tests {
     use std::ffi::OsString;
     use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
-    use super::{CredentialStore, FileStore};
+    use tracing::Level;
+
+    use super::{BACKEND_NAME, CredentialStore, FileStore, verify_file_retains};
     use crate::auth::Session;
     use crate::error::StorageError;
+    use crate::storage::test_support::capture_logs;
+    use crate::storage::{load_async, save_async};
 
     // ===================== Round trip =====================
 
@@ -719,15 +812,464 @@ mod tests {
         );
     }
 
+    // ===================== read-back verification =====================
+
+    #[test]
+    fn a_successful_save_is_ok_and_logs_no_warning() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileStore::new(dir.path().join("cookies.json"));
+
+        store
+            .save(&Session::from_token("file_token"))
+            .expect("save succeeds");
+
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert_eq!(logs.count(Level::DEBUG, "Saved authentication data to"), 1);
+        assert!(!logs.mentions("file_token"));
+    }
+
+    #[test]
+    fn a_read_back_that_finds_another_token_is_not_retained() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        fs_write(&path, r#"{"session_id":"other","schema_version":2}"#);
+
+        let err = verify_file_retains(&path, &Session::from_token("file_token"))
+            .expect_err("another token is on disk");
+
+        assert!(
+            matches!(&err, StorageError::NotRetained { backend } if backend == BACKEND_NAME),
+            "got {err:?}"
+        );
+        assert_eq!(
+            logs.messages(Level::WARN),
+            vec!["Credential file did not retain the saved session".to_owned()]
+        );
+        assert!(!logs.mentions("file_token") && !logs.mentions("other"));
+        assert!(!err.to_string().contains("file_token"));
+    }
+
+    #[test]
+    fn a_read_back_that_finds_the_same_token_is_retained_even_for_a_legacy_record() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+
+        fs_write(&path, r#"{"session_id":"file_token","schema_version":2}"#);
+        verify_file_retains(&path, &Session::from_token("file_token")).expect("same token");
+
+        fs_write(&path, r#"{"user_token":"file_token"}"#);
+        verify_file_retains(&path, &Session::from_token("file_token"))
+            .expect("a legacy record is parsed like a load would parse it");
+
+        assert!(logs.messages(Level::WARN).is_empty());
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_file_is_not_retained() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        let saved = Session::from_token("file_token");
+
+        let missing = verify_file_retains(&path, &saved).expect_err("nothing on disk");
+        assert!(matches!(missing, StorageError::NotRetained { .. }));
+
+        fs_write(&path, "not json");
+        let garbled = verify_file_retains(&path, &saved).expect_err("not a record");
+        assert!(matches!(garbled, StorageError::NotRetained { .. }));
+
+        assert_eq!(
+            logs.count(
+                Level::WARN,
+                "Credential file did not retain the saved session"
+            ),
+            2,
+            "one fixed WARN per failure"
+        );
+    }
+
+    #[test]
+    fn a_read_back_that_fails_for_another_reason_is_an_io_error() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Reading a directory as a file fails with something other than "not found".
+        let err = verify_file_retains(dir.path(), &Session::from_token("file_token"))
+            .expect_err("a directory cannot be read as the record");
+
+        assert!(matches!(err, StorageError::Io(_)), "got {err:?}");
+        assert!(logs.messages(Level::WARN).is_empty());
+    }
+
+    #[test]
+    fn save_under_a_parent_that_is_a_regular_file_is_an_io_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        fs_write(&blocker, "blocking");
+        let store = FileStore::new(blocker.join("cookies.json"));
+
+        let err = store
+            .save(&Session::from_token("tok"))
+            .expect_err("the parent directory cannot be created");
+
+        assert!(matches!(err, StorageError::Io(_)), "got {err:?}");
+    }
+
+    // ===================== legacy migration: logging and failure =====================
+
+    #[test]
+    fn a_legacy_load_logs_the_migration_and_its_verified_read_back() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        fs_write(&path, r#"{"user_token":"legacy_token"}"#);
+        // Owner-only, like a file this crate wrote, so the loose-permission warning stays quiet.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+
+        let session = FileStore::new(&path).load().expect("load succeeds");
+
+        assert_eq!(session.expose_token(), "legacy_token");
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "Migrated legacy credential record in file storage"
+            ),
+            1
+        );
+        assert_eq!(
+            logs.count(
+                Level::DEBUG,
+                "Migration read-back verified for file storage"
+            ),
+            1
+        );
+        assert!(logs.messages(Level::WARN).is_empty());
+        assert!(!logs.mentions("legacy_token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_migration_that_cannot_be_written_still_returns_the_session_with_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cookies.json");
+        fs_write(&path, r#"{"user_token":"legacy_token"}"#);
+        // A read-only directory refuses the temporary file the migration save needs.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).expect("chmod");
+        let restore = RestoreMode(dir.path().to_path_buf());
+        if fs::File::create(dir.path().join("probe")).is_ok() {
+            // Running with privileges that ignore directory modes (root): nothing to observe.
+            return;
+        }
+
+        let session = FileStore::new(&path)
+            .load()
+            .expect("a failed migration write must not fail the load");
+
+        assert_eq!(session.expose_token(), "legacy_token");
+        assert_eq!(
+            logs.count(
+                Level::WARN,
+                "Migration read-back did not match for file storage; in-memory credentials are \
+                 still returned to the caller"
+            ),
+            1
+        );
+        assert!(!logs.mentions("legacy_token"));
+        drop(restore);
+    }
+
+    /// Restores a directory's mode on drop so the tempdir can be removed.
+    #[cfg(unix)]
+    struct RestoreMode(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    // ===================== per-instance operation lock =====================
+
+    /// Holds a [`FileStore`]'s operation lock on a thread of its own until released, standing in
+    /// for an operation that is running inside the store.
+    struct LockHolder {
+        release: mpsc::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl LockHolder {
+        fn hold(store: &Arc<FileStore>) -> Self {
+            let (locked_tx, locked_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let store = Arc::clone(store);
+            let thread = std::thread::spawn(move || {
+                let _guard = store.lock_operations();
+                locked_tx.send(()).expect("the test is waiting");
+                let _ = release_rx.recv();
+            });
+            locked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the holder takes the lock");
+            Self {
+                release: release_tx,
+                thread,
+            }
+        }
+
+        fn release(self) {
+            let _ = self.release.send(());
+            self.thread.join().expect("the holder thread finishes");
+        }
+    }
+
+    fn new_store(dir: &tempfile::TempDir) -> Arc<FileStore> {
+        Arc::new(FileStore::new(dir.path().join("cookies.json")))
+    }
+
+    /// Runs `operation` on a thread of its own while the lock is held elsewhere, and checks it
+    /// neither runs nor finishes until the lock is released.
+    fn assert_waits_for_the_lock(operation: impl FnOnce(&FileStore) + Send + 'static) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = new_store(&dir);
+        let holder = LockHolder::hold(&store);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = Arc::clone(&store);
+        let thread = std::thread::spawn(move || {
+            operation(&worker);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the operation ran while another one held the lock"
+        );
+
+        holder.release();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the operation completes once the lock is free");
+        thread.join().expect("the operation thread finishes");
+    }
+
+    #[test]
+    fn load_waits_for_the_operation_lock() {
+        assert_waits_for_the_lock(|store| {
+            store.load().expect("load succeeds");
+        });
+    }
+
+    #[test]
+    fn save_waits_for_the_operation_lock() {
+        assert_waits_for_the_lock(|store| {
+            store
+                .save(&Session::from_token("tok"))
+                .expect("save succeeds");
+        });
+    }
+
+    #[test]
+    fn clear_waits_for_the_operation_lock() {
+        assert_waits_for_the_lock(|store| {
+            store.clear().expect("clear succeeds");
+        });
+    }
+
+    #[test]
+    fn operations_on_one_instance_are_serialised() {
+        // Spelled as the issue is worded: a thread that wants the lock while it is taken must
+        // not get past it, and does as soon as the holder lets go.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = new_store(&dir);
+        let guard = store.lock_operations();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = Arc::clone(&store);
+        let thread = std::thread::spawn(move || {
+            worker.clear().expect("clear succeeds");
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the clear completes once the guard is dropped");
+        thread.join().expect("the clear thread finishes");
+    }
+
+    #[test]
+    fn save_then_clear_ends_cleared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = new_store(&dir);
+        let path = store.path().to_path_buf();
+
+        // A save is in flight: it has done its work and still holds the lock.
+        let guard = store.lock_operations();
+        store
+            .save_unlocked(&Session::from_token("saved"))
+            .expect("the in-flight save works");
+        let worker = Arc::clone(&store);
+        let clearer = std::thread::spawn(move || worker.clear().expect("clear succeeds"));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(path.exists(), "the queued clear waits behind the save");
+        assert!(!clearer.is_finished());
+
+        drop(guard);
+        clearer.join().expect("the clear thread finishes");
+        assert!(
+            !path.exists(),
+            "call order decides: save, then clear, ends cleared"
+        );
+    }
+
+    #[test]
+    fn clear_then_save_ends_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = new_store(&dir);
+        let path = store.path().to_path_buf();
+        store
+            .save(&Session::from_token("old"))
+            .expect("seed save succeeds");
+
+        // A clear is in flight: it has done its work and still holds the lock.
+        let guard = store.lock_operations();
+        store.clear_unlocked().expect("the in-flight clear works");
+        let worker = Arc::clone(&store);
+        let saver = std::thread::spawn(move || {
+            worker
+                .save(&Session::from_token("new"))
+                .expect("save succeeds");
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!path.exists(), "the queued save waits behind the clear");
+        assert!(!saver.is_finished());
+
+        drop(guard);
+        saver.join().expect("the save thread finishes");
+        assert_eq!(
+            store.load().expect("load succeeds").expose_token(),
+            "new",
+            "call order decides: clear, then save, ends saved"
+        );
+    }
+
+    #[test]
+    fn a_panic_while_the_lock_is_held_does_not_wedge_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = new_store(&dir);
+        let poisoner = Arc::clone(&store);
+        let result = std::thread::spawn(move || {
+            let _guard = poisoner.lock_operations();
+            panic!("a store operation panicked");
+        })
+        .join();
+        assert!(result.is_err());
+
+        store
+            .save(&Session::from_token("tok"))
+            .expect("a poisoned lock is recovered, not propagated");
+        assert_eq!(store.load().expect("load").expose_token(), "tok");
+    }
+
+    // ===================== async adapters: waiting for the lock, never skipping =====================
+
+    /// Reads the token straight from disk, without taking the operation lock.
+    fn token_on_disk(path: &Path) -> Option<String> {
+        let contents = fs::read_to_string(path).ok()?;
+        let session = Session::from_json(&contents).ok()?;
+        Some(session.expose_token().to_owned())
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_async_load_waits_behind_the_running_operation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = new_store(&dir);
+        store
+            .save(&Session::from_token("old"))
+            .expect("seed save succeeds");
+        let holder = LockHolder::hold(&store);
+
+        let load = tokio::spawn(load_async(Arc::clone(&store) as _));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !load.is_finished(),
+            "a follow-up operation waits instead of racing the running one"
+        );
+
+        holder.release();
+        let session = load
+            .await
+            .expect("the load task finishes")
+            .expect("load succeeds");
+        assert_eq!(session.expose_token(), "old");
+    }
+
+    #[tokio::test]
+    async fn an_aborted_save_async_still_waiting_for_the_lock_still_lands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = new_store(&dir);
+        let path = store.path().to_path_buf();
+        store
+            .save(&Session::from_token("old"))
+            .expect("seed save succeeds");
+        let holder = LockHolder::hold(&store);
+
+        let queued = tokio::spawn(save_async(
+            Arc::clone(&store) as _,
+            Session::from_token("queued"),
+        ));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        queued.abort();
+        assert!(
+            queued
+                .await
+                .expect_err("the awaiting task was aborted")
+                .is_cancelled()
+        );
+        assert_eq!(token_on_disk(&path).as_deref(), Some("old"));
+
+        // Dropping the future never skips the write: the blocking task was already handed to
+        // the pool, so it runs as soon as the lock frees.
+        holder.release();
+        wait_until("the aborted save to land", || {
+            token_on_disk(&path).as_deref() == Some("queued")
+        })
+        .await;
+    }
+
     // ===================== Debug redaction =====================
 
     #[test]
     fn debug_only_ever_prints_the_path() {
-        // `FileStore` holds nothing but a path, so a derived `Debug` cannot leak a credential —
-        // confirmed here rather than merely asserted in a doc comment.
+        // `FileStore` holds a path and a lock and nothing else, so its `Debug` cannot leak a
+        // credential — confirmed here rather than merely asserted in a doc comment.
         let store = FileStore::new("/tmp/example/cookies.json");
         let debug = format!("{store:?}");
         assert!(debug.contains("cookies.json"));
+        assert!(debug.contains("FileStore"));
     }
 
     /// Small helper so every test above reads as "write this exact byte string", without
