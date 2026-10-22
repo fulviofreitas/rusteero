@@ -453,3 +453,63 @@ async fn device_writes_pin_v2_3_for_a_path_form_network() -> anyhow::Result<()> 
     client.pause_device("device-0001", true, network).await?;
     Ok(())
 }
+
+// ===================== the caller's own id spelling =====================
+
+/// Only the cache key is canonicalised: a request carries the device id exactly as the caller
+/// wrote it, upper case and colons included.
+#[tokio::test]
+async fn device_requests_carry_the_callers_id_spelling() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
+        .and(session_cookie())
+        .and(body_json(json!({ "paused": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_device("AA:BB:CC:DD:EE:FF", Some("network-0001"), false)
+        .await?;
+    client
+        .pause_device("AA:BB:CC:DD:EE:FF", true, Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
+/// `set_profile_devices` sends the device urls exactly as given; the cache invalidation around
+/// it never rewrites or canonicalises them.
+#[tokio::test]
+async fn set_profile_devices_sends_the_device_urls_as_given() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .and(body_json(json!({
+            "devices": [{ "url": "/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF" }],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .set_profile_devices(
+            "profile-0001",
+            &["/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"],
+            Some("network-0001"),
+        )
+        .await?;
+    Ok(())
+}
