@@ -36,12 +36,13 @@ use std::time::Duration;
 use reqwest::header::COOKIE;
 use secrecy::ExposeSecret;
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, Request, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
+use rusteero::consts::LEGACY_USER_AGENT;
 use rusteero::error::{Error, StorageError};
 use rusteero::storage::{CredentialStore, MemoryStore};
 use rusteero::transport::StorageFailures;
@@ -159,6 +160,11 @@ async fn get_devices_refetches_after_the_ttl_expires() -> anyhow::Result<()> {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
 
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    // The refetched response replaced the expired entry, so a third call is a cache hit: the
+    // mock's `.expect(2)` would fail if it were fetched again.
     client
         .get_devices(Some("network-0001"), false, None, None)
         .await?;
@@ -862,10 +868,10 @@ async fn client_set_session_token_offloads_and_clears_cache_after_persist() -> a
 }
 
 #[tokio::test]
-async fn client_set_session_token_failing_under_fatal_leaves_the_cache_alone() -> anyhow::Result<()>
+async fn client_set_session_token_failing_under_fatal_still_resets_the_cache() -> anyhow::Result<()>
 {
     let mock = MockEero::start().await;
-    mount_devices(&mock, 1).await;
+    mount_devices(&mock, 2).await;
     let store = GateStore::new(false, true);
     let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
 
@@ -874,7 +880,7 @@ async fn client_set_session_token_failing_under_fatal_leaves_the_cache_alone() -
         .await?;
 
     let err = client
-        .set_session_token("replacement-token")
+        .set_session_token(TEST_TOKEN)
         .await
         .expect_err("Fatal policy surfaces the failed save");
     assert!(matches!(err, Error::Storage(_)), "got {err:?}");
@@ -884,12 +890,12 @@ async fn client_set_session_token_failing_under_fatal_leaves_the_cache_alone() -
             .expect("installed before persisting")
             .token()
             .expose_secret(),
-        "replacement-token",
+        TEST_TOKEN,
         "the in-memory session changed even though persisting failed"
     );
 
-    // The cache is cleared only after the auth call succeeds, so it is still there; the entry
-    // carries no token, so the replacement session needs no second request.
+    // The new session is already in place when the error is returned, so nothing cached under
+    // the previous one may be served to it: the same read goes to the network again.
     client
         .get_devices(Some("network-0001"), false, None, None)
         .await?;
@@ -982,5 +988,613 @@ async fn client_build_initial_store_load_does_not_block_the_runtime() -> anyhow:
         std::thread::current().id(),
         "the load ran off the runtime"
     );
+    Ok(())
+}
+
+// ===================== User-Agent reaches every request =====================
+
+/// A `User-Agent` given once to the builder reaches a domain read, not only the login handshake:
+/// the whole client shares one transport.
+#[tokio::test]
+async fn user_agent_is_forwarded_to_domain_requests() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices"))
+        .and(header("user-agent", LEGACY_USER_AGENT))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = Client::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .user_agent(Some(LEGACY_USER_AGENT.to_owned()))
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL");
+
+    let env = client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    assert_eq!(env.as_value(), &fixture_json("devices.json"));
+    Ok(())
+}
+
+// ===================== Shared helpers for discovery and session-change tests =====================
+
+/// Mounts `GET /2.2/networks` answering `{"data": {"networks": <networks>}}` exactly once. Mount
+/// two of these to make a second discovery see a different account.
+async fn mount_networks_once(mock: &MockEero, networks: serde_json::Value) {
+    let body = json!({"meta": {"code": 200}, "data": {"networks": networks}});
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+}
+
+/// Mounts the device list of `network_id`, expected `times` times.
+async fn mount_devices_of(mock: &MockEero, network_id: &str, times: u64) {
+    Mock::given(method("GET"))
+        .and(path(format!("/2.2/networks/{network_id}/devices")))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
+        .expect(times)
+        .mount(&mock.server)
+        .await;
+}
+
+// ===================== Integer network ids =====================
+
+/// Some accounts' `/networks` lists give the id as a JSON number. Auto-discovery in
+/// `ensure_network_id` renders it as its decimal string, with no `url` to fall back on.
+#[tokio::test]
+async fn auto_discovery_coerces_an_integer_network_id() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": 12_345_678}])).await;
+    mount_devices_of(&mock, "12345678", 1).await;
+
+    let client = client(&mock).await;
+    client.get_devices(None, false, None, None).await?;
+
+    assert_eq!(client.preferred_network_id().as_deref(), Some("12345678"));
+    Ok(())
+}
+
+/// The auto-select side effect of `get_networks` coerces the same way, with or without a `url`.
+#[tokio::test]
+async fn get_networks_auto_select_coerces_an_integer_network_id() -> anyhow::Result<()> {
+    for entry in [
+        json!({"id": 12_345_678}),
+        json!({"id": 12_345_678, "url": "/2.2/networks/12345678"}),
+    ] {
+        let mock = MockEero::start().await;
+        mount_networks_once(&mock, json!([entry.clone()])).await;
+
+        let client = client(&mock).await;
+        client.get_networks(false).await?;
+
+        assert_eq!(
+            client.preferred_network_id().as_deref(),
+            Some("12345678"),
+            "{entry}"
+        );
+    }
+    Ok(())
+}
+
+/// Python's truthiness rule: an integer `0` counts as absent, so the `url` tail is used.
+#[tokio::test]
+async fn a_zero_integer_network_id_falls_back_to_the_url() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(
+        &mock,
+        json!([{"id": 0, "url": "/2.2/networks/network-0001"}]),
+    )
+    .await;
+
+    let client = client(&mock).await;
+    client.get_networks(false).await?;
+
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+    Ok(())
+}
+
+// ===================== Preferred network provenance =====================
+
+/// A network chosen with `set_preferred_network` after a discovery is explicit, so it survives
+/// a later session change that would have forgotten the discovered one.
+#[tokio::test]
+async fn an_explicit_choice_wins_over_an_earlier_discovery() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+
+    let client = client(&mock).await;
+    client.get_networks(false).await?;
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+
+    client.set_preferred_network("7");
+    client.set_session_token(TEST_TOKEN).await?;
+
+    assert_eq!(client.preferred_network_id().as_deref(), Some("7"));
+    Ok(())
+}
+
+/// A discovery never overwrites a preferred network that is already set.
+#[tokio::test]
+async fn discovery_does_not_replace_an_explicit_choice() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+
+    let client = client(&mock).await;
+    client.set_preferred_network("7");
+    client.get_networks(false).await?;
+
+    assert_eq!(client.preferred_network_id().as_deref(), Some("7"));
+    Ok(())
+}
+
+// ===================== Session changes reset a discovered network =====================
+
+#[derive(Debug, Clone, Copy)]
+enum Transition {
+    SetSessionToken,
+    ClearSessionToken,
+    Logout,
+}
+
+impl Transition {
+    const ALL: [Self; 3] = [Self::SetSessionToken, Self::ClearSessionToken, Self::Logout];
+
+    /// Mounts what the transition itself needs on the wire.
+    async fn mount(self, mock: &MockEero) {
+        if matches!(self, Self::Logout) {
+            Mock::given(method("POST"))
+                .and(path("/2.2/logout"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&mock.server)
+                .await;
+        }
+    }
+
+    async fn run(self, client: &Client) -> anyhow::Result<()> {
+        match self {
+            Self::SetSessionToken => client.set_session_token(TEST_TOKEN).await?,
+            Self::ClearSessionToken => client.clear_session_token().await?,
+            Self::Logout => {
+                assert!(client.logout().await?, "there was a session to log out of");
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts a session back at the `EeroApi` layer, so it cannot be this call that resets the
+    /// facade state under test. `SetSessionToken` leaves a session in place already.
+    async fn restore_session(self, client: &Client) -> anyhow::Result<()> {
+        if !matches!(self, Self::SetSessionToken) {
+            client.api().auth().set_session_token(TEST_TOKEN).await?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_session_change_forgets_a_discovered_network_and_rediscovers() -> anyhow::Result<()> {
+    for transition in Transition::ALL {
+        let mock = MockEero::start().await;
+        transition.mount(&mock).await;
+        mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+        mount_networks_once(&mock, json!([{"id": "network-0002"}])).await;
+        mount_devices_of(&mock, "network-0002", 1).await;
+
+        let client = client(&mock).await;
+        client.get_networks(false).await?;
+        assert_eq!(
+            client.preferred_network_id().as_deref(),
+            Some("network-0001"),
+            "{transition:?}"
+        );
+
+        transition.run(&client).await?;
+        assert_eq!(client.preferred_network_id(), None, "{transition:?}");
+
+        transition.restore_session(&client).await?;
+        client.get_devices(None, false, None, None).await?;
+        assert_eq!(
+            client.preferred_network_id().as_deref(),
+            Some("network-0002"),
+            "{transition:?}: the next call rediscovers the new account's network"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_explicit_network_survives_every_session_change() -> anyhow::Result<()> {
+    for transition in Transition::ALL {
+        let mock = MockEero::start().await;
+        transition.mount(&mock).await;
+        mount_devices_of(&mock, "network-0001", 1).await;
+
+        let client = client(&mock).await;
+        client.set_preferred_network("network-0001");
+
+        transition.run(&client).await?;
+        assert_eq!(
+            client.preferred_network_id().as_deref(),
+            Some("network-0001"),
+            "{transition:?}"
+        );
+
+        transition.restore_session(&client).await?;
+        client.get_devices(None, false, None, None).await?;
+    }
+    Ok(())
+}
+
+/// `logout` with no session to log out of reports `false` and changes nothing but the cache,
+/// so a discovered network is kept.
+#[tokio::test]
+async fn logout_without_a_session_keeps_the_discovered_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+
+    let client = client(&mock).await;
+    client.get_networks(false).await?;
+    // Drop the session at the `EeroApi` layer, which leaves the facade state alone.
+    client.api().auth().clear_session_token().await?;
+    assert!(!client.is_authenticated());
+
+    assert!(!client.logout().await?);
+
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+    Ok(())
+}
+
+/// A token that fails validation changes nothing, so neither the cache nor the discovered
+/// network is touched.
+#[tokio::test]
+async fn a_rejected_token_keeps_the_cache_and_the_discovered_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+    mount_devices_of(&mock, "network-0001", 1).await;
+
+    let client = client(&mock).await;
+    client.get_devices(None, false, None, None).await?;
+
+    let err = client
+        .set_session_token("")
+        .await
+        .expect_err("an empty token is rejected");
+    assert!(
+        matches!(err, Error::Validation { ref field, .. } if field == "token"),
+        "{err:?}"
+    );
+
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+    // Served from the cache: the device mock above is expected exactly once.
+    client.get_devices(None, false, None, None).await?;
+    Ok(())
+}
+
+/// A failed store write under `Fatal` still leaves the new session in place, so the previous
+/// account's network is forgotten as well.
+#[tokio::test]
+async fn a_failed_store_write_under_fatal_still_forgets_the_discovered_network()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+    mount_networks_once(&mock, json!([{"id": "network-0002"}])).await;
+    mount_devices_of(&mock, "network-0002", 1).await;
+    let store = GateStore::new(false, true);
+    let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
+
+    client.get_networks(false).await?;
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+
+    let err = client
+        .set_session_token(TEST_TOKEN)
+        .await
+        .expect_err("Fatal policy surfaces the failed save");
+    assert!(matches!(err, Error::Storage(_)), "{err:?}");
+    assert_eq!(client.preferred_network_id(), None);
+
+    client.get_devices(None, false, None, None).await?;
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0002")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_store_clear_under_fatal_still_forgets_the_discovered_network()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+    let store = GateStore::new(false, true);
+    let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
+
+    client.get_networks(false).await?;
+
+    let err = client
+        .clear_session_token()
+        .await
+        .expect_err("Fatal policy surfaces the failed clear");
+    assert!(matches!(err, Error::Storage(_)), "{err:?}");
+
+    assert!(!client.is_authenticated());
+    assert_eq!(client.preferred_network_id(), None);
+    Ok(())
+}
+
+// ===================== clear_auth_data =====================
+
+/// `clear_auth_data` drops even a network chosen with `set_preferred_network`, and the cache.
+#[tokio::test]
+async fn clear_auth_data_drops_an_explicit_network_and_the_cache() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_devices_of(&mock, "network-0001", 2).await;
+
+    let client = client(&mock).await;
+    client.set_preferred_network("network-0001");
+    client.get_devices(None, false, None, None).await?;
+
+    client.clear_auth_data().await?;
+
+    assert_eq!(client.preferred_network_id(), None);
+    assert!(!client.is_authenticated());
+    assert!(client.session().is_none());
+
+    client.api().auth().set_session_token(TEST_TOKEN).await?;
+    client
+        .get_devices(Some("network-0001"), false, None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_auth_data_drops_a_discovered_network_too() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks_once(&mock, json!([{"id": "network-0001"}])).await;
+
+    let client = client(&mock).await;
+    client.get_networks(false).await?;
+    assert_eq!(
+        client.preferred_network_id().as_deref(),
+        Some("network-0001")
+    );
+
+    client.clear_auth_data().await?;
+
+    assert_eq!(client.preferred_network_id(), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_auth_data_makes_no_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+
+    client.clear_auth_data().await?;
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "{requests:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_auth_data_removes_the_stored_record() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store = Arc::new(MemoryStore::new());
+    store.save(&Session::from_token(TEST_TOKEN))?;
+    let client = Client::builder()
+        .base_url(mock.uri())
+        .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL");
+    assert!(client.is_authenticated(), "the stored session was loaded");
+
+    client.clear_auth_data().await?;
+
+    assert!(!client.is_authenticated());
+    assert!(
+        !store.load()?.is_valid(),
+        "the stored record was removed from the store"
+    );
+    assert!(client.credentials_persisted());
+    Ok(())
+}
+
+/// A store that fails to clear is reported, but the in-memory session is already gone, so the
+/// facade state is reset regardless.
+#[tokio::test]
+async fn clear_auth_data_under_fatal_reports_the_store_failure_and_still_resets()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store = GateStore::new(false, true);
+    let client = client_with_store(&mock, &store, StorageFailures::Fatal).await;
+    client.set_preferred_network("network-0001");
+
+    let err = client
+        .clear_auth_data()
+        .await
+        .expect_err("Fatal policy surfaces the failed clear");
+
+    assert!(matches!(err, Error::Storage(_)), "{err:?}");
+    assert!(!client.is_authenticated());
+    assert_eq!(client.preferred_network_id(), None);
+    Ok(())
+}
+
+// ===================== Configuration is validated before the store is read =====================
+
+/// A store that only counts how often it is touched.
+#[derive(Debug, Default)]
+struct CountingStore {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingStore {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl CredentialStore for CountingStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Session::empty())
+    }
+
+    fn save(&self, _session: &Session) -> Result<(), StorageError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn build_rejects_a_bad_configuration_before_reading_the_store() {
+    type Configure = fn(rusteero::client::ClientBuilder) -> rusteero::client::ClientBuilder;
+    let cases: [(&str, Configure, &str); 3] = [
+        (
+            "base_url",
+            |builder| builder.base_url("not a url"),
+            "base_url",
+        ),
+        (
+            "accept_language",
+            |builder| builder.accept_language("bad\nvalue"),
+            "X-Accept-Language",
+        ),
+        // The field name for a bad `User-Agent` is not pinned here: it is spelled by the
+        // transport's own validation, which this test deliberately does not duplicate.
+        (
+            "user_agent",
+            |builder| builder.user_agent(Some("bad\nvalue".to_owned())),
+            "",
+        ),
+    ];
+
+    for (label, configure, field) in cases {
+        let store = Arc::new(CountingStore::default());
+        let builder = configure(
+            Client::builder().store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>)),
+        );
+
+        let err = builder
+            .build()
+            .await
+            .expect_err("the configuration is invalid");
+
+        match err {
+            Error::Validation {
+                field: actual_field,
+                ..
+            } => {
+                if !field.is_empty() {
+                    assert_eq!(actual_field, field, "{label}");
+                }
+            }
+            other => panic!("{label}: expected a validation error, got {other:?}"),
+        }
+        assert_eq!(store.calls(), 0, "{label}: the store must not be touched");
+    }
+}
+
+#[tokio::test]
+async fn build_reads_the_store_exactly_once_for_a_valid_configuration() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store = Arc::new(CountingStore::default());
+
+    let _client = Client::builder()
+        .base_url(mock.uri())
+        .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+        .build()
+        .await?;
+
+    assert_eq!(store.calls(), 1);
+    Ok(())
+}
+
+// ===================== A rejected 2xx body is not cached =====================
+
+/// A `2xx` whose body is not a JSON object is an error from the transport, so `get_networks`
+/// returns it before the `/account` fallback and before anything is cached or selected.
+///
+/// Ignored until the transport rejects non-object `2xx` bodies (`Unexpected JSON response:
+/// expected an object`): today it wraps `[]` in an empty envelope, which sends `get_networks`
+/// on to `/account`. Drop the `#[ignore]` when that change is in.
+#[tokio::test]
+#[ignore = "needs the transport to reject non-object 2xx bodies with Error::Api"]
+async fn get_networks_with_a_non_object_body_is_an_error_and_caches_nothing() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"meta": {"code": 200}})))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    for attempt in 1..=2 {
+        let err = client
+            .get_networks(false)
+            .await
+            .expect_err("a non-object body is an error");
+        assert!(
+            matches!(
+                err,
+                Error::Api { status: 200, ref message, .. }
+                    if message == "Unexpected JSON response: expected an object"
+            ),
+            "attempt {attempt}: {err:?}"
+        );
+    }
+
+    assert_eq!(client.preferred_network_id(), None);
     Ok(())
 }
