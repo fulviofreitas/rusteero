@@ -28,7 +28,11 @@ use wiremock::matchers::{
 };
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
+use common::{
+    LogCapture, MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie,
+    user_token_header,
+};
+use tracing::Level;
 
 // ===================== shared helpers =====================
 
@@ -1902,5 +1906,512 @@ async fn timed_out_get_does_not_leak_its_response_into_the_next_request() -> any
         .request(Method::GET, fast, &[], RequestBody::None)
         .await?;
     assert_eq!(env.data()["id"], json!("fast"));
+    Ok(())
+}
+
+// ===================== transport log lines =====================
+//
+// The WARN and ERROR lines are Python's, with its URL-free wording (`base.py:777-1039`): a
+// request URL holds network, device and eero ids, so only a DEBUG line may show the path, and no
+// line shows a query string or the host. `common::capture_logs` records the message text only,
+// which is why every value these lines show is rendered into the message.
+
+/// A network id that no WARN or ERROR line may ever show.
+const NETWORK_ID: &str = "net-CANARY-url-4c7d";
+/// A device MAC (Python's `PLACEHOLDER_MAC`) that no WARN or ERROR line may ever show.
+const MAC_CANARY: &str = "aa:bb:cc:dd:ee:ff-CANARY-MAC-9f21";
+/// A query-string value that no log line at any level may ever show.
+const QUERY_CANARY: &str = "CANARY-QUERY-5e1a";
+/// The path of the request the log tests send.
+const DEVICES_PATH: &str = "/2.2/networks/net-CANARY-url-4c7d/devices";
+
+/// A transport pointed at `base` with a valid session.
+fn transport_at(base: &str) -> Transport {
+    Transport::builder()
+        .base_url(base)
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .build()
+        .expect("a test base URL is valid")
+}
+
+/// Sends `method` to the canary devices path on `base`, with a canary query value.
+async fn send_canary(transport: &Transport, method: Method, base: &str) -> Result<Envelope, Error> {
+    let url = Url::parse(&format!("{base}{DEVICES_PATH}")).expect("a test URL is valid");
+    transport
+        .request(
+            method,
+            url,
+            &[("token", QUERY_CANARY.to_owned())],
+            RequestBody::None,
+        )
+        .await
+}
+
+/// The messages this crate itself logged at `level`, so another crate's DEBUG chatter on the
+/// same thread cannot make an assertion flaky.
+fn own_messages(logs: &LogCapture, level: Level) -> Vec<String> {
+    logs.records()
+        .into_iter()
+        .filter(|(record_level, target, _)| {
+            *record_level == level && target.starts_with("rusteero")
+        })
+        .map(|(.., message)| message)
+        .collect()
+}
+
+/// Asserts that no WARN or ERROR record, from any crate, carries a request identifier, the
+/// configured host, a query string or any part of a URL, and that no log line at all carries the
+/// query value.
+fn assert_nothing_above_debug_identifies_the_request(logs: &LogCapture) {
+    let loud: Vec<_> = logs
+        .records()
+        .into_iter()
+        .filter(|(level, ..)| *level == Level::WARN || *level == Level::ERROR)
+        .collect();
+    for (level, _, message) in &loud {
+        for forbidden in [
+            NETWORK_ID,
+            MAC_CANARY,
+            QUERY_CANARY,
+            "127.0.0.1",
+            "localhost",
+            "?",
+            "://",
+            "/2.2",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "{level} record {message:?} carries {forbidden:?}"
+            );
+        }
+    }
+    for (level, target, message) in logs.records() {
+        if target.starts_with("rusteero") {
+            assert!(
+                !message.contains(QUERY_CANARY),
+                "{level} record {message:?} carries the query value"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn timeout_error_line_names_the_method_but_not_the_path() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(DEVICES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                .set_delay(Duration::from_millis(500)),
+        )
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .timeout(Duration::from_millis(50))
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    let err = send_canary(&transport, Method::GET, &mock.uri())
+        .await
+        .expect_err("the response outlives the 50 ms total");
+    assert!(matches!(err, Error::Timeout), "{err:?}");
+
+    assert_eq!(logs.errors(), ["Request timed out on GET request"]);
+    assert!(logs.warnings().is_empty());
+    assert_eq!(
+        own_messages(&logs, Level::DEBUG)
+            .iter()
+            .filter(|message| **message == format!("Request to {DEVICES_PATH} timed out"))
+            .count(),
+        1
+    );
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn network_error_line_has_no_path_and_no_reqwest_text() -> anyhow::Result<()> {
+    // No listener on this port: the connection attempt fails below the HTTP layer.
+    let base = "http://127.0.0.1:1";
+    let transport = transport_at(base);
+
+    let (_guard, logs) = capture_logs();
+    let err = send_canary(&transport, Method::GET, base)
+        .await
+        .expect_err("nothing listens on port 1");
+    assert!(matches!(err, Error::Network(_)), "{err:?}");
+
+    assert_eq!(logs.errors(), ["Network error (connect) on GET request"]);
+    assert!(logs.warnings().is_empty());
+
+    let debug = own_messages(&logs, Level::DEBUG);
+    let line = debug
+        .iter()
+        .find(|message| message.starts_with("Network error: "))
+        .expect("a DEBUG line carries the cause");
+    assert!(
+        line.ends_with(&format!(" for URL: {DEVICES_PATH}")),
+        "{line:?}"
+    );
+    // Not reqwest's own text, which is `error sending request for url (<full URL>)`.
+    for forbidden in [
+        "127.0.0.1",
+        "error sending request",
+        "http://",
+        QUERY_CANARY,
+    ] {
+        assert!(!line.contains(forbidden), "{line:?} carries {forbidden:?}");
+    }
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_method_is_named_on_the_error_line() -> anyhow::Result<()> {
+    let base = "http://127.0.0.1:1";
+    let transport = transport_at(base);
+
+    let (_guard, logs) = capture_logs();
+    let err = send_canary(&transport, Method::POST, base)
+        .await
+        .expect_err("nothing listens on port 1");
+    assert!(matches!(err, Error::Network(_)), "{err:?}");
+
+    assert_eq!(logs.errors(), ["Network error (connect) on POST request"]);
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_retry_warning_has_no_path_and_debug_keeps_it() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(DEVICES_PATH))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(DEVICES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("account.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(1)
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    send_canary(&transport, Method::GET, &mock.uri()).await?;
+
+    assert_eq!(
+        logs.warnings(),
+        ["Retrying GET request after transient failure (attempt 2/2)"]
+    );
+    assert!(logs.errors().is_empty());
+    assert_eq!(
+        own_messages(&logs, Level::DEBUG)
+            .iter()
+            .filter(|message| **message == format!("Retrying GET {DEVICES_PATH}"))
+            .count(),
+        1
+    );
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_retry_warning_counts_attempts_out_of_the_total() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(DEVICES_PATH))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(4)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(3)
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    let err = send_canary(&transport, Method::GET, &mock.uri())
+        .await
+        .expect_err("every attempt answers 503");
+    assert!(matches!(err, Error::Api { status: 503, .. }), "{err:?}");
+
+    assert_eq!(
+        logs.warnings(),
+        [
+            "Retrying GET request after transient failure (attempt 2/4)",
+            "Retrying GET request after transient failure (attempt 3/4)",
+            "Retrying GET request after transient failure (attempt 4/4)",
+        ]
+    );
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_redirect_location_is_debug_only() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(DEVICES_PATH))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            format!("https://api.example.com/networks/{NETWORK_ID}/devices?token={QUERY_CANARY}"),
+        ))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let transport = transport_at(&mock.uri());
+
+    let (_guard, logs) = capture_logs();
+    let err = send_canary(&transport, Method::GET, &mock.uri())
+        .await
+        .expect_err("a redirect is refused");
+    assert!(matches!(err, Error::Api { status: 302, .. }), "{err:?}");
+
+    assert_eq!(logs.warnings(), ["Redirect response 302 blocked"]);
+    assert!(logs.errors().is_empty());
+    let debug = own_messages(&logs, Level::DEBUG);
+    assert!(
+        debug.contains(&format!(
+            "Blocked redirect Location: api.example.com/networks/{NETWORK_ID}/devices"
+        )),
+        "{debug:?}"
+    );
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_redirect_without_a_location_logs_none_at_debug() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(DEVICES_PATH))
+        .respond_with(ResponseTemplate::new(307))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let transport = transport_at(&mock.uri());
+
+    let (_guard, logs) = capture_logs();
+    let err = send_canary(&transport, Method::GET, &mock.uri())
+        .await
+        .expect_err("a redirect is refused");
+    assert!(matches!(err, Error::Api { status: 307, .. }), "{err:?}");
+
+    assert_eq!(logs.warnings(), ["Redirect response 307 blocked"]);
+    assert!(
+        own_messages(&logs, Level::DEBUG).contains(&"Blocked redirect Location: <none>".to_owned())
+    );
+    Ok(())
+}
+
+// ===================== log hygiene: no identifiers above DEBUG =====================
+//
+// Every way a request can fail is driven with a network id and a device MAC in its path and a
+// canary in its query, and no WARN or ERROR record may carry any of them (nor the host, nor a
+// `?`). A DEBUG record may show the path, which each test also checks, so the assertions about
+// the loud levels cannot pass just because nothing was logged.
+
+/// The path of a device read, with a network id and a MAC in it.
+const DEVICE_PATH: &str =
+    "/2.3/networks/net-CANARY-url-4c7d/devices/aa:bb:cc:dd:ee:ff-CANARY-MAC-9f21";
+
+/// Sends `method` to [`DEVICE_PATH`] on `base`, with a canary query value.
+async fn send_device(transport: &Transport, method: Method, base: &str) -> Result<Envelope, Error> {
+    let url = Url::parse(&format!("{base}{DEVICE_PATH}")).expect("a test URL is valid");
+    transport
+        .request(
+            method,
+            url,
+            &[("token", QUERY_CANARY.to_owned())],
+            RequestBody::None,
+        )
+        .await
+}
+
+/// Whether this crate logged a DEBUG record that shows the MAC, proving the loud-level checks
+/// are not vacuous.
+fn debug_shows_the_mac(logs: &LogCapture) -> bool {
+    own_messages(logs, Level::DEBUG)
+        .iter()
+        .any(|message| message.contains(MAC_CANARY))
+}
+
+#[tokio::test]
+async fn timeouts_and_retries_do_not_log_identifiers_above_debug() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .timeout(Duration::from_millis(40))
+        .get_retries(1)
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    let err = send_device(&transport, Method::GET, &mock.uri())
+        .await
+        .expect_err("both attempts time out");
+    assert!(matches!(err, Error::Timeout), "{err:?}");
+
+    assert_eq!(
+        logs.errors(),
+        ["Request timed out on GET request"; 2],
+        "one ERROR per failed attempt"
+    );
+    assert_eq!(
+        logs.warnings(),
+        ["Retrying GET request after transient failure (attempt 2/2)"]
+    );
+    assert!(debug_shows_the_mac(&logs));
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn connect_failures_and_retries_do_not_log_identifiers_above_debug() -> anyhow::Result<()> {
+    let base = "http://127.0.0.1:1";
+    let transport = Transport::builder()
+        .base_url(base)
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(2)
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    let err = send_device(&transport, Method::GET, base)
+        .await
+        .expect_err("nothing listens on port 1");
+    assert!(matches!(err, Error::Network(_)), "{err:?}");
+
+    // Three failed attempts and two retries: five records above DEBUG, as `eero-api` logs.
+    assert_eq!(logs.errors(), ["Network error (connect) on GET request"; 3]);
+    assert_eq!(
+        logs.warnings(),
+        [
+            "Retrying GET request after transient failure (attempt 2/3)",
+            "Retrying GET request after transient failure (attempt 3/3)",
+        ]
+    );
+    assert!(debug_shows_the_mac(&logs));
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_errors_and_retries_do_not_log_identifiers_above_debug() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(DEVICE_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string(format!(
+            r#"{{"meta":{{"code":503,"error":"{NETWORK_ID} {MAC_CANARY}"}}}}"#
+        )))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(1)
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    let err = send_device(&transport, Method::GET, &mock.uri())
+        .await
+        .expect_err("both attempts answer 503");
+    assert!(matches!(err, Error::Api { status: 503, .. }), "{err:?}");
+
+    assert_eq!(
+        logs.warnings(),
+        ["Retrying GET request after transient failure (attempt 2/2)"]
+    );
+    assert!(debug_shows_the_mac(&logs));
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_write_does_not_log_identifiers_above_debug() -> anyhow::Result<()> {
+    let base = "http://127.0.0.1:1";
+    let transport = Transport::builder()
+        .base_url(base)
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(3)
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    let err = send_device(&transport, Method::PUT, base)
+        .await
+        .expect_err("nothing listens on port 1");
+    assert!(matches!(err, Error::Network(_)), "{err:?}");
+
+    // A write is attempted once, so there is one ERROR and no retry WARN.
+    assert_eq!(logs.errors(), ["Network error (connect) on PUT request"]);
+    assert!(logs.warnings().is_empty());
+    assert!(debug_shows_the_mac(&logs));
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn redirects_and_error_statuses_do_not_log_identifiers_above_debug() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let location = format!(
+        "https://api.example.com/networks/{NETWORK_ID}/devices/{MAC_CANARY}?token={QUERY_CANARY}"
+    );
+    let error_body = format!(r#"{{"meta":{{"code":400,"error":"{NETWORK_ID} {MAC_CANARY}"}}}}"#);
+    // One response per call, in order: a redirect, then four error statuses.
+    for response in [
+        ResponseTemplate::new(302).insert_header("location", location.as_str()),
+        ResponseTemplate::new(401).set_body_string(error_body.as_str()),
+        ResponseTemplate::new(404).set_body_string(error_body.as_str()),
+        ResponseTemplate::new(429)
+            .insert_header("retry-after", "7")
+            .set_body_string(error_body.as_str()),
+        ResponseTemplate::new(500).set_body_string(error_body.as_str()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(DEVICE_PATH))
+            .respond_with(response)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+    let transport = transport_at(&mock.uri());
+
+    let (_guard, logs) = capture_logs();
+    for expected in [302, 401, 404, 429, 500] {
+        let err = send_device(&transport, Method::GET, &mock.uri())
+            .await
+            .expect_err("every response is an error");
+        assert_eq!(err.status(), Some(expected), "{err:?}");
+    }
+
+    assert_eq!(logs.warnings(), ["Redirect response 302 blocked"]);
+    assert!(
+        own_messages(&logs, Level::DEBUG).contains(&format!(
+            "Blocked redirect Location: api.example.com/networks/{NETWORK_ID}/devices/{MAC_CANARY}"
+        )),
+        "the DEBUG line shows the location's path"
+    );
+    assert_nothing_above_debug_identifies_the_request(&logs);
     Ok(())
 }

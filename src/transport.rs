@@ -933,7 +933,7 @@ impl Transport {
         let mut attempt: u32 = 0;
         loop {
             let outcome = self
-                .execute_once(method.clone(), url.clone(), query, body, token, timeout)
+                .execute_once(&method, url, query, body, token, timeout)
                 .await;
             let is_get = method == Method::GET;
             let retryable = is_get
@@ -947,12 +947,18 @@ impl Transport {
                 return outcome;
             }
             attempt += 1;
+            // `attempt` counts the retries started so far, so the first retry reads `2/N`, as in
+            // `_request_with_get_retry` (`base.py:1033-1038`). Widened because `get_retries` is
+            // an unbounded `u32`. The WARN line carries no URL: the path holds network, device
+            // and eero identifiers, which only the DEBUG line may show.
+            let shown = u64::from(attempt) + 1;
+            let max_attempts = u64::from(self.get_retries) + 1;
             tracing::warn!(
-                attempt,
-                method = %method,
-                path = url.path(),
-                "retrying GET request"
+                attempt = shown,
+                max_attempts,
+                "Retrying GET request after transient failure (attempt {shown}/{max_attempts})"
             );
+            tracing::debug!(path = url.path(), "Retrying GET {}", url.path());
             tokio::time::sleep(consts::GET_RETRY_DELAY).await;
         }
     }
@@ -964,10 +970,13 @@ impl Transport {
     ///
     /// The `total` bound wraps the whole attempt ([`Transport::send_and_read`]: send plus capped
     /// body read); the `read` bound is applied inside it. Either elapsing is [`Error::Timeout`].
+    ///
+    /// A transport failure (timeout or network error) is logged here, once per attempt, with
+    /// [`log_transport_failure`].
     async fn execute_once(
         &self,
-        method: Method,
-        url: Url,
+        method: &Method,
+        url: &Url,
         query: &[(&str, String)],
         body: &RequestBody,
         token: Option<&SecretString>,
@@ -975,12 +984,16 @@ impl Transport {
     ) -> Result<RawExchange, Error> {
         let bounds = self.bounds_for(timeout);
         let attempt = self.send_and_read(method, url, query, body, token, bounds);
-        match bounds.total {
+        let outcome = match bounds.total {
             Some(total) => tokio::time::timeout(total, attempt)
                 .await
                 .unwrap_or_else(|_elapsed| Err(Error::Timeout)),
             None => attempt.await,
+        };
+        if let Err(err) = &outcome {
+            log_transport_failure(method, url, err);
         }
+        outcome
     }
 
     /// Resolves the bounds one attempt runs under: `per_call` replaces the transport default
@@ -1005,8 +1018,8 @@ impl Transport {
     /// the response-size cap.
     async fn send_and_read(
         &self,
-        method: Method,
-        url: Url,
+        method: &Method,
+        url: &Url,
         query: &[(&str, String)],
         body: &RequestBody,
         token: Option<&SecretString>,
@@ -1015,7 +1028,7 @@ impl Transport {
         // Query parameters are appended directly onto the `Url` via `url`'s own percent-encoding
         // rather than `reqwest::RequestBuilder::query`, which requires reqwest's `query` cargo
         // feature — not enabled for this crate.
-        let mut url = url;
+        let mut url = url.clone();
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
@@ -1081,6 +1094,21 @@ impl Transport {
                 .and_then(|value| value.to_str().ok())
                 .filter(|value| !value.is_empty())
                 .and_then(|value| Url::parse(value).ok().or_else(|| url.join(value).ok()));
+            // The WARN line names the status only; the server-supplied `Location` (whose path
+            // can carry identifiers) is for DEBUG, without its query, as `_request` logs it
+            // (`base.py:777-778`).
+            tracing::warn!(
+                status = status.as_u16(),
+                "Redirect response {} blocked",
+                status.as_u16()
+            );
+            tracing::debug!(
+                "Blocked redirect Location: {}",
+                location_url.as_ref().map_or_else(
+                    || "<none>".to_owned(),
+                    |loc| format!("{}{}", loc.host_str().unwrap_or(""), loc.path())
+                )
+            );
             let message = location_url.map_or_else(
                 || {
                     format!(
@@ -1183,12 +1211,11 @@ fn status_to_envelope(
     let envelope = errors::parse_envelope(body);
     let error_code = envelope.as_ref().and_then(errors::error_code_from_envelope);
 
-    let redacted_envelope = envelope
-        .as_ref()
-        .map(|value| redact::redact_sensitive(value).to_string());
+    // The redaction sits inside the macro's field list, which `tracing` evaluates only when the
+    // callsite is enabled, so a disabled DEBUG level costs no redaction (`logging.py:321-322`).
     tracing::debug!(
         status = code,
-        envelope = ?redacted_envelope,
+        envelope = ?envelope.as_ref().map(redacted_for_log),
         "eero transport error response"
     );
 
@@ -1279,12 +1306,99 @@ fn refresh_signal_detected(body: &str) -> bool {
     errors::classify_error_code(error_code.as_deref()) == Some(errors::ErrorGroup::SessionRefresh)
 }
 
+thread_local! {
+    /// How many envelopes [`redacted_for_log`] has redacted on this thread; lets a unit test
+    /// prove that a disabled log level does no redaction work.
+    #[cfg(test)]
+    static REDACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Renders `envelope` with every sensitive field redacted, for a log line.
+fn redacted_for_log(envelope: &Value) -> String {
+    #[cfg(test)]
+    REDACTIONS.with(|count| count.set(count.get() + 1));
+    redact::redact_sensitive(envelope).to_string()
+}
+
 /// Maps a transport-level `reqwest::Error` onto this crate's `Error`.
 fn map_reqwest_error(err: reqwest::Error) -> Error {
     if err.is_timeout() {
         Error::Timeout
     } else {
         Error::Network(err)
+    }
+}
+
+/// The fixed token that names the kind of a network failure on the `ERROR` line.
+///
+/// Stands in for the exception class name `eero-api` logs (`type(err).__name__`,
+/// `base.py:990`), which `reqwest` has no equivalent of. It is a closed mapping from `reqwest`'s
+/// own predicates and never derived from the error's text, which embeds the request URL.
+fn network_error_kind(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_redirect() {
+        "redirect"
+    } else if err.is_body() {
+        "body"
+    } else if err.is_decode() {
+        "decode"
+    } else if err.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+/// The underlying causes of a network failure, joined, for the `DEBUG` line.
+///
+/// `reqwest::Error`'s own `Display` is `error sending request for url (<full URL>)`, query string
+/// included, so it is never rendered. The causes below it (hyper's, the OS's) do not carry the
+/// URL. With no cause, the kind stands in.
+fn network_error_cause(err: &reqwest::Error) -> String {
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    if causes.is_empty() {
+        format!("{} error", network_error_kind(err))
+    } else {
+        causes.join(": ")
+    }
+}
+
+/// Logs one failed attempt the way `_request` does (`base.py:981-992`): an `ERROR` line with the
+/// HTTP method (and, for a network error, the kind) and nothing else, then a `DEBUG` line with
+/// the request path. Neither line carries the host or the query string, and the `ERROR` line
+/// carries no part of the path either, because the path holds network, device and eero ids.
+/// Errors other than a timeout or a network failure are not this function's business.
+fn log_transport_failure(method: &Method, url: &Url, error: &Error) {
+    match error {
+        Error::Timeout => {
+            tracing::error!(method = %method, "Request timed out on {method} request");
+            tracing::debug!(
+                method = %method,
+                path = url.path(),
+                "Request to {} timed out",
+                url.path()
+            );
+        }
+        Error::Network(err) => {
+            let kind = network_error_kind(err);
+            tracing::error!(method = %method, kind, "Network error ({kind}) on {method} request");
+            tracing::debug!(
+                method = %method,
+                path = url.path(),
+                "Network error: {} for URL: {}",
+                network_error_cause(err),
+                url.path()
+            );
+        }
+        _ => {}
     }
 }
 
@@ -1591,8 +1705,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        RequestTimeout, Transport, parse_retry_after, refresh_signal_detected,
-        validate_header_value,
+        REDACTIONS, RequestTimeout, Transport, parse_retry_after, refresh_signal_detected,
+        status_to_envelope, validate_header_value,
     };
     use crate::error::Error;
     use crate::routes::{ACCOUNT, ApiVersion, Resource};
@@ -1681,6 +1795,32 @@ mod tests {
     #[test]
     fn refresh_signal_not_detected_on_invalid_json() {
         assert!(!refresh_signal_detected("not json at all"));
+    }
+
+    // ===================== lazy redaction of error bodies =====================
+
+    /// Runs `status_to_envelope` on a 400 with a JSON error body under a subscriber that lets
+    /// events through up to `level`, and returns how many envelopes were redacted meanwhile.
+    fn redactions_at(level: tracing::Level) -> usize {
+        const BODY: &str =
+            r#"{"meta":{"code":400,"error":"error.request.invalid"},"data":{"token":"x"}}"#;
+        let url = Url::parse("http://mock.test:1234/2.2/account").unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(std::io::sink)
+            .finish();
+        REDACTIONS.with(|count| count.set(0));
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = status_to_envelope(reqwest::StatusCode::BAD_REQUEST, BODY, &url, None);
+        });
+        REDACTIONS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_disabled_debug_level_never_invokes_the_redactor() {
+        assert_eq!(redactions_at(tracing::Level::WARN), 0);
+        // Non-vacuity: with DEBUG enabled the same call does redact, exactly once.
+        assert_eq!(redactions_at(tracing::Level::DEBUG), 1);
     }
 
     // ===================== validate_header_value =====================
