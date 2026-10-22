@@ -9,13 +9,16 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rstest::rstest;
 use rusteero::auth::Session;
 use rusteero::endpoints::data_usage::DataUsageApi;
 use rusteero::envelope::Envelope;
 use rusteero::error::Error;
 use rusteero::transport::{RequestTimeout, Transport};
-use serde_json::json;
-use wiremock::matchers::{body_json, method, path, query_param, query_param_is_missing};
+use serde_json::{Value, json};
+use wiremock::matchers::{
+    body_json, method, path, path_regex, query_param, query_param_is_missing,
+};
 use wiremock::{Mock, Request, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
@@ -808,6 +811,202 @@ async fn set_report_settings_invalid_cadence_rejected_before_any_request() -> an
         .await
         .expect_err("an invalid cadence must be rejected before any request");
     assert!(matches!(err, Error::Validation { field, .. } if field == "cadence"));
+    Ok(())
+}
+
+// ===================== published parent urls are not family-confined =====================
+//
+// A parent's published `url` is only shape-checked (`data_usage.py:156-157` resolves it through
+// `resolve_network_url`, which returns it verbatim); it is never confined to `networks/{id}`.
+// Only a caller-supplied `network_id` is.
+
+/// The twelve calls this module makes, each paired with the path suffix it must reach below the
+/// parent's published url, in the order [`call_every_method_with_parent`] makes them.
+const PUBLISHED_URL_SUFFIXES: [(&str, &str); 12] = [
+    ("GET", "/data_usage"),
+    ("GET", "/data_usage/breakdown"),
+    ("GET", "/data_usage/devices"),
+    ("GET", "/data_usage/devices/d1"),
+    ("GET", "/data_usage/eeros"),
+    ("GET", "/data_usage/eeros/summary"),
+    ("GET", "/data_usage/eeros/e1"),
+    ("GET", "/data_usage/profiles/p1"),
+    ("GET", "/data_usage/unprofiled/devices"),
+    ("GET", "/data_usage/unprofiled/summary"),
+    ("GET", "/data_usage/report_settings"),
+    ("PUT", "/data_usage/report_settings"),
+];
+
+/// Calls every `DataUsageApi` method with `parent`, naming a different network than `network_id`
+/// would resolve to, in [`PUBLISHED_URL_SUFFIXES`] order.
+async fn call_every_method_with_parent(api: &DataUsageApi, parent: &Value) -> Result<(), Error> {
+    let net = "network-0001";
+    api.get_data_usage(net, "s", "e", "daily", None, None, Some(parent))
+        .await?;
+    api.get_breakdown(net, "s", "e", None, None, None, Some(parent))
+        .await?;
+    api.get_devices_usage(net, "s", "e", None, None, None, None, Some(parent))
+        .await?;
+    api.get_device_usage(net, "d1", "s", "e", "daily", None, None, Some(parent))
+        .await?;
+    api.get_eeros_usage(net, "s", "e", "daily", None, None, Some(parent))
+        .await?;
+    api.get_eeros_summary(net, "s", "e", "daily", None, None, Some(parent))
+        .await?;
+    api.get_eero_usage(net, "e1", "s", "e", "daily", None, None, Some(parent))
+        .await?;
+    api.get_profile_usage(net, "p1", "s", "e", "daily", None, None, Some(parent))
+        .await?;
+    api.get_unprofiled_devices(net, "s", "e", None, None, None, Some(parent))
+        .await?;
+    api.get_unprofiled_summary(net, "s", "e", "daily", None, None, Some(parent))
+        .await?;
+    api.get_report_settings(net, Some(parent)).await?;
+    api.set_report_settings(net, "daily", "monday", Some(parent))
+        .await?;
+    Ok(())
+}
+
+/// A parent whose published `url` is not `/<version>/networks/<id>`-shaped still resolves every
+/// method under that url verbatim: `<published url><suffix>`, with the bare-id template for the
+/// caller's `network_id` never touched.
+#[rstest]
+#[case::account("/2.2/account", "/2.2/account")]
+#[case::another_family("/2.3/networks/other/eeros", "/2.3/networks/other/eeros")]
+#[case::unknown_shape("/2.4/some/other/shape", "/2.4/some/other/shape")]
+#[case::trailing_slash("/2.4/some/other/shape/", "/2.4/some/other/shape")]
+#[tokio::test]
+async fn every_method_resolves_a_non_network_shaped_published_url_verbatim(
+    #[case] published_url: &str,
+    #[case] base: &str,
+) -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let ok = json!({"meta": {"code": 200}, "data": {}});
+    for (verb, suffix) in PUBLISHED_URL_SUFFIXES {
+        Mock::given(method(verb))
+            .and(path(format!("{base}{suffix}")))
+            .and(session_cookie())
+            .and(user_token_header())
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok.clone()))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+    // Nothing may fall back to the template built from the caller's `network_id`.
+    Mock::given(path_regex("^/2\\.2/networks/network-0001/"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    let parent = json!({"url": published_url});
+    call_every_method_with_parent(&api, &parent).await?;
+    Ok(())
+}
+
+/// The query string and the JSON body are exactly what they are for a network-shaped parent.
+#[tokio::test]
+async fn a_non_network_shaped_published_url_keeps_the_query_and_body_shapes() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/account/data_usage"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(|request: &Request| {
+            request.url.query() == Some("start=s&end=e&cadence=daily&timezone=UTC")
+                && request.body.is_empty()
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/account/data_usage/report_settings"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(
+            json!({"cadence": "hourly", "notification_day": "friday"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    let parent = json!({"url": "/2.2/account"});
+    api.get_data_usage(
+        "network-0001",
+        "s",
+        "e",
+        "daily",
+        Some("UTC"),
+        None,
+        Some(&parent),
+    )
+    .await?;
+    api.set_report_settings("network-0001", "hourly", "friday", Some(&parent))
+        .await?;
+    Ok(())
+}
+
+/// A published url is still shape-checked (field `link`), before any request.
+#[rstest]
+#[case::query("/2.2/networks/network-0001?x=1", "must not carry a query or fragment")]
+#[case::absolute(
+    "https://elsewhere.invalid/2.2/networks/network-0001",
+    "must be a host-relative API path"
+)]
+#[tokio::test]
+async fn a_malformed_published_url_is_still_rejected_before_any_request(
+    #[case] published_url: &str,
+    #[case] message: &str,
+) -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let api = data_usage_api(&mock);
+    let parent = json!({"url": published_url});
+
+    let err = api
+        .get_eeros_usage("network-0001", "s", "e", "daily", None, None, Some(&parent))
+        .await
+        .expect_err("a malformed published url must be rejected before any request");
+    assert!(
+        matches!(
+            &err,
+            Error::Validation { field, message: got, .. } if field == "link" && got == message
+        ),
+        "{err:?}"
+    );
+    assert!(
+        mock.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// Only a caller-supplied `network_id` (the template fallback, no parent) is confined to
+/// `networks/{id}`. The confinement itself is `links::resource_url`'s, so this holds once that
+/// check exists.
+#[tokio::test]
+#[ignore = "needs the caller-path family check in links::resource_url; un-ignore when it lands"]
+async fn a_caller_supplied_network_outside_the_network_family_is_rejected() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    let err = api
+        .get_data_usage("/2.2/account", "s", "e", "daily", None, None, None)
+        .await
+        .expect_err("a caller-supplied non-network path must be rejected before any request");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "id_or_url"));
     Ok(())
 }
 

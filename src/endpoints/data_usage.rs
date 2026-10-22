@@ -9,10 +9,13 @@
 //! accept a request body; the API rejects a body-bearing `GET` with a `400`"
 //! (`data_usage.py:10-11`).
 //!
-//! Every method resolves its network segment via the same "prefer `parent`'s own `self_url`,
-//! else the bare `network_id` template" rule as [`crate::params::resolve_network_url`] — see
-//! `DataUsageApi::network_id_or_self_url` for why this is implemented locally rather than by
-//! threading `parent` through [`crate::routes::Resource::resolve`] itself.
+//! Every method resolves its network base through [`crate::params::resolve_network_url`] — the
+//! "prefer `parent`'s own `self_url`, else the bare `network_id` template" rule of Python's
+//! `_get_usage` (`data_usage.py:157`) — and then appends the route's literal suffix (the template
+//! text after `{id}`, e.g. `/data_usage/breakdown`). A published `self_url` is therefore only
+//! shape-checked, never fed back through [`crate::links::resource_url`] as if a caller had typed
+//! it, so it is not confined to the `networks/{id}` family; only a caller-supplied `network_id`
+//! is. See `DataUsageApi::route_url`.
 //!
 //! `cadence` is required on seven of the twelve methods (`get_data_usage`, `get_device_usage`,
 //! `get_eeros_summary`, `get_eeros_usage`, `get_eero_usage`, `get_profile_usage`,
@@ -163,11 +166,10 @@ impl DataUsageApi {
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence_opt(cadence)?;
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = routes::data_usage::GET_DEVICES_DATA_USAGE.resolve(
-            self.transport.api_host(),
-            &id_or_url,
-            None,
+        let url = self.route_url(
+            &routes::data_usage::GET_DEVICES_DATA_USAGE,
+            network_id,
+            parent,
         )?;
         let mut query = usage_query(start, end, cadence, timezone);
         if let Some(profile_id) = profile_id {
@@ -463,11 +465,10 @@ impl DataUsageApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = routes::data_usage::GET_DATA_USAGE_REPORT_SETTINGS.resolve(
-            self.transport.api_host(),
-            &id_or_url,
-            None,
+        let url = self.route_url(
+            &routes::data_usage::GET_DATA_USAGE_REPORT_SETTINGS,
+            network_id,
+            parent,
         )?;
         self.transport
             .request(Method::GET, url, &[], RequestBody::None)
@@ -496,11 +497,10 @@ impl DataUsageApi {
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = routes::data_usage::SET_DATA_USAGE_REPORT_SETTINGS.resolve(
-            self.transport.api_host(),
-            &id_or_url,
-            None,
+        let url = self.route_url(
+            &routes::data_usage::SET_DATA_USAGE_REPORT_SETTINGS,
+            network_id,
+            parent,
         )?;
         crate::links::warn_uncharacterised_write("set data usage report settings for network");
         self.transport
@@ -530,8 +530,7 @@ impl DataUsageApi {
         timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = route.resolve(self.transport.api_host(), &id_or_url, None)?;
+        let url = self.route_url(route, network_id, parent)?;
         let query = usage_query(start, end, cadence, timezone);
         self.transport
             .request_with_timeout(Method::GET, url, &query, RequestBody::None, timeout)
@@ -562,8 +561,7 @@ impl DataUsageApi {
     ) -> Result<Envelope, Error> {
         let validated_child = crate::links::validate_identifier(child)?;
         let cadence = validated_cadence(cadence)?;
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let collection = route.resolve(self.transport.api_host(), &id_or_url, None)?;
+        let collection = self.route_url(route, network_id, parent)?;
         let url = append_path(&collection, validated_child)?;
         let query = usage_query(start, end, Some(cadence), timezone);
         self.transport
@@ -571,34 +569,47 @@ impl DataUsageApi {
             .await
     }
 
-    /// Resolves `network_id`'s id-or-self-url for use as a [`Resource`]'s `id_or_url`: prefers
-    /// `parent`'s own published `url` ([`crate::links::self_url`]) when present, falling back to
-    /// the bare `network_id` unchanged.
+    /// Resolves `route`'s absolute URL for `network_id`: the network base from
+    /// [`params::resolve_network_url`] (`parent`'s own published `url` when present, else the
+    /// `networks/{id}` template at the route's API version), then the route's literal suffix.
     ///
-    /// Every `DataUsageAPI` method resolves its network segment via
-    /// `resolve_network_url(network_id, parent)` (`data_usage.py:97-153`'s shared `_get_usage`),
-    /// which prefers `parent`'s own `self_url` over the `network_id` template exactly like
-    /// [`crate::params::resolve_network_url`] does. `Resource::resolve`'s own `parent` argument
-    /// only supports a *named* link inside a *different* resource's `resources` map
-    /// (`sub_resource_url`), not "prefer this same resource's own `url`" — so this helper performs
-    /// that preference itself, up front, and hands the result to `Resource::resolve` as a bare
-    /// `id_or_url` with `parent: None`: when `parent`'s `self_url` is present, the returned string
-    /// is an absolute `http(s)://` URL on this transport's host, which `Resource::resolve`'s
-    /// underlying `resource_url` already knows how to validate and append a template's suffix
-    /// onto (the same branch an API-returned absolute URL takes) — so no separate "self-url
-    /// preferred" branch needs to exist inside `Resource`/`Nested` itself.
-    fn network_id_or_self_url(
+    /// Every `DataUsageAPI` method does exactly this (`data_usage.py:156-157` at `v8.4.1`:
+    /// `base_url = resolve_network_url(network, parent)` and
+    /// `f"{base_url}/data_usage/{path}"`), so the suffix comes from [`Resource::template`], the
+    /// single source of each path, as the text after `{id}`.
+    ///
+    /// A published `url` is returned by `resolve_network_url` after a plain shape check only
+    /// (field `link`), and must stay that way: handing it back to [`Resource::resolve`] as if it
+    /// were a caller-typed `id_or_url` would subject it to the caller-path family check, which
+    /// rejects any parent whose url is not `/<version>/networks/<id>` — something Python never
+    /// does to a published link. Only the template fallback, built from the caller's
+    /// `network_id`, is checked as a caller-supplied id.
+    fn route_url(
         &self,
+        route: &Resource,
         network_id: &str,
         parent: Option<&Value>,
-    ) -> Result<String, Error> {
-        if let Some(parent) = parent
-            && let Some(self_url) = crate::links::self_url(self.transport.api_host(), parent)?
-        {
-            return Ok(self_url.to_string());
-        }
-        Ok(network_id.to_owned())
+    ) -> Result<Url, Error> {
+        let base = params::resolve_network_url(
+            self.transport.api_host(),
+            network_id,
+            parent,
+            route.version,
+        )?;
+        let joined = format!(
+            "{}{}",
+            base.as_str().trim_end_matches('/'),
+            route_suffix(route.template)
+        );
+        Url::parse(&joined)
+            .map_err(|err| Error::validation("url", format!("not a valid URL: {err}")))
     }
+}
+
+/// The literal path text after a route template's `{id}` placeholder (`/data_usage/breakdown` for
+/// `networks/{id}/data_usage/breakdown`).
+fn route_suffix(template: &str) -> &str {
+    template.split_once("{id}").map_or("", |(_, suffix)| suffix)
 }
 
 /// Validates a required `cadence` value against [`params::CADENCE_VALUES`] (`"hourly"`/
@@ -634,4 +645,55 @@ fn usage_query(
 fn append_path(base: &Url, child: &str) -> Result<Url, Error> {
     let joined = format!("{}/{child}", base.as_str().trim_end_matches('/'));
     Url::parse(&joined).map_err(|err| Error::validation("url", format!("not a valid URL: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_suffix;
+    use crate::routes::data_usage as routes;
+
+    /// Each route's literal suffix is the text after `{id}`, and it is what `route_url`
+    /// appends: every data-usage template hangs `/data_usage[/..]` off `networks/{id}`.
+    #[test]
+    fn route_suffix_is_the_template_text_after_the_id_placeholder() {
+        for (template, suffix) in [
+            (routes::V8_GET_DATA_USAGE.template, "/data_usage"),
+            (
+                routes::GET_DATA_USAGE_BREAKDOWN.template,
+                "/data_usage/breakdown",
+            ),
+            (
+                routes::GET_DEVICES_DATA_USAGE.template,
+                "/data_usage/devices",
+            ),
+            (
+                routes::GET_EEROS_DATA_USAGE_SUMMARY.template,
+                "/data_usage/eeros/summary",
+            ),
+            (routes::GET_EEROS_DATA_USAGE.template, "/data_usage/eeros"),
+            (
+                routes::GET_PROFILES_DATA_USAGE.template,
+                "/data_usage/profiles",
+            ),
+            (
+                routes::GET_UNPROFILED_DEVICES_DATA_USAGE.template,
+                "/data_usage/unprofiled/devices",
+            ),
+            (
+                routes::GET_UNPROFILED_DATA_USAGE_SUMMARY.template,
+                "/data_usage/unprofiled/summary",
+            ),
+            (
+                routes::GET_DATA_USAGE_REPORT_SETTINGS.template,
+                "/data_usage/report_settings",
+            ),
+            (
+                routes::SET_DATA_USAGE_REPORT_SETTINGS.template,
+                "/data_usage/report_settings",
+            ),
+        ] {
+            assert!(template.starts_with("networks/{id}/"), "{template}");
+            assert_eq!(route_suffix(template), suffix, "{template}");
+        }
+    }
 }

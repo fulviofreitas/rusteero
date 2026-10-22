@@ -6,17 +6,15 @@ use super::{ApiVersion, Resource};
 use reqwest::Method;
 
 // ============================================================================================
-// v8.0.4 constants (`.claude/tasks/briefs/v8/g3-devices.md`). Every `DataUsageApi` method in
-// `src/endpoints/data_usage.rs` is built on one of these. All eleven Python methods this group
-// ports resolve their network segment via `resolve_network_url(network_id, parent)`
-// (`data_usage.py:97-153`'s shared `_get_usage`) — i.e. they prefer `parent`'s own published
-// `url` over the bare `network_id` template, exactly like [`crate::params::resolve_network_url`]
-// — then literal-append a fixed suffix. `Resource::resolve`'s own `parent` handling only
-// supports a *named* link inside a *different* resource's `resources` map (`sub_resource_url`),
-// not "prefer this same resource's own `url`" (`resolve_network_url`), so every endpoint method
-// below performs that preference itself (via `crate::links::self_url`) and then calls
-// `Resource::resolve` with the *resolved* id-or-url string and `parent: None` — see
-// `DataUsageApi`'s private `network_id_or_self_url` helper.
+// Every `DataUsageApi` method in `src/endpoints/data_usage.rs` is built on one of these. All
+// twelve Python methods this group ports resolve their network base via
+// `resolve_network_url(network_id, parent)` (`data_usage.py:156-157`'s shared `_get_usage`) —
+// i.e. they prefer `parent`'s own published `url` over the bare `network_id` template, exactly
+// like [`crate::params::resolve_network_url`] — then literal-append a fixed suffix. Each
+// constant's `template` is the single source of that suffix: `DataUsageApi`'s private
+// `route_url` appends the template text after `{id}` to the resolved network base, so a
+// published `url` is never fed back through `Resource::resolve` (which would apply the
+// caller-path family check to a link Python only shape-checks).
 // ============================================================================================
 
 /// `GET /2.2/networks/{id}/data_usage` — network-wide data-usage statistics.
