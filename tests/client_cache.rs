@@ -569,3 +569,525 @@ async fn a_networks_read_overtaken_by_a_session_change_selects_nothing() -> anyh
     }
     Ok(())
 }
+
+// ===================== Canonical device cache keys =====================
+
+/// Mounts `GET` `target` answering a device-shaped body, expected `times` times.
+async fn mount_get(mock: &MockEero, target: &str, body: Value, times: u64) {
+    Mock::given(method("GET"))
+        .and(path(target))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(times)
+        .mount(&mock.server)
+        .await;
+}
+
+fn device_body() -> Value {
+    json!({"meta": {"code": 200}, "data": {"mac": "aa:bb:cc:dd:ee:ff"}})
+}
+
+const DEVICE_PATH: &str = "/2.2/networks/network-0001/devices/aabbccddeeff";
+const DEVICES_PATH: &str = "/2.2/networks/network-0001/devices";
+
+/// A MAC address read as `aabbccddeeff` and then under every other spelling is one cache entry:
+/// one request in total.
+#[tokio::test]
+async fn get_device_under_every_mac_spelling_is_served_from_one_entry() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(&mock, DEVICE_PATH, device_body(), 1).await;
+    let client = client(&mock).await;
+
+    let first = client
+        .get_device("aabbccddeeff", Some(NETWORK), false)
+        .await?;
+    let absolute = format!("{}{DEVICE_PATH}", mock.uri());
+    for spelling in [
+        "aabbccddeeff",
+        "AA:BB:CC:DD:EE:FF",
+        "aa-bb-cc-dd-ee-ff",
+        "aabb.ccdd.eeff",
+        DEVICE_PATH,
+        "/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF/",
+        absolute.as_str(),
+    ] {
+        let again = client.get_device(spelling, Some(NETWORK), false).await?;
+        assert_eq!(again, first, "{spelling}");
+    }
+    Ok(())
+}
+
+/// The cache key is canonical; the request still carries the caller's own spelling.
+#[tokio::test]
+async fn the_request_keeps_the_callers_spelling() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF",
+        device_body(),
+        1,
+    )
+    .await;
+    let client = client(&mock).await;
+
+    client
+        .get_device("AA:BB:CC:DD:EE:FF", Some(NETWORK), false)
+        .await?;
+    // The lowercase spelling is a hit on the entry just written, so no second request.
+    client
+        .get_device("aabbccddeeff", Some(NETWORK), false)
+        .await?;
+    Ok(())
+}
+
+/// Ids that are not MACs are kept as written, so differently-cased ids stay separate.
+#[tokio::test]
+async fn ids_that_are_not_macs_are_keyed_as_written() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices/d1",
+        device_body(),
+        1,
+    )
+    .await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices/D1",
+        device_body(),
+        1,
+    )
+    .await;
+    let client = client(&mock).await;
+
+    client.get_device("d1", Some(NETWORK), false).await?;
+    client.get_device("D1", Some(NETWORK), false).await?;
+    client.get_device("d1", Some(NETWORK), false).await?;
+    client.get_device("D1", Some(NETWORK), false).await?;
+    Ok(())
+}
+
+fn assert_empty_id(err: &Error) {
+    assert!(
+        matches!(
+            err,
+            Error::Validation { field, message, .. }
+                if field == "id_or_url" && message == "must be a non-empty string"
+        ),
+        "{err:?}"
+    );
+}
+
+async fn assert_no_requests(mock: &MockEero) {
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+#[tokio::test]
+async fn an_empty_device_id_is_rejected_before_any_request() {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+
+    let err = client
+        .get_device("", Some(NETWORK), false)
+        .await
+        .expect_err("an empty device id is rejected");
+    assert_empty_id(&err);
+
+    let err = client
+        .update_device_via_link("", Some("x"), None, None, Some(NETWORK))
+        .await
+        .expect_err("an empty device id is rejected before the all-None check");
+    assert_empty_id(&err);
+
+    let err = client
+        .update_device_via_link("", None, None, None, Some(NETWORK))
+        .await
+        .expect_err("the id check comes before the domain's own check");
+    assert_empty_id(&err);
+
+    assert_no_requests(&mock).await;
+}
+
+/// `block_device("")` fails before the write, where Python posts `mac=` and only then fails to
+/// derive the cache key. The cache is untouched.
+#[tokio::test]
+async fn block_device_with_an_empty_mac_is_rejected_before_the_write() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(&mock, DEVICES_PATH, ok(), 1).await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/blacklist"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok()))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    let client = client(&mock).await;
+    client.get_devices(Some(NETWORK), false, None, None).await?;
+
+    let err = client
+        .block_device("", Some(NETWORK))
+        .await
+        .expect_err("an empty MAC is rejected");
+    assert_empty_id(&err);
+
+    // Still cached: the mock above is expected exactly once.
+    client.get_devices(Some(NETWORK), false, None, None).await?;
+    Ok(())
+}
+
+// ===================== Every device write invalidates across spellings =====================
+
+#[derive(Debug, Clone, Copy)]
+enum DeviceWrite {
+    Nickname,
+    Pause,
+    PauseByPath,
+    Block,
+    Unblock,
+    Type,
+    Labels,
+    UpdateViaLink,
+    SecondaryWan,
+}
+
+impl DeviceWrite {
+    const ALL: [Self; 9] = [
+        Self::Nickname,
+        Self::Pause,
+        Self::PauseByPath,
+        Self::Block,
+        Self::Unblock,
+        Self::Type,
+        Self::Labels,
+        Self::UpdateViaLink,
+        Self::SecondaryWan,
+    ];
+
+    const MAC: &'static str = "AA:BB:CC:DD:EE:FF";
+
+    fn endpoint(self) -> (&'static str, String) {
+        let v22 = "/2.2/networks/network-0001";
+        let v23 = "/2.3/networks/network-0001";
+        let mac = Self::MAC;
+        match self {
+            Self::Nickname | Self::Pause | Self::PauseByPath | Self::SecondaryWan => {
+                ("PUT", format!("{v23}/devices/{mac}"))
+            }
+            Self::Block => ("POST", format!("{v22}/blacklist")),
+            Self::Unblock => ("DELETE", format!("{v22}/blacklist/{mac}")),
+            Self::Type | Self::UpdateViaLink => ("PUT", format!("{v22}/devices/{mac}")),
+            Self::Labels => ("PUT", format!("{v22}/devices/{mac}/labels")),
+        }
+    }
+
+    async fn run(self, client: &Client) -> Result<(), Error> {
+        let mac = Self::MAC;
+        match self {
+            Self::Nickname => {
+                client
+                    .set_device_nickname(mac, "Phone", Some(NETWORK))
+                    .await?;
+            }
+            Self::Pause => {
+                client.pause_device(mac, true, Some(NETWORK)).await?;
+            }
+            Self::PauseByPath => {
+                client
+                    .pause_device(
+                        "/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF",
+                        true,
+                        Some(NETWORK),
+                    )
+                    .await?;
+            }
+            Self::Block => {
+                client.block_device(mac, Some(NETWORK)).await?;
+            }
+            Self::Unblock => {
+                client.unblock_device(mac, Some(NETWORK)).await?;
+            }
+            Self::Type => {
+                client
+                    .set_device_type(mac, "computer", Some(NETWORK))
+                    .await?;
+            }
+            Self::Labels => {
+                client
+                    .set_device_labels(mac, Some("Acme"), None, None, None, Some(NETWORK))
+                    .await?;
+            }
+            Self::UpdateViaLink => {
+                client
+                    .update_device_via_link(mac, Some("Phone"), None, None, Some(NETWORK))
+                    .await?;
+            }
+            Self::SecondaryWan => {
+                client
+                    .set_device_secondary_wan_access(mac, true, Some(NETWORK))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Issue #168's scenario: the device is read as `aabbccddeeff`, the write names it
+/// `AA:BB:CC:DD:EE:FF`. The write drops the entry read under the other spelling and the list.
+#[tokio::test]
+async fn every_device_write_drops_the_entry_read_under_another_spelling() -> anyhow::Result<()> {
+    for write in DeviceWrite::ALL {
+        let mock = MockEero::start().await;
+        mount_get(&mock, DEVICE_PATH, device_body(), 2).await;
+        mount_get(&mock, DEVICES_PATH, ok(), 2).await;
+        let (verb, target) = write.endpoint();
+        Mock::given(method(verb))
+            .and(path(target))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok()))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+        let client = client(&mock).await;
+
+        client
+            .get_device("aabbccddeeff", Some(NETWORK), false)
+            .await?;
+        client.get_devices(Some(NETWORK), false, None, None).await?;
+
+        write.run(&client).await?;
+
+        // Both reads go back to the network (`.expect(2)` above).
+        client
+            .get_device("aabbccddeeff", Some(NETWORK), false)
+            .await
+            .unwrap_or_else(|err| panic!("{write:?}: {err:?}"));
+        client
+            .get_devices(Some(NETWORK), false, None, None)
+            .await
+            .unwrap_or_else(|err| panic!("{write:?}: {err:?}"));
+    }
+    Ok(())
+}
+
+/// A write for one device leaves another device's entry alone.
+#[tokio::test]
+async fn a_device_write_leaves_other_devices_cached() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_get(&mock, DEVICE_PATH, device_body(), 2).await;
+    mount_get(
+        &mock,
+        "/2.2/networks/network-0001/devices/112233445566",
+        device_body(),
+        1,
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let client = client(&mock).await;
+
+    client
+        .get_device("aabbccddeeff", Some(NETWORK), false)
+        .await?;
+    client
+        .get_device("112233445566", Some(NETWORK), false)
+        .await?;
+    client
+        .pause_device("AA:BB:CC:DD:EE:FF", true, Some(NETWORK))
+        .await?;
+
+    client
+        .get_device("aabbccddeeff", Some(NETWORK), false)
+        .await?;
+    client
+        .get_device("112233445566", Some(NETWORK), false)
+        .await?;
+    Ok(())
+}
+
+/// A device cached under one spelling is reused as `parent=` under another, so the update goes
+/// to the device's own published url instead of the template.
+#[tokio::test]
+async fn update_device_via_link_reuses_a_device_cached_under_another_spelling() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    mount_get(
+        &mock,
+        DEVICE_PATH,
+        json!({
+            "meta": {"code": 200},
+            "data": {
+                "url": "/2.3/networks/network-0001/devices/aabbccddeeff",
+                "mac": "aa:bb:cc:dd:ee:ff"
+            },
+        }),
+        1,
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/devices/aabbccddeeff"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let client = client(&mock).await;
+
+    client
+        .get_device("aabbccddeeff", Some(NETWORK), false)
+        .await?;
+    client
+        .update_device_via_link("AA:BB:CC:DD:EE:FF", Some("x"), None, None, Some(NETWORK))
+        .await?;
+    Ok(())
+}
+
+// ===================== set_profile_devices also drops the named devices =====================
+
+const PROFILE_PATH: &str = "/2.2/networks/network-0001/profiles/profile-0001";
+const PROFILES_PATH: &str = "/2.2/networks/network-0001/profiles";
+const OTHER_DEVICE_PATH: &str = "/2.2/networks/network-0001/devices/other";
+const D1_PATH: &str = "/2.2/networks/network-0001/devices/d1";
+
+/// Primes the device entries `aabbccddeeff`, `d1` and `other`, the device list, a profile and the
+/// profile list. `refetched` lists which of the six are expected to be fetched twice.
+async fn prime_for_set_profile_devices(mock: &MockEero, client: &Client, refetched: &[&str]) {
+    let times = |name: &str| if refetched.contains(&name) { 2 } else { 1 };
+    mount_get(mock, DEVICE_PATH, device_body(), times("mac")).await;
+    mount_get(mock, D1_PATH, device_body(), times("d1")).await;
+    mount_get(mock, OTHER_DEVICE_PATH, device_body(), times("other")).await;
+    mount_get(mock, DEVICES_PATH, ok(), times("list")).await;
+    mount_get(mock, PROFILE_PATH, ok(), times("profile")).await;
+    mount_get(mock, PROFILES_PATH, ok(), times("profiles")).await;
+    read_for_set_profile_devices(client).await;
+}
+
+async fn read_for_set_profile_devices(client: &Client) {
+    let network = Some(NETWORK);
+    client
+        .get_device("aabbccddeeff", network, false)
+        .await
+        .expect("mac device");
+    client.get_device("d1", network, false).await.expect("d1");
+    client
+        .get_device("other", network, false)
+        .await
+        .expect("other");
+    client
+        .get_devices(network, false, None, None)
+        .await
+        .expect("device list");
+    client
+        .get_profile("profile-0001", network, false)
+        .await
+        .expect("profile");
+    client.get_profiles(network, false).await.expect("profiles");
+}
+
+async fn mount_profile_put(mock: &MockEero, status: u16) {
+    Mock::given(method("PUT"))
+        .and(path(PROFILE_PATH))
+        .respond_with(ResponseTemplate::new(status).set_body_json(ok()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+}
+
+#[tokio::test]
+async fn set_profile_devices_drops_the_named_devices_the_list_and_both_profile_keys()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+    prime_for_set_profile_devices(
+        &mock,
+        &client,
+        &["mac", "d1", "list", "profile", "profiles"],
+    )
+    .await;
+    mount_profile_put(&mock, 200).await;
+
+    client
+        .set_profile_devices(
+            "profile-0001",
+            &[
+                "/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF",
+                "/2.2/networks/network-0001/devices/d1",
+            ],
+            Some(NETWORK),
+        )
+        .await?;
+
+    // Everything but `other` is fetched again; `other` stays cached.
+    read_for_set_profile_devices(&client).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_profile_devices_with_no_devices_still_drops_the_device_list() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+    prime_for_set_profile_devices(&mock, &client, &["list", "profile", "profiles"]).await;
+    mount_profile_put(&mock, 200).await;
+
+    client
+        .set_profile_devices("profile-0001", &[], Some(NETWORK))
+        .await?;
+
+    read_for_set_profile_devices(&client).await;
+    Ok(())
+}
+
+/// An unusable entry never fails a write the server has already accepted.
+#[tokio::test]
+async fn set_profile_devices_skips_empty_entries() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+    prime_for_set_profile_devices(&mock, &client, &["d1", "list", "profile", "profiles"]).await;
+    mount_profile_put(&mock, 200).await;
+
+    client
+        .set_profile_devices(
+            "profile-0001",
+            &["", "/2.2/networks/network-0001/devices/d1"],
+            Some(NETWORK),
+        )
+        .await?;
+
+    read_for_set_profile_devices(&client).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_set_profile_devices_invalidates_nothing() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let client = client(&mock).await;
+    prime_for_set_profile_devices(&mock, &client, &[]).await;
+    mount_profile_put(&mock, 500).await;
+
+    client
+        .set_profile_devices(
+            "profile-0001",
+            &["/2.2/networks/network-0001/devices/d1"],
+            Some(NETWORK),
+        )
+        .await
+        .expect_err("the write fails");
+
+    // Every read is still a cache hit: each mock is expected exactly once.
+    read_for_set_profile_devices(&client).await;
+    Ok(())
+}
