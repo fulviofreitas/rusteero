@@ -2103,6 +2103,110 @@ async fn write_method_is_named_on_the_error_line() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Python logs `API error {status} on {method} request` at `ERROR` for every response that is not
+/// a success and has no line of its own (`base.py:970`), with no URL.
+#[tokio::test]
+async fn an_api_error_status_logs_pythons_error_line_without_the_url() -> anyhow::Result<()> {
+    for (verb, status) in [
+        (Method::GET, 500_u16),
+        (Method::GET, 403),
+        (Method::POST, 409),
+        (Method::PUT, 400),
+        (Method::DELETE, 502),
+    ] {
+        let mock = MockEero::start().await;
+        Mock::given(method(verb.as_str()))
+            .and(path(DEVICES_PATH))
+            .and(user_token_header())
+            .and(session_cookie())
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_string(format!(r#"{{"meta":{{"code":{status}}}}}"#)),
+            )
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+        let transport = transport_at(&mock.uri());
+
+        let (_guard, logs) = capture_logs();
+        let err = send_canary(&transport, verb.clone(), &mock.uri())
+            .await
+            .expect_err("a non-success status is an error");
+
+        assert_eq!(err.status(), Some(status), "{verb} {status}: {err:?}");
+        assert_eq!(
+            logs.errors(),
+            [format!("API error {status} on {verb} request")],
+            "{verb} {status}"
+        );
+        assert_nothing_above_debug_identifies_the_request(&logs);
+    }
+    Ok(())
+}
+
+/// A `401`, a `404` and a `429` have their own handling in `_request` and no `ERROR` line.
+#[tokio::test]
+async fn a_401_a_404_and_a_429_log_no_error_line() -> anyhow::Result<()> {
+    for status in [401_u16, 404, 429] {
+        let mock = MockEero::start().await;
+        Mock::given(method("GET"))
+            .and(path(DEVICES_PATH))
+            .and(user_token_header())
+            .and(session_cookie())
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_string(format!(r#"{{"meta":{{"code":{status}}}}}"#)),
+            )
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+        let transport = transport_at(&mock.uri());
+
+        let (_guard, logs) = capture_logs();
+        let err = send_canary(&transport, Method::GET, &mock.uri())
+            .await
+            .expect_err("a non-success status is an error");
+
+        assert_eq!(err.status(), Some(status), "{status}: {err:?}");
+        assert!(logs.errors().is_empty(), "{status}: {:?}", logs.errors());
+        assert!(
+            logs.warnings().is_empty(),
+            "{status}: {:?}",
+            logs.warnings()
+        );
+    }
+    Ok(())
+}
+
+/// The line is written once per attempt, so a `GET` retried to its limit logs one for each.
+#[tokio::test]
+async fn the_api_error_line_is_logged_once_per_attempt() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path(DEVICES_PATH))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(500).set_body_string(r#"{"meta":{"code":500}}"#))
+        .expect(3)
+        .mount(&mock.server)
+        .await;
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .get_retries(2)
+        .build()?;
+
+    let (_guard, logs) = capture_logs();
+    send_canary(&transport, Method::GET, &mock.uri())
+        .await
+        .expect_err("every attempt fails");
+
+    assert_eq!(logs.errors(), ["API error 500 on GET request"; 3]);
+    assert_eq!(logs.warnings().len(), 2, "one retry line per retry");
+    assert_nothing_above_debug_identifies_the_request(&logs);
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_retry_warning_has_no_path_and_debug_keeps_it() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
@@ -2132,7 +2236,8 @@ async fn get_retry_warning_has_no_path_and_debug_keeps_it() -> anyhow::Result<()
         logs.warnings(),
         ["Retrying GET request after transient failure (attempt 2/2)"]
     );
-    assert!(logs.errors().is_empty());
+    // The failed first attempt is logged like any other 5xx, and the retry that succeeds is not.
+    assert_eq!(logs.errors(), ["API error 503 on GET request"]);
     assert_eq!(
         own_messages(&logs, Level::DEBUG)
             .iter()

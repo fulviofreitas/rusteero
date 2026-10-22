@@ -971,12 +971,15 @@ impl Transport {
                 .execute_once(method, url, query, body, token, timeout)
                 .await
             {
-                Ok(exchange) => status_to_envelope(
-                    exchange.status,
-                    &exchange.body,
-                    &exchange.url,
-                    exchange.retry_after,
-                ),
+                Ok(exchange) => {
+                    log_api_error(method, exchange.status);
+                    status_to_envelope(
+                        exchange.status,
+                        &exchange.body,
+                        &exchange.url,
+                        exchange.retry_after,
+                    )
+                }
                 Err(err) => Err(err),
             };
             let retryable = *method == Method::GET
@@ -1675,6 +1678,20 @@ fn log_transport_failure(method: &Method, url: &Url, error: &Error) {
         }
         _ => {}
     }
+}
+
+/// Logs the `ERROR` line `_request` writes for a status that has no line of its own
+/// (`base.py:970`): every response other than a success, a `401` (refresh or authentication
+/// failure), a `404` or a `429`. It names the status and the HTTP method and nothing else: the
+/// path holds network, device and eero ids, and the body can hold anything. It is written once
+/// per attempt, before the response is classified, so a retried `GET` logs one line for each
+/// failed attempt.
+fn log_api_error(method: &Method, status: StatusCode) {
+    let code = status.as_u16();
+    if status.is_success() || matches!(code, 401 | 404 | 429) {
+        return;
+    }
+    tracing::error!(status = code, method = %method, "API error {code} on {method} request");
 }
 
 /// The `base_url` problem for an authority that cannot be parsed (`base.py:333`).
