@@ -473,3 +473,142 @@ async fn wan_writes_warn_once_after_resolving_and_pinning() -> anyhow::Result<()
     );
     Ok(())
 }
+
+// ===================== URL safety =====================
+//
+// Every WAN call refuses, before any request, a network or device that could address a different
+// resource than the call is meant for. The bare-network-id and device checks are
+// `links::validate_identifier`'s; the control-character, not-exactly-one-network and
+// published-link checks pass only once `links::resource_url` and the published-link rule apply the
+// caller-path rules.
+
+const CONTROLS: [&str; 5] = ["\n", "\t", "\r", " ", "\u{0}"];
+
+/// Which of the four WAN calls a table test drives.
+#[derive(Clone, Copy, Debug)]
+enum WanCall {
+    GetMultistaticip,
+    SetMultistaticip,
+    SetSecondaryWanConfig,
+    SetDeviceSecondaryWanAccess,
+}
+
+impl WanCall {
+    const ALL: [Self; 4] = [
+        Self::GetMultistaticip,
+        Self::SetMultistaticip,
+        Self::SetSecondaryWanConfig,
+        Self::SetDeviceSecondaryWanAccess,
+    ];
+
+    async fn run(self, api: &WanApi, network: &str) -> Result<rusteero::envelope::Envelope, Error> {
+        match self {
+            Self::GetMultistaticip => api.get_multistaticip(network, None).await,
+            Self::SetMultistaticip => api.set_multistaticip(network, json!({})).await,
+            Self::SetSecondaryWanConfig => api.set_secondary_wan_config(network, json!({})).await,
+            Self::SetDeviceSecondaryWanAccess => {
+                api.set_device_secondary_wan_access(network, "aa:bb:cc:00:00:01", true)
+                    .await
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_control_character_in_the_network_is_refused_before_any_request() -> anyhow::Result<()> {
+    for call in WanCall::ALL {
+        for control in CONTROLS {
+            let mock = MockEero::start().await;
+            expect_no_request(&mock).await;
+            let uri = mock.uri();
+            let upper = uri.replacen("http", "HTTP", 1);
+
+            for network in [
+                format!("net{control}work_123"),
+                format!("/2.2/networks/network_123{control}"),
+                format!("{uri}/2.2/networks/network_123{control}"),
+                format!("{upper}/2.2/networks/net{control}work_123"),
+            ] {
+                let err = call
+                    .run(&wan_api(&mock), &network)
+                    .await
+                    .expect_err("a control character in the network must be refused");
+                assert!(
+                    matches!(err, Error::Validation { .. }),
+                    "{call:?} {network:?} gave {err:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_network_path_that_is_not_exactly_one_network_is_refused() -> anyhow::Result<()> {
+    for call in WanCall::ALL {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        for network in [
+            "/2.2/account",
+            "/2.2/networks/network_123/../../account",
+            "/2.2/networks/network_123?x=1",
+            "/2.2/networks/%2e%2e/account",
+        ] {
+            let err = call
+                .run(&wan_api(&mock), network)
+                .await
+                .expect_err("a path that is not exactly one network must be refused");
+            assert!(
+                matches!(err, Error::Validation { .. }),
+                "{call:?} {network:?} gave {err:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_published_multistaticip_link_with_a_control_character_is_refused() -> anyhow::Result<()>
+{
+    for control in ["\n", "\t", "\r", "\u{0}"] {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        let link = format!("/2.2/networks/network_123/multi{control}");
+        let parent = json!({"resources": {"multistaticip": link}});
+        let err = wan_api(&mock)
+            .get_multistaticip("network_123", Some(&parent))
+            .await
+            .expect_err("a published link carrying a control character must be refused");
+        assert!(
+            matches!(err, Error::Validation { ref field, .. } if field == "link"),
+            "{control:?} gave {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unsafe_device_mac_is_refused_before_any_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_request(&mock).await;
+
+    for mac in [
+        "AA:BB:CC:DD:EE:FF\n",
+        "AA:BB:CC\t:DD:EE:FF",
+        "..",
+        "AA:BB:CC:DD:EE:FF?x=1",
+        "",
+    ] {
+        let err = wan_api(&mock)
+            .set_device_secondary_wan_access("network_123", mac, true)
+            .await
+            .expect_err("an unsafe mac must be refused");
+        assert!(
+            matches!(err, Error::Validation { .. }),
+            "{mac:?} gave {err:?}"
+        );
+    }
+    Ok(())
+}

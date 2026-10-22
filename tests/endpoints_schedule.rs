@@ -695,6 +695,59 @@ async fn a_full_pause_envelope_resolves_through_its_data_url() -> anyhow::Result
     Ok(())
 }
 
+/// A dot segment in a caller's path is refused as a path (field `id_or_url`) rather than resolved
+/// away by the URL parser into a pause's own path.
+///
+/// Passes only once `links::resource_url` applies its caller-path rules.
+#[tokio::test]
+async fn a_schedule_path_with_a_dot_segment_is_refused_before_any_request() -> anyhow::Result<()> {
+    for write in Write::ALL {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        let err = write
+            .run(
+                &schedule_api(&mock),
+                "/2.2/networks/n1/profiles/p1/schedules/x/../s1",
+            )
+            .await
+            .expect_err("a dot segment must be refused");
+
+        assert_validation(
+            &err,
+            "id_or_url",
+            "must not contain dot segments",
+            &format!("{write:?}"),
+        );
+    }
+    Ok(())
+}
+
+/// A dot segment in a published envelope url is refused too (field `link`).
+///
+/// Passes only once the plain-path rule for published links refuses dot segments.
+#[tokio::test]
+async fn a_published_envelope_url_with_a_dot_segment_is_refused() -> anyhow::Result<()> {
+    for write in Write::ALL {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        let envelope = json!({"url": "/2.4/some/../shape"});
+        let err = write
+            .run_with_envelope(&schedule_api(&mock), &envelope)
+            .await
+            .expect_err("a dot segment in a published url must be refused");
+
+        assert_validation(
+            &err,
+            "link",
+            "must not contain dot segments",
+            &format!("{write:?}"),
+        );
+    }
+    Ok(())
+}
+
 /// A published url that is not a plain host-relative path is still refused, never sent.
 #[tokio::test]
 async fn a_published_envelope_url_must_still_be_a_plain_host_relative_path() -> anyhow::Result<()> {

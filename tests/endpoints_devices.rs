@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rusteero::endpoints::devices::DevicesApi;
 use rusteero::error::Error;
 use serde_json::{Value, json};
-use wiremock::matchers::{body_json, method, path, query_param};
+use wiremock::matchers::{any, body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{
@@ -688,5 +688,120 @@ async fn block_device_does_not_log_the_uncharacterised_write_warning() -> anyhow
         "block_device must not warn, got {:?}",
         logs.warnings()
     );
+    Ok(())
+}
+
+// ===================== write URL safety =====================
+//
+// The checks below refuse, before any request, a network or device that could address a different
+// resource than the write is meant for. The device-id and bare-network-id checks are
+// `links::validate_identifier`'s; the control-character and not-exactly-one-network checks on a
+// network path or URL pass only once `links::resource_url` applies its caller-path rules.
+
+const CONTROLS: [&str; 5] = ["\n", "\t", "\r", " ", "\u{0}"];
+
+/// Which device write a table test drives.
+#[derive(Clone, Copy, Debug)]
+enum DeviceWrite {
+    Pause,
+    Nickname,
+}
+
+impl DeviceWrite {
+    const ALL: [Self; 2] = [Self::Pause, Self::Nickname];
+
+    async fn run(
+        self,
+        api: &DevicesApi,
+        network: &str,
+        device: &str,
+    ) -> Result<rusteero::envelope::Envelope, Error> {
+        match self {
+            Self::Pause => api.pause_device(network, device, true).await,
+            Self::Nickname => api.set_device_nickname(network, device, "nick").await,
+        }
+    }
+}
+
+/// Mounts a catch-all mock that fails the test if it receives any request at all.
+async fn expect_no_request(mock: &MockEero) {
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_control_character_in_the_network_is_refused_before_any_request() -> anyhow::Result<()> {
+    for write in DeviceWrite::ALL {
+        for control in CONTROLS {
+            let mock = MockEero::start().await;
+            expect_no_request(&mock).await;
+            let uri = mock.uri();
+            let upper = uri.replacen("http", "HTTP", 1);
+
+            for network in [
+                format!("net{control}work_123"),
+                format!("/2.2/networks/network_123{control}"),
+                format!("{uri}/2.2/networks/network_123{control}"),
+                format!("{upper}/2.2/networks/net{control}work_123"),
+            ] {
+                let err = write
+                    .run(&devices_api(&mock), &network, "device_abc")
+                    .await
+                    .expect_err("a control character in the network must be refused");
+                assert!(
+                    matches!(err, Error::Validation { .. }),
+                    "{write:?} {network:?} gave {err:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_network_path_that_is_not_exactly_one_network_is_refused() -> anyhow::Result<()> {
+    for write in DeviceWrite::ALL {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        for network in [
+            "/2.2/account",
+            "/2.2/networks/network_123/../../account",
+            "/2.2/networks/network_123?x=1",
+            "/2.2/networks/%2e%2e/account",
+        ] {
+            let err = write
+                .run(&devices_api(&mock), network, "device_abc")
+                .await
+                .expect_err("a path that is not exactly one network must be refused");
+            assert!(
+                matches!(err, Error::Validation { .. }),
+                "{write:?} {network:?} gave {err:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unsafe_device_id_is_refused_before_any_request() -> anyhow::Result<()> {
+    for write in DeviceWrite::ALL {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        for device in ["device_abc\n", "device\t_abc", "..", "."] {
+            let err = write
+                .run(&devices_api(&mock), "network_123", device)
+                .await
+                .expect_err("an unsafe device id must be refused");
+            assert!(
+                matches!(err, Error::Validation { .. }),
+                "{write:?} {device:?} gave {err:?}"
+            );
+        }
+    }
     Ok(())
 }

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rusteero::endpoints::routing::RoutingApi;
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
@@ -48,6 +48,15 @@ fn network_form(uri: &str, form: &str) -> String {
         "mixed-case-scheme-url-2.3" => format!("{mixed}/2.3/networks/network-0001"),
         other => panic!("unknown network form {other}"),
     }
+}
+
+/// Mounts a catch-all mock that fails the test if it receives any request at all.
+async fn expect_no_request(mock: &MockEero) {
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
 }
 
 // ===================== get_routing =====================
@@ -179,6 +188,60 @@ async fn get_routing_pins_to_2_2_for_every_network_form() -> anyhow::Result<()> 
             .get_routing(&network, None)
             .await
             .unwrap_or_else(|err| panic!("network form {form}: {err}"));
+    }
+    Ok(())
+}
+
+/// A whitespace or control character in a caller's network path or URL is refused before any
+/// request: the URL parser would otherwise strip some of them and send a different path.
+///
+/// Passes only once `links::resource_url` itself refuses such characters in a caller's path or URL.
+#[tokio::test]
+async fn get_routing_rejects_a_control_character_in_the_network_before_any_request()
+-> anyhow::Result<()> {
+    for control in ["\n", "\t", "\r", " ", "\u{0}"] {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+        let uri = mock.uri();
+
+        for network in [
+            format!("/2.3/networks/network-0001{control}"),
+            format!("/2.3/networks/net{control}work-0001"),
+            format!("{uri}/2.3/networks/network-0001{control}"),
+        ] {
+            let err = routing_api(&mock)
+                .get_routing(&network, None)
+                .await
+                .expect_err("a control character in the network must be refused");
+            assert!(
+                matches!(err, Error::Validation { .. }),
+                "{network:?} gave {err:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A published link carrying a control character is refused rather than silently pinned.
+///
+/// Passes only once the plain-path rule for published links refuses control characters.
+#[tokio::test]
+async fn get_routing_rejects_a_control_character_in_a_published_link_instead_of_pinning_it()
+-> anyhow::Result<()> {
+    for control in ["\n", "\t", "\r", "\u{0}"] {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        let link = format!("/2.3/networks/network-0001/routing{control}");
+        let parent = json!({"resources": {"routing": link}});
+        let err = routing_api(&mock)
+            .get_routing("network-0001", Some(&parent))
+            .await
+            .expect_err("a published link carrying a control character must be refused");
+        assert!(
+            matches!(err, Error::Validation { ref field, .. } if field == "link"),
+            "{control:?} gave {err:?}"
+        );
     }
     Ok(())
 }
