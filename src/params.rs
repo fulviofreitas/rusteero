@@ -94,6 +94,65 @@ pub fn validate_cadence<'a>(value: &'a str, allowed: &[&str]) -> Result<&'a str,
     Ok(value)
 }
 
+/// Rejects an empty string for a required text parameter.
+///
+/// Ported from `require_non_empty_string` (`_params.py:53-69`). Python's form encoding renders
+/// `None`, `False` or `0` as the literal text `"None"`, `"False"` or `"0"`, so the helper exists
+/// to reject those instead of writing them to the network. In Rust the `&str` parameter already
+/// rules out the "not a `str`" half, leaving only the emptiness check. The value is not trimmed,
+/// so a whitespace-only string is accepted exactly as Python accepts it, and it is never
+/// included in the error message.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] with `field` and the fixed message `"must be a non-empty
+/// string"` if `value` is empty.
+///
+/// # Examples
+///
+/// ```
+/// # use rusteero::params::require_non_empty_string;
+/// assert!(require_non_empty_string("ssid", "Home").is_ok());
+/// assert_eq!(
+///     require_non_empty_string("ssid", "").unwrap_err().to_string(),
+///     "Validation error for 'ssid': must be a non-empty string"
+/// );
+/// ```
+pub fn require_non_empty_string(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::validation(field, "must be a non-empty string"));
+    }
+    Ok(())
+}
+
+/// Rejects an hour of day that is not an integer from 0 to 23.
+///
+/// Ported from `require_hour` (`_params.py:86-99`). Python must also reject `bool` (an `int`
+/// subclass), `float`, `str` and `None` with the same message; the `i32` parameter makes all of
+/// those unrepresentable, so only the range check carries over.
+///
+/// # Errors
+///
+/// Returns [`Error::validation`] with `field` and the fixed message `"must be an int from 0 to
+/// 23"` if `value` is outside `0..=23`.
+///
+/// # Examples
+///
+/// ```
+/// # use rusteero::params::require_hour;
+/// assert!(require_hour("hour", 23).is_ok());
+/// assert_eq!(
+///     require_hour("hour", 24).unwrap_err().to_string(),
+///     "Validation error for 'hour': must be an int from 0 to 23"
+/// );
+/// ```
+pub fn require_hour(field: &str, value: i32) -> Result<(), Error> {
+    if !(0..=23).contains(&value) {
+        return Err(Error::validation(field, "must be an int from 0 to 23"));
+    }
+    Ok(())
+}
+
 /// Resolves a network identifier to its absolute base [`Url`].
 ///
 /// The network's own URL ([`self_url`]) is preferred whenever `parent` is supplied and carries
@@ -313,8 +372,8 @@ mod regex_free_matchers {
 #[cfg(test)]
 mod tests {
     use super::{
-        CADENCE_VALUES, require_schedule_family, resolve_nested_url, resolve_network_url,
-        validate_cadence,
+        CADENCE_VALUES, require_hour, require_non_empty_string, require_schedule_family,
+        resolve_nested_url, resolve_network_url, validate_cadence,
     };
     use crate::error::Error;
     use crate::routes::ApiVersion;
@@ -323,6 +382,90 @@ mod tests {
 
     fn host() -> Url {
         Url::parse("http://mock.test:1234").unwrap()
+    }
+
+    // ===================== TestSharedSetterValidators / TestRequireHour =====================
+
+    /// Asserts that `result` is a client-side validation error with exactly `field` and
+    /// `message` (no envelope, no error code) and Python's `str()` rendering.
+    fn assert_validation(result: Result<(), Error>, field: &str, message: &str) {
+        match result {
+            Err(Error::Validation {
+                field: got_field,
+                message: got_message,
+                envelope: None,
+                error_code: None,
+            }) => {
+                assert_eq!(got_field, field);
+                assert_eq!(got_message, message);
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_non_empty_string_rejects_empty_without_echoing() {
+        let err = require_non_empty_string("field", "").unwrap_err();
+        assert!(matches!(
+            &err,
+            Error::Validation { field, message, envelope: None, error_code: None }
+                if field == "field" && message == "must be a non-empty string"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "Validation error for 'field': must be a non-empty string"
+        );
+    }
+
+    #[test]
+    fn require_non_empty_string_accepts_any_non_empty_string() {
+        // Not trimmed: whitespace-only is accepted, as in Python.
+        for value in ["x", "None", "False", "0", "  padded  ", " ", "\t", "\u{e9}"] {
+            assert!(
+                require_non_empty_string("field", value).is_ok(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_non_empty_string_reports_the_given_field_name() {
+        assert_validation(
+            require_non_empty_string("ssid", ""),
+            "ssid",
+            "must be a non-empty string",
+        );
+    }
+
+    #[test]
+    fn require_hour_accepts_hours_of_day() {
+        for value in 0..=23 {
+            assert!(require_hour("hour", value).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn require_hour_rejects_out_of_range() {
+        for value in [-1, 24, 99, i32::MIN, i32::MAX] {
+            assert_validation(
+                require_hour("hour", value),
+                "hour",
+                "must be an int from 0 to 23",
+            );
+        }
+    }
+
+    #[test]
+    fn require_hour_reports_the_given_field_name() {
+        assert_validation(
+            require_hour("when", 99),
+            "when",
+            "must be an int from 0 to 23",
+        );
+        assert_eq!(
+            require_hour("hour", -1).unwrap_err().to_string(),
+            "Validation error for 'hour': must be an int from 0 to 23"
+        );
     }
 
     // ===================== TestValidateCadence =====================
