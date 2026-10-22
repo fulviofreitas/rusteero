@@ -687,12 +687,19 @@ const PARK_LIMIT: Duration = Duration::from_secs(10);
 /// that arrives on the thread that built the store, which is the thread driving a
 /// `#[tokio::test]` runtime, panics instead of parking: a store call that ran inline on the
 /// runtime would otherwise block the very runtime whose timeouts are meant to report it.
+/// Which `GateStore` operation parks until the gate opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parks {
+    Nothing,
+    Saves,
+    Loads,
+    Clears,
+}
+
 #[derive(Debug)]
 struct GateStore {
     inner: MemoryStore,
-    parks_saves: bool,
-    parks_loads: bool,
-    parks_clears: bool,
+    parks: Parks,
     test_thread: ThreadId,
     load_threads: Mutex<Vec<ThreadId>>,
     gate_open: Mutex<bool>,
@@ -702,12 +709,10 @@ struct GateStore {
 }
 
 impl GateStore {
-    fn make(parks_saves: bool, parks_loads: bool, parks_clears: bool, failing: bool) -> Self {
+    fn make(parks: Parks, failing: bool) -> Self {
         Self {
             inner: MemoryStore::new(),
-            parks_saves,
-            parks_loads,
-            parks_clears,
+            parks,
             test_thread: std::thread::current().id(),
             load_threads: Mutex::new(Vec::new()),
             gate_open: Mutex::new(false),
@@ -718,17 +723,22 @@ impl GateStore {
     }
 
     fn new(parks_saves: bool, failing: bool) -> Arc<Self> {
-        Arc::new(Self::make(parks_saves, false, false, failing))
+        let parks = if parks_saves {
+            Parks::Saves
+        } else {
+            Parks::Nothing
+        };
+        Arc::new(Self::make(parks, failing))
     }
 
     /// A store that parks every `clear` until opened.
     fn parking_clears() -> Arc<Self> {
-        Arc::new(Self::make(false, false, true, false))
+        Arc::new(Self::make(Parks::Clears, false))
     }
 
     /// A store that already holds `token` and parks every `load` until opened.
     fn parking_loads(token: &str) -> Arc<Self> {
-        let store = Self::make(false, true, false, false);
+        let store = Self::make(Parks::Loads, false);
         store
             .inner
             .save(&Session::from_token(token))
@@ -807,14 +817,14 @@ impl CredentialStore for GateStore {
             .lock()
             .expect("load threads lock")
             .push(std::thread::current().id());
-        if self.parks_loads {
+        if self.parks == Parks::Loads {
             self.park()?;
         }
         self.inner.load()
     }
 
     fn save(&self, session: &Session) -> Result<(), StorageError> {
-        if self.parks_saves {
+        if self.parks == Parks::Saves {
             self.park()?;
         }
         self.failure()?;
@@ -822,7 +832,7 @@ impl CredentialStore for GateStore {
     }
 
     fn clear(&self) -> Result<(), StorageError> {
-        if self.parks_clears {
+        if self.parks == Parks::Clears {
             self.park()?;
         }
         self.failure()?;
