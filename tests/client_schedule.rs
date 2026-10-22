@@ -1,6 +1,9 @@
-//! `Client` integration suite for `ScheduleApi` at v8.0.4 — scheduled pauses as sub-resources of
-//! a profile, no cache invalidation anywhere in this domain (see `src/client/schedule.rs`'s
-//! module docs for why the pre-v8 profile-cache invalidation was retired).
+//! `Client` integration suite for `ScheduleApi` at v8.4.1 — scheduled pauses as sub-resources of
+//! a profile. The schedule calls themselves invalidate nothing (see `src/client/schedule.rs`'s
+//! module docs for why the pre-v8 profile-cache invalidation was retired); the one exception is
+//! the bedtime helpers, `set_weekday_bedtime` and `set_weekend_bedtime`, which drop the profile
+//! entry and the profile list only, as
+//! `the_bedtime_helpers_invalidate_the_profile_and_the_profile_list_only` pins.
 
 mod common;
 
