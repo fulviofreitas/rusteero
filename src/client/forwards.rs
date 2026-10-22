@@ -10,7 +10,9 @@ impl Client {
     ///
     /// Ported from `get_forwards()` (`eero-api src/eero/client.py:1538-1543`). `auto_discover =
     /// false`. Passes the network's cached envelope (if fresh) as `parent`, matching
-    /// `_network_parent_kwargs`.
+    /// `_network_parent_kwargs`. The request always goes to API version 2.2, even when that
+    /// envelope publishes its `forwards` link on 2.3; see
+    /// [`crate::endpoints::forwards::ForwardsApi::get_forwards`].
     ///
     /// # Errors
     ///

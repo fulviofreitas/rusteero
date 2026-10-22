@@ -23,7 +23,8 @@ async fn client(mock: &MockEero) -> Client {
 }
 
 #[tokio::test]
-async fn get_forwards_prefers_the_cached_networks_published_link() -> anyhow::Result<()> {
+async fn get_forwards_pins_to_2_2_when_the_cached_network_publishes_a_2_3_link()
+-> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let network_with_link = json!({
         "meta": { "code": 200 },
@@ -42,6 +43,12 @@ async fn get_forwards_prefers_the_cached_networks_published_link() -> anyhow::Re
         .await;
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/forwards"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/forwards"))
         .and(session_cookie())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": []}).to_string()))
         .expect(1)
@@ -51,6 +58,49 @@ async fn get_forwards_prefers_the_cached_networks_published_link() -> anyhow::Re
     let client = client(&mock).await;
     client.get_network(Some("network-0001"), false).await?;
     client.get_forwards(Some("network-0001")).await?;
+    Ok(())
+}
+
+/// A write is not pinned: `create_forward` still follows the cached network's published
+/// `forwards` link on whatever version it names.
+#[tokio::test]
+async fn create_forward_follows_the_cached_networks_published_link_unpinned() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let network_with_link = json!({
+        "meta": { "code": 200 },
+        "data": {
+            "id": "network-0001",
+            "url": "/2.2/networks/network-0001",
+            "resources": { "forwards": "/2.3/networks/network-0001/forwards" },
+        },
+    });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/forwards"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network-0001/forwards"))
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .create_forward(json!({"protocol": "tcp"}), Some("network-0001"))
+        .await?;
     Ok(())
 }
 

@@ -19,6 +19,34 @@ fn support_api(mock: &MockEero) -> SupportApi {
     SupportApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
 }
 
+/// Every spelling of the network `get_support` must pin to 2.2: a bare id, API paths and absolute
+/// API-host URLs on either version, and absolute URLs whose scheme is not lower case.
+const NETWORK_FORMS: [&str; 7] = [
+    "id",
+    "path-2.2",
+    "path-2.3",
+    "url-2.2",
+    "url-2.3",
+    "upper-case-scheme-url-2.3",
+    "mixed-case-scheme-url-2.3",
+];
+
+/// Renders one of [`NETWORK_FORMS`] against the mock server's origin.
+fn network_form(uri: &str, form: &str) -> String {
+    let upper = uri.replacen("http", "HTTP", 1);
+    let mixed = uri.replacen("http", "hTTp", 1);
+    match form {
+        "id" => "network-0001".to_owned(),
+        "path-2.2" => "/2.2/networks/network-0001".to_owned(),
+        "path-2.3" => "/2.3/networks/network-0001".to_owned(),
+        "url-2.2" => format!("{uri}/2.2/networks/network-0001"),
+        "url-2.3" => format!("{uri}/2.3/networks/network-0001"),
+        "upper-case-scheme-url-2.3" => format!("{upper}/2.3/networks/network-0001"),
+        "mixed-case-scheme-url-2.3" => format!("{mixed}/2.3/networks/network-0001"),
+        other => panic!("unknown network form {other}"),
+    }
+}
+
 // ===================== get_support =====================
 
 #[tokio::test]
@@ -67,6 +95,85 @@ async fn get_support_prefers_the_parents_support_link() -> anyhow::Result<()> {
     let api = support_api(&mock);
     let env = api.get_support("network-0001", Some(&parent)).await?;
     assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_support_pins_to_2_2_even_with_2_3_parent_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": { "code": 200 }, "data": { "email": "support@example.com" } });
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/support"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/support"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"support": "/2.3/networks/network-0001/support"}});
+    let env = support_api(&mock)
+        .get_support("network-0001", Some(&parent))
+        .await?;
+
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_support_pins_a_published_link_on_any_version_to_2_2() -> anyhow::Result<()> {
+    for version in ["2.2", "2.3", "2.4", "10.25"] {
+        let mock = MockEero::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2.2/networks/network-0001/support"))
+            .and(session_cookie())
+            .and(user_token_header())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let link = format!("/{version}/networks/network-0001/support");
+        let parent = json!({"resources": {"support": link}});
+        support_api(&mock)
+            .get_support("network-0001", Some(&parent))
+            .await
+            .unwrap_or_else(|err| panic!("published link on {version}: {err}"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_support_pins_to_2_2_for_every_network_form() -> anyhow::Result<()> {
+    for form in NETWORK_FORMS {
+        let mock = MockEero::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2.3/networks/network-0001/support"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2.2/networks/network-0001/support"))
+            .and(session_cookie())
+            .and(user_token_header())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let network = network_form(&mock.uri(), form);
+        support_api(&mock)
+            .get_support(&network, None)
+            .await
+            .unwrap_or_else(|err| panic!("network form {form}: {err}"));
+    }
     Ok(())
 }
 
@@ -129,5 +236,32 @@ async fn request_support_prefers_the_parents_support_link() -> anyhow::Result<()
         .await?;
 
     assert_eq!(env.into_value(), response);
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_support_is_not_version_pinned() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let payload = json!({"issue": "wifi-dropping"});
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/support"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network-0001/support"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(payload.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({"resources": {"support": "/2.3/networks/network-0001/support"}});
+    support_api(&mock)
+        .request_support("network-0001", payload, Some(&parent))
+        .await?;
     Ok(())
 }

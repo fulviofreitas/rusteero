@@ -7,12 +7,15 @@ use reqwest::Method;
 
 // ------------------------------------ v8.0.4 routes --------------------------------------
 
-/// `GET /2.2/networks/{id}/forwards` (or the parent's own `forwards` link) — list port
-/// forwards.
+/// `GET /2.2/networks/{id}/forwards` (or the parent's own `forwards` link, pinned back to 2.2) —
+/// list port forwards.
 ///
-/// Ported from `eero-api src/eero/api/forwards.py:80-105` (v8.0.4, `ForwardsAPI.get_forwards`):
+/// Ported from `eero-api src/eero/api/forwards.py:80-119` (`ForwardsAPI.get_forwards`):
 /// `sub_resource_url(network, "networks/{id}/forwards", link="forwards", parent=..,
-/// version=API_VERSION_DEFAULT)`.
+/// version=API_VERSION_DEFAULT)`, then `rewrite_version(url, API_VERSION_DEFAULT)` (`:117`). The
+/// pin is applied by the endpoint after resolution, for safety: the API publishes the link on 2.3
+/// for a current `User-Agent`, and the shape does not change between versions. The writes that
+/// share this resource ([`FORWARDS_CREATE`]) are not pinned.
 pub const FORWARDS_GET: Resource = Resource {
     method: Method::GET,
     version: ApiVersion::V2_2,
@@ -23,8 +26,9 @@ pub const FORWARDS_GET: Resource = Resource {
 /// `POST /2.2/networks/{id}/forwards` (or the parent's own `forwards` link) — create a port
 /// forward.
 ///
-/// Ported from `eero-api src/eero/api/forwards.py:113-151` (v8.0.4,
-/// `ForwardsAPI.create_forward`): same URL resolution as [`FORWARDS_GET`].
+/// Ported from `eero-api src/eero/api/forwards.py:121-160` (`ForwardsAPI.create_forward`): same
+/// URL resolution as [`FORWARDS_GET`], without the version pin — a published link is followed on
+/// whatever version it names.
 pub const FORWARDS_CREATE: Resource = Resource {
     method: Method::POST,
     version: ApiVersion::V2_2,
