@@ -162,6 +162,29 @@ async fn capture_logs_records_the_uncharacterised_write_warning() {
 }
 
 #[tokio::test]
+async fn capture_logs_keeps_structured_fields_next_to_the_message() {
+    let (_guard, logs) = capture_logs();
+
+    tracing::warn!(attempt = 2, path = "/2.2/account", "Retrying GET request");
+    tracing::warn!(error = %"boom", "second");
+
+    assert_eq!(
+        logs.fields(Level::WARN, "Retrying GET request"),
+        Some(vec![
+            ("attempt".to_owned(), "2".to_owned()),
+            ("path".to_owned(), "/2.2/account".to_owned()),
+        ])
+    );
+    assert_eq!(
+        logs.field(Level::WARN, "second", "error").as_deref(),
+        Some("boom")
+    );
+    assert_eq!(logs.field(Level::WARN, "second", "attempt"), None);
+    assert_eq!(logs.fields(Level::ERROR, "Retrying"), None);
+    assert_eq!(logs.warnings(), vec!["Retrying GET request", "second"]);
+}
+
+#[tokio::test]
 async fn capture_logs_keeps_level_target_and_message_of_every_level() {
     let (_guard, logs) = capture_logs();
 

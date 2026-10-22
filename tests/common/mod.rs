@@ -199,9 +199,15 @@ fn fixture_path(name: &str) -> PathBuf {
 /// One captured `tracing` event: its [`Level`], its target (the emitting module path, e.g.
 /// `rusteero::links`), and its `message` field rendered as text.
 ///
-/// Structured fields other than `message` are not part of the record: this crate inlines every
-/// value it logs into the message text, as `eero-api` does, so the message is what a test pins.
+/// Structured fields other than `message` (`error = %err`, `attempt`, `path`, ...) are kept
+/// alongside, in event order; read them with [`LogCapture::fields`] / [`LogCapture::field`].
 pub type LogRecord = (Level, String, String);
+
+/// The structured fields of one captured event other than `message`, as `(name, rendered value)`
+/// pairs in the order the event recorded them. String values arrive verbatim (no quotes),
+/// `Display`-captured values (`%x`) as their `Display` text and `Debug`-captured ones (`?x`) as
+/// their `Debug` text.
+pub type LogFields = Vec<(String, String)>;
 
 /// Keeps a [`capture_logs`] subscriber installed on the current thread; dropping it restores the
 /// subscriber that was in place before. Bind it to a named variable (`let (_guard, logs) = ...`,
@@ -212,14 +218,17 @@ pub type LogGuard = DefaultGuard;
 /// clone sees the same records, and the handle stays readable after its [`LogGuard`] is dropped.
 #[derive(Clone, Default)]
 pub struct LogCapture {
-    records: Arc<Mutex<Vec<LogRecord>>>,
+    records: Arc<Mutex<Vec<(LogRecord, LogFields)>>>,
 }
 
 impl LogCapture {
     /// Every captured event, oldest first.
     #[must_use]
     pub fn records(&self) -> Vec<LogRecord> {
-        self.lock().clone()
+        self.lock()
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect()
     }
 
     /// The messages of every captured event at exactly `level`, oldest first.
@@ -227,8 +236,8 @@ impl LogCapture {
     pub fn messages(&self, level: Level) -> Vec<String> {
         self.lock()
             .iter()
-            .filter(|(record_level, ..)| *record_level == level)
-            .map(|(.., message)| message.clone())
+            .filter(|((record_level, ..), _)| *record_level == level)
+            .map(|((.., message), _)| message.clone())
             .collect()
     }
 
@@ -247,9 +256,9 @@ impl LogCapture {
     /// Whether any captured event at exactly `level` has a message containing `needle`.
     #[must_use]
     pub fn contains(&self, level: Level, needle: &str) -> bool {
-        self.lock()
-            .iter()
-            .any(|(record_level, _, message)| *record_level == level && message.contains(needle))
+        self.lock().iter().any(|((record_level, _, message), _)| {
+            *record_level == level && message.contains(needle)
+        })
     }
 
     /// How many captured events at exactly `level` have a message containing `needle`.
@@ -257,8 +266,32 @@ impl LogCapture {
     pub fn count(&self, level: Level, needle: &str) -> usize {
         self.lock()
             .iter()
-            .filter(|(record_level, _, message)| *record_level == level && message.contains(needle))
+            .filter(|((record_level, _, message), _)| {
+                *record_level == level && message.contains(needle)
+            })
             .count()
+    }
+
+    /// The structured fields of the first captured event at exactly `level` whose message
+    /// contains `needle`, or `None` if no such event was captured.
+    #[must_use]
+    pub fn fields(&self, level: Level, needle: &str) -> Option<LogFields> {
+        self.lock()
+            .iter()
+            .find(|((record_level, _, message), _)| {
+                *record_level == level && message.contains(needle)
+            })
+            .map(|(_, fields)| fields.clone())
+    }
+
+    /// The rendered value of field `name` on the first captured event at exactly `level` whose
+    /// message contains `needle`, or `None` if there is no such event or field.
+    #[must_use]
+    pub fn field(&self, level: Level, needle: &str, name: &str) -> Option<String> {
+        self.fields(level, needle)?
+            .into_iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value)
     }
 
     /// Whether nothing at all has been captured.
@@ -273,29 +306,36 @@ impl LogCapture {
         self.lock().clear();
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<LogRecord>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(LogRecord, LogFields)>> {
         // A panic while a test thread held the lock must not hide the records from the
         // assertion that reports it.
         self.records.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// Collects the `message` field of one event.
+/// Collects the `message` field of one event, plus every other field as rendered text.
 #[derive(Default)]
 struct MessageVisitor {
     message: String,
+    fields: LogFields,
 }
 
 impl Visit for MessageVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
             value.clone_into(&mut self.message);
+        } else {
+            self.fields
+                .push((field.name().to_owned(), value.to_owned()));
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{value:?}");
+        } else {
+            self.fields
+                .push((field.name().to_owned(), format!("{value:?}")));
         }
     }
 }
@@ -303,7 +343,7 @@ impl Visit for MessageVisitor {
 /// The `tracing` layer behind [`capture_logs`]: appends every event, at every level, to a shared
 /// vector.
 struct CaptureLayer {
-    records: Arc<Mutex<Vec<LogRecord>>>,
+    records: Arc<Mutex<Vec<(LogRecord, LogFields)>>>,
 }
 
 impl<S: Subscriber> Layer<S> for CaptureLayer {
@@ -315,9 +355,12 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((
-                *metadata.level(),
-                metadata.target().to_owned(),
-                visitor.message,
+                (
+                    *metadata.level(),
+                    metadata.target().to_owned(),
+                    visitor.message,
+                ),
+                visitor.fields,
             ));
     }
 }
@@ -341,9 +384,10 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
 /// The subscriber is installed with `tracing::subscriber::set_default`, which is thread-local.
 /// That is exactly right for `#[tokio::test]`, whose default runtime is current-thread, so every
 /// task the test spawns runs on the test's own thread. Events logged on any other thread — a
-/// `#[tokio::test(flavor = "multi_thread")]` worker, a `std::thread::spawn`ed thread, a
-/// `tokio::task::spawn_blocking` closure, reqwest's connection tasks on a separate runtime — are
-/// **not** captured. The capture is also isolated per test: tests running in parallel on their own
+/// `#[tokio::test(flavor = "multi_thread")]` worker, a `std::thread::spawn`ed thread, reqwest's
+/// connection tasks on a separate runtime — are **not** captured, unless the code that hops threads
+/// carries the caller's dispatcher across (the crate's `storage::*_async` adapters do, so a
+/// credential store's own lines are captured). The capture is also isolated per test: tests running in parallel on their own
 /// threads never see each other's events.
 #[must_use]
 pub fn capture_logs() -> (LogGuard, LogCapture) {
