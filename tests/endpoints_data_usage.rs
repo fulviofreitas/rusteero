@@ -7,12 +7,16 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use rusteero::auth::Session;
 use rusteero::endpoints::data_usage::DataUsageApi;
+use rusteero::envelope::Envelope;
 use rusteero::error::Error;
+use rusteero::transport::{RequestTimeout, Transport};
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
@@ -48,6 +52,7 @@ async fn get_data_usage_sends_query_params_and_no_body() -> anyhow::Result<()> {
             "daily",
             Some("America/New_York"),
             None,
+            None,
         )
         .await?;
     assert_eq!(env.into_value(), response);
@@ -70,7 +75,7 @@ async fn get_data_usage_omits_timezone_when_not_supplied() -> anyhow::Result<()>
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_data_usage("network-0001", "s", "e", "daily", None, None)
+    api.get_data_usage("network-0001", "s", "e", "daily", None, None, None)
         .await?;
     Ok(())
 }
@@ -87,7 +92,7 @@ async fn get_data_usage_rejects_invalid_cadence_before_any_request() -> anyhow::
     let api = data_usage_api(&mock);
     for bad in ["weekly", "", "DAILY"] {
         let err = api
-            .get_data_usage("network-0001", "s", "e", bad, None, None)
+            .get_data_usage("network-0001", "s", "e", bad, None, None, None)
             .await
             .expect_err("an invalid cadence must be rejected before any request");
         assert!(matches!(err, Error::Validation { field, .. } if field == "cadence"));
@@ -120,7 +125,7 @@ async fn get_data_usage_never_sends_a_request_body() -> anyhow::Result<()> {
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_data_usage("network-0001", "s", "e", "daily", None, None)
+    api.get_data_usage("network-0001", "s", "e", "daily", None, None, None)
         .await?;
     Ok(())
 }
@@ -142,7 +147,7 @@ async fn get_breakdown_url_and_required_params() -> anyhow::Result<()> {
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_breakdown("network-0001", "s", "e", None, None, None)
+    api.get_breakdown("network-0001", "s", "e", None, None, None, None)
         .await?;
     Ok(())
 }
@@ -161,7 +166,7 @@ async fn get_breakdown_cadence_included_when_supplied() -> anyhow::Result<()> {
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_breakdown("network-0001", "s", "e", Some("hourly"), None, None)
+    api.get_breakdown("network-0001", "s", "e", Some("hourly"), None, None, None)
         .await?;
     Ok(())
 }
@@ -171,7 +176,7 @@ async fn get_breakdown_invalid_cadence_rejected() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let api = data_usage_api(&mock);
     let err = api
-        .get_breakdown("network-0001", "s", "e", Some("weekly"), None, None)
+        .get_breakdown("network-0001", "s", "e", Some("weekly"), None, None, None)
         .await
         .expect_err("weekly must be rejected");
     assert!(matches!(err, Error::Validation { field, .. } if field == "cadence"));
@@ -200,6 +205,7 @@ async fn get_devices_usage_profile_id_included_when_supplied() -> anyhow::Result
         None,
         Some("profile-0001"),
         None,
+        None,
     )
     .await?;
     Ok(())
@@ -218,7 +224,7 @@ async fn get_devices_usage_profile_id_omitted_when_none() -> anyhow::Result<()> 
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_devices_usage("network-0001", "s", "e", None, None, None, None)
+    api.get_devices_usage("network-0001", "s", "e", None, None, None, None, None)
         .await?;
     Ok(())
 }
@@ -240,7 +246,7 @@ async fn get_unprofiled_devices_url_and_required_params() -> anyhow::Result<()> 
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_unprofiled_devices("network-0001", "s", "e", None, None, None)
+    api.get_unprofiled_devices("network-0001", "s", "e", None, None, None, None)
         .await?;
     Ok(())
 }
@@ -265,8 +271,17 @@ async fn get_device_usage_url_and_params() -> anyhow::Result<()> {
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_device_usage("network-0001", "aa:bb:cc", "s", "e", "daily", None, None)
-        .await?;
+    api.get_device_usage(
+        "network-0001",
+        "aa:bb:cc",
+        "s",
+        "e",
+        "daily",
+        None,
+        None,
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -275,7 +290,7 @@ async fn get_device_usage_empty_child_id_rejected() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let api = data_usage_api(&mock);
     let err = api
-        .get_device_usage("network-0001", "", "s", "e", "daily", None, None)
+        .get_device_usage("network-0001", "", "s", "e", "daily", None, None, None)
         .await
         .expect_err("an empty device_mac must be rejected before any request");
     assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
@@ -287,7 +302,16 @@ async fn get_device_usage_id_with_brace_does_not_break_template() -> anyhow::Res
     let mock = MockEero::start().await;
     let api = data_usage_api(&mock);
     let err = api
-        .get_device_usage("network-0001", "aa{bb}cc", "s", "e", "daily", None, None)
+        .get_device_usage(
+            "network-0001",
+            "aa{bb}cc",
+            "s",
+            "e",
+            "daily",
+            None,
+            None,
+            None,
+        )
         .await
         .expect_err("a brace-carrying child id must be rejected, not silently substituted");
     assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
@@ -303,7 +327,7 @@ async fn get_device_usage_validates_child_id_before_cadence() -> anyhow::Result<
     let mock = MockEero::start().await;
     let api = data_usage_api(&mock);
     let err = api
-        .get_device_usage("network-0001", "", "s", "e", "weekly", None, None)
+        .get_device_usage("network-0001", "", "s", "e", "weekly", None, None, None)
         .await
         .expect_err("both id and cadence are invalid; id must be checked first");
     assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
@@ -315,7 +339,7 @@ async fn get_eero_usage_validates_child_id_before_cadence() -> anyhow::Result<()
     let mock = MockEero::start().await;
     let api = data_usage_api(&mock);
     let err = api
-        .get_eero_usage("network-0001", "", "s", "e", "weekly", None, None)
+        .get_eero_usage("network-0001", "", "s", "e", "weekly", None, None, None)
         .await
         .expect_err("both id and cadence are invalid; id must be checked first");
     assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
@@ -327,7 +351,7 @@ async fn get_profile_usage_validates_child_id_before_cadence() -> anyhow::Result
     let mock = MockEero::start().await;
     let api = data_usage_api(&mock);
     let err = api
-        .get_profile_usage("network-0001", "", "s", "e", "weekly", None, None)
+        .get_profile_usage("network-0001", "", "s", "e", "weekly", None, None, None)
         .await
         .expect_err("both id and cadence are invalid; id must be checked first");
     assert!(matches!(err, Error::Validation { field, .. } if field == "id"));
@@ -348,7 +372,7 @@ async fn get_eeros_summary_url_and_params() -> anyhow::Result<()> {
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_eeros_summary("network-0001", "s", "e", "daily", None, None)
+    api.get_eeros_summary("network-0001", "s", "e", "daily", None, None, None)
         .await?;
     Ok(())
 }
@@ -369,8 +393,17 @@ async fn get_eero_usage_url_and_params() -> anyhow::Result<()> {
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_eero_usage("network-0001", "eero-0001", "s", "e", "hourly", None, None)
-        .await?;
+    api.get_eero_usage(
+        "network-0001",
+        "eero-0001",
+        "s",
+        "e",
+        "hourly",
+        None,
+        None,
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -398,6 +431,7 @@ async fn get_profile_usage_url_and_params() -> anyhow::Result<()> {
         "daily",
         None,
         None,
+        None,
     )
     .await?;
     Ok(())
@@ -419,7 +453,7 @@ async fn get_unprofiled_summary_url_and_params() -> anyhow::Result<()> {
         .await;
 
     let api = data_usage_api(&mock);
-    api.get_unprofiled_summary("network-0001", "s", "e", "daily", None, None)
+    api.get_unprofiled_summary("network-0001", "s", "e", "daily", None, None, None)
         .await?;
     Ok(())
 }
@@ -531,12 +565,21 @@ async fn network_and_device_level_methods_prefer_parents_self_url() -> anyhow::R
     .await;
 
     let api = data_usage_api(&mock);
-    api.get_data_usage("network-0001", "s", "e", "daily", None, Some(&parent))
+    api.get_data_usage("network-0001", "s", "e", "daily", None, None, Some(&parent))
         .await?;
-    api.get_breakdown("network-0001", "s", "e", None, None, Some(&parent))
+    api.get_breakdown("network-0001", "s", "e", None, None, None, Some(&parent))
         .await?;
-    api.get_devices_usage("network-0001", "s", "e", None, None, None, Some(&parent))
-        .await?;
+    api.get_devices_usage(
+        "network-0001",
+        "s",
+        "e",
+        None,
+        None,
+        None,
+        None,
+        Some(&parent),
+    )
+    .await?;
     api.get_device_usage(
         "network-0001",
         "dev-0001",
@@ -544,10 +587,11 @@ async fn network_and_device_level_methods_prefer_parents_self_url() -> anyhow::R
         "e",
         "daily",
         None,
+        None,
         Some(&parent),
     )
     .await?;
-    api.get_eeros_summary("network-0001", "s", "e", "daily", None, Some(&parent))
+    api.get_eeros_summary("network-0001", "s", "e", "daily", None, None, Some(&parent))
         .await?;
     api.get_eero_usage(
         "network-0001",
@@ -555,6 +599,7 @@ async fn network_and_device_level_methods_prefer_parents_self_url() -> anyhow::R
         "s",
         "e",
         "daily",
+        None,
         None,
         Some(&parent),
     )
@@ -613,12 +658,13 @@ async fn profile_and_report_level_methods_prefer_parents_self_url() -> anyhow::R
         "e",
         "daily",
         None,
+        None,
         Some(&parent),
     )
     .await?;
-    api.get_unprofiled_devices("network-0001", "s", "e", None, None, Some(&parent))
+    api.get_unprofiled_devices("network-0001", "s", "e", None, None, None, Some(&parent))
         .await?;
-    api.get_unprofiled_summary("network-0001", "s", "e", "daily", None, Some(&parent))
+    api.get_unprofiled_summary("network-0001", "s", "e", "daily", None, None, Some(&parent))
         .await?;
     api.get_report_settings("network-0001", Some(&parent))
         .await?;
@@ -642,5 +688,251 @@ async fn set_report_settings_invalid_cadence_rejected_before_any_request() -> an
         .await
         .expect_err("an invalid cadence must be rejected before any request");
     assert!(matches!(err, Error::Validation { field, .. } if field == "cadence"));
+    Ok(())
+}
+
+// ===================== per-call timeout =====================
+//
+// Real clock (the crate's timeouts and a paused clock do not mix with a real HTTP round trip):
+// every response is held back 400 ms, longer than the 150 ms default these tests configure and
+// shorter than the 3 s budget they supply per call.
+
+const SLOW: Duration = Duration::from_millis(400);
+const SHORT: Duration = Duration::from_millis(150);
+const GENEROUS: Duration = Duration::from_secs(3);
+
+/// A `DataUsageApi` whose transport times out after 150 ms (total and read).
+fn short_timeout_api(mock: &MockEero) -> DataUsageApi {
+    let transport = Transport::builder()
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .timeout(SHORT)
+        .read_timeout(SHORT)
+        .build()
+        .expect("a MockServer's own URI is always a valid base URL");
+    DataUsageApi::new(Arc::new(transport))
+}
+
+/// The paths of the nine time-windowed reads, in declaration order.
+const TIME_WINDOWED_PATHS: [&str; 9] = [
+    "/2.2/networks/network-0001/data_usage",
+    "/2.2/networks/network-0001/data_usage/breakdown",
+    "/2.2/networks/network-0001/data_usage/devices",
+    "/2.2/networks/network-0001/data_usage/devices/aa:bb:cc",
+    "/2.2/networks/network-0001/data_usage/eeros/summary",
+    "/2.2/networks/network-0001/data_usage/eeros/eero-0001",
+    "/2.2/networks/network-0001/data_usage/profiles/profile-0001",
+    "/2.2/networks/network-0001/data_usage/unprofiled/devices",
+    "/2.2/networks/network-0001/data_usage/unprofiled/summary",
+];
+
+/// Mounts one authenticated, [`SLOW`] `GET` mock per time-windowed path, each expecting exactly
+/// one request carrying `start`/`end` query parameters.
+async fn mount_slow_time_windowed_reads(mock: &MockEero) {
+    for route in TIME_WINDOWED_PATHS {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(session_cookie())
+            .and(user_token_header())
+            .and(query_param("start", "s"))
+            .and(query_param("end", "e"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"meta": {"code": 200}, "data": {}}))
+                    .set_delay(SLOW),
+            )
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+}
+
+/// Calls all nine time-windowed reads concurrently with `timeout`, in [`TIME_WINDOWED_PATHS`]
+/// order.
+async fn call_every_time_windowed_read(
+    api: &DataUsageApi,
+    timeout: Option<RequestTimeout>,
+) -> [Result<Envelope, Error>; 9] {
+    let (
+        data_usage,
+        breakdown,
+        devices,
+        device,
+        eeros_summary,
+        eero,
+        profile,
+        unprofiled_devices,
+        unprofiled_summary,
+    ) = tokio::join!(
+        api.get_data_usage("network-0001", "s", "e", "daily", None, timeout, None),
+        api.get_breakdown("network-0001", "s", "e", None, None, timeout, None),
+        api.get_devices_usage("network-0001", "s", "e", None, None, None, timeout, None),
+        api.get_device_usage(
+            "network-0001",
+            "aa:bb:cc",
+            "s",
+            "e",
+            "daily",
+            None,
+            timeout,
+            None
+        ),
+        api.get_eeros_summary("network-0001", "s", "e", "daily", None, timeout, None),
+        api.get_eero_usage(
+            "network-0001",
+            "eero-0001",
+            "s",
+            "e",
+            "daily",
+            None,
+            timeout,
+            None
+        ),
+        api.get_profile_usage(
+            "network-0001",
+            "profile-0001",
+            "s",
+            "e",
+            "daily",
+            None,
+            timeout,
+            None
+        ),
+        api.get_unprofiled_devices("network-0001", "s", "e", None, None, timeout, None),
+        api.get_unprofiled_summary("network-0001", "s", "e", "daily", None, timeout, None),
+    );
+    [
+        data_usage,
+        breakdown,
+        devices,
+        device,
+        eeros_summary,
+        eero,
+        profile,
+        unprofiled_devices,
+        unprofiled_summary,
+    ]
+}
+
+#[tokio::test]
+async fn every_time_windowed_read_honours_a_supplied_timeout() {
+    let mock = MockEero::start().await;
+    mount_slow_time_windowed_reads(&mock).await;
+    let api = short_timeout_api(&mock);
+
+    // `total` only: the 150 ms default read bound is replaced too, not merged back in.
+    let results = Box::pin(call_every_time_windowed_read(
+        &api,
+        Some(RequestTimeout::total(GENEROUS)),
+    ))
+    .await;
+    for (route, result) in TIME_WINDOWED_PATHS.iter().zip(results) {
+        assert!(result.is_ok(), "{route}: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn every_time_windowed_read_keeps_the_default_without_a_timeout() {
+    let mock = MockEero::start().await;
+    mount_slow_time_windowed_reads(&mock).await;
+    let api = short_timeout_api(&mock);
+
+    let results = Box::pin(call_every_time_windowed_read(&api, None)).await;
+    for (route, result) in TIME_WINDOWED_PATHS.iter().zip(results) {
+        assert!(matches!(result, Err(Error::Timeout)), "{route}: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_supplied_timeout_does_not_change_the_request_that_is_sent() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/data_usage"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(query_param("start", "s"))
+        .and(query_param("end", "e"))
+        .and(query_param("cadence", "daily"))
+        .and(query_param("timezone", "UTC"))
+        // No extra query parameter (the timeout is client-side only) and no body.
+        .and(|request: &Request| request.url.query_pairs().count() == 4 && request.body.is_empty())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    api.get_data_usage(
+        "network-0001",
+        "s",
+        "e",
+        "daily",
+        Some("UTC"),
+        Some(RequestTimeout::total(GENEROUS)),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn validation_still_runs_before_any_request_when_a_timeout_is_supplied() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = data_usage_api(&mock);
+    let err = api
+        .get_data_usage(
+            "network-0001",
+            "s",
+            "e",
+            "weekly",
+            None,
+            Some(RequestTimeout::total(GENEROUS)),
+            None,
+        )
+        .await
+        .expect_err("an invalid cadence is rejected before any request");
+    assert!(matches!(err, Error::Validation { field, .. } if field == "cadence"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn report_settings_methods_take_no_timeout_and_keep_the_transport_default()
+-> anyhow::Result<()> {
+    // `get_report_settings` / `set_report_settings` keep their pre-timeout arity (this file's
+    // other tests call them the same way) and run under the transport default.
+    let mock = MockEero::start().await;
+    for verb in ["GET", "PUT"] {
+        Mock::given(method(verb))
+            .and(path(
+                "/2.2/networks/network-0001/data_usage/report_settings",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({}))
+                    .set_delay(SLOW),
+            )
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+    let api = short_timeout_api(&mock);
+
+    let err = api
+        .get_report_settings("network-0001", None)
+        .await
+        .expect_err("the 150 ms transport default applies");
+    assert!(matches!(err, Error::Timeout), "{err:?}");
+    let err = api
+        .set_report_settings("network-0001", "daily", "monday", None)
+        .await
+        .expect_err("the 150 ms transport default applies");
+    assert!(matches!(err, Error::Timeout), "{err:?}");
     Ok(())
 }

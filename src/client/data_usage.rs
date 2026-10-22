@@ -6,11 +6,17 @@
 //! never supplies one for this family (`.claude/tasks/briefs/v8/client.md`'s `data_usage` table
 //! has no `+net` annotation on any row); the underlying domain methods still accept `parent=`
 //! for a caller reaching `client.api().data_usage()` directly with its own cached envelope.
+//!
+//! The nine time-windowed reads take `timeout: Option<RequestTimeout>` immediately before the
+//! trailing `network_id` and forward it unchanged to the matching `DataUsageApi` read
+//! (`client.py:2056,2077` at `v8.4.1`); `get_data_usage_report_settings` and
+//! `set_data_usage_report_settings` do not.
 
 use super::Client;
 use crate::cache::CacheKey;
 use crate::envelope::Envelope;
 use crate::error::Error;
+use crate::transport::RequestTimeout;
 
 impl Client {
     /// Gets network-wide data-usage statistics — returns the raw Eero API response.
@@ -20,21 +26,26 @@ impl Client {
     /// `payload`/`resource` parameters are gone, replaced by required `start`/`end`/`cadence` and
     /// optional `timezone`. `auto_discover = false`.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_data_usage(
         &self,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_data_usage(&network_id, start, end, cadence, timezone, None)
+            .get_data_usage(&network_id, start, end, cadence, timezone, timeout, None)
             .await
     }
 
@@ -43,21 +54,26 @@ impl Client {
     /// Ported from `get_data_usage_breakdown()` (`eero-api src/eero/client.py:1607-1625`).
     /// `auto_discover = false`. `cadence` is optional.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_data_usage_breakdown(
         &self,
         start: &str,
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_breakdown(&network_id, start, end, cadence, timezone, None)
+            .get_breakdown(&network_id, start, end, cadence, timezone, timeout, None)
             .await
     }
 
@@ -66,6 +82,9 @@ impl Client {
     ///
     /// Ported from `get_devices_data_usage()` (`eero-api src/eero/client.py:1626-1650`).
     /// `auto_discover = false`. `cadence`/`profile_id` are optional.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -78,12 +97,22 @@ impl Client {
         cadence: Option<&str>,
         timezone: Option<&str>,
         profile_id: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_devices_usage(&network_id, start, end, cadence, timezone, profile_id, None)
+            .get_devices_usage(
+                &network_id,
+                start,
+                end,
+                cadence,
+                timezone,
+                profile_id,
+                timeout,
+                None,
+            )
             .await
     }
 
@@ -92,9 +121,13 @@ impl Client {
     /// Ported from `get_device_data_usage()` (`eero-api src/eero/client.py:1651-1670`).
     /// `auto_discover = false`. `cadence` is required.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_device_data_usage(
         &self,
         device_mac: &str,
@@ -102,12 +135,22 @@ impl Client {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_device_usage(&network_id, device_mac, start, end, cadence, timezone, None)
+            .get_device_usage(
+                &network_id,
+                device_mac,
+                start,
+                end,
+                cadence,
+                timezone,
+                timeout,
+                None,
+            )
             .await
     }
 
@@ -117,21 +160,26 @@ impl Client {
     /// Ported from `get_eeros_data_usage_summary()` (`eero-api src/eero/client.py:1671-1689`).
     /// `auto_discover = false`. `cadence` is required.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_eeros_data_usage_summary(
         &self,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_eeros_summary(&network_id, start, end, cadence, timezone, None)
+            .get_eeros_summary(&network_id, start, end, cadence, timezone, timeout, None)
             .await
     }
 
@@ -140,9 +188,13 @@ impl Client {
     /// Ported from `get_eero_data_usage()` (`eero-api src/eero/client.py:1690-1709`).
     /// `auto_discover = false`. `cadence` is required.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_eero_data_usage(
         &self,
         eero_id: &str,
@@ -150,12 +202,22 @@ impl Client {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_eero_usage(&network_id, eero_id, start, end, cadence, timezone, None)
+            .get_eero_usage(
+                &network_id,
+                eero_id,
+                start,
+                end,
+                cadence,
+                timezone,
+                timeout,
+                None,
+            )
             .await
     }
 
@@ -164,9 +226,13 @@ impl Client {
     /// Ported from `get_profile_data_usage()` (`eero-api src/eero/client.py:1710-1729`).
     /// `auto_discover = false`. `cadence` is required.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_profile_data_usage(
         &self,
         profile_id: &str,
@@ -174,12 +240,22 @@ impl Client {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_profile_usage(&network_id, profile_id, start, end, cadence, timezone, None)
+            .get_profile_usage(
+                &network_id,
+                profile_id,
+                start,
+                end,
+                cadence,
+                timezone,
+                timeout,
+                None,
+            )
             .await
     }
 
@@ -189,21 +265,26 @@ impl Client {
     /// Ported from `get_unprofiled_devices_data_usage()` (`eero-api src/eero/client.py:1730-1748`).
     /// `auto_discover = false`. `cadence` is optional.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_unprofiled_devices_data_usage(
         &self,
         start: &str,
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_unprofiled_devices(&network_id, start, end, cadence, timezone, None)
+            .get_unprofiled_devices(&network_id, start, end, cadence, timezone, timeout, None)
             .await
     }
 
@@ -213,21 +294,26 @@ impl Client {
     /// Ported from `get_unprofiled_data_usage_summary()` (`eero-api src/eero/client.py:1749-1767`).
     /// `auto_discover = false`. `cadence` is required.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`Client::get_diagnostics`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_unprofiled_data_usage_summary(
         &self,
         start: &str,
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         network_id: Option<&str>,
     ) -> Result<Envelope, Error> {
         let network_id = self.ensure_network_id(network_id, false).await?;
         self.api
             .data_usage()
-            .get_unprofiled_summary(&network_id, start, end, cadence, timezone, None)
+            .get_unprofiled_summary(&network_id, start, end, cadence, timezone, timeout, None)
             .await
     }
 

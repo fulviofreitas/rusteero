@@ -21,6 +21,16 @@
 //! query parameters at all. Every method here funnels through [`crate::transport::Transport`],
 //! which already implements the "not authenticated" precondition and every status-to-error
 //! mapping a response can produce.
+//!
+//! # Per-call timeout
+//!
+//! All nine time-windowed reads (everything except `get_report_settings`/`set_report_settings`)
+//! take `timeout: Option<RequestTimeout>` immediately before `parent` (`data_usage.py:111,
+//! 159-160` at `v8.4.1`, where the keyword-only `timeout` is forwarded only when supplied).
+//! `Some(timeout)` replaces the transport default (30 s total, 10 s read, unless the builder
+//! changed them) for that one request, wholesale: a field left unset is unbounded and does not
+//! fall back to the default. `None` keeps the default. A large time window can take the server
+//! longer than the default allows, which is what this is for.
 
 use std::sync::Arc;
 
@@ -33,7 +43,7 @@ use crate::error::Error;
 use crate::params;
 use crate::routes;
 use crate::routes::Resource;
-use crate::transport::{RequestBody, Transport};
+use crate::transport::{RequestBody, RequestTimeout, Transport};
 
 /// `eero-api`'s `DataUsageAPI` (`src/eero/api/data_usage.py`).
 ///
@@ -57,12 +67,16 @@ impl DataUsageApi {
     /// required; `cadence` is required (`cadence_required=True`); `timezone` is optional,
     /// included only when supplied.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Validation`] with `field: "cadence"` if `cadence` is not `"hourly"` or
     /// `"daily"`, or if `parent`'s own `url` field (when present) is malformed, before any
     /// request is sent. Returns `Error::Authentication("Not authenticated")` if no valid session
     /// is configured, or whatever other status-mapped [`Error`] the request produces otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_data_usage(
         &self,
         network_id: &str,
@@ -70,6 +84,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
@@ -80,6 +95,7 @@ impl DataUsageApi {
             end,
             Some(cadence),
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -90,9 +106,13 @@ impl DataUsageApi {
     /// Ported from `DataUsageAPI.get_breakdown` (`data_usage.py:199-236`). `cadence` is
     /// optional, validated only when supplied.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_breakdown(
         &self,
         network_id: &str,
@@ -100,6 +120,7 @@ impl DataUsageApi {
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence_opt(cadence)?;
@@ -110,6 +131,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -120,6 +142,9 @@ impl DataUsageApi {
     ///
     /// Ported from `DataUsageAPI.get_devices_usage` (`data_usage.py:238-280`). `cadence` and
     /// `profile_id` are both optional, each included only when supplied.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -133,6 +158,7 @@ impl DataUsageApi {
         cadence: Option<&str>,
         timezone: Option<&str>,
         profile_id: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence_opt(cadence)?;
@@ -147,7 +173,7 @@ impl DataUsageApi {
             query.push(("profile_id", profile_id.to_owned()));
         }
         self.transport
-            .request(Method::GET, url, &query, RequestBody::None)
+            .request_with_timeout(Method::GET, url, &query, RequestBody::None, timeout)
             .await
     }
 
@@ -158,6 +184,9 @@ impl DataUsageApi {
     /// ([`crate::routes::data_usage::GET_DEVICES_DATA_USAGE`]) with `device_mac` literal-appended
     /// after `validate_identifier` — never a second `.format()` call (`data_usage.py:317`).
     /// `cadence` is required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -173,6 +202,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         self.get_child_usage(
@@ -183,6 +213,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -194,9 +225,13 @@ impl DataUsageApi {
     /// Ported from `DataUsageAPI.get_eeros_summary` (`data_usage.py:327-368`). `cadence` is
     /// required.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_eeros_summary(
         &self,
         network_id: &str,
@@ -204,6 +239,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
@@ -214,6 +250,7 @@ impl DataUsageApi {
             end,
             Some(cadence),
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -224,6 +261,9 @@ impl DataUsageApi {
     ///
     /// Ported from `DataUsageAPI.get_eero_usage` (`data_usage.py:370-413`). `cadence` is
     /// required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -237,6 +277,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         self.get_child_usage(
@@ -247,6 +288,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -257,6 +299,9 @@ impl DataUsageApi {
     ///
     /// Ported from `DataUsageAPI.get_profile_usage` (`data_usage.py:415-458`). `cadence` is
     /// required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -270,6 +315,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         self.get_child_usage(
@@ -280,6 +326,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -291,9 +338,13 @@ impl DataUsageApi {
     /// Ported from `DataUsageAPI.get_unprofiled_devices` (`data_usage.py:460-497`). `cadence` is
     /// optional.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_unprofiled_devices(
         &self,
         network_id: &str,
@@ -301,6 +352,7 @@ impl DataUsageApi {
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence_opt(cadence)?;
@@ -311,6 +363,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -322,9 +375,13 @@ impl DataUsageApi {
     /// Ported from `DataUsageAPI.get_unprofiled_summary` (`data_usage.py:499-540`). `cadence` is
     /// required.
     ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_unprofiled_summary(
         &self,
         network_id: &str,
@@ -332,6 +389,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
@@ -342,6 +400,7 @@ impl DataUsageApi {
             end,
             Some(cadence),
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -426,13 +485,14 @@ impl DataUsageApi {
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let id_or_url = self.network_id_or_self_url(network_id, parent)?;
         let url = route.resolve(self.transport.api_host(), &id_or_url, None)?;
         let query = usage_query(start, end, cadence, timezone);
         self.transport
-            .request(Method::GET, url, &query, RequestBody::None)
+            .request_with_timeout(Method::GET, url, &query, RequestBody::None, timeout)
             .await
     }
 
@@ -455,6 +515,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let validated_child = crate::links::validate_identifier(child)?;
@@ -464,7 +525,7 @@ impl DataUsageApi {
         let url = append_path(&collection, validated_child)?;
         let query = usage_query(start, end, Some(cadence), timezone);
         self.transport
-            .request(Method::GET, url, &query, RequestBody::None)
+            .request_with_timeout(Method::GET, url, &query, RequestBody::None, timeout)
             .await
     }
 
