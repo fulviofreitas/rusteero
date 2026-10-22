@@ -85,7 +85,7 @@ let client = Client::builder()
     .session(Some(session))                          // Option<Session>; omit to load from the store
     .store(Some(Arc::new(MemoryStore::new())))        // Option<Arc<dyn CredentialStore>>; None = no persistence
     .storage_failures(StorageFailures::Warn)          // Warn (default) | Fatal
-    .cache_ttl(Duration::from_secs(60))               // default 60 s; Duration::ZERO disables cache reads
+    .cache_ttl(Duration::from_secs(60))               // default 60 s; Duration::ZERO disables caching
     .user_agent(None)                                 // None = consts::DEFAULT_USER_AGENT
     .accept_language("en-US")                         // X-Accept-Language; default consts::DEFAULT_ACCEPT_LANGUAGE
     .send_legacy_cookie(true)                         // also send Cookie: s=<token>; default true
@@ -101,7 +101,7 @@ let client = Client::builder()
 | `session` | `Option<Session>` | `None` | An explicit session wins over whatever the store holds; the store is still installed for later persistence |
 | `store` | `Option<Arc<dyn CredentialStore>>` | `None` | Loaded once at `build()` when no explicit session was given |
 | `storage_failures` | `StorageFailures` | `Warn` | `Fatal` turns any store failure (including the initial load) into `Error::Storage` |
-| `cache_ttl` | `Duration` | 60 s | TTL of the eight cached getters; `Duration::ZERO` disables reads but not writes |
+| `cache_ttl` | `Duration` | 60 s | TTL of the eight cached getters; `Duration::ZERO` disables caching (the getters keep no entries) |
 | `user_agent` | `Option<String>` | `eero-ios/2026.8.1 (iPhone; iOS 18.5)` (`consts::DEFAULT_USER_AGENT`) | Printable ASCII only (field `"User-Agent"`). The API reads it as the app version and advertises more capabilities to this string than to `consts::LEGACY_USER_AGENT` (`eero/3.0 (iPhone; iOS 17.0)`, the previous default), which you can pass to keep the old behaviour. The session refresh carries it too; `LoginFlow` builds its own transport (see [Configuration — The `User-Agent`](Configuration#the-user-agent)) |
 | `accept_language` | `impl Into<String>` | `en-US` | Printable ASCII only (field `"X-Accept-Language"`), validated at `build()` |
 | `send_legacy_cookie` | `bool` | `true` | `false` sends only the `X-User-Token` header |

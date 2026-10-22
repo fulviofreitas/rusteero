@@ -87,9 +87,10 @@ and vice versa; `with_entry` is for tests or several accounts on one machine.
 Every save is read back through a fresh entry. A keyring that accepts the write and keeps
 nothing is `StorageError::NotRetained`, one that rejects it is `StorageError::Backend`; either
 way the store logs one fixed `WARN` (`Keyring did not retain the session; credentials are not
-persisted and will be lost when this process exits`), never the token. Silence that line with
+persisted and will be lost when this process exits`), never the token. A clear that fails logs
+`Keyring could not be cleared; a stored session may remain in it`. Silence both lines with
 `KeyringStore::new().warn_on_unpersisted(false)` when a file fallback sits behind the keyring;
-`create_storage` does so for its chained row. The failed save is still reported as an error.
+`create_storage` does so for its chained row, where the `ChainedStore` reports instead. The failed save is still reported as an error.
 
 ### `ChainedStore`
 
@@ -198,7 +199,7 @@ let client = Client::builder()
     .session(Some(Session::from_token("<token>")))   // Option<Session>; omit to load from `.store(..)`
     .store(Some(store))                              // Option<Arc<dyn CredentialStore>>
     .storage_failures(StorageFailures::Warn)         // Warn (default) or Fatal
-    .cache_ttl(Duration::from_secs(60))              // Duration::ZERO disables cache reads
+    .cache_ttl(Duration::from_secs(60))              // Duration::ZERO disables caching
     .user_agent(None)                                // None = "eero-ios/2026.8.1 (iPhone; iOS 18.5)"
     .accept_language("en-US")                        // X-Accept-Language; default "en-US"
     .send_legacy_cookie(true)                        // default true
@@ -316,10 +317,15 @@ tracing_subscriber::fmt()
 *   `WARN` (transport): a GET retry (`Retrying GET request after transient failure (attempt
     N/M)`), a refused redirect (`Redirect response <status> blocked`), a credential withheld from
     an off-origin request (`Session header withheld from a request to a <reason>: <scheme://host>`,
-    or `Session header withheld from a request with URL with userinfo`), and a store failure under
-    `StorageFailures::Warn` (`failed to persist session to credential store`, with the store's
-    error as a field; a `NotRetained` failure is recorded at `DEBUG` instead, see
-    [`StorageFailures`](#storagefailures)).
+    or `Session header withheld from a request with URL with userinfo`), and, under
+    `StorageFailures::Warn`, a failure of a store that does not log its own failures
+    (`failed to persist session to credential store` for a save, `failed to clear session from
+    credential store` for a clear, with the store's error as a field). The crate's own
+    `FileStore`, `ChainedStore` and `KeyringStore` (with `warn_on_unpersisted` on) report their
+    failures themselves (`CredentialStore::reports_failures`), so the transport records those at
+    `DEBUG` and each failure appears exactly once (see [`StorageFailures`](#storagefailures)).
+*   `ERROR` (transport): `API error <status> on <method> request` for every non-success status
+    except 401, 404 and 429, once per attempt and with no URL.
 *   `WARN` (elsewhere): the stores' own fixed lines for a save that was not kept (see
     [Credential stores](#credential-stores)), a `ChainedStore::clear` that left a backend
     uncleared, a `FileStore` file found group- or other-accessible when read (Unix; the line names
