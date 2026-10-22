@@ -663,9 +663,9 @@ impl Client {
     // cached, or a cached entry that is no longer fresh) is simply `None`, mirroring Python's
     // `{}`-kwargs-omitted shape (this port returns `Option<Value>` instead — the caller passes
     // it straight through as `parent: Option<&Value>`, the shape `crate::routes::Resource::resolve`
-    // and `Nested::resolve` already expect). `Client::eero_parent` and `Client::find_by_id_or_url`
-    // have no call site yet; every other helper below does, and all of them are exercised
-    // directly by this module's own `#[cfg(test)] mod tests`.
+    // and `Nested::resolve` already expect). All of them are exercised directly by this module's
+    // own `#[cfg(test)] mod tests`; `Client::network_parent_or` is the one a wrapper takes when
+    // it also accepts a caller-supplied `parent`.
 
     /// Returns the cached network envelope for `network_id`, if a fresh entry exists.
     ///
@@ -690,7 +690,7 @@ impl Client {
     /// `v8.4.1`): the caller's envelope is forwarded unchanged and wins over the cache, and an
     /// empty object still counts as supplied. The cache lookup is keyed by the *resolved*
     /// `network_id`, so an explicit network with nothing cached yields no parent.
-    #[allow(dead_code)] // the wrappers that need it are added next to it; see the banner above
+    #[allow(dead_code)] // the network-scoped wrappers that use it are added next to it
     fn network_parent_or(&self, network_id: &str, parent: Option<&Value>) -> Option<Value> {
         parent.cloned().or_else(|| self.network_parent(network_id))
     }
@@ -706,7 +706,6 @@ impl Client {
     /// a match, exactly like Python's own `isinstance(url, str)` guard skips a non-string `url`.
     /// Entries that are not JSON objects are skipped, mirroring Python's `isinstance(entry,
     /// dict)` guard. Never mutates `envelopes`; returns a clone of the matching entry, if any.
-    #[allow(dead_code)] // see the banner above
     fn find_by_id_or_url(envelopes: &[Value], resource_id: &str) -> Option<Value> {
         envelopes
             .iter()
@@ -732,7 +731,6 @@ impl Client {
     /// reads its envelope's `data` field as a JSON array (a non-array `data`, like Python's own
     /// `isinstance(cached, dict)`/list check, yields `None` rather than a match) and searches it
     /// via [`Client::find_by_id_or_url`].
-    #[allow(dead_code)] // see the banner above
     fn eero_parent(&self, network_id: &str, eero_id: &str) -> Option<Value> {
         let cached = self.cache.get(&CacheKey::eeros(network_id))?;
         let data = cached.data().as_array()?;
