@@ -10,7 +10,7 @@
 ---
 
 _`rusteero` is a Rust client library for the Eero (Amazon) mesh Wi-Fi cloud API._
-_It is a port of the Python [`eero-api`](https://github.com/fulviofreitas/eero-api) library at **v8.0.4**: same raw JSON contract, same method names, same credential record._
+_It is a port of the Python [`eero-api`](https://github.com/fulviofreitas/eero-api) library at **v8.4.1**: same raw JSON contract, same method names, same credential record._
 
 [Status](#-status) · [Quick Start](#-quick-start) · [Docs](#-docs) · [Acknowledgments](#-acknowledgments) · [License](#-license)
 
@@ -22,27 +22,28 @@ _It is a port of the Python [`eero-api`](https://github.com/fulviofreitas/eero-a
 
 - 🚀 **Async-first** — `tokio` + `reqwest` (rustls), no Python runtime
 - 📦 **Raw JSON** — every call returns the exact `{meta, data}` envelope Eero sends, wrapped in a lossless `Envelope`
-- 🔗 **Link-aware** — every resource argument accepts a bare id, an API path or an absolute API-host URL, and every domain method takes a `parent` envelope so the request follows the link the API published
-- 🔐 **Secure** — session tokens are `SecretString`s sent only to the configured API host, redirects are refused, error messages never embed a response body
+- 🔗 **Link-aware** — every resource argument accepts a bare id, an API path or an absolute API-host URL, and domain methods take a `parent` envelope wherever the Python method accepts one (`parent=`, or a cached envelope in place of the id), so the request follows the link the API published
+- 🔐 **Secure** — session tokens are `SecretString`s sent only to the configured API origin (scheme, host and port), redirects are refused, error messages never embed a response body, and the transport's warning/error log lines never carry a request path or query (the withheld-credential warning names only the target's `scheme://host`)
 - 🔁 **Compatible** — the `{"session_id", "schema_version": 2}` credential record is shared with `eero-api`, so a login made by [`eeroctl`](https://github.com/fulviofreitas/eeroctl) works unchanged (legacy records are migrated on first load)
 - 🧩 **Headless-friendly** — the email/SMS code step is separable; inject a pre-obtained token instead
 
 ## 🚧 Status
 
-**Ported to `eero-api` 8.0.4, not yet released.** Transport, authentication, credential storage,
-the error catalogue, link resolution, all 37 domain modules, the `Client` facade and its cache are
-in place, each pinned by wiremock tests. [`PARITY.md`](PARITY.md) is the method-by-method table
-against the Python library at tag `v8.0.4`: 267 rows — 218 ported, 22 changed with a reason,
-20 dropped with a reason, 3 identical, 4 renamed; none planned.
+**Ported to `eero-api` 8.4.1.** Transport, authentication, verified credential storage, the error
+catalogue, link resolution and path confinement, per-call timeouts, all 37 domain modules, the
+`Client` facade and its cache are in place, each pinned by wiremock tests. [`PARITY.md`](PARITY.md)
+is the method-by-method table against the Python library at tag `v8.4.1`: every row carries its
+status (ported, changed, dropped, identical or renamed), every change or drop carries its reason,
+and the summary line near the top of that file gives the totals per status.
 
 ## 📦 Install
 
 ```toml
 [dependencies]
-rusteero = "2"
+rusteero = "3"
 
 # Headless / embedded (no system keyring):
-rusteero = { version = "2", default-features = false }
+rusteero = { version = "3", default-features = false }
 ```
 
 ## 🚀 Quick Start
@@ -97,11 +98,13 @@ if current.data()["sqm"] != json!(true) {
 
 Wherever a method takes a `network_id`, `eero_id`, `device_id` or `profile_id`, you may pass a
 bare id, the resource's API path (`/2.2/networks/<id>`) or its absolute URL on the API host;
-anything on another host or scheme is rejected with `Error::Validation` before a request is sent.
-Every method on the domain modules (`client.api().networks()`, …) also takes
-`parent: Option<&Value>` — the envelope you already hold — and resolves its URL from the link the
-API published on it; `Client` passes its cached network, eero and device envelopes as `parent`
-automatically.
+anything on another host, scheme or port, carrying userinfo, or naming a different kind of
+resource than the method expects is rejected with `Error::Validation` before a request is sent.
+Every domain-module method (`client.api().networks()`, …) whose Python counterpart has `parent=`
+also takes `parent: Option<&Value>` — the envelope you already hold — and resolves its URL from
+the link the API published on it (as do `update_forward`, `update_reservation`, `update_schedule`
+and `delete_schedule`, whose Python versions take the item's envelope in place of its id);
+`Client` passes its cached network, eero and device envelopes as `parent` automatically.
 
 ### Error handling
 
@@ -115,7 +118,7 @@ match client.get_network(None, false).await {
         eprintln!("re-login needed: {error_code:?}");
     }
     Err(Error::PremiumRequired { .. }) => eprintln!("needs Eero Plus"),
-    Err(Error::RateLimit { retry_after, .. }) => eprintln!("back off: {retry_after:?}"),
+    Err(Error::RateLimit { retry_after, status, .. }) => eprintln!("back off ({status:?}): {retry_after:?}"),
     Err(e) => {
         // Branch on the catalogue string, never on the message text.
         if classify_error_code(e.error_code()) == Some(ErrorGroup::Domain) {
@@ -127,7 +130,10 @@ match client.get_network(None, false).await {
 ```
 
 `Error::error_code()` is `meta.error` as the API sent it; `Error::envelope()` is the raw parsed
-response; `Error::status()` the HTTP status when one applies. Messages are fixed, leak-safe labels.
+response; `Error::status()` the HTTP status when a response produced the error (`Authentication`
+and `RateLimit` included, a server-side `Validation` excepted; `retry_after` is capped at 24
+hours). Messages never embed a response body; a `Network` error's text includes the request URL
+and a refused redirect's names the path and the `Location` host.
 
 ## 📄 Raw Response Format
 
@@ -140,7 +146,8 @@ All API methods return the exact JSON from Eero's API, wrapped in a lossless `En
 }
 ```
 
-`env.meta()`, `env.data()`, `env.into_value()` and `env.data_as::<T>()` are the only helpers.
+`env.meta()`, `env.data()`, `env.as_value()`, `env.into_value()` and `env.data_as::<T>()` are the
+accessors; `Envelope::from_value`, `Envelope::empty` and `From<Value>` build one.
 
 ## 🎛️ Features
 
@@ -155,7 +162,7 @@ All API methods return the exact JSON from Eero's API, wrapped in a lossless `En
 | **[📖 Rust API](../../wiki/Rust-API)** | Layers, builder options, every domain accessor, caching, errors |
 | **[⚙️ Configuration](../../wiki/Configuration)** | Sessions, credential stores, transport options, logging |
 | **[🔧 Troubleshooting](../../wiki/Troubleshooting)** | 401s, premium gating, validation errors, writes that change nothing |
-| **[🔀 Migration](../../wiki/Migration)** | Upgrading from rusteero 1.0.0 |
+| **[🔀 Migration](../../wiki/Migration)** | Upgrading from rusteero 2.x (and from 1.0.0) |
 | **[🏠 Wiki Home](../../wiki)** | All documentation |
 | **[✅ Parity checklist](PARITY.md)** | Method-by-method status against `eero-api` |
 

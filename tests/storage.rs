@@ -10,7 +10,9 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -33,7 +35,7 @@ fn copy_fixture_into(dir: &Path, fixture_name: &str) -> PathBuf {
     path
 }
 
-// ===================== D-5 contract: FileStore reads a real eero-api cookies.json =====================
+// ===================== Shared-schema contract: FileStore reads a real eero-api cookies.json =====
 
 #[test]
 fn filestore_loads_a_real_eeroctl_cookies_file() -> anyhow::Result<()> {
@@ -185,6 +187,10 @@ fn chained_store_load_falls_back_and_migrates_into_a_real_primary_file() -> anyh
     assert!(primary_path.exists());
     let migrated = primary_file.load()?;
     assert_eq!(migrated.token().expose_secret(), "fallback-token");
+    assert!(
+        !fallback_path.exists(),
+        "a verified promotion retires the fallback copy"
+    );
     Ok(())
 }
 
@@ -453,5 +459,503 @@ async fn transport_refresh_session_terminal_failure_clears_the_store() -> anyhow
     let refreshed = transport.refresh_session().await?;
     assert!(!refreshed);
     assert!(!store.load()?.is_valid());
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_set_session_async_persists_the_new_session_and_clear() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    let transport = mock.transport_with_store("initial-token", Arc::clone(&store));
+
+    transport
+        .set_session_async(Some(Session::from_token("rotated-token")))
+        .await?;
+    assert_eq!(store.load()?.token().expose_secret(), "rotated-token");
+    assert_eq!(
+        transport
+            .session()
+            .map(|s| s.token().expose_secret().to_owned()),
+        Some("rotated-token".to_owned())
+    );
+    assert!(transport.credentials_persisted());
+
+    transport.set_session_async(None).await?;
+    assert!(transport.session().is_none());
+    assert!(!store.load()?.is_valid());
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_set_session_async_rejects_an_invalid_token_before_touching_anything()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    // The store already holds the record the transport's session came from, so "writes nothing"
+    // can fail: a rejected session that was saved, or a store that was cleared, changes it.
+    store.save(&Session::from_token("initial-token"))?;
+    let transport = mock.transport_with_store("initial-token", Arc::clone(&store));
+
+    let err = transport
+        .set_session_async(Some(Session::from_token("")))
+        .await
+        .expect_err("an empty token is rejected");
+    assert!(matches!(err, Error::Validation { ref field, .. } if field == "token"));
+    assert_eq!(
+        transport
+            .session()
+            .map(|s| s.token().expose_secret().to_owned()),
+        Some("initial-token".to_owned()),
+        "a rejected session leaves the current one in place"
+    );
+    assert_eq!(
+        store.load()?.token().expose_secret(),
+        "initial-token",
+        "and writes nothing"
+    );
+    assert!(transport.credentials_persisted());
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_set_session_async_under_fatal_returns_the_error_after_changing_memory() {
+    let store: Arc<dyn CredentialStore> = Arc::new(AlwaysFailsStore);
+    let transport = Transport::builder()
+        .store(Some(store))
+        .storage_failures(StorageFailures::Fatal)
+        .build()
+        .expect("builds");
+
+    let err = transport
+        .set_session_async(Some(Session::from_token("fresh-token")))
+        .await
+        .expect_err("the store always fails");
+    assert!(matches!(err, Error::Storage(_)));
+    assert!(
+        transport.is_authenticated(),
+        "memory changed before the store was called"
+    );
+    assert!(!transport.credentials_persisted());
+}
+
+// ===================== Persistence ordering: store always matches memory =====================
+
+/// The longest a parked save waits for [`ParkingStore::open`]. A test that fails while a save is
+/// parked would otherwise wait for it forever: `std::thread::scope` joins every spawned thread
+/// before it lets a panic out.
+const PARK_LIMIT: Duration = Duration::from_secs(10);
+
+/// A [`CredentialStore`] over a [`MemoryStore`] whose `save` of one chosen token parks until
+/// [`ParkingStore::open`] (at most [`PARK_LIMIT`], then it fails), and which yields the CPU
+/// inside every call to widen race windows.
+#[derive(Debug)]
+struct ParkingStore {
+    inner: MemoryStore,
+    park_token: Option<&'static str>,
+    gate_open: Mutex<bool>,
+    gate_changed: Condvar,
+    parked: AtomicBool,
+}
+
+impl ParkingStore {
+    fn new(park_token: Option<&'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryStore::new(),
+            park_token,
+            gate_open: Mutex::new(false),
+            gate_changed: Condvar::new(),
+            parked: AtomicBool::new(false),
+        })
+    }
+
+    fn open(&self) {
+        *self.gate_open.lock().expect("gate lock") = true;
+        self.gate_changed.notify_all();
+    }
+
+    /// Opens the gate when dropped. Create it *inside* a `std::thread::scope` closure: a panic
+    /// that unwinds out of the closure then releases the parked thread before the scope joins it.
+    fn release_on_drop(self: &Arc<Self>) -> OpenOnDrop {
+        OpenOnDrop(Arc::clone(self))
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// See [`ParkingStore::release_on_drop`].
+struct OpenOnDrop(Arc<ParkingStore>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+impl CredentialStore for ParkingStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        if self.park_token == Some(session.token().expose_secret()) {
+            self.parked.store(true, Ordering::SeqCst);
+            let open = self.gate_open.lock().expect("gate lock");
+            let (_open, waited) = self
+                .gate_changed
+                .wait_timeout_while(open, PARK_LIMIT, |open| !*open)
+                .expect("gate wait");
+            if waited.timed_out() {
+                return Err(StorageError::Backend {
+                    backend: "parking".to_owned(),
+                    message: "the gate was never opened".to_owned(),
+                });
+            }
+        }
+        std::thread::yield_now();
+        self.inner.save(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        std::thread::yield_now();
+        self.inner.clear()
+    }
+}
+
+fn token_of(session: Option<Session>) -> Option<String> {
+    session.map(|s| s.token().expose_secret().to_owned())
+}
+
+fn stored_token_of(store: &ParkingStore) -> Option<String> {
+    let loaded = store.load().expect("in-memory load cannot fail");
+    loaded
+        .is_valid()
+        .then(|| loaded.token().expose_secret().to_owned())
+}
+
+#[test]
+fn a_clear_applied_while_an_earlier_save_is_in_flight_wins_in_memory_and_in_the_store()
+-> anyhow::Result<()> {
+    let store = ParkingStore::new(Some("slow-token"));
+    let transport = Transport::builder()
+        .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+        .build()?;
+
+    std::thread::scope(|scope| {
+        let _release = store.release_on_drop();
+        let saver = scope.spawn(|| transport.set_session(Some(Session::from_token("slow-token"))));
+        ParkingStore::wait_until("the save to park inside the store", || {
+            store.parked.load(Ordering::SeqCst)
+        });
+
+        let clearer = scope.spawn(|| transport.set_session(None));
+        // The clear is applied to memory immediately, then waits behind the parked save.
+        ParkingStore::wait_until("the clear to reach memory", || {
+            transport.session().is_none()
+        });
+
+        store.open();
+        saver.join().expect("saver thread").expect("save ok");
+        clearer.join().expect("clearer thread").expect("clear ok");
+    });
+
+    assert!(transport.session().is_none());
+    assert_eq!(
+        stored_token_of(&store),
+        None,
+        "the older save must not resurrect the cleared session"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_set_session_calls_leave_store_matching_memory() -> anyhow::Result<()> {
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 200;
+
+    let store = ParkingStore::new(None);
+    let transport = Transport::builder()
+        .store(Some(Arc::clone(&store) as Arc<dyn CredentialStore>))
+        .build()?;
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let transport = &transport;
+            scope.spawn(move || {
+                for iteration in 0..ITERATIONS {
+                    let session = if (thread + iteration) % 3 == 0 {
+                        None
+                    } else {
+                        Some(Session::from_token(format!("t{thread}-i{iteration}")))
+                    };
+                    transport
+                        .set_session(session)
+                        .expect("a working store never fails");
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        token_of(transport.session()),
+        stored_token_of(&store),
+        "after every call has returned, the stored record matches the in-memory session"
+    );
+    assert!(transport.credentials_persisted());
+    Ok(())
+}
+
+// ===================== ChainedStore: verified saves and fallback ownership, on real files =====================
+
+/// Accepts every write and retains nothing, like a keyring backend that silently drops writes.
+#[derive(Debug, Default)]
+struct NullStore;
+
+impl CredentialStore for NullStore {
+    fn load(&self) -> Result<Session, StorageError> {
+        Ok(Session::empty())
+    }
+
+    fn save(&self, _session: &Session) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_primary_that_drops_writes_leaves_the_record_in_the_file_fallback() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cookies.json");
+    let chained = ChainedStore::new(
+        Arc::new(NullStore) as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(&path)) as Arc<dyn CredentialStore>,
+    );
+
+    chained.save(&Session::from_token("fresh_token"))?;
+
+    let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(on_disk["session_id"], "fresh_token");
+    assert_eq!(chained.load()?.token().expose_secret(), "fresh_token");
+    Ok(())
+}
+
+#[test]
+fn a_chain_where_nothing_retains_the_record_reports_it() {
+    let chained = ChainedStore::new(
+        Arc::new(NullStore) as Arc<dyn CredentialStore>,
+        Arc::new(NullStore) as Arc<dyn CredentialStore>,
+    );
+
+    let err = chained
+        .save(&Session::from_token("live_token"))
+        .expect_err("no backend holds the record");
+
+    assert!(
+        matches!(&err, StorageError::NotRetained { backend } if backend == "chained"),
+        "got {err:?}"
+    );
+    assert!(!err.to_string().contains("live_token"));
+}
+
+/// A [`MemoryStore`] whose saves can be switched off, standing in for a keyring that is down.
+#[derive(Debug, Default)]
+struct TogglePrimary {
+    inner: MemoryStore,
+    fail_saves: AtomicBool,
+}
+
+impl CredentialStore for TogglePrimary {
+    fn load(&self) -> Result<Session, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, session: &Session) -> Result<(), StorageError> {
+        if self.fail_saves.load(Ordering::SeqCst) {
+            return Err(StorageError::Backend {
+                backend: "toggle".to_owned(),
+                message: "the keyring is down".to_owned(),
+            });
+        }
+        self.inner.save(session)
+    }
+
+    fn clear(&self) -> Result<(), StorageError> {
+        self.inner.clear()
+    }
+}
+
+#[test]
+fn fallback_this_instance_wrote_is_retired_after_the_primary_recovers() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fallback_path = dir.path().join("cookies.json");
+    let primary = Arc::new(TogglePrimary::default());
+    primary.fail_saves.store(true, Ordering::SeqCst);
+    let chained = ChainedStore::new(
+        Arc::clone(&primary) as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(&fallback_path)) as Arc<dyn CredentialStore>,
+    );
+
+    chained.save(&Session::from_token("first_token"))?;
+    assert!(fallback_path.exists(), "the file fallback took the record");
+
+    primary.fail_saves.store(false, Ordering::SeqCst);
+    chained.save(&Session::from_token("second_token"))?;
+    assert!(
+        !fallback_path.exists(),
+        "the record this instance wrote to the fallback is retired once the primary holds the new one"
+    );
+
+    // With the fallback gone, wiping the primary cannot resurrect the old session.
+    primary.clear()?;
+    assert!(!chained.load()?.is_valid());
+    Ok(())
+}
+
+#[test]
+fn a_session_another_process_left_in_the_cookie_file_is_not_deleted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fallback_path = dir.path().join("cookies.json");
+    let other_process = FileStore::new(&fallback_path);
+    other_process.save(&Session::from_token("other_process_token"))?;
+    let chained = ChainedStore::new(
+        Arc::new(MemoryStore::new()) as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(&fallback_path)) as Arc<dyn CredentialStore>,
+    );
+
+    chained.save(&Session::from_token("my_token"))?;
+
+    assert_eq!(
+        other_process.load()?.token().expose_secret(),
+        "other_process_token",
+        "a record this instance never loaded or wrote is not its to delete"
+    );
+    Ok(())
+}
+
+// ===================== FileStore: one instance serialises its operations =====================
+
+fn leftover_temp_files(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        })
+        .collect()
+}
+
+#[test]
+fn filestore_concurrent_save_and_clear_never_fail_or_leave_temp_files() -> anyhow::Result<()> {
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 25;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cookies.json");
+    let store = Arc::new(FileStore::new(&path));
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let store = &store;
+            scope.spawn(move || {
+                for iteration in 0..ITERATIONS {
+                    if (thread + iteration) % 2 == 0 {
+                        store
+                            .save(&Session::from_token(format!("t{thread}-i{iteration}")))
+                            .expect("a save never fails because of a concurrent clear");
+                    } else {
+                        store.clear().expect("a clear never fails");
+                    }
+                }
+            });
+        }
+    });
+
+    assert_eq!(leftover_temp_files(dir.path()), Vec::<String>::new());
+    let names: Vec<String> = std::fs::read_dir(dir.path())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    if !names.is_empty() {
+        assert_eq!(names, ["cookies.json"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let token = store.load()?.token().expose_secret().to_owned();
+        let written: std::collections::HashSet<String> = (0..THREADS)
+            .flat_map(|thread| {
+                (0..ITERATIONS)
+                    .filter(move |iteration| (thread + iteration) % 2 == 0)
+                    .map(move |iteration| format!("t{thread}-i{iteration}"))
+            })
+            .collect();
+        assert!(
+            written.contains(&token),
+            "the file holds a record some save wrote"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_chain_over_two_file_stores_leaves_no_temp_files_under_concurrent_use() -> anyhow::Result<()> {
+    const THREADS: usize = 6;
+    const ITERATIONS: usize = 15;
+
+    let primary_dir = tempfile::tempdir()?;
+    let fallback_dir = tempfile::tempdir()?;
+    let chained = Arc::new(ChainedStore::new(
+        Arc::new(FileStore::new(primary_dir.path().join("cookies.json")))
+            as Arc<dyn CredentialStore>,
+        Arc::new(FileStore::new(fallback_dir.path().join("cookies.json")))
+            as Arc<dyn CredentialStore>,
+    ));
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let chained = &chained;
+            scope.spawn(move || {
+                for iteration in 0..ITERATIONS {
+                    // The chain is not atomic across its two backends, so a save racing a clear
+                    // may legitimately report that the record was not retained; only the
+                    // absence of leftovers is pinned here.
+                    match (thread + iteration) % 3 {
+                        0 => {
+                            let _ = chained
+                                .save(&Session::from_token(format!("t{thread}-i{iteration}")));
+                        }
+                        1 => {
+                            let _ = chained.clear();
+                        }
+                        _ => {
+                            let _ = chained.load();
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        leftover_temp_files(primary_dir.path()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        leftover_temp_files(fallback_dir.path()),
+        Vec::<String>::new()
+    );
     Ok(())
 }

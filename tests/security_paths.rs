@@ -196,3 +196,151 @@ async fn get_eero_still_accepts_every_safe_value() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// ===================== absolute URLs: the origin rule at the endpoint boundary =====================
+
+/// The mock server's `host:port`, as it appears in an absolute URL.
+fn mock_authority(mock: &MockEero) -> String {
+    mock.uri().trim_start_matches("http://").to_owned()
+}
+
+/// The mock server's port.
+fn mock_port(mock: &MockEero) -> u16 {
+    mock_authority(mock)
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .expect("a MockServer URI ends in its port")
+}
+
+/// The one message the origin rule gives, for the configured host `127.0.0.1`. It is a fixed
+/// string, so a message that echoed any part of the offending URL could not equal it.
+const ORIGIN_MESSAGE: &str =
+    "must be an absolute http URL on 127.0.0.1 with no userinfo and no other port";
+
+/// Asserts `err` is the origin-rule validation error: field `url` and exactly [`ORIGIN_MESSAGE`].
+fn assert_is_origin_error(err: &Error) {
+    match err {
+        Error::Validation { field, message, .. } => {
+            assert_eq!(field, "url");
+            assert_eq!(message, ORIGIN_MESSAGE);
+        }
+        other => panic!("expected Error::Validation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn get_eero_rejects_userinfo_on_the_configured_host_before_any_request() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    deny_all_requests(&mock).await;
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    let authority = mock_authority(&mock);
+
+    for userinfo in ["user:pass@", "user@", ":pass@", "@"] {
+        let url = format!("http://{userinfo}{authority}/2.2/eeros/1");
+        let err = api
+            .get_eero(&url, None)
+            .await
+            .expect_err(&format!("{url:?} must be rejected, not sent to the server"));
+        assert_is_origin_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eero_rejects_another_port_on_the_configured_host_before_any_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    deny_all_requests(&mock).await;
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    let port = mock_port(&mock);
+    let other = port.checked_add(1).unwrap_or(1);
+
+    for authority in [
+        format!("127.0.0.1:{other}"),
+        "127.0.0.1".to_owned(),
+        "127.0.0.1:0".to_owned(),
+    ] {
+        let url = format!("http://{authority}/2.2/eeros/1");
+        let err = api
+            .get_eero(&url, None)
+            .await
+            .expect_err(&format!("{url:?} must be rejected, not sent to the server"));
+        assert_is_origin_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eero_rejects_unparseable_and_rewritten_authorities_before_any_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    deny_all_requests(&mock).await;
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    let authority = mock_authority(&mock);
+    let port = mock_port(&mock);
+
+    for url in [
+        "http://127.0.0.1:abc/2.2/eeros/1".to_owned(),
+        "http://127.0.0.1:99999/2.2/eeros/1".to_owned(),
+        "http://[::1/2.2/eeros/1".to_owned(),
+        "http://127.0.0.1\u{ff1a}99/2.2/eeros/1".to_owned(),
+        format!("http://evil.example\\@{authority}/2.2/eeros/1"),
+        format!("http://{authority}\\@evil.example/2.2/eeros/1"),
+        format!("http://{authority}\u{ff0f}@evil.example/2.2/eeros/1"),
+        format!("http://%31{}/2.2/eeros/1", &authority[1..]),
+        // The parser folds IPv4 shorthand into `127.0.0.1`, port included, so only the raw
+        // authority rule can tell this from the configured origin.
+        format!("http://127.1:{port}/2.2/eeros/1"),
+    ] {
+        let err = api
+            .get_eero(&url, None)
+            .await
+            .expect_err(&format!("{url:?} must be rejected, not sent to the server"));
+        assert_is_origin_error(&err);
+    }
+    Ok(())
+}
+
+/// The shape rule runs before the origin rule: an off-origin URL carrying a query is reported
+/// for its query, not its origin, and no request is sent either way.
+#[tokio::test]
+async fn get_eero_reports_a_bad_shape_before_a_bad_origin() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    deny_all_requests(&mock).await;
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    let err = api
+        .get_eero("https://evil.example/2.2/eeros/1?x=1", None)
+        .await
+        .expect_err("a query string must be rejected");
+    assert!(
+        matches!(
+            &err,
+            Error::Validation { field, message, .. }
+                if field == "url" && message == "must not carry a query or fragment"
+        ),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_eero_accepts_an_absolute_url_on_the_configured_origin() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2.2/eeros/e_1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    let uri = mock.uri();
+
+    api.get_eero(&format!("{uri}/2.2/eeros/e_1"), None).await?;
+    // An upper-case scheme and host are the same origin, and one trailing slash is tolerated.
+    let shouty = format!("{uri}/2.2/eeros/e_1/").replacen("http", "HTTP", 1);
+    api.get_eero(&shouty, None).await?;
+    Ok(())
+}

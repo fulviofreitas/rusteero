@@ -8,9 +8,9 @@ impl Client {
     /// Gets network routing information — returns the raw Eero API response.
     ///
     /// Ported from `get_routing()` (`client.py:1413-1418`). `auto_discover = false` — see
-    /// [`Client::get_diagnostics`]. Passes the cached network envelope as `parent=` (`+net`) —
-    /// which may resolve to the API's 2.3 `routing` link instead of the 2.2 template fallback;
-    /// see [`crate::routes::routing::GET_ROUTING_V8`]'s doc comment.
+    /// [`Client::get_diagnostics`]. Passes the cached network envelope as `parent=` (`+net`). The
+    /// request always goes to API version 2.2, even when that envelope publishes its `routing`
+    /// link on 2.3; see [`crate::endpoints::routing::RoutingApi::get_routing`].
     ///
     /// # Errors
     ///

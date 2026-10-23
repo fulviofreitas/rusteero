@@ -219,16 +219,15 @@ impl ProfilesApi {
     /// object, matching Python's `devices_payload = [{"url": url} for url in device_urls]`
     /// exactly.
     ///
-    /// **Double-warn, reproduced deliberately (see the g4 brief's open question 3).** This method
+    /// **Double-warn, reproduced deliberately.** This method
     /// calls `warn_uncharacterised_write("set devices for profile")` itself
     /// (`profiles.py:241`) *and then* delegates to the same `_update_profile` helper
     /// [`ProfilesApi::pause_profile`]/[`ProfilesApi::rename_profile`] use, which logs a second,
     /// differently-worded `warn_uncharacterised_write("update profile")`
     /// (`profiles.py:154`) — two `tracing::warn!` lines per call, unlike its siblings, which log
     /// exactly one. This looks like a Python oversight, not a deliberate design, but is
-    /// reproduced faithfully rather than silently "fixed" to one warning: this crate's own
-    /// discipline (see `CLAUDE.md`'s lessons-learned entries) is to preserve observed server/SDK
-    /// behaviour and flag it, not quietly diverge.
+    /// reproduced faithfully rather than silently "fixed" to one warning: this crate preserves
+    /// observed server/SDK behaviour and flags it, rather than quietly diverging.
     ///
     /// # Errors
     ///

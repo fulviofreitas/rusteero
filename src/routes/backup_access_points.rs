@@ -1,8 +1,6 @@
 //! `backup_access_points` routes (`BackupAccessPointsAPI`, new in v8.0.0).
 //!
-//! Ported from `eero-api src/eero/api/backup_access_points.py` (v8.0.4). See
-//! `.claude/tasks/briefs/v8/g7-backup-members.md` §1 for the per-method URL-resolution table
-//! these constants are drawn from.
+//! Ported from `eero-api src/eero/api/backup_access_points.py` (v8.0.4).
 
 use super::{ApiVersion, Nested, Resource};
 use reqwest::Method;

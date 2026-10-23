@@ -14,13 +14,50 @@ use std::sync::Arc;
 use rusteero::endpoints::forwards::ForwardsApi;
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{any, body_json, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 fn forwards_api(mock: &MockEero) -> ForwardsApi {
     ForwardsApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)))
+}
+
+/// Every spelling of the network `get_forwards` must pin to 2.2: a bare id, API paths and absolute
+/// API-host URLs on either version, and absolute URLs whose scheme is not lower case.
+const NETWORK_FORMS: [&str; 7] = [
+    "id",
+    "path-2.2",
+    "path-2.3",
+    "url-2.2",
+    "url-2.3",
+    "upper-case-scheme-url-2.3",
+    "mixed-case-scheme-url-2.3",
+];
+
+/// Renders one of [`NETWORK_FORMS`] against the mock server's origin.
+fn network_form(uri: &str, form: &str) -> String {
+    let upper = uri.replacen("http", "HTTP", 1);
+    let mixed = uri.replacen("http", "hTTp", 1);
+    match form {
+        "id" => "network-0001".to_owned(),
+        "path-2.2" => "/2.2/networks/network-0001".to_owned(),
+        "path-2.3" => "/2.3/networks/network-0001".to_owned(),
+        "url-2.2" => format!("{uri}/2.2/networks/network-0001"),
+        "url-2.3" => format!("{uri}/2.3/networks/network-0001"),
+        "upper-case-scheme-url-2.3" => format!("{upper}/2.3/networks/network-0001"),
+        "mixed-case-scheme-url-2.3" => format!("{mixed}/2.3/networks/network-0001"),
+        other => panic!("unknown network form {other}"),
+    }
+}
+
+/// Mounts a catch-all mock that fails the test if it receives any request at all.
+async fn expect_no_request(mock: &MockEero) {
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
 }
 
 // ===================== get_forwards =====================
@@ -58,11 +95,17 @@ async fn get_forwards_hits_v22_path_with_session_cookie_and_matches_body() -> an
 #[tokio::test]
 async fn get_forwards_prefers_the_parents_published_link_over_the_template() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let parent = json!({"resources": {"forwards": "/2.3/networks/network-0001/forwards"}});
+    let parent = json!({"resources": {"forwards": "/2.2/networks/network-0001/custom-forwards"}});
     let body = json!({ "meta": { "code": 200 }, "data": [] });
 
     Mock::given(method("GET"))
-        .and(path("/2.3/networks/network-0001/forwards"))
+        .and(path("/2.2/networks/network-0001/forwards"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/custom-forwards"))
         .and(session_cookie())
         .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
@@ -74,6 +117,138 @@ async fn get_forwards_prefers_the_parents_published_link_over_the_template() -> 
     let env = api.get_forwards("network-0001", Some(&parent)).await?;
 
     assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_forwards_pins_to_2_2_even_with_2_3_parent_link() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    let body = json!({ "meta": {"code": 200}, "data": {} });
+    Mock::given(method("GET"))
+        .and(path("/2.3/networks/network-0001/forwards"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/forwards"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let parent = json!({
+        "url": "/2.2/networks/network-0001",
+        "resources": {"forwards": "/2.3/networks/network-0001/forwards"},
+    });
+    let env = forwards_api(&mock)
+        .get_forwards("network-0001", Some(&parent))
+        .await?;
+
+    assert_eq!(env.into_value(), body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_forwards_pins_a_published_link_on_any_version_to_2_2() -> anyhow::Result<()> {
+    for version in ["2.2", "2.3", "2.4", "10.25"] {
+        let mock = MockEero::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2.2/networks/network-0001/forwards"))
+            .and(session_cookie())
+            .and(user_token_header())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let link = format!("/{version}/networks/network-0001/forwards");
+        let parent = json!({"resources": {"forwards": link}});
+        forwards_api(&mock)
+            .get_forwards("network-0001", Some(&parent))
+            .await
+            .unwrap_or_else(|err| panic!("published link on {version}: {err}"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_forwards_pins_to_2_2_for_every_network_form() -> anyhow::Result<()> {
+    for form in NETWORK_FORMS {
+        let mock = MockEero::start().await;
+        Mock::given(method("GET"))
+            .and(path("/2.3/networks/network-0001/forwards"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/2.2/networks/network-0001/forwards"))
+            .and(session_cookie())
+            .and(user_token_header())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let network = network_form(&mock.uri(), form);
+        forwards_api(&mock)
+            .get_forwards(&network, None)
+            .await
+            .unwrap_or_else(|err| panic!("network form {form}: {err}"));
+    }
+    Ok(())
+}
+
+/// A whitespace or control character in a caller's network path or URL is refused before any
+/// request: the URL parser would otherwise strip some of them and send a different path.
+#[tokio::test]
+async fn get_forwards_rejects_a_control_character_in_the_network_before_any_request()
+-> anyhow::Result<()> {
+    for control in ["\n", "\t", "\r", " ", "\u{0}"] {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+        let uri = mock.uri();
+
+        for network in [
+            format!("/2.3/networks/network-0001{control}"),
+            format!("/2.3/networks/net{control}work-0001"),
+            format!("{uri}/2.3/networks/network-0001{control}"),
+        ] {
+            let err = forwards_api(&mock)
+                .get_forwards(&network, None)
+                .await
+                .expect_err("a control character in the network must be refused");
+            assert!(
+                matches!(err, Error::Validation { .. }),
+                "{network:?} gave {err:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A published link carrying a control character is refused rather than silently pinned.
+#[tokio::test]
+async fn get_forwards_rejects_a_control_character_in_a_published_link_instead_of_pinning_it()
+-> anyhow::Result<()> {
+    for control in ["\n", "\t", "\r", "\u{0}"] {
+        let mock = MockEero::start().await;
+        expect_no_request(&mock).await;
+
+        let link = format!("/2.3/networks/network-0001/forwards{control}");
+        let parent = json!({"resources": {"forwards": link}});
+        let err = forwards_api(&mock)
+            .get_forwards("network-0001", Some(&parent))
+            .await
+            .expect_err("a published link carrying a control character must be refused");
+        assert!(
+            matches!(err, Error::Validation { ref field, .. } if field == "link"),
+            "{control:?} gave {err:?}"
+        );
+    }
     Ok(())
 }
 

@@ -113,7 +113,7 @@ fn resolve_self_preferred(
 /// unwraps `data` only when `value` looks like a *full* envelope (has both a `meta` key and an
 /// object `data` key) — exactly [`crate::links::as_data`]'s rule, used here instead of a
 /// bespoke unwrap so a bare `data` object that happens to carry its own `data` field is never
-/// double-unwrapped (phase-G fix list item 16).
+/// double-unwrapped.
 fn nightlight_url_from_value(host: &Url, value: &Value) -> Result<Option<Url>, Error> {
     let data = crate::links::as_data(value);
     let Some(url) = data
@@ -570,7 +570,7 @@ impl EerosApi {
     /// single [`Resource`]. **Unverified against a live network.**
     ///
     /// `interface_number: u32` is narrower than Python's `interface_number: str`
-    /// (`eeros.py:698`) — a deliberate divergence (phase-G fix list item 24), not an oversight:
+    /// (`eeros.py:698`) — a deliberate divergence, not an oversight:
     /// every observed interface number is a small non-negative integer, and `u32` still ends up
     /// as the identical decimal string once it reaches [`crate::links::child_url`]
     /// (`interface_number.to_string()`), so this only narrows the accepted *input* shape, never
@@ -628,8 +628,8 @@ impl EerosApi {
     /// live network.**
     ///
     /// `duration: u32`/`time_per_color: u32` are narrower than Python's `duration: str`/
-    /// `time_per_color: str` (`eeros.py:749-750`) — a deliberate divergence (phase-G fix list
-    /// item 24), not an oversight: both are forwarded to the API as decimal strings either way
+    /// `time_per_color: str` (`eeros.py:749-750`) — a deliberate divergence, not an oversight:
+    /// both are forwarded to the API as decimal strings either way
     /// (`duration.to_string()`/`time_per_color.to_string()`), so this only narrows the accepted
     /// *input* shape, never the wire value.
     pub async fn led_cycle(

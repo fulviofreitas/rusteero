@@ -1,10 +1,9 @@
 //! `Client` methods for the `ProfilesAPI` domain at v8.0.4.
 //!
-//! Ported from `eero-api src/eero/client.py`'s profiles-scoped wrappers
-//! (`.claude/tasks/briefs/v8/client.md` §4 "profiles"). `update_profile_content_filter`,
-//! `update_profile_block_list`, `get_blocked_applications` and `set_blocked_applications` are
-//! **removed** (client.md §5): the domain methods they wrapped never persisted anything (silent
-//! no-op, live-verified) and have no v8.0.4 `client.py` equivalent — replaced by
+//! Ported from `eero-api src/eero/client.py`'s profiles-scoped wrappers.
+//! `update_profile_content_filter`, `update_profile_block_list`, `get_blocked_applications` and
+//! `set_blocked_applications` are **removed**: the domain methods they wrapped never persisted
+//! anything (silent no-op, live-verified) and have no v8.0.4 `client.py` equivalent — replaced by
 //! [`Client::allow_domain_for_profiles`]/[`Client::block_domain_for_profiles`]/
 //! [`Client::get_dns_policy_applications`]/[`Client::set_profile_blocked_applications`]
 //! (`crate::client::dns_policies`).
@@ -17,10 +16,11 @@ use crate::error::Error;
 impl Client {
     /// Gets the list of profiles on a network — returns the raw Eero API response.
     ///
-    /// Ported from `get_profiles()` (`eero-api src/eero/client.py:930-957`); see
+    /// Ported from `get_profiles()` (`eero-api src/eero/client.py:1189-1217` at `v8.4.1`); see
     /// [`Client::get_network`] for the shared `auto_discover = true` note. Passes the cached
-    /// network envelope as `parent=` when fresh (`client.md` §4's `+net`), so the request prefers
-    /// the network's own published `profiles` link.
+    /// network envelope as `parent=` when fresh (`+net`), so the request prefers the network's
+    /// own published `profiles` link. The response is stored only if no cache invalidation ran
+    /// while the request was in flight.
     ///
     /// # Errors
     ///
@@ -35,22 +35,24 @@ impl Client {
         if !refresh_cache && let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
+        let generation = self.cache.generation();
         let parent = self.network_parent(network_id.as_str());
         let response = self
             .api
             .profiles()
             .get_profiles(&network_id, parent.as_ref())
             .await?;
-        self.cache.put(key, response.clone());
+        self.cache.put_if_current(key, response.clone(), generation);
         Ok(response)
     }
 
     /// Gets a single profile's full object — returns the raw Eero API response.
     ///
-    /// Ported from `get_profile()` (`eero-api src/eero/client.py:959-988`); see
+    /// Ported from `get_profile()` (`eero-api src/eero/client.py:1219-1249` at `v8.4.1`); see
     /// [`Client::get_network`] for the shared `auto_discover = true` note. No `parent=` is passed
-    /// — `client.py` has no `_profile_parent_kwargs` helper (`client.md` §3.3): nothing in this
-    /// client's cache is keyed in a way that could supply one.
+    /// — `client.py` has no `_profile_parent_kwargs` helper: nothing in this client's cache is
+    /// keyed in a way that could supply one. The response is stored only if no cache
+    /// invalidation ran while the request was in flight.
     ///
     /// # Errors
     ///
@@ -66,12 +68,13 @@ impl Client {
         if !refresh_cache && let Some(cached) = self.cache.get(&key) {
             return Ok(cached);
         }
+        let generation = self.cache.generation();
         let response = self
             .api
             .profiles()
             .get_profile(&network_id, profile_id, None)
             .await?;
-        self.cache.put(key, response.clone());
+        self.cache.put_if_current(key, response.clone(), generation);
         Ok(response)
     }
 
@@ -202,11 +205,15 @@ impl Client {
 
     /// Sets the devices assigned to a profile — returns the raw Eero API response.
     ///
-    /// Ported from `set_profile_devices` (`eero-api src/eero/client.py:2280-2288`).
+    /// Ported from `set_profile_devices` (`eero-api src/eero/client.py:2969-2995` at `v8.4.1`).
     /// `auto_discover = true`. No `parent=`. On success, invalidates **both**
     /// `profiles[{nid}_{pid}]` and `profiles[{nid}_profiles]` — Python's `_invalidate_profile_cache`
-    /// (`client.py:1012-1020`, called at `:2289`) drops both keys, unlike
-    /// [`Client::create_profile`], which only ever had the list key to drop.
+    /// drops both keys, unlike [`Client::create_profile`], which only ever had the list key to
+    /// drop — **and** the device cache: the canonical entry of every device named in
+    /// `device_urls` (an id, MAC or device URL, in any spelling; empty entries are skipped and
+    /// never fail the completed write) plus `devices[{nid}_devices]`, which is dropped even when
+    /// `device_urls` is empty. A device that the call removed from the profile is not named, so
+    /// its cached entry stays until its TTL.
     ///
     /// # Errors
     ///
@@ -226,6 +233,12 @@ impl Client {
             .set_profile_devices(&network_id, profile_id, device_urls, None)
             .await?;
         self.invalidate_profile_cache(network_id.as_str(), profile_id);
+        let named: Vec<&str> = device_urls
+            .iter()
+            .copied()
+            .filter(|url| !url.is_empty())
+            .collect();
+        self.invalidate_device_cache(network_id.as_str(), &named);
         Ok(response)
     }
 }

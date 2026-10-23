@@ -10,25 +10,26 @@ use super::CredentialStore;
 /// An in-memory [`CredentialStore`] that holds at most one [`Session`] for the lifetime of the
 /// process.
 ///
-/// Ported from `MemoryStorage` (`auth_storage.py:240-261`): `load()` returns
+/// Ported from `MemoryStorage` (`auth_storage.py:609-642`): `load()` returns
 /// [`Session::empty`] until the first [`MemoryStore::save`], `save()` replaces whatever was
 /// held, and `clear()` resets to empty. This is the default backend when a caller wants no
 /// persistence at all (`create_storage(use_keyring=False, cookie_file=None)` in Python,
-/// `auth_storage.py:318-344`, always yields a `MemoryStorage`).
+/// `auth_storage.py:807-830`, always yields a `MemoryStorage`). A saved record counts as
+/// retained even though it does not outlive the process.
 ///
-/// One behaviour is intentionally *not* carried over: Python's `load()` returns the very same
-/// `AuthCredentials` object reference every time (`auth_storage.py:253`), so a caller that
-/// mutates the returned value in place mutates the store's internal state without ever calling
-/// `save()` — a latent footgun the brief calls out explicitly. Rust's ownership model makes
-/// this reproduction impossible by construction: [`CredentialStore::load`] returns an owned
-/// [`Session`], so [`MemoryStore::load`] always returns a clone, and mutating it can never
-/// affect the store. This is a strict safety improvement, not a behavioural gap.
+/// Like Python's `MemoryStorage`, which copies on both `load()` and `save()`
+/// (`dataclasses.replace`, `auth_storage.py:620-638`) so that mutating a live record can never
+/// alter the stored one behind `save()`/`clear()`, this store hands out and keeps its own
+/// copies. Rust's ownership model gives that by construction: [`CredentialStore::load`] returns
+/// an owned [`Session`], [`CredentialStore::save`] clones what it is given, and a [`Session`]
+/// has no mutating methods, so nothing a caller does with a loaded or saved value can affect
+/// the store.
 #[derive(Debug, Default)]
 pub struct MemoryStore(RwLock<Option<Session>>);
 
 impl MemoryStore {
     /// Creates an empty store, equivalent to `MemoryStorage()`'s fresh `AuthCredentials()`
-    /// (`auth_storage.py:249`).
+    /// (`auth_storage.py:616-618`).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -125,11 +126,10 @@ mod tests {
 
     #[test]
     fn each_load_returns_an_independent_clone() {
-        // Documents the deliberate behavioural improvement over `MemoryStorage.load()`, which
-        // returns the very same live object reference on every call in Python
-        // (`auth_storage.py:253`). Here, `load()` returns an owned `Session`, so dropping it
-        // (or, in a real caller, ever mutating a local copy through a future setter) cannot
-        // reach back into the store — only `save()` can change what is stored.
+        // `MemoryStorage.load()` returns a copy (`auth_storage.py:620-626`); here `load()`
+        // returns an owned `Session`, so dropping it (or, in a real caller, ever mutating a
+        // local copy through a future setter) cannot reach back into the store — only `save()`
+        // can change what is stored.
         let store = MemoryStore::new();
         store
             .save(&Session::from_token("original"))
@@ -141,6 +141,20 @@ mod tests {
         assert_eq!(
             store.load().expect("load succeeds").expose_token(),
             "original"
+        );
+    }
+
+    #[test]
+    fn save_stores_an_independent_copy() {
+        let store = MemoryStore::new();
+        let original = Session::from_token("original");
+        store.save(&original).expect("save succeeds");
+        drop(original);
+
+        assert_eq!(
+            store.load().expect("load succeeds").expose_token(),
+            "original",
+            "the store keeps its own copy of what it was given"
         );
     }
 }

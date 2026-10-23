@@ -1,21 +1,23 @@
 //! In-memory TTL cache backing `Client`'s cached getters.
 //!
 //! There is no single Python file this module is "ported from" — `eero-api`'s cache is a plain
-//! `dict` mixed directly into `EeroClient` (`eero-api src/eero/client.py:54-125`). This module
-//! pulls that logic out into a standalone, HTTP-free, unit-testable type so `client.rs` (the
-//! next task) can hold one `Cache` and call [`Cache::get`] / [`Cache::put`] / [`Cache::invalidate`]
-//! / [`Cache::invalidate_bucket`] / [`Cache::clear`] around its endpoint calls, exactly mirroring
-//! the read-then-write shape of every Python cached getter:
+//! `dict` mixed directly into `EeroClient` (`eero-api src/eero/client.py:99-259` at `v8.4.1`).
+//! This module pulls that logic out into a standalone, HTTP-free, unit-testable type so the
+//! `Client` facade can hold one `Cache` and call [`Cache::get`] / [`Cache::put`] /
+//! [`Cache::invalidate`] / [`Cache::invalidate_bucket`] / [`Cache::clear`] around its endpoint
+//! calls, exactly mirroring the read-then-write shape of every Python cached getter:
 //!
 //! ```python
 //! if not refresh_cache and self._is_cache_valid("account"):
 //!     cached = self._get_from_cache("account")
 //!     if cached:
 //!         return cached
+//!
+//! cache_epoch = self._cache_epoch
 //! response = await self._api.account.get_account()
-//! self._update_cache("account", None, response)
+//! self._update_cache("account", None, response, epoch=cache_epoch)
 //! ```
-//! (`eero-api src/eero/client.py:247-255`, one of eight call sites with this shape).
+//! (`eero-api src/eero/client.py:590-597` at `v8.4.1`, one of eight call sites with this shape).
 //!
 //! # Buckets and key shapes
 //!
@@ -35,18 +37,17 @@
 //!
 //! # The falsy-value rule
 //!
-//! **This is a faithful port of a real Python quirk — do not "fix" it.** See
-//! the port plan §1.5 ("Falsy cached values are never served (`if cached:`
-//! guards)."). `eero-api` guards every cached read with `if cached:` (e.g. `client.py:249-250,
-//! 275-276, 352-353, 381-382, 456-457, 487-488, 599-600, 630-631`) — a Python truthiness check —
-//! so a cached value that is falsy is treated as a cache miss and silently refetched, even though
-//! a timestamp says the entry is still "fresh". Python truthiness maps onto the JSON shapes this
-//! crate stores as: `None` → JSON `null`, `False` → JSON `false`, `0`/`0.0` → a numeric zero,
-//! `""` → an empty string, `[]` → an empty array, `{}` → an empty object. [`Cache::get`]
-//! reproduces every one of these via the private `is_falsy` helper: an [`Envelope`] whose wire
-//! value (`Envelope::as_value`) is any of the six degenerate shapes above is treated as a miss.
-//! The stale entry is left in place (Python doesn't delete it either); it is simply overwritten
-//! the next time the caller writes a fresh value via [`Cache::put`].
+//! **This is a faithful port of a real Python quirk — do not "fix" it.** Falsy cached values are
+//! never served. `eero-api` guards every cached read with `if cached:` (e.g. `client.py:249-250,
+//! 275-276, 352-353, 381-382, 456-457, 487-488, 599-600, 630-631`) — a Python truthiness check — so
+//! a cached value that is falsy is treated as a cache miss and silently refetched, even though a
+//! timestamp says the entry is still "fresh". Python truthiness maps onto the JSON shapes this
+//! crate stores as: `None` → JSON `null`, `False` → JSON `false`, `0`/`0.0` → a numeric zero, `""`
+//! → an empty string, `[]` → an empty array, `{}` → an empty object. [`Cache::get`] reproduces
+//! every one of these via the private `is_falsy` helper: an [`Envelope`] whose wire value
+//! (`Envelope::as_value`) is any of the six degenerate shapes above is treated as a miss. The stale
+//! entry is left in place (Python doesn't delete it either); it is simply overwritten the next time
+//! the caller writes a fresh value via [`Cache::put`].
 //!
 //! # `refresh_cache` and `cache_timeout = 0`
 //!
@@ -65,28 +66,54 @@
 //!
 //! # Invalidation
 //!
-//! [`Cache::clear`] mirrors `clear_cache()` (`client.py:120-125`, called from `verify`, `logout`,
-//! and every credential-clearing path — `:194, 205, 225, 234`). [`Cache::invalidate`] mirrors the
+//! [`Cache::clear`] mirrors `clear_cache()` (`client.py:252-259` at `v8.4.1`, called from
+//! `verify`, `logout`, and every credential-clearing path). [`Cache::invalidate`] mirrors the
 //! many single-key deletes scattered through `client.py` (`_invalidate_device_cache`,
 //! `_invalidate_profile_cache`, `_invalidate_profiles_list_cache`, and the inline
 //! `del self._cache[bucket][key]` after reboot/LED/nightlight, guest-network, speed-test and
-//! network-rename writes). **`account` and `networks` are never invalidated by any Python writer**
-//! — nothing in this crate calls `invalidate` on those keys either; that is a `client.rs`-level
-//! fact about which methods it calls, not something `Cache` enforces.
+//! network-rename writes). **`account` and `networks` are never invalidated by any Python writer
+//! except the four account writes** — nothing else in this crate calls `invalidate` on those
+//! keys either; that is a `Client`-level fact about which methods it calls, not something
+//! `Cache` enforces.
 //!
-//! Two behaviours are intentionally **safer** than `eero-api`, per the port plan
-//! §3.8's "what's new" list. Both are marked `Divergence from eero-api:` at the exact point they
-//! apply:
+//! # Reads in flight during an invalidation
+//!
+//! Every invalidator ([`Cache::invalidate`], [`Cache::invalidate_bucket`], [`Cache::clear`])
+//! advances one cache-wide generation counter, whether or not it removed anything. A cached read
+//! takes a snapshot of that counter after its cache check and before it awaits the request, and
+//! stores its response only if the counter is still the same afterwards — so a read that started
+//! before a write and finished after it hands its response to its own caller but cannot put the
+//! pre-write snapshot back in the cache for everyone else. This mirrors `_cache_epoch` /
+//! `_update_cache(.., epoch=)` (`client.py:111-113`, `:198-229` at `v8.4.1`). The counter is
+//! cache-wide on purpose: invalidating one resource also blocks the fill of an unrelated read
+//! that is in flight, which costs at most one extra fetch and never leaves stale data behind.
+//! [`Cache::put`] stays unconditional, and neither [`Cache::put`] nor the expiry pruning done by
+//! [`Cache::get`] advances the counter. The counter lives under the same lock as the entries, so
+//! the check and the insert in the guarded store cannot be separated by an invalidation.
+//!
+//! Two behaviours are intentionally **safer** than `eero-api`. Both are marked
+//! `Divergence from eero-api:` at the exact point they apply:
 //!
 //! - (a) see [`Cache::clear`] — clearing removes timestamps, not just values.
-//! - (b) is a **contract for `client.rs`**, not code in this module (`Cache` has no notion of
-//!   "LED brightness" or "DNS settings"): `eero-api`'s `set_led_brightness`
-//!   (`client.py:1052-1057`) never invalidates `eeros`, and its DNS/SQM/security setters
-//!   (`client.py:1178-1330`) never invalidate `network`, even though the written fields are part
-//!   of those cached objects. `client.rs` MUST call `invalidate(&CacheKey::eeros(network_id))`
-//!   after a successful LED-brightness write, and `invalidate(&CacheKey::network(network_id))`
-//!   after a successful DNS, SQM or security write. Both are documented here so the next task
-//!   does not have to re-derive them from `client.py`.
+//! - (b) is a **contract for the `Client` facade**, not code in this module (`Cache` has no
+//!   notion of "LED brightness" or "DNS settings"): `eero-api`'s `set_led_brightness` never
+//!   invalidates `eeros`, and its DNS/SQM/security setters never invalidate `network`, even
+//!   though the written fields are part of those cached objects. The facade therefore calls
+//!   `invalidate(&CacheKey::eeros(network_id))` after a successful LED-brightness write, and
+//!   `invalidate(&CacheKey::network(network_id))` after a successful DNS, SQM or security write.
+//!
+//! # Expired entries
+//!
+//! [`Cache::get`] removes an entry it finds expired, as `_is_cache_valid` does
+//! (`client.py:162-196` at `v8.4.1`), so a long-lived client does not accumulate devices and
+//! profiles it will never serve again. Entries that are never read again stay until a write or
+//! [`Cache::clear`] removes them.
+//!
+//! With a zero TTL every entry is expired the moment it is written, so [`Cache::get`] removes the
+//! key it is asked for, and the guarded store the `Client` getters use (`Cache::put_if_current`)
+//! stores nothing: a client built with `cache_ttl(Duration::ZERO)` keeps no envelope (the Wi-Fi
+//! password in a `network[..]` response included) in memory after the call that fetched it.
+//! [`Cache::put`] stays unconditional.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -105,9 +132,9 @@ use crate::envelope::Envelope;
 /// buckets with no network id to scope by, so dropping either one is just
 /// `cache.invalidate(&CacheKey::Account)` / `cache.invalidate(&CacheKey::Networks)` — a whole
 /// enum variant would be a distinction without a difference. `Bucket` exists specifically for
-/// the shape phase 5 needs: "drop every device entry for network N" or "drop every profile
-/// entry for network N" in one call, without the caller enumerating which device/profile ids
-/// happen to be cached for that network.
+/// the shape the mutating `Client` methods need: "drop every device entry for network N" or
+/// "drop every profile entry for network N" in one call, without the caller enumerating which
+/// device/profile ids happen to be cached for that network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bucket {
     /// The `network[{nid}]` bucket.
@@ -285,11 +312,34 @@ struct Entry {
     inserted_at: Instant,
 }
 
+/// An opaque snapshot of a [`Cache`]'s invalidation counter, taken by
+/// `Cache::generation` and handed back to `Cache::put_if_current`.
+///
+/// Two snapshots are equal exactly when no invalidation ran between them. The counter wraps
+/// instead of overflowing; only inequality is ever checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheGeneration(u64);
+
+/// Everything a [`Cache`] guards with one lock: the entries and the invalidation counter, so a
+/// guarded store can compare the counter and insert without an invalidation slipping in between.
+struct Inner {
+    entries: HashMap<CacheKey, Entry>,
+    generation: u64,
+}
+
+impl Inner {
+    /// Advances the invalidation counter. Called by every invalidator under the write lock,
+    /// whether or not it removed anything.
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
 /// An in-memory, TTL-bounded cache of [`Envelope`] values, keyed by [`CacheKey`].
 ///
-/// This is a hand-written map rather than a crate like `moka`: the port plan
-/// §3.8 rejected `moka` as overkill for eight key shapes with no eviction policy beyond TTL
-/// (Python has none either — the map is bounded by how many networks/devices/profiles exist).
+/// This is a hand-written map rather than a crate like `moka`, which would be overkill for eight
+/// key shapes with no eviction policy beyond TTL (Python has none either — the map is bounded by
+/// how many networks/devices/profiles exist).
 ///
 /// # Locking
 ///
@@ -302,9 +352,9 @@ struct Entry {
 /// elsewhere in the process should not turn every future cache access into a panic too — via
 /// [`PoisonError::into_inner`].
 ///
-/// `Cache` is cheap to [`Clone`]: the map lives behind an [`Arc`], so cloning shares the same
-/// underlying storage (the way `client.rs` is expected to hand copies of one `Cache` to whatever
-/// needs it) rather than duplicating entries.
+/// `Cache` is cheap to [`Clone`]: the map and the invalidation counter live behind an [`Arc`],
+/// so cloning shares the same underlying storage (the way the `Client` facade hands copies of one
+/// `Cache` to whatever needs it) rather than duplicating entries.
 ///
 /// # Examples
 ///
@@ -331,69 +381,102 @@ struct Entry {
 /// ```
 pub struct Cache {
     ttl: Duration,
-    inner: Arc<RwLock<HashMap<CacheKey, Entry>>>,
+    inner: Arc<RwLock<Inner>>,
 }
 
 impl Cache {
     /// Creates an empty cache with the given TTL.
     ///
-    /// `ttl = Duration::ZERO` disables reads entirely (see the module-level docs); it does not
-    /// disable writes.
+    /// `ttl = Duration::ZERO` disables reads entirely (see the module-level docs), and
+    /// [`Cache::get`] then removes whatever it is asked for. [`Cache::put`] still stores, but the
+    /// guarded store the `Client` getters use does not.
     #[must_use]
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(Inner {
+                entries: HashMap::new(),
+                generation: 0,
+            })),
         }
     }
 
     /// Reads the map, recovering from a poisoned lock instead of panicking.
-    fn read(&self) -> RwLockReadGuard<'_, HashMap<CacheKey, Entry>> {
+    fn read(&self) -> RwLockReadGuard<'_, Inner> {
         self.inner.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Writes the map, recovering from a poisoned lock instead of panicking.
-    fn write(&self) -> RwLockWriteGuard<'_, HashMap<CacheKey, Entry>> {
+    fn write(&self) -> RwLockWriteGuard<'_, Inner> {
         self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `entry` has lived for at least this cache's TTL (`_is_cache_valid`'s strict `<`
+    /// makes an entry exactly `ttl` old already expired, `client.py:188`).
+    fn is_expired(&self, entry: &Entry) -> bool {
+        entry.inserted_at.elapsed() >= self.ttl
     }
 
     /// Returns a cached value for `key`, or `None` on a miss.
     ///
     /// A "miss" covers three cases, matching `_is_cache_valid` plus the `if cached:` guard in
-    /// `eero-api src/eero/client.py:77-93, 249-250`: no entry exists for `key`; an entry exists
-    /// but was written `>= ` the cache's TTL ago; or an entry exists, is fresh, but its value is
-    /// "falsy" (an empty JSON object or empty JSON array — see the module-level docs). The third
-    /// case does not remove the stale entry; it is simply not served.
+    /// `eero-api src/eero/client.py:162-196, 590-594` at `v8.4.1`: no entry exists for `key`; an
+    /// entry exists but was written `>= ` the cache's TTL ago; or an entry exists, is fresh, but
+    /// its value is "falsy" (an empty JSON object or empty JSON array — see the module-level
+    /// docs). The third case does not remove the entry; it is simply not served.
     ///
-    /// Always `None` when this cache's TTL is [`Duration::ZERO`], without taking the lock.
+    /// An entry found expired is removed (`client.py:188-196`), after re-checking under the
+    /// write lock that a concurrent [`Cache::put`] has not refreshed it in the meantime. Pruning
+    /// does not advance the invalidation counter: it removes nothing a reader could still be
+    /// served.
+    ///
+    /// Always `None` when this cache's TTL is [`Duration::ZERO`]: a zero-TTL cache never serves a
+    /// read, because every entry is already expired (`_is_cache_valid` finds each one so and
+    /// deletes it, `client.py:188-196`), so the entry under `key`, if any, is removed.
     #[must_use]
     pub fn get(&self, key: &CacheKey) -> Option<Envelope> {
         if self.ttl.is_zero() {
+            self.write().entries.remove(key);
             return None;
         }
 
-        let entries = self.read();
-        let entry = entries.get(key)?;
-        if entry.inserted_at.elapsed() >= self.ttl {
-            return None;
+        {
+            let inner = self.read();
+            let entry = inner.entries.get(key)?;
+            if !self.is_expired(entry) {
+                if is_falsy(&entry.value) {
+                    return None;
+                }
+                return Some(entry.value.clone());
+            }
         }
-        if is_falsy(&entry.value) {
-            return None;
+
+        let mut inner = self.write();
+        if inner
+            .entries
+            .get(key)
+            .is_some_and(|entry| self.is_expired(entry))
+        {
+            inner.entries.remove(key);
         }
-        Some(entry.value.clone())
+        None
     }
 
     /// Stores `value` under `key`, stamped with the current time.
     ///
     /// Unconditional: unlike [`Cache::get`], this is never skipped by a zero TTL — it mirrors
-    /// `_update_cache`'s unconditional write (`eero-api src/eero/client.py:95-104`), which every
-    /// cached getter calls after a live fetch regardless of `refresh_cache` or `cache_timeout`.
-    /// A caller implementing `refresh_cache` semantics simply skips calling [`Cache::get`] for
-    /// that one call while still calling `put` — `Cache` has no `refresh_cache` parameter of its
-    /// own.
+    /// `_update_cache`'s unconditional write (`eero-api src/eero/client.py:198-229` at `v8.4.1`
+    /// with no `epoch=`), which every cached getter calls after a live fetch regardless of
+    /// `refresh_cache` or `cache_timeout`. A caller implementing `refresh_cache` semantics simply
+    /// skips calling [`Cache::get`] for that one call while still calling `put` — `Cache` has no
+    /// `refresh_cache` parameter of its own. It does not advance the invalidation counter. With a
+    /// zero TTL the entry is never served, and the next [`Cache::get`] of the key removes it.
+    ///
+    /// The `Client` getters use `Cache::put_if_current` instead, so a response fetched before an
+    /// invalidation cannot be stored after it.
     pub fn put(&self, key: CacheKey, value: Envelope) {
-        let mut entries = self.write();
-        entries.insert(
+        let mut inner = self.write();
+        inner.entries.insert(
             key,
             Entry {
                 value,
@@ -402,53 +485,103 @@ impl Cache {
         );
     }
 
-    /// Removes a single key, if present. Mirrors the many `del self._cache[bucket][key]` /
-    /// `_invalidate_device_cache` / `_invalidate_profile_cache` sites in `client.py` (see the
-    /// module-level docs for the full list and the two divergences).
+    /// Returns a snapshot of the invalidation counter, to be taken after a cache check and
+    /// before the request whose response will be stored with `Cache::put_if_current`.
+    ///
+    /// Mirrors `cache_epoch = self._cache_epoch` (`client.py:595` at `v8.4.1`).
+    #[must_use]
+    pub(crate) fn generation(&self) -> CacheGeneration {
+        CacheGeneration(self.read().generation)
+    }
+
+    /// Stores `value` under `key` only if no invalidation has run since `generation` was taken,
+    /// and returns whether it stored.
+    ///
+    /// The comparison and the insert happen under one write lock. A rejected store is silent:
+    /// the caller still hands its response to its own caller, and later readers miss and fetch
+    /// fresh data (`_update_cache(.., epoch=)`, `client.py:219-220` at `v8.4.1`).
+    ///
+    /// With a zero TTL nothing is stored, and this returns `false`: every read would find the
+    /// entry expired, so it would only keep the response in memory.
+    pub(crate) fn put_if_current(
+        &self,
+        key: CacheKey,
+        value: Envelope,
+        generation: CacheGeneration,
+    ) -> bool {
+        if self.ttl.is_zero() {
+            return false;
+        }
+        let mut inner = self.write();
+        if inner.generation != generation.0 {
+            return false;
+        }
+        inner.entries.insert(
+            key,
+            Entry {
+                value,
+                inserted_at: Instant::now(),
+            },
+        );
+        true
+    }
+
+    /// Removes a single key, if present, and advances the invalidation counter either way.
+    /// Mirrors the many `del self._cache[bucket][key]` / `_invalidate_device_cache` /
+    /// `_invalidate_profile_cache` sites in `client.py` (see the module-level docs for the full
+    /// list and the two divergences).
     pub fn invalidate(&self, key: &CacheKey) {
-        self.write().remove(key);
+        let mut inner = self.write();
+        inner.bump_generation();
+        inner.entries.remove(key);
     }
 
     /// Removes every key belonging to `bucket` for `network_id`, leaving every other network's
-    /// entries in that same bucket untouched.
+    /// entries in that same bucket untouched, and advances the invalidation counter either way.
     ///
-    /// No single `eero-api` call site clears a whole bucket at once this way — `client.py`
-    /// deletes one key at a time (e.g. `_invalidate_device_cache` removes exactly
-    /// `devices[{nid}_{did}]` and `devices[{nid}_devices]`) — but phase 5's writers need "drop
-    /// every device entry for network N" / "drop every profile entry for network N" as a single
-    /// call rather than tracking which specific device/profile ids happen to be cached, so this
-    /// is exposed as a primitive alongside [`Cache::invalidate`] and [`Cache::clear`]. It is a
-    /// superset of what any individual Python writer does (it also drops device/profile ids
-    /// Python's own inline deletes never touch), which is strictly safer — a dropped entry is
-    /// just an extra network round trip, never stale data served past its TTL.
+    /// Python's `_invalidate_all_profile_caches` is the one call site that clears a whole
+    /// bucket this way; elsewhere `client.py` deletes one key at a time (e.g.
+    /// `_invalidate_device_cache` removes exactly the named devices' entries and
+    /// `devices[{nid}_devices]`). Writers that need "drop every device entry for network N" as a
+    /// single call, without tracking which specific device/profile ids happen to be cached, use
+    /// this primitive alongside [`Cache::invalidate`] and [`Cache::clear`]. It is a superset of
+    /// what any individual Python writer does (it also drops device/profile ids Python's own
+    /// inline deletes never touch), which is strictly safer — a dropped entry is just an extra
+    /// network round trip, never stale data served past its TTL.
     pub fn invalidate_bucket(&self, bucket: Bucket, network_id: &str) {
-        self.write()
+        let mut inner = self.write();
+        inner.bump_generation();
+        inner
+            .entries
             .retain(|key, _| !key.is_in_bucket(bucket, network_id));
     }
 
-    /// Removes every cached entry.
+    /// Removes every cached entry and advances the invalidation counter.
     ///
-    /// Mirrors `clear_cache()` (`eero-api src/eero/client.py:120-125`), called on `verify`,
-    /// `logout`, and every credential-clearing path (`:194, 205, 225, 234`).
+    /// Mirrors `clear_cache()` (`eero-api src/eero/client.py:252-259` at `v8.4.1`), called on
+    /// `verify`, `logout`, and every credential-clearing path.
     ///
     /// `Divergence from eero-api:` Python's `clear_cache()` sets each entry's `data` back to
-    /// `None` but leaves its `timestamp` untouched for the flat `account`/`networks` keys
-    /// (`client.py:122-124`), so `_is_cache_valid` can keep reporting those keys as "fresh" after
-    /// a clear — harmless only because `_get_from_cache` then returns `None`, which the `if
-    /// cached:` guard treats as a miss anyway. This method removes the whole entry — value
-    /// *and* timestamp together — so there is no stale timestamp left to reason about, for any
-    /// key shape, not just the flat ones.
+    /// `None` but leaves its `timestamp` untouched for the flat `account`/`networks` keys, so
+    /// `_is_cache_valid` can keep reporting those keys as "fresh" after a clear — harmless only
+    /// because `_get_from_cache` then returns `None`, which the `if cached:` guard treats as a
+    /// miss anyway. This method removes the whole entry — value *and* timestamp together — so
+    /// there is no stale timestamp left to reason about, for any key shape, not just the flat
+    /// ones.
     pub fn clear(&self) {
-        self.write().clear();
+        let mut inner = self.write();
+        inner.bump_generation();
+        inner.entries.clear();
     }
 
     /// Returns the number of entries currently stored, expired or not.
     ///
     /// Exists mainly for tests and for a `Cache`'s [`fmt::Debug`] output; TTL expiry is
-    /// lazy (checked on read), so this can include entries [`Cache::get`] would no longer serve.
+    /// lazy (an entry is removed when [`Cache::get`] next finds it expired), so this can include
+    /// entries [`Cache::get`] would no longer serve.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.read().len()
+        self.read().entries.len()
     }
 
     /// Returns `true` if no entries are stored, expired or not.
@@ -484,21 +617,20 @@ impl Default for Cache {
 /// `Envelope`'s own hand-written `Debug` documents.
 impl fmt::Debug for Cache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let entries = self.read();
-        let mut keys: Vec<String> = entries.keys().map(ToString::to_string).collect();
+        let inner = self.read();
+        let mut keys: Vec<String> = inner.entries.keys().map(ToString::to_string).collect();
         keys.sort_unstable();
         f.debug_struct("Cache")
             .field("ttl", &self.ttl)
-            .field("len", &entries.len())
+            .field("len", &inner.entries.len())
             .field("keys", &keys)
             .finish_non_exhaustive()
     }
 }
 
 /// Returns `true` if `value`'s wire payload is "falsy" in the Python sense this cache
-/// reproduces. See the module-level "falsy-value rule" docs and
-/// the port plan §1.5 — **this is a deliberate port of a real Python quirk,
-/// not a bug to clean up.**
+/// reproduces. See the module-level "falsy-value rule" docs — **this is a deliberate port of a
+/// real Python quirk, not a bug to clean up.**
 fn is_falsy(value: &Envelope) -> bool {
     match value.as_value() {
         Value::Null => true,
@@ -602,10 +734,10 @@ mod tests {
 
     #[test]
     fn each_falsy_shape_is_treated_as_a_miss() {
-        // The five shapes the task brief calls out verbatim, plus JSON `false` for full parity
-        // with Python's `if cached:` truthiness (see the module-level "falsy-value rule" docs
-        // and the port plan §1.5). Every one of these must be a miss even
-        // though the entry is freshly written and well within the TTL.
+        // The five falsy shapes (`null`, `{}`, `[]`, `""`, `0`), plus JSON `false` for full
+        // parity with Python's `if cached:` truthiness (see the module-level "falsy-value rule"
+        // docs). Every one of these must be a miss even though the entry is freshly written and
+        // well within the TTL.
         let falsy_shapes = [
             ("null", json!(null)),
             ("empty object", json!({})),
@@ -674,9 +806,44 @@ mod tests {
     fn zero_ttl_disables_reads_but_not_writes() {
         let cache = Cache::new(Duration::ZERO);
         cache.put(CacheKey::Account, non_empty());
+        assert_eq!(cache.len(), 1, "the write must still have happened");
 
         assert!(cache.get(&CacheKey::Account).is_none());
-        assert_eq!(cache.len(), 1, "the write must still have happened");
+    }
+
+    #[test]
+    fn zero_ttl_read_removes_the_entry_it_is_asked_for() {
+        let cache = Cache::new(Duration::ZERO);
+        cache.put(CacheKey::Account, non_empty());
+        cache.put(CacheKey::Networks, non_empty());
+
+        assert!(cache.get(&CacheKey::Account).is_none());
+
+        assert_eq!(cache.len(), 1, "only the key that was read is pruned");
+        assert!(cache.get(&CacheKey::Networks).is_none());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn zero_ttl_guarded_store_keeps_nothing() {
+        let cache = Cache::new(Duration::ZERO);
+        let generation = cache.generation();
+
+        let stored = cache.put_if_current(CacheKey::Account, non_empty(), generation);
+
+        assert!(!stored);
+        assert_eq!(cache.len(), 0, "an entry no read could serve is not kept");
+    }
+
+    #[test]
+    fn zero_ttl_does_not_prune_by_advancing_the_invalidation_counter() {
+        let cache = Cache::new(Duration::ZERO);
+        let generation = cache.generation();
+        cache.put(CacheKey::Account, non_empty());
+
+        let _ = cache.get(&CacheKey::Account);
+
+        assert_eq!(cache.generation(), generation);
     }
 
     // ===================== key/bucket shapes =====================
@@ -749,9 +916,9 @@ mod tests {
 
     #[test]
     fn devices_for_different_networks_never_collide() {
-        // The exact scenario the task brief calls out: two networks' `devices` entries — both
-        // the `{nid}_devices` list key and a `{nid}_{did}` single-device key sharing the same
-        // device id across networks — must never overwrite one another.
+        // Two networks' `devices` entries — both the `{nid}_devices` list key and a
+        // `{nid}_{did}` single-device key sharing the same device id across networks — must
+        // never overwrite one another.
         let cache = Cache::new(Duration::from_secs(60));
         cache.put(
             CacheKey::devices("net-1"),
@@ -847,9 +1014,9 @@ mod tests {
 
     #[test]
     fn invalidate_bucket_drops_only_the_targeted_networks_entries() {
-        // The required behaviour phase 5 depends on: "drop every device entry for network N"
-        // must leave network M's device entries alone, even though both live in the same
-        // `Devices` bucket and even share a device id.
+        // The required behaviour the mutating `Client` methods depend on: "drop every device
+        // entry for network N" must leave network M's device entries alone, even though both
+        // live in the same `Devices` bucket and even share a device id.
         let cache = Cache::new(Duration::from_secs(60));
         cache.put(CacheKey::devices("net-1"), non_empty());
         cache.put(CacheKey::device("net-1", "shared-id"), non_empty());
@@ -887,6 +1054,265 @@ mod tests {
         assert!(cache.get(&CacheKey::profile("net-1", "p2")).is_none());
         assert!(cache.get(&CacheKey::profiles("net-2")).is_some());
         assert!(cache.get(&CacheKey::profile("net-2", "p1")).is_some());
+    }
+
+    // ===================== invalidation generation =====================
+
+    #[test]
+    fn generation_advances_on_invalidate_even_when_the_key_is_absent() {
+        let cache = Cache::new(Duration::from_secs(60));
+        let before = cache.generation();
+
+        cache.invalidate(&CacheKey::device("n1", "never-cached"));
+
+        assert_ne!(cache.generation(), before);
+    }
+
+    #[test]
+    fn generation_advances_on_invalidate_bucket_and_clear_of_an_empty_cache() {
+        let cache = Cache::new(Duration::from_secs(60));
+        let start = cache.generation();
+
+        cache.invalidate_bucket(Bucket::Devices, "n1");
+        let after_bucket = cache.generation();
+        assert_ne!(after_bucket, start);
+
+        cache.clear();
+        assert_ne!(cache.generation(), after_bucket);
+    }
+
+    #[test]
+    fn generation_advances_when_an_invalidation_removes_an_entry() {
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(CacheKey::Account, non_empty());
+        let before = cache.generation();
+
+        cache.invalidate(&CacheKey::Account);
+
+        assert_ne!(cache.generation(), before);
+    }
+
+    #[test]
+    fn put_does_not_advance_generation() {
+        let cache = Cache::new(Duration::from_secs(60));
+        let before = cache.generation();
+
+        cache.put(CacheKey::Account, non_empty());
+        cache.put(CacheKey::Account, non_empty());
+
+        assert_eq!(cache.generation(), before);
+    }
+
+    #[test]
+    fn generation_is_shared_between_clones() {
+        let cache = Cache::new(Duration::from_secs(60));
+        let clone = cache.clone();
+        let before = cache.generation();
+
+        clone.invalidate(&CacheKey::Networks);
+
+        assert_ne!(cache.generation(), before);
+        assert_eq!(cache.generation(), clone.generation());
+    }
+
+    #[test]
+    fn an_unrelated_invalidation_still_advances_the_generation() {
+        // The counter is cache-wide on purpose: dropping network-1's devices also blocks the
+        // fill of a profile read for network-2 that is in flight.
+        let cache = Cache::new(Duration::from_secs(60));
+        let captured_for_net_2_profile = cache.generation();
+
+        cache.invalidate_bucket(Bucket::Devices, "net-1");
+
+        assert!(!cache.put_if_current(
+            CacheKey::profile("net-2", "p1"),
+            non_empty(),
+            captured_for_net_2_profile
+        ));
+        assert!(cache.get(&CacheKey::profile("net-2", "p1")).is_none());
+    }
+
+    #[test]
+    fn put_if_current_stores_when_nothing_was_invalidated() {
+        let cache = Cache::new(Duration::from_secs(60));
+        let generation = cache.generation();
+
+        assert!(cache.put_if_current(CacheKey::Account, non_empty(), generation));
+
+        assert_eq!(cache.get(&CacheKey::Account), Some(non_empty()));
+    }
+
+    #[test]
+    fn put_if_current_stores_after_unguarded_puts() {
+        // A concurrent plain `put` is not an invalidation: the generation is unchanged.
+        let cache = Cache::new(Duration::from_secs(60));
+        let generation = cache.generation();
+        cache.put(CacheKey::Networks, non_empty());
+
+        assert!(cache.put_if_current(CacheKey::Account, non_empty(), generation));
+    }
+
+    #[test]
+    fn put_if_current_refuses_after_every_kind_of_invalidation() {
+        type Invalidator = fn(&Cache);
+        let invalidators: [(&str, Invalidator); 3] = [
+            ("invalidate", |cache| {
+                cache.invalidate(&CacheKey::device("n1", "d1"));
+            }),
+            ("invalidate_bucket", |cache| {
+                cache.invalidate_bucket(Bucket::Devices, "n1");
+            }),
+            ("clear", Cache::clear),
+        ];
+
+        for (label, invalidate) in invalidators {
+            for previously_present in [false, true] {
+                let cache = Cache::new(Duration::from_secs(60));
+                let key = CacheKey::device("n1", "d1");
+                if previously_present {
+                    cache.put(key.clone(), envelope(json!({"data": {"which": "old"}})));
+                }
+                let generation = cache.generation();
+
+                invalidate(&cache);
+
+                assert!(
+                    !cache.put_if_current(
+                        key.clone(),
+                        envelope(json!({"data": {"which": "stale"}})),
+                        generation
+                    ),
+                    "{label} (previously present: {previously_present}) must reject the store"
+                );
+                assert!(
+                    cache.get(&key).is_none(),
+                    "{label} (previously present: {previously_present}) left an entry behind"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fresh_generation_taken_after_an_invalidation_is_accepted() {
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.clear();
+        let generation = cache.generation();
+
+        assert!(cache.put_if_current(CacheKey::Account, non_empty(), generation));
+    }
+
+    // ===================== expiry pruning =====================
+
+    #[tokio::test]
+    async fn an_expired_entry_is_removed_when_it_is_read() {
+        tokio::time::pause();
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(CacheKey::device("n1", "d1"), non_empty());
+        cache.put(CacheKey::device("n1", "d2"), non_empty());
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        // d2 is written again, so only d1 is expired.
+        cache.put(CacheKey::device("n1", "d2"), non_empty());
+
+        assert!(cache.get(&CacheKey::device("n1", "d1")).is_none());
+        assert_eq!(cache.len(), 1, "only the refreshed d2 entry is left");
+        assert!(cache.get(&CacheKey::device("n1", "d2")).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_expired_single_entry_key_is_removed_when_it_is_read() {
+        tokio::time::pause();
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(CacheKey::Account, non_empty());
+        cache.put(CacheKey::Networks, non_empty());
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(cache.get(&CacheKey::Account).is_none());
+
+        assert_eq!(
+            cache.len(),
+            1,
+            "the account entry is gone, networks is not read"
+        );
+        assert!(cache.get(&CacheKey::Networks).is_none());
+        assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fresh_entries_are_left_alone_by_a_read() {
+        tokio::time::pause();
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(CacheKey::Account, non_empty());
+        cache.put(CacheKey::device("n1", "d1"), non_empty());
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(cache.get(&CacheKey::Account).is_some());
+        assert!(cache.get(&CacheKey::device("n1", "d1")).is_some());
+        assert!(cache.get(&CacheKey::device("n1", "absent")).is_none());
+
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reading_a_pruned_key_again_is_a_plain_miss() {
+        tokio::time::pause();
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(CacheKey::device("n1", "d1"), non_empty());
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        assert!(cache.get(&CacheKey::device("n1", "d1")).is_none());
+        assert!(cache.get(&CacheKey::device("n1", "d1")).is_none());
+        assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_is_replaced_by_the_next_write() {
+        tokio::time::pause();
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(
+            CacheKey::Account,
+            envelope(json!({"data": {"name": "old"}})),
+        );
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(cache.get(&CacheKey::Account).is_none());
+
+        cache.put(
+            CacheKey::Account,
+            envelope(json!({"data": {"name": "new"}})),
+        );
+
+        let cached = cache
+            .get(&CacheKey::Account)
+            .expect("fresh entry is served");
+        assert_eq!(cached.data()["name"], json!("new"));
+    }
+
+    #[test]
+    fn a_fresh_falsy_entry_is_not_pruned() {
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(CacheKey::Account, envelope(json!({})));
+
+        assert!(cache.get(&CacheKey::Account).is_none());
+
+        assert_eq!(
+            cache.len(),
+            1,
+            "a falsy entry is not served but is not expired either"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_does_not_advance_the_generation() {
+        tokio::time::pause();
+        let cache = Cache::new(Duration::from_secs(60));
+        cache.put(CacheKey::Account, non_empty());
+        let generation = cache.generation();
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        assert!(cache.get(&CacheKey::Account).is_none());
+
+        assert_eq!(cache.generation(), generation);
+        assert!(cache.put_if_current(CacheKey::Account, non_empty(), generation));
     }
 
     // ===================== Debug redaction =====================

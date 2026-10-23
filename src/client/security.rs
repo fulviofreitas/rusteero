@@ -1,25 +1,27 @@
-//! `Client` methods for the `SecurityAPI` domain, v8.0.4.
+//! `Client` methods for the `SecurityAPI` domain, v8.4.1.
 //!
-//! Ported from `eero-api src/eero/client.py:2205-2801` (the Security/MLO/fast-transition/
-//! Passpoint/proxied-nodes group of `EeroClient`). Every method below passes
+//! Ported from `eero-api src/eero/client.py:2852-2960` and `:3571-3620` (the Security and
+//! MLO/fast-transition/Passpoint/proxied-nodes groups of `EeroClient`). Every method below passes
 //! `**self._network_parent_kwargs(network_id)` in Python — this port's [`Client::network_parent`]
-//! equivalent.
+//! equivalent — except [`Client::set_ipv6_upstream`], which takes a caller `parent` and passes
+//! `**self._network_parent_kwargs_or(network_id, parent)`.
 //!
 //! **`Client::set_thread_enabled` is not defined here.** The old `SecurityAPI.set_thread` write
 //! this method used to wrap is fully removed upstream (replaced by the `ThreadAPI` family) — see
-//! [`crate::client::Client::set_thread_enabled`] in `src/client/thread.rs`, the v8.0.4
-//! replacement wrapping the new `ThreadAPI.set_thread_enabled`.
+//! [`crate::client::Client::set_thread_enabled`] in `src/client/thread.rs`, the replacement
+//! wrapping `ThreadAPI.set_thread_enabled`.
 
 use super::Client;
 use crate::envelope::Envelope;
 use crate::error::Error;
+use serde_json::Value;
 
 impl Client {
     // ==================== Security ====================
 
     /// Gets security settings — returns the raw Eero API response.
     ///
-    /// Ported from `get_security_settings()` (`client.py:2205-2208`). `auto_discover = false` —
+    /// Ported from `get_security_settings()` (`client.py:2852-2857`). `auto_discover = false` —
     /// see [`Client::get_diagnostics`].
     ///
     /// # Errors
@@ -38,7 +40,7 @@ impl Client {
 
     /// Enables or disables WPA3 encryption — returns the raw Eero API response.
     ///
-    /// Ported from `set_wpa3` (`client.py:2212-2219`). `auto_discover = false`. On success,
+    /// Ported from `set_wpa3` (`client.py:2859-2866`). `auto_discover = false`. On success,
     /// invalidates `network[nid]`.
     ///
     /// # Errors
@@ -62,7 +64,7 @@ impl Client {
 
     /// Enables or disables band steering — returns the raw Eero API response.
     ///
-    /// Ported from `set_band_steering` (`client.py:2221-2229`). `auto_discover = false`. On
+    /// Ported from `set_band_steering` (`client.py:2868-2877`). `auto_discover = false`. On
     /// success, invalidates `network[nid]`.
     ///
     /// # Errors
@@ -86,7 +88,7 @@ impl Client {
 
     /// Enables or disables `UPnP` — returns the raw Eero API response.
     ///
-    /// Ported from `set_upnp` (`client.py:2232-2239`). `auto_discover = false`. On success,
+    /// Ported from `set_upnp` (`client.py:2879-2886`). `auto_discover = false`. On success,
     /// invalidates `network[nid]`.
     ///
     /// # Errors
@@ -111,7 +113,7 @@ impl Client {
     /// Enables or disables IPv6 (both upstream and downstream) — returns the raw Eero API
     /// response.
     ///
-    /// Ported from `set_ipv6` (`client.py:2241-2248`). `auto_discover = false`. On success,
+    /// Ported from `set_ipv6` (`client.py:2888-2895`). `auto_discover = false`. On success,
     /// invalidates `network[nid]`.
     ///
     /// # Errors
@@ -133,9 +135,44 @@ impl Client {
         Ok(response)
     }
 
+    /// Enables or disables IPv6 on the upstream (WAN) side only — returns the raw Eero API
+    /// response.
+    ///
+    /// Ported from `set_ipv6_upstream` (`client.py:2897-2937`), new at `v8.4.0`. `auto_discover =
+    /// false`. Forwards the caller's `parent` when supplied, otherwise the fresh cached network
+    /// envelope (`_network_parent_kwargs_or`), and sends only `{"ipv6_upstream": enabled}` to the
+    /// `settings` link — it never calls [`Client::set_ipv6`], which writes both flags. This is the
+    /// upstream connectivity toggle, **not** IPv6 DNS. On success, invalidates `network[nid]` only;
+    /// the eeros and devices caches are untouched.
+    ///
+    /// **Settings-class write**: unverified against a live account, and the DNS write on the same
+    /// `settings` endpoint is confirmed to reboot every eero on the mesh, so treat this one as
+    /// capable of the same. Read the current configuration first, skip the write when it already
+    /// matches, and never retry a failed write in a loop.
+    ///
+    /// # Errors
+    ///
+    /// See [`Client::get_diagnostics`]. The cache is left untouched on any `Err`.
+    pub async fn set_ipv6_upstream(
+        &self,
+        enabled: bool,
+        network_id: Option<&str>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        let network_id = self.ensure_network_id(network_id, false).await?;
+        let parent = self.network_parent_or(&network_id, parent);
+        let response = self
+            .api
+            .security()
+            .set_ipv6_upstream(&network_id, enabled, parent.as_ref())
+            .await?;
+        self.invalidate_network_cache(&network_id);
+        Ok(response)
+    }
+
     /// Configures multiple security settings in one call — returns the raw Eero API response.
     ///
-    /// Ported from `configure_security` (`client.py:2250-2269`). **`thread` is not a parameter**
+    /// Ported from `configure_security` (`client.py:2939-2960`). **`thread` is not a parameter**
     /// — see [`crate::endpoints::security::SecurityApi::configure_security`]'s own docs for why.
     /// `auto_discover = false`. On success, invalidates `network[nid]`.
     ///
@@ -175,7 +212,7 @@ impl Client {
     /// Sets the network's MLO (Multi-Link Operation) mode — returns the raw Eero API response
     /// (unverified; may reboot the mesh).
     ///
-    /// Ported from `set_mlo_mode` (`client.py:2763-2769`). `auto_discover = false`. On success,
+    /// Ported from `set_mlo_mode` (`client.py:3571-3578`). `auto_discover = false`. On success,
     /// invalidates `network[nid]`.
     ///
     /// # Errors
@@ -202,7 +239,7 @@ impl Client {
     /// Gets the network's 802.11r fast-transition setting — returns the raw Eero API response
     /// (verified read).
     ///
-    /// Ported from `get_fast_transition` (`client.py:2772-2777`). `auto_discover = false`.
+    /// Ported from `get_fast_transition` (`client.py:3580-3585`). `auto_discover = false`.
     ///
     /// # Errors
     ///
@@ -219,7 +256,7 @@ impl Client {
     /// Sets fast transition — returns the raw Eero API response (unverified; may reboot the
     /// mesh).
     ///
-    /// Ported from `set_fast_transition` (`client.py:2779-2788`). `auto_discover = false`. On
+    /// Ported from `set_fast_transition` (`client.py:3587-3596`). `auto_discover = false`. On
     /// success, invalidates `network[nid]`.
     ///
     /// # Errors
@@ -243,7 +280,7 @@ impl Client {
 
     /// Enables or disables Passpoint — returns the raw Eero API response (unverified write).
     ///
-    /// Ported from `set_passpoint_enabled` (`client.py:2790-2799`). `auto_discover = false`. On
+    /// Ported from `set_passpoint_enabled` (`client.py:3598-3607`). `auto_discover = false`. On
     /// success, invalidates `network[nid]`.
     ///
     /// # Errors
@@ -267,7 +304,7 @@ impl Client {
 
     /// Enables or disables proxied nodes — returns the raw Eero API response (unverified write).
     ///
-    /// Ported from `set_proxied_nodes` (`client.py:2801-2810`). `auto_discover = false`. On
+    /// Ported from `set_proxied_nodes` (`client.py:3609-3620`). `auto_discover = false`. On
     /// success, invalidates `network[nid]`.
     ///
     /// # Errors

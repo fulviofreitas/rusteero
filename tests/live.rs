@@ -14,10 +14,11 @@
 //! `RUSTEERO_SESSION_TOKEN` is a session token already obtained out of band (e.g. from a prior
 //! interactive login) — this file's tests only ever perform read-only calls with it.
 //!
-//! The former D-16 diagnostic (`login/verify`'s `Set-Cookie` behaviour) is gone: `v8.0.4` has no
-//! `Set-Cookie` reader anywhere in `base.py`/`auth.py`, and the login token is unconditionally the
-//! session token (see `crate::auth::flow::PendingLogin::verify`'s docs), so there is no longer an
-//! open question for a live capture to settle.
+//! The former live diagnostic of `login/verify`'s `Set-Cookie` behaviour is gone: `v8.4.1` has no
+//! `Set-Cookie` reader anywhere in `base.py`/`auth.py` (its session uses a `DummyCookieJar`,
+//! `base.py:486-490`), and the login token is unconditionally the session token (see
+//! `crate::auth::flow::PendingLogin::verify`'s docs), so there is no longer an open question for
+//! a live capture to settle.
 
 use rusteero::auth::AuthApi;
 use rusteero::auth::Session;
@@ -52,8 +53,7 @@ fn live_credentials() -> Option<String> {
 /// This only *starts* the handshake — it never calls `PendingLogin::verify`, so it never mutates
 /// which session is currently active on the account. It does, however, cause the server to send
 /// a fresh one-time code to `RUSTEERO_LOGIN_IDENTIFIER` as a side effect of starting the
-/// handshake; that email/SMS can simply be ignored (or reused for
-/// [`live_verify_sets_a_fresh_session_cookie_open_question_d16`], run separately).
+/// handshake; that email/SMS can simply be ignored.
 #[tokio::test]
 #[ignore = "hits the real Eero cloud API; see this file's module docs for how to run it"]
 async fn live_login_start_returns_a_pending_login() {

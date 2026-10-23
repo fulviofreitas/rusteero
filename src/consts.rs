@@ -1,20 +1,15 @@
 //! Wire constants: base URLs, size limits, timeouts, and other values ported from `eero-api`'s
-//! `src/eero/const.py` at `v8.0.4`.
+//! `src/eero/const.py` at `v8.4.1`.
 //!
 //! ## Deliberate omissions
 //!
 //! - **`DEFAULT_HEADERS`**: `const.py`'s dict-literal form is not ported as a separate constant
 //!   — [`DEFAULT_USER_AGENT`] and [`DEFAULT_ACCEPT_LANGUAGE`] are ported individually instead,
-//!   since `v8.0.4`'s request pipeline sends each of them as its own header
-//!   (`api/base.py:124-164`). **Decision D-7 is superseded at `v8.0.4`**: earlier `rusteero`
-//!   revisions documented that the Python library built this mobile-style `User-Agent` string but
-//!   never actually sent it, and deliberately sent reqwest's own default instead. That was true
-//!   against `v6.2.0`'s `session.request(...)` call site, which never passed `headers=`. At
-//!   `v8.0.4` the request pipeline was rewritten and `build_request_headers` unconditionally sets
-//!   `User-Agent: <DEFAULT_USER_AGENT>` on every request (`api/base.py:154-155`) — the header is
-//!   now genuinely sent. Wiring this into the transport's header set is phase B's job (this phase
-//!   only ports the constant itself); until that lands, a caller can still opt in via
-//!   `TransportBuilder::user_agent`.
+//!   since the request pipeline sends each of them as its own header (`api/base.py:136-183`).
+//!   The `User-Agent` is genuinely sent on every request: `build_request_headers` sets
+//!   `User-Agent: <DEFAULT_USER_AGENT>` unless the caller supplies their own, and
+//!   [`crate::transport`] does the same (override via `TransportBuilder::user_agent`;
+//!   [`LEGACY_USER_AGENT`] reproduces the previous default).
 //! - **`EeroDeviceType`, `EeroNetworkStatus`, `EeroDeviceStatus`** (`const.py`'s trailing enums)
 //!   are not ported. All three are dead code in the Python library — nothing in `src/eero/`
 //!   imports or branches on them (confirmed by grep across the package) — so there is no
@@ -24,13 +19,13 @@ use std::time::Duration;
 
 /// Scheme + host of the Eero cloud API, with no path, query, or trailing slash.
 ///
-/// Ported from `API_HOST` (`const.py:8`). The single source of truth every versioned base URL
+/// Ported from `API_HOST` (`const.py:7`). The single source of truth every versioned base URL
 /// below (and [`api_endpoint`]) is derived from.
 pub const API_HOST: &str = "https://api-user.e2ro.com";
 
 /// Builds the base endpoint URL for a given API version segment (e.g. `"2.2"` or `"2.3"`).
 ///
-/// Ported from `api_endpoint` (`const.py:11-25`): the single place that joins a version segment
+/// Ported from `api_endpoint` (`const.py:10-25`): the single place that joins a version segment
 /// onto [`API_HOST`]. `API_BASE_22`/`API_BASE_23` are this same join, pre-computed as `'static`
 /// strings for the two versions this crate actually uses today; this function stays available
 /// for call sites (e.g. `links`/`params`) that only have a version segment string, not an
@@ -43,7 +38,7 @@ pub fn api_endpoint(version: &str) -> String {
 /// Default API version used by most families (networks, eeros, profiles, guest network, and the
 /// majority of resources).
 ///
-/// Ported from `API_VERSION_DEFAULT` (`const.py:29`).
+/// Ported from `API_VERSION_DEFAULT` (`const.py:30`).
 pub const API_VERSION_DEFAULT: &str = "2.2";
 
 /// API version required for device-mutation writes (nickname, pause).
@@ -66,36 +61,40 @@ pub const API_VERSION_SECONDARY_WAN: &str = "2.3";
 
 /// Base URL for API version 2.2 — the default version for almost every endpoint.
 ///
-/// Ported from `API_ENDPOINT` (`const.py:51`), i.e. `api_endpoint(API_VERSION_DEFAULT)`.
+/// Ported from `API_ENDPOINT` (`const.py:50`), i.e. `api_endpoint(API_VERSION_DEFAULT)`.
 pub const API_BASE_22: &str = "https://api-user.e2ro.com/2.2";
 
 /// Base URL for API version 2.3.
 ///
-/// Ported from `DEVICE_UPDATE_ENDPOINT` (`const.py:52`), i.e.
+/// Ported from `DEVICE_UPDATE_ENDPOINT` (`const.py:51`), i.e.
 /// `api_endpoint(API_VERSION_DEVICE_WRITES)`.
 pub const API_BASE_23: &str = "https://api-user.e2ro.com/2.3";
 
 /// Maximum number of bytes read from a single response body before the request is aborted.
 ///
 /// Guards against unbounded memory consumption from a hostile or misbehaving upstream response.
-/// Ported from `MAX_RESPONSE_BYTES` (`const.py:77`).
+/// Ported from `MAX_RESPONSE_BYTES` (`const.py:109`).
 pub const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Overall request timeout, from connect through to the full response body.
 ///
 /// Ported from `api/base.py`'s `aiohttp.ClientTimeout(total=30, sock_read=10)`; this is the
 /// `total` half of that pair. See [`READ_TIMEOUT`] for the `sock_read` half. Unchanged at
-/// `v8.0.4`.
+/// `v8.4.1`. The transport enforces it per attempt, and a per-call
+/// [`crate::transport::RequestTimeout`] replaces this pair wholesale for that one request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Per-read timeout applied while streaming a response body.
+/// Per-read timeout: the longest the transport waits for the response head, and then for each
+/// chunk of the response body.
 ///
-/// Ported from `api/base.py`'s `sock_read=10`. Unchanged at `v8.0.4`.
+/// Ported from `api/base.py`'s `sock_read=10`. Unchanged at `v8.4.1`. aiohttp starts `sock_read`
+/// only once the request is written; the wait for the response head here also covers connecting
+/// and writing, since that is the one point the HTTP client exposes.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default time-to-live for cached responses.
 ///
-/// Ported from `CACHE_TIMEOUT` (`const.py:74`).
+/// Ported from `CACHE_TIMEOUT` (`const.py:106`).
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Name of the cookie that carries the session token on an authenticated request, when the
@@ -131,14 +130,47 @@ pub const USER_TOKEN_HEADER: &str = "X-User-Token";
 
 /// Default value of the `User-Agent` header sent on every request.
 ///
-/// Ported from `DEFAULT_USER_AGENT` (`const.py:68`). Decision D-7 is superseded at `v8.0.4`: this
-/// header is genuinely sent by the Python library at this tag, and by [`crate::transport`] here
-/// unless overridden via `TransportBuilder::user_agent`.
-pub const DEFAULT_USER_AGENT: &str = "eero/3.0 (iPhone; iOS 17.0)";
+/// Ported from `DEFAULT_USER_AGENT` (`const.py:64-96`). A mobile-style string, sent by
+/// [`crate::transport`] on every request unless overridden via `TransportBuilder::user_agent`
+/// (or `ClientBuilder::user_agent`).
+///
+/// The Eero cloud also reads this string as the client's app version and decides which
+/// capabilities to advertise from it (`eero-api` issue #135). The same account, network and
+/// session, one `GET networks/{id}` per string, counting the capabilities marked `capable`:
+///
+/// | Client version string | Capable | `has_min_mobile_version: false` |
+/// |---|--:|--:|
+/// | `eero/3.0 (iPhone; iOS 17.0)` (the previous default, [`LEGACY_USER_AGENT`]) | 41 | 44 |
+/// | `eero/6.16.0 (iPhone; iOS 17.4.1)` | 66 | 10 |
+/// | `eero-ios/2026.8.1 (iPhone; iOS 18.5)` (this default) | 76 | 1 |
+/// | `eero-android/2026.8.1` | 77 | 1 |
+///
+/// The product token matters as well as the version — `eero/2026.8.1` scores 70 where
+/// `eero-ios/2026.8.1` scores 76 — so both were updated together. The capabilities the previous
+/// default gave up include `led_action`, `device_blacklist`, `device_management`, `diagnostics`,
+/// `device_usage`, `unified_content_filters`, `block_apps`, `block_apps_categories`,
+/// `ddns_enabled`, `port_forward_range`, `historical_usage`, `ac_compat`, and the five
+/// `dnsfilter_*` entries.
+///
+/// Side effect: under this default the network's `resources` map points `forwards`, `routing` and
+/// `support` at API 2.3 instead of 2.2. `forwards` and `routing` return the same shape on both
+/// versions; `support` does not — 2.3 returns a `contacts` array where 2.2 returns a flat object.
+/// The `get_support`, `get_forwards` and `get_routing` endpoint methods pin their requests to
+/// 2.2 regardless of what a parent envelope publishes, so their return shape does not change.
+/// Pass [`LEGACY_USER_AGENT`] to keep every link on 2.2.
+pub const DEFAULT_USER_AGENT: &str = "eero-ios/2026.8.1 (iPhone; iOS 18.5)";
+
+/// The previous default `User-Agent`, kept available so its (lower-capability) behaviour can
+/// still be reproduced — see [`DEFAULT_USER_AGENT`] for the capability comparison.
+///
+/// Ported from `LEGACY_USER_AGENT` (`const.py:98-100`). Pass it to
+/// `ClientBuilder::user_agent(Some(LEGACY_USER_AGENT.to_owned()))` (or the same method on
+/// `TransportBuilder`) to send it on every request.
+pub const LEGACY_USER_AGENT: &str = "eero/3.0 (iPhone; iOS 17.0)";
 
 /// Default value of the `X-Accept-Language` header sent on every request.
 ///
-/// Ported from `DEFAULT_ACCEPT_LANGUAGE` (`const.py:71`).
+/// Ported from `DEFAULT_ACCEPT_LANGUAGE` (`const.py:103`).
 pub const DEFAULT_ACCEPT_LANGUAGE: &str = "en-US";
 
 /// Name of the form field the `logout` request's body carries the session-cookie-shaped value
@@ -158,14 +190,22 @@ pub const SESSION_COOKIE_PREFIX: &str = "s=";
 
 /// Fixed delay between bounded `GET` retries (transport errors / 5xx only).
 ///
-/// Ported from `GET_RETRY_DELAY_SECONDS` (`const.py:80`, `0.5`). Applied by
+/// Ported from `GET_RETRY_DELAY_SECONDS` (`const.py:112`, `0.5`). Applied by
 /// [`crate::transport::Transport`]'s bounded `GET`-only retry loop
 /// (`TransportBuilder::get_retries`).
 pub const GET_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Upper bound on a parsed `Retry-After` value: one day.
+///
+/// Ported from `RETRY_AFTER_MAX_SECONDS` (`api/base.py:45-50`, `86400.0`). The header is
+/// server-controlled input: an HTTP-date far in the future, or a very long digit string, would
+/// otherwise make a caller that sleeps for the value stall indefinitely. A parsed delay is capped
+/// at this value before it reaches [`crate::Error::RateLimit`]'s `retry_after`.
+pub const RETRY_AFTER_MAX: Duration = Duration::from_hours(24);
+
 /// Version marker written to every persisted credential record.
 ///
-/// Ported from `CREDENTIAL_SCHEMA_VERSION` (`const.py:86`). A record loaded without this key
+/// Ported from `CREDENTIAL_SCHEMA_VERSION` (`const.py:118`). A record loaded without this key
 /// predates the marker — possibly carrying now-unsupported fields such as a legacy `user_token`,
 /// `refresh_token`, or `session_expiry` — and is migrated in place on load
 /// (`crate::auth::session::Session::from_stored`).
@@ -184,9 +224,9 @@ mod tests {
         API_BASE_22, API_BASE_23, API_HOST, API_VERSION_DEFAULT, API_VERSION_DEVICE_WRITES,
         API_VERSION_MULTISTATICIP, API_VERSION_SECONDARY_WAN, CREDENTIAL_SCHEMA_VERSION,
         DEFAULT_ACCEPT_LANGUAGE, DEFAULT_CACHE_TTL, DEFAULT_USER_AGENT, GET_RETRY_DELAY,
-        LOGOUT_COOKIE_FIELD_NAME, MAX_RESPONSE_BYTES, READ_TIMEOUT, REQUEST_TIMEOUT,
-        SESSION_COOKIE_NAME, SESSION_COOKIE_PREFIX, SESSION_REFRESH_GUARD_TIMEOUT,
-        USER_TOKEN_HEADER, USER_TOKEN_KEY, api_endpoint,
+        LEGACY_USER_AGENT, LOGOUT_COOKIE_FIELD_NAME, MAX_RESPONSE_BYTES, READ_TIMEOUT,
+        REQUEST_TIMEOUT, RETRY_AFTER_MAX, SESSION_COOKIE_NAME, SESSION_COOKIE_PREFIX,
+        SESSION_REFRESH_GUARD_TIMEOUT, USER_TOKEN_HEADER, USER_TOKEN_KEY, api_endpoint,
     };
     use std::time::Duration;
 
@@ -244,8 +284,26 @@ mod tests {
 
     #[test]
     fn default_headers_match_const_py() {
-        assert_eq!(DEFAULT_USER_AGENT, "eero/3.0 (iPhone; iOS 17.0)");
+        assert_eq!(DEFAULT_USER_AGENT, "eero-ios/2026.8.1 (iPhone; iOS 18.5)");
         assert_eq!(DEFAULT_ACCEPT_LANGUAGE, "en-US");
+    }
+
+    #[test]
+    fn legacy_user_agent_is_the_previous_default() {
+        assert_eq!(LEGACY_USER_AGENT, "eero/3.0 (iPhone; iOS 17.0)");
+        assert_ne!(LEGACY_USER_AGENT, DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn both_user_agents_are_printable_ascii_without_cr_lf() {
+        // Mirrors `_validate_header_value` (`api/base.py:120-133`): the defaults must pass the
+        // very check that guards a caller-supplied value.
+        for value in [DEFAULT_USER_AGENT, LEGACY_USER_AGENT] {
+            assert!(
+                value.bytes().all(|b| (0x20..=0x7E).contains(&b)),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
@@ -257,6 +315,12 @@ mod tests {
     #[test]
     fn get_retry_delay_matches_const_py() {
         assert_eq!(GET_RETRY_DELAY, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn retry_after_max_is_one_day() {
+        assert_eq!(RETRY_AFTER_MAX.as_secs(), 86_400);
+        assert_eq!(RETRY_AFTER_MAX, Duration::from_hours(24));
     }
 
     #[test]

@@ -1,23 +1,22 @@
-//! Path-traversal regression suite for security review finding F1 (HIGH), plus one end-to-end
-//! test for finding F3 (LOW).
+//! Path-traversal regression suite, plus one end-to-end test for network-id auto-discovery.
 //!
-//! F1: an empty, `"."`, or `".."` path parameter must never reach the wire. At v8.0.4 every
-//! identifier substituted into a resolved URL is validated by
+//! Path parameters: an empty, `"."`, or `".."` path parameter must never reach the wire. At v8.0.4
+//! every identifier substituted into a resolved URL is validated by
 //! [`rusteero::links::validate_identifier`] (a strict `^[A-Za-z0-9][A-Za-z0-9._:-]*$` whitelist,
-//! plus an explicit `".."` rejection) before it is ever joined onto a request URL — either
-//! directly (`child_url`, used by `BlacklistApi::remove_from_blacklist`), or via
+//! plus an explicit `".."` rejection) before it is ever joined onto a request URL — either directly
+//! (`child_url`, used by `BlacklistApi::remove_from_blacklist`), or via
 //! [`rusteero::params::resolve_nested_url`] (used by every `Nested`-routed delete/update below),
 //! whose own explicit empty-child check runs first (`field: "child"`) before it too falls back to
 //! `child_url` for a non-empty-but-still-invalid value (`field: "id"`). See `src/routes/mod.rs`'s
 //! module docs ("Path traversal") for the full mechanism; the pre-v8.0.4 `Route`/`validate_segment`
 //! model this file used to pin directly is gone.
 //!
-//! Every destructive route below is exercised the same way, proving the point the module docs
-//! make explicitly: checking only the returned error is not enough, because the bug this finding
-//! describes was that a request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."`
-//! case therefore mounts a catch-all `wiremock::matchers::any()` mock with `.expect(0)` — if
-//! identifier validation ever regresses to the pre-fix behaviour, the mock server's own drop-time
-//! verification fails the test, not just the returned `Result`.
+//! Every destructive route below is exercised the same way, proving the point the module docs make
+//! explicitly: checking only the returned error is not enough, because the bug this suite guards
+//! against was that a request went out *at all*, to the wrong resource. Each `""`/`"."`/`".."` case
+//! therefore mounts a catch-all `wiremock::matchers::any()` mock with `.expect(0)` — if identifier
+//! validation ever regresses to the pre-fix behaviour, the mock server's own drop-time verification
+//! fails the test, not just the returned `Result`.
 //!
 //! A slash-bearing id (e.g. `"../../secrets"`) is also covered per route below, but its expected
 //! outcome is the opposite of the pre-v8.0.4 suite this file replaces: `validate_identifier`'s
@@ -31,12 +30,19 @@
 //! A positive case (an ordinary id) is included per route too, so this suite cannot pass by
 //! rejecting everything.
 //!
-//! F3: `Client::ensure_network_id`'s auto-discovery path and `Client::derive_preferred_network_id`
-//! both extract a network id out of a `/networks` response body via the shared
-//! `extract_network_id` helper (`src/client/mod.rs`), which applies `crate::routes::validate_segment`
-//! before handing a candidate id back — see `auto_discovered_network_id_rejects_a_hostile_id_field`
-//! below. Unrelated to the `Resource`/`Nested` route model: `extract_network_id` reads a candidate
-//! id straight out of an untrusted response body, never through `links::validate_identifier`.
+//! Family confinement: a *path or URL* passed in place of a bare id must name one resource of the
+//! family the method addresses, so `NetworksApi::set_network_password("/2.2/account", ..)` can no
+//! longer be retargeted onto `PUT /2.2/account/password`, and `EerosApi::reboot_eero` cannot be
+//! pointed at a network. Each rejected value below is checked against a catch-all
+//! `.expect(0)` mock; the legitimate path form still reaches the wire.
+//!
+//! Network-id auto-discovery: `Client::ensure_network_id`'s auto-discovery path and
+//! `Client::derive_preferred_network_id` both extract a network id out of a `/networks` response
+//! body via the shared `extract_network_id` helper (`src/client/mod.rs`), which applies
+//! `crate::routes::validate_segment` before handing a candidate id back — see
+//! `auto_discovered_network_id_rejects_a_hostile_id_field` below. Unrelated to the
+//! `Resource`/`Nested` route model: `extract_network_id` reads a candidate id straight out of an
+//! untrusted response body, never through `links::validate_identifier`.
 
 mod common;
 
@@ -45,15 +51,17 @@ use std::sync::Arc;
 use rusteero::auth::Session;
 use rusteero::client::Client;
 use rusteero::endpoints::blacklist::BlacklistApi;
+use rusteero::endpoints::eeros::EerosApi;
 use rusteero::endpoints::forwards::ForwardsApi;
+use rusteero::endpoints::networks::NetworksApi;
 use rusteero::endpoints::profiles::ProfilesApi;
 use rusteero::endpoints::reservations::ReservationsApi;
 use rusteero::error::Error;
 use serde_json::json;
-use wiremock::matchers::{any, method, path};
+use wiremock::matchers::{any, body_string, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 
 /// Mounts a catch-all mock on `mock` that fails the test (via `wiremock`'s own drop-time
 /// verification) the moment *any* request, on any method or path, reaches the server — the
@@ -108,7 +116,7 @@ async fn remove_from_blacklist_single_dot_id_is_rejected_before_any_request() ->
     Ok(())
 }
 
-/// The concrete reproduction from the security finding: before the fix, this DELETE landed on
+/// The concrete reproduction: before the fix, this DELETE landed on
 /// `DELETE /2.2/networks/network-0001/blacklist` — the whole blacklist, unblocking every device
 /// on the network — instead of erroring. This must be rejected with zero requests sent.
 #[tokio::test]
@@ -495,9 +503,203 @@ async fn update_reservation_slash_bearing_id_is_rejected_before_any_request() ->
     Ok(())
 }
 
-// ============================ F3: network-id auto-discovery ============================
+// ======================== family confinement: network and eero paths ========================
 
-/// Security review finding F3: a hostile or buggy `/networks` response must not hand
+/// Paths and URLs that do not name exactly one network, for methods addressing one. `{mock}` stands
+/// for the mock server's own origin, so the absolute form is on the configured host.
+const NOT_A_NETWORK: &[&str] = &[
+    "/2.2/account",
+    "/2.2/eeros/9",
+    "/2.2/networks/network_123/devices",
+    "/2.2/networks/network_123/../../account",
+    "/2.2/networks/network_123?x=1",
+    "/2.2/networks/%2e%2e/account",
+    "/2.2/networks/network_123\n",
+    "{mock}/2.2/account",
+];
+
+/// Paths and URLs that do not name exactly one eero, for methods addressing one.
+const NOT_AN_EERO: &[&str] = &[
+    "/2.2/networks/123",
+    "/2.2/account",
+    "/2.2/eeros/9/../../networks/123",
+    "/2.2/eeros/9?x=1",
+    "/2.2/eeros/%2e%2e/%2e%2e/networks/1",
+    "/2.2/eeros/9\t",
+    "{mock}/2.2/networks/123",
+];
+
+/// Expands the `{mock}` placeholder of a table entry to the mock server's origin.
+fn supplied(entry: &str, mock: &MockEero) -> String {
+    entry.replace("{mock}", &mock.uri())
+}
+
+#[tokio::test]
+async fn set_network_password_rejects_a_path_that_is_not_one_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_A_NETWORK {
+        let value = supplied(entry, &mock);
+        let err = api
+            .set_network_password(&value, "password-placeholder", None)
+            .await
+            .expect_err(&format!("{value:?} must not reach PUT .../password"));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_network_rejects_a_path_that_is_not_one_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_A_NETWORK {
+        let value = supplied(entry, &mock);
+        let err = api
+            .reboot_network(&value, None)
+            .await
+            .expect_err(&format!("{value:?} must not reach POST .../reboot"));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_profile_rejects_a_network_path_that_is_not_one_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = ProfilesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_A_NETWORK {
+        let value = supplied(entry, &mock);
+        let err = api
+            .delete_profile(&value, "profile_1")
+            .await
+            .expect_err(&format!(
+                "{value:?} must not reach DELETE .../profiles/{{id}}"
+            ));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reboot_eero_rejects_a_path_that_is_not_one_eero() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for entry in NOT_AN_EERO {
+        let value = supplied(entry, &mock);
+        let err = api
+            .reboot_eero(&value, None)
+            .await
+            .expect_err(&format!("{value:?} must not reach POST .../reboot"));
+        assert_is_validation_error(&err);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wrong_family_path_reports_the_callers_argument_and_the_family() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    let err = api
+        .set_network_password("/2.2/account", "password-placeholder", None)
+        .await
+        .expect_err("/2.2/account is not a network");
+    assert!(
+        matches!(
+            &err,
+            Error::Validation { field, message, .. }
+                if field == "id_or_url"
+                    && message == "must be a path under networks/{id} on the API host"
+        ),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+/// A bare dot-segment child must be rejected rather than collapsing onto the collection, and the
+/// error names the caller's argument and the dot rule, not the family.
+#[tokio::test]
+async fn delete_profile_dot_segment_child_is_rejected_before_any_request() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    expect_no_requests_at_all(&mock).await;
+    let api = ProfilesApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+
+    for child in [
+        "/2.2/networks/network_123/profiles/..",
+        "/2.2/networks/network_123/profiles/.",
+    ] {
+        let err = api
+            .delete_profile("network_123", child)
+            .await
+            .expect_err(&format!("{child:?} must not collapse onto the collection"));
+        assert!(
+            matches!(
+                &err,
+                Error::Validation { field, message, .. }
+                    if field == "id_or_url" && message == "must not contain dot segments"
+            ),
+            "{child:?}: unexpected error {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The legitimate path form is unaffected: it targets that eero's own reboot endpoint.
+#[tokio::test]
+async fn reboot_eero_with_a_path_in_the_family_still_reaches_the_eero_endpoint()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/eeros/e_9/reboot"))
+        .and(body_string("\"\""))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let api = EerosApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    api.reboot_eero("/2.2/eeros/e_9", None).await?;
+    Ok(())
+}
+
+/// A path or URL naming exactly one network is accepted, keeps the caller's own version segment,
+/// and drops one trailing slash.
+#[tokio::test]
+async fn reboot_network_with_a_network_path_or_url_still_reaches_the_network_endpoint()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network_123/reboot"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(2)
+        .mount(&mock.server)
+        .await;
+
+    let api = NetworksApi::new(Arc::new(mock.transport_with_token(TEST_TOKEN)));
+    api.reboot_network("/2.3/networks/network_123/", None)
+        .await?;
+    api.reboot_network(&format!("{}/2.3/networks/network_123", mock.uri()), None)
+        .await?;
+    Ok(())
+}
+
+// ============================ network-id auto-discovery ============================
+
+/// A hostile or buggy `/networks` response must not hand
 /// `Client::ensure_network_id`'s auto-discovery path a `".."` network id that then flows into
 /// every subsequent request URL. Before the fix, `extract_network_id` accepted an `id` field of
 /// `".."` verbatim; now it is rejected, auto-discovery finds no usable network, and the call

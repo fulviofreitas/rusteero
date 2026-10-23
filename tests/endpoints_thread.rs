@@ -12,6 +12,7 @@ use std::sync::Arc;
 use rusteero::endpoints::thread::ThreadApi;
 use rusteero::error::Error;
 use serde_json::json;
+use tracing::Level;
 use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -64,23 +65,120 @@ async fn get_thread_prefers_the_parents_published_link() -> anyhow::Result<()> {
 // ===================== set_thread_enabled =====================
 
 #[tokio::test]
-async fn set_thread_enabled_sends_json_payload_to_the_literal_path() -> anyhow::Result<()> {
+async fn set_thread_enabled_sends_the_thread_enable_payload_to_the_literal_path()
+-> anyhow::Result<()> {
+    for enabled in [true, false] {
+        let mock = MockEero::start().await;
+        let body = json!({ "meta": { "code": 200 }, "data": {} });
+        // Exact match on `{"thread_enable": <bool>}`: the pre-8.4.0 `{"enabled": <bool>}` key (or
+        // any extra key) would never match.
+        Mock::given(method("PUT"))
+            .and(path("/2.2/networks/network-0001/thread"))
+            .and(session_cookie())
+            .and(user_token_header())
+            .and(header("content-type", "application/json"))
+            .and(body_string(json!({ "thread_enable": enabled }).to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+
+        let api = thread_api(&mock);
+        let env = api
+            .set_thread_enabled("network-0001", enabled, None)
+            .await?;
+        assert_eq!(env.into_value(), body, "enabled={enabled}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_thread_enabled_matches_update_thread() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
-    let body = json!({ "meta": { "code": 200 }, "data": {} });
+    // One mock for both calls: the alias and `update_thread(thread_enable=...)` issue the identical
+    // request.
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/thread"))
         .and(session_cookie())
         .and(user_token_header())
-        .and(body_string(json!({ "enabled": true }).to_string()))
         .and(header("content-type", "application/json"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
-        .expect(1)
+        .and(body_string(json!({ "thread_enable": true }).to_string()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": {"code": 200}, "data": {} })),
+        )
+        .expect(2)
         .mount(&mock.server)
         .await;
 
     let api = thread_api(&mock);
-    let env = api.set_thread_enabled("network-0001", true, None).await?;
-    assert_eq!(env.into_value(), body);
+    api.set_thread_enabled("network-0001", true, None).await?;
+    api.update_thread("network-0001", Some(true), None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_thread_enabled_logs_the_update_thread_warning() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(path("/2.2/networks/network-0001/thread"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": {"code": 200}, "data": {} })),
+        )
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    let (_guard, logs) = common::capture_logs();
+
+    thread_api(&mock)
+        .set_thread_enabled("network-0001", true, None)
+        .await?;
+
+    assert_eq!(
+        logs.warnings().len(),
+        1,
+        "expected exactly one WARN, got {:?}",
+        logs.warnings()
+    );
+    assert_eq!(
+        logs.count(
+            Level::WARN,
+            "Issuing write (update thread config for network)"
+        ),
+        1
+    );
+    assert!(!logs.contains(Level::WARN, "set thread enabled for network"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_thread_enabled_not_authenticated_returns_authentication_error_without_a_request()
+-> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/thread"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "meta": {"code": 200}, "data": {} })),
+        )
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+
+    let api = ThreadApi::new(Arc::new(mock.transport_anonymous()));
+    let err = api
+        .set_thread_enabled("network-0001", true, None)
+        .await
+        .expect_err("an unauthenticated write must fail");
+    assert!(err.is_auth_error(), "got {err:?}");
+
+    let requests = mock
+        .server
+        .received_requests()
+        .await
+        .expect("request recording is enabled by default");
+    assert!(requests.is_empty(), "expected zero requests: {requests:?}");
     Ok(())
 }
 
@@ -94,6 +192,7 @@ async fn set_thread_enabled_ignores_a_supplied_parent_and_still_uses_the_literal
         .and(path("/2.2/networks/network-0001/thread"))
         .and(session_cookie())
         .and(user_token_header())
+        .and(body_string(json!({ "thread_enable": true }).to_string()))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({ "meta": {"code": 200}, "data": {} })),
         )

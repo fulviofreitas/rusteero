@@ -1,27 +1,31 @@
-//! Shared wiremock test harness (`MockEero`) used by every later phase's HTTP integration test.
+//! Shared wiremock test harness (`MockEero`) used by every HTTP integration test.
 //!
 //! This file is a *module*, not its own integration-test binary: it lives at
 //! `tests/common/mod.rs` rather than `tests/common.rs` specifically so cargo never tries to run
-//! it as a standalone test target (see the crate's testing conventions' "File Structure" section).
+//! it as a standalone test target.
 //! Any file directly under `tests/` pulls it in with `mod common;`.
 //!
-//! [`MockEero`] answers one design question up front, correctly, for every one of the ~150 tests
-//! later phases will write against it: [`Transport::builder`]'s `base_url` setter derives *both*
+//! [`MockEero`] answers one design question up front, correctly, for every test written against
+//! it: [`Transport::builder`]'s `base_url` setter derives *both*
 //! the `/2.2` and `/2.3` bases from the same root (see `src/transport.rs`'s
 //! `TransportBuilder::base_url` docs), so a single `wiremock::MockServer` stands in for the real
 //! Eero cloud's two hosts — a test can assert a device PUT really went to `/2.3/...` while a GET
 //! from the same [`Transport`] went to `/2.2/...`, exactly like the real API.
 
 // Not every helper here has a caller in every test binary that pulls in this module with `mod
-// common;` — e.g. `transport_with_store` has no caller yet in this phase's own
-// `harness_smoke.rs`, but is required surface for phase 4's client+cache suite and phase 2's
-// storage-backed auth tests. A plain `cargo clippy` would otherwise flag whichever subset any one
-// binary doesn't happen to call as dead code.
+// common;` — e.g. `transport_with_store` has no caller in `harness_smoke.rs`, but is required
+// surface for the client+cache suite and the storage-backed auth tests. A plain `cargo clippy`
+// would otherwise flag whichever subset any one binary doesn't happen to call as dead code.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use tracing::field::{Field, Visit};
+use tracing::subscriber::DefaultGuard;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::{Layer, registry};
 use wiremock::MockServer;
 use wiremock::matchers::{HeaderExactMatcher, header};
 
@@ -187,4 +191,237 @@ fn fixture_path(name: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(name)
+}
+
+// ===================== log capture =====================
+
+/// One captured `tracing` event: its [`Level`], its target (the emitting module path, e.g.
+/// `rusteero::links`), and its `message` field rendered as text.
+///
+/// Structured fields other than `message` (`error = %err`, `attempt`, `path`, ...) are kept
+/// alongside, in event order; read them with [`LogCapture::fields`] / [`LogCapture::field`].
+pub type LogRecord = (Level, String, String);
+
+/// The structured fields of one captured event other than `message`, as `(name, rendered value)`
+/// pairs in the order the event recorded them. String values arrive verbatim (no quotes),
+/// `Display`-captured values (`%x`) as their `Display` text and `Debug`-captured ones (`?x`) as
+/// their `Debug` text.
+pub type LogFields = Vec<(String, String)>;
+
+/// Keeps a [`capture_logs`] subscriber installed on the current thread; dropping it restores the
+/// subscriber that was in place before. Bind it to a named variable (`let (_guard, logs) = ...`,
+/// not `_`), or the capture ends immediately.
+pub type LogGuard = DefaultGuard;
+
+/// A handle onto the events [`capture_logs`] recorded on the current thread. Cheap to clone; every
+/// clone sees the same records, and the handle stays readable after its [`LogGuard`] is dropped.
+#[derive(Clone, Default)]
+pub struct LogCapture {
+    records: Arc<Mutex<Vec<(LogRecord, LogFields)>>>,
+}
+
+impl LogCapture {
+    /// Every captured event, oldest first.
+    #[must_use]
+    pub fn records(&self) -> Vec<LogRecord> {
+        self.lock()
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect()
+    }
+
+    /// Every captured event together with its structured fields, oldest first. For hygiene checks
+    /// that must see what a formatting subscriber would print on the same line: the fields are
+    /// not part of [`LogCapture::records`].
+    #[must_use]
+    pub fn entries(&self) -> Vec<(LogRecord, LogFields)> {
+        self.lock().clone()
+    }
+
+    /// The messages of every captured event at exactly `level`, oldest first.
+    #[must_use]
+    pub fn messages(&self, level: Level) -> Vec<String> {
+        self.lock()
+            .iter()
+            .filter(|((record_level, ..), _)| *record_level == level)
+            .map(|((.., message), _)| message.clone())
+            .collect()
+    }
+
+    /// The messages of every captured `WARN` event, oldest first.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        self.messages(Level::WARN)
+    }
+
+    /// The messages of every captured `ERROR` event, oldest first.
+    #[must_use]
+    pub fn errors(&self) -> Vec<String> {
+        self.messages(Level::ERROR)
+    }
+
+    /// Whether any captured event at exactly `level` has a message containing `needle`.
+    #[must_use]
+    pub fn contains(&self, level: Level, needle: &str) -> bool {
+        self.lock().iter().any(|((record_level, _, message), _)| {
+            *record_level == level && message.contains(needle)
+        })
+    }
+
+    /// How many captured events at exactly `level` have a message containing `needle`.
+    #[must_use]
+    pub fn count(&self, level: Level, needle: &str) -> usize {
+        self.lock()
+            .iter()
+            .filter(|((record_level, _, message), _)| {
+                *record_level == level && message.contains(needle)
+            })
+            .count()
+    }
+
+    /// The structured fields of the first captured event at exactly `level` whose message
+    /// contains `needle`, or `None` if no such event was captured.
+    #[must_use]
+    pub fn fields(&self, level: Level, needle: &str) -> Option<LogFields> {
+        self.lock()
+            .iter()
+            .find(|((record_level, _, message), _)| {
+                *record_level == level && message.contains(needle)
+            })
+            .map(|(_, fields)| fields.clone())
+    }
+
+    /// The rendered value of field `name` on the first captured event at exactly `level` whose
+    /// message contains `needle`, or `None` if there is no such event or field.
+    #[must_use]
+    pub fn field(&self, level: Level, needle: &str, name: &str) -> Option<String> {
+        self.fields(level, needle)?
+            .into_iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value)
+    }
+
+    /// Whether any captured event, at any level, has `needle` in its message or in the rendered
+    /// value of one of its structured fields. For leak assertions: a credential that reaches the
+    /// log through `error = %err` or `token = %x` is as much a leak as one in the message.
+    #[must_use]
+    pub fn mentions(&self, needle: &str) -> bool {
+        self.lock().iter().any(|((_, _, message), fields)| {
+            message.contains(needle) || fields.iter().any(|(_, value)| value.contains(needle))
+        })
+    }
+
+    /// Whether nothing at all has been captured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Forgets everything captured so far, e.g. to drop the noise of a test's setup phase before
+    /// the call under test.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(LogRecord, LogFields)>> {
+        // A panic while a test thread held the lock must not hide the records from the
+        // assertion that reports it.
+        self.records.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Collects the `message` field of one event, plus every other field as rendered text.
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+    fields: LogFields,
+}
+
+impl Visit for MessageVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            value.clone_into(&mut self.message);
+        } else {
+            self.fields
+                .push((field.name().to_owned(), value.to_owned()));
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields
+                .push((field.name().to_owned(), format!("{value:?}")));
+        }
+    }
+}
+
+/// The `tracing` layer behind [`capture_logs`]: appends every event, at every level, to a shared
+/// vector.
+struct CaptureLayer {
+    records: Arc<Mutex<Vec<(LogRecord, LogFields)>>>,
+}
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        let metadata = event.metadata();
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((
+                (
+                    *metadata.level(),
+                    metadata.target().to_owned(),
+                    visitor.message,
+                ),
+                visitor.fields,
+            ));
+    }
+}
+
+/// Installs a capturing `tracing` subscriber for the **current thread** and returns the
+/// [`LogGuard`] that keeps it installed plus the [`LogCapture`] handle to read what was logged.
+///
+/// Use it to pin a changed or new `WARN`/`ERROR` line, or to prove a warning was *not* emitted:
+///
+/// ```ignore
+/// let (_guard, logs) = common::capture_logs();
+/// // ... drive the call under test ...
+/// assert!(logs.contains(tracing::Level::WARN, "Issuing write (set nightlight for eero)"));
+/// ```
+///
+/// Events are captured at every level and from every crate, so filter by level and message text
+/// rather than counting all records.
+///
+/// # Current thread only
+///
+/// The subscriber is installed with `tracing::subscriber::set_default`, which is thread-local.
+/// That is exactly right for `#[tokio::test]`, whose default runtime is current-thread, so every
+/// task the test spawns runs on the test's own thread. Events logged on any other thread — a
+/// `#[tokio::test(flavor = "multi_thread")]` worker, a `std::thread::spawn`ed thread, reqwest's
+/// connection tasks on a separate runtime — are **not** captured, unless the code that hops threads
+/// carries the caller's dispatcher across (the crate's `storage::*_async` adapters do, so a
+/// credential store's own lines are captured). The capture is also isolated per test: tests running in parallel on their own
+/// threads never see each other's events.
+///
+/// # Parallel tests
+///
+/// `tracing-core` keeps one process-wide interest cache per callsite. While only one dispatcher
+/// exists it decides a newly hit callsite against the *calling* thread's default alone, so a
+/// parallel test thread with no subscriber can cache "never" for a library callsite before this
+/// capture is installed, and the capture then misses that event. An always-live anchor
+/// dispatcher, registered once per test binary, keeps every interest decision consulting all
+/// live dispatchers, this capture included.
+#[must_use]
+pub fn capture_logs() -> (LogGuard, LogCapture) {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(registry()));
+    let capture = LogCapture::default();
+    let subscriber = registry().with(CaptureLayer {
+        records: Arc::clone(&capture.records),
+    });
+    (tracing::subscriber::set_default(subscriber), capture)
 }

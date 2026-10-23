@@ -2,20 +2,22 @@
 //!
 //! This is not a test of `rusteero` itself — every behaviour it exercises is already covered by
 //! `src/transport.rs`'s own unit tests — it exists purely to prove `MockEero` actually reaches a
-//! running mock server for both API versions *before* any later-phase test file starts depending
-//! on it (see the task brief for this file: "do not hand the next wave an untested harness").
+//! running mock server for both API versions, so no other test file depends on an untested
+//! harness.
 
 mod common;
 
 use reqwest::Method;
 use rusteero::error::Error;
+use rusteero::links::warn_uncharacterised_write;
 use rusteero::routes::{ACCOUNT, ApiVersion, Nested};
 use rusteero::transport::RequestBody;
 use serde_json::json;
+use tracing::Level;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie};
 
 // ===================== transport_with_token: reaches the mock on v2.2 =====================
 
@@ -131,6 +133,135 @@ async fn auth_api_with_token_is_immediately_authenticated() {
     assert!(auth.session().is_some());
 }
 
+// ===================== capture_logs: records tracing events for the current thread =====================
+
+#[tokio::test]
+async fn capture_logs_records_the_uncharacterised_write_warning() {
+    let (_guard, logs) = capture_logs();
+    assert!(logs.is_empty());
+
+    warn_uncharacterised_write("x");
+
+    let records = logs.records();
+    assert_eq!(records.len(), 1, "got {records:?}");
+    let (level, target, message) = &records[0];
+    assert_eq!(*level, Level::WARN);
+    assert_eq!(target, "rusteero::links");
+    assert!(
+        message
+            .starts_with("Issuing write (x): its side effects have not been fully characterised"),
+        "got {message:?}"
+    );
+
+    assert_eq!(logs.warnings(), vec![message.clone()]);
+    assert!(logs.errors().is_empty());
+    assert!(logs.contains(Level::WARN, "Issuing write (x)"));
+    assert!(!logs.contains(Level::ERROR, "Issuing write (x)"));
+    assert!(!logs.contains(Level::WARN, "Issuing write (y)"));
+    assert_eq!(logs.count(Level::WARN, "Issuing write"), 1);
+}
+
+#[tokio::test]
+async fn capture_logs_keeps_structured_fields_next_to_the_message() {
+    let (_guard, logs) = capture_logs();
+
+    tracing::warn!(attempt = 2, path = "/2.2/account", "Retrying GET request");
+    tracing::warn!(error = %"boom", "second");
+
+    assert_eq!(
+        logs.fields(Level::WARN, "Retrying GET request"),
+        Some(vec![
+            ("attempt".to_owned(), "2".to_owned()),
+            ("path".to_owned(), "/2.2/account".to_owned()),
+        ])
+    );
+    assert_eq!(
+        logs.field(Level::WARN, "second", "error").as_deref(),
+        Some("boom")
+    );
+    assert_eq!(logs.field(Level::WARN, "second", "attempt"), None);
+    assert_eq!(logs.fields(Level::ERROR, "Retrying"), None);
+    assert_eq!(logs.warnings(), vec!["Retrying GET request", "second"]);
+}
+
+/// `mentions` is for leak assertions, so it must see a value that reaches the log through a
+/// structured field as well as one in the message.
+#[tokio::test]
+async fn capture_logs_mentions_scans_messages_and_field_values() {
+    let (_guard, logs) = capture_logs();
+
+    tracing::warn!("in the message: msg_canary");
+    tracing::debug!(token = "str_canary", "plain");
+    tracing::debug!(error = %"display_canary", "plain");
+    tracing::debug!(count = 4242, "plain");
+
+    for needle in ["msg_canary", "str_canary", "display_canary", "4242"] {
+        assert!(logs.mentions(needle), "{needle}");
+    }
+    assert!(!logs.mentions("absent_canary"));
+    // Field names are not values.
+    assert!(!logs.mentions("token"));
+}
+
+#[tokio::test]
+async fn capture_logs_keeps_level_target_and_message_of_every_level() {
+    let (_guard, logs) = capture_logs();
+
+    tracing::error!(target: "smoke::target", "first {}", 1);
+    tracing::info!("second");
+    tracing::debug!(count = 3, "third");
+
+    assert_eq!(
+        logs.records(),
+        vec![
+            (
+                Level::ERROR,
+                "smoke::target".to_owned(),
+                "first 1".to_owned()
+            ),
+            (Level::INFO, module_path!().to_owned(), "second".to_owned()),
+            (Level::DEBUG, module_path!().to_owned(), "third".to_owned()),
+        ]
+    );
+    assert_eq!(logs.errors(), vec!["first 1".to_owned()]);
+    assert!(logs.warnings().is_empty());
+
+    logs.clear();
+    assert!(logs.is_empty());
+}
+
+#[tokio::test]
+async fn capture_logs_sees_events_from_tasks_spawned_on_the_test_runtime() {
+    // `#[tokio::test]` runs a current-thread runtime, so a spawned task executes on the test's own
+    // thread and its events land in the capture.
+    let (_guard, logs) = capture_logs();
+
+    tokio::spawn(async { warn_uncharacterised_write("spawned") })
+        .await
+        .expect("the spawned task does not panic");
+
+    assert!(logs.contains(Level::WARN, "Issuing write (spawned)"));
+}
+
+#[test]
+fn capture_logs_stops_when_its_guard_drops_and_ignores_other_threads() {
+    let (guard, logs) = capture_logs();
+    warn_uncharacterised_write("while captured");
+
+    // Another thread has no subscriber installed: its event is not captured.
+    std::thread::spawn(|| warn_uncharacterised_write("other thread"))
+        .join()
+        .expect("the other thread does not panic");
+
+    drop(guard);
+    warn_uncharacterised_write("after the guard dropped");
+
+    assert_eq!(logs.count(Level::WARN, "Issuing write"), 1);
+    assert!(logs.contains(Level::WARN, "Issuing write (while captured)"));
+    assert!(!logs.contains(Level::WARN, "other thread"));
+    assert!(!logs.contains(Level::WARN, "after the guard dropped"));
+}
+
 // ===================== fixture / fixture_json =====================
 
 #[test]
@@ -156,8 +287,8 @@ fn every_minimum_fixture_parses_as_an_envelope_shaped_object() {
 
 #[test]
 fn network_and_device_ids_are_consistent_across_fixtures() {
-    // The task brief requires ids to be shared across fixtures so phase-3/phase-4 tests can
-    // compose them (e.g. fetch `networks.json`, then `network.json` for one of its ids).
+    // Ids are shared across fixtures so endpoint and client tests can compose them (e.g. fetch
+    // `networks.json`, then `network.json` for one of its ids).
     let network_id = fixture_json("network.json")["data"]["id"].clone();
     assert_eq!(fixture_json("networks.json")["data"][0]["id"], network_id);
     assert_eq!(

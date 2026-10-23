@@ -7,7 +7,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 
@@ -23,7 +23,8 @@ async fn client(mock: &MockEero) -> Client {
 }
 
 #[tokio::test]
-async fn get_forwards_prefers_the_cached_networks_published_link() -> anyhow::Result<()> {
+async fn get_forwards_pins_to_2_2_when_the_cached_network_publishes_a_2_3_link()
+-> anyhow::Result<()> {
     let mock = MockEero::start().await;
     let network_with_link = json!({
         "meta": { "code": 200 },
@@ -36,13 +37,21 @@ async fn get_forwards_prefers_the_cached_networks_published_link() -> anyhow::Re
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
         .expect(1)
         .mount(&mock.server)
         .await;
     Mock::given(method("GET"))
         .and(path("/2.3/networks/network-0001/forwards"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/forwards"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": []}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -54,14 +63,60 @@ async fn get_forwards_prefers_the_cached_networks_published_link() -> anyhow::Re
     Ok(())
 }
 
+/// A write is not pinned: `create_forward` still follows the cached network's published
+/// `forwards` link on whatever version it names.
+#[tokio::test]
+async fn create_forward_follows_the_cached_networks_published_link_unpinned() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    let network_with_link = json!({
+        "meta": { "code": 200 },
+        "data": {
+            "id": "network-0001",
+            "url": "/2.2/networks/network-0001",
+            "resources": { "forwards": "/2.3/networks/network-0001/forwards" },
+        },
+    });
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(network_with_link.to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/forwards"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2.3/networks/network-0001/forwards"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client.get_network(Some("network-0001"), false).await?;
+    client
+        .create_forward(json!({"protocol": "tcp"}), Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn forward_setter_does_not_invalidate_the_network_bucket() -> anyhow::Result<()> {
-    // No `forwards` cache bucket exists (behaviour brief §2.1) — a create must not, in passing,
+    // No `forwards` cache bucket exists — a create must not, in passing,
     // touch the unrelated `network[nid]` entry either.
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("network.json")))
         .expect(1)
         .mount(&mock.server)
@@ -69,6 +124,7 @@ async fn forward_setter_does_not_invalidate_the_network_bucket() -> anyhow::Resu
     Mock::given(method("POST"))
         .and(path("/2.2/networks/network-0001/forwards"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -94,6 +150,7 @@ async fn update_forward_resolves_network_id_and_reaches_the_template_path() -> a
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/forwards/fwd-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -112,6 +169,7 @@ async fn delete_forward_resolves_network_id() -> anyhow::Result<()> {
     Mock::given(method("DELETE"))
         .and(path("/2.2/networks/network-0001/forwards/fwd-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(json!({"data": {}}).to_string()))
         .expect(1)
         .mount(&mock.server)

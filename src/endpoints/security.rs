@@ -1,6 +1,6 @@
-//! Security settings API: `eero-api`'s `SecurityAPI`, v8.0.4.
+//! Security settings API: `eero-api`'s `SecurityAPI`, v8.4.1.
 //!
-//! Ported from `eero-api src/eero/api/security.py` at v8.0.4. Every method here funnels through
+//! Ported from `eero-api src/eero/api/security.py` at v8.4.1. Every method here funnels through
 //! [`crate::transport::Transport::request`]/[`crate::transport::Transport::resource`], which
 //! already implements the "not authenticated" precondition Python repeats at the top of every
 //! method and every status-to-error mapping a response can produce — so, unlike the Python
@@ -12,12 +12,11 @@
 //! immediately before the request. Two warning classes exist and are not conflated: writes to the
 //! shared `networks/{id}/settings` resource ([`SecurityApi::set_wpa3`],
 //! [`SecurityApi::set_band_steering`], [`SecurityApi::set_upnp`], [`SecurityApi::set_ipv6`],
-//! [`SecurityApi::configure_security`]) and to `networks/{id}/mlo_mode`
-//! ([`SecurityApi::set_mlo_mode`]) carry the "-- may reboot every eero, like the confirmed DNS
-//! write path" suffix; writes to a narrower dedicated sub-resource
+//! [`SecurityApi::set_ipv6_upstream`], [`SecurityApi::configure_security`]) and to
+//! `networks/{id}/mlo_mode` ([`SecurityApi::set_mlo_mode`]) carry the "-- may reboot every eero,
+//! like the confirmed DNS write path" suffix; writes to a narrower dedicated sub-resource
 //! ([`SecurityApi::set_fast_transition`], [`SecurityApi::set_passpoint_enabled`],
-//! [`SecurityApi::set_proxied_nodes`]) carry a shorter warning with no reboot claim (g5 brief §3
-//! note 4).
+//! [`SecurityApi::set_proxied_nodes`]) carry a shorter warning with no reboot claim.
 
 use std::sync::Arc;
 
@@ -26,7 +25,7 @@ use serde_json::{Map, Value, json};
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::links::warn_uncharacterised_write;
-use crate::params::resolve_network_url;
+use crate::params::{py_list, py_quote, resolve_network_url};
 use crate::routes;
 use crate::routes::ApiVersion;
 use crate::transport::{RequestBody, Transport};
@@ -34,10 +33,10 @@ use crate::transport::{RequestBody, Transport};
 /// Valid values for the network's MLO (Multi-Link Operation) mode.
 ///
 /// Ported from `MLO_MODE_DISABLED`/`MLO_MODE_SINGLE`/`MLO_MODE_MULTI`/`_MLO_MODES`
-/// (`security.py:19-23`).
+/// (`security.py:20-23`).
 pub const MLO_MODES: &[&str] = &["disabled", "multi", "single"];
 
-/// `SecurityAPI` (`src/eero/api/security.py`), v8.0.4.
+/// `SecurityAPI` (`src/eero/api/security.py`), v8.4.1.
 ///
 /// Build one with [`SecurityApi::new`], wrapping a [`Transport`] shared with the rest of the
 /// [`crate::api::EeroApi`] aggregator — `SecurityApi` never constructs or owns a `Transport`
@@ -57,7 +56,7 @@ impl SecurityApi {
     /// Gets security settings for a network — returns the raw Eero API response.
     ///
     /// Ported from `eero-api src/eero/api/security.py:53-80` (`SecurityAPI.get_security_settings`).
-    /// Resolves via the module's own `_network_own_url` helper (`security.py:26-31`), which
+    /// Resolves via the module's own `_network_own_url` helper (`security.py:26-33`), which
     /// prefers a supplied `parent`'s own `url` field over the bare-id `networks/{id}` template —
     /// byte-for-byte [`crate::params::resolve_network_url`], which this method calls directly
     /// (see `src/routes/security.rs`'s module docs for why this is not a [`crate::routes::Resource`]).
@@ -87,7 +86,7 @@ impl SecurityApi {
     /// `PUT /2.2/networks/{id}/settings` — enables or disables WPA3 encryption.
     ///
     /// Ported from `eero-api src/eero/api/security.py:82-134` (`SecurityAPI.set_wpa3`). Sends
-    /// `{"wpa3": enabled}` (`security.py:129`).
+    /// `{"wpa3": enabled}` (`security.py:133`).
     ///
     /// # Errors
     ///
@@ -110,7 +109,7 @@ impl SecurityApi {
     /// `PUT /2.2/networks/{id}/settings` — enables or disables band steering.
     ///
     /// Ported from `eero-api src/eero/api/security.py:136-189` (`SecurityAPI.set_band_steering`).
-    /// Sends `{"band_steering": enabled}` (`security.py:183`).
+    /// Sends `{"band_steering": enabled}` (`security.py:188`).
     ///
     /// # Errors
     ///
@@ -133,7 +132,7 @@ impl SecurityApi {
     /// `PUT /2.2/networks/{id}/settings` — enables or disables `UPnP`.
     ///
     /// Ported from `eero-api src/eero/api/security.py:191-243` (`SecurityAPI.set_upnp`). Sends
-    /// `{"upnp": enabled}` (`security.py:238`).
+    /// `{"upnp": enabled}` (`security.py:242`).
     ///
     /// # Errors
     ///
@@ -155,9 +154,10 @@ impl SecurityApi {
 
     /// `PUT /2.2/networks/{id}/settings` — enables or disables IPv6.
     ///
-    /// Ported from `eero-api src/eero/api/security.py:245-297` (`SecurityAPI.set_ipv6`). Sends
-    /// **both** `{"ipv6_upstream": enabled, "ipv6_downstream": enabled}` (`security.py:294-297`)
-    /// — a single flag fans out to two wire keys.
+    /// Ported from `eero-api src/eero/api/security.py:245-300` (`SecurityAPI.set_ipv6`). Sends
+    /// **both** `{"ipv6_upstream": enabled, "ipv6_downstream": enabled}` (`security.py:296-299`)
+    /// — a single flag fans out to two wire keys. Use [`SecurityApi::set_ipv6_upstream`] to change
+    /// the upstream flag alone.
     ///
     /// # Errors
     ///
@@ -177,13 +177,50 @@ impl SecurityApi {
         .await
     }
 
+    /// `PUT /2.2/networks/{id}/settings` — enables or disables IPv6 on the upstream (WAN) side
+    /// only.
+    ///
+    /// Ported from `eero-api src/eero/api/security.py:302-358` (`SecurityAPI.set_ipv6_upstream`),
+    /// new at v8.4.0. Sends exactly `{"ipv6_upstream": enabled}` (`security.py:357`) — never
+    /// `ipv6_downstream`, which stays untouched — to the network's `settings` sub-resource,
+    /// preferring `parent`'s own published `settings` link. This is the upstream connectivity
+    /// toggle, **not** IPv6 DNS (see [`crate::endpoints::dns::DnsApi::set_custom_dns_ipv6`]);
+    /// [`SecurityApi::set_ipv6`] and [`SecurityApi::configure_security`] with `ipv6` write both the
+    /// upstream and downstream flags.
+    ///
+    /// **Settings-class write**: unverified against a live account, and the DNS write on the same
+    /// `settings` endpoint is confirmed to reboot every eero on the mesh, so treat this one as
+    /// capable of the same. Read the current configuration first, skip the write when it already
+    /// matches, and never retry a failed write in a loop. Logs one `WARNING` via
+    /// [`warn_uncharacterised_write`] — `"set IPv6 upstream for network -- may reboot every eero,
+    /// like the confirmed DNS write path"` — after URL resolution and just before the request.
+    ///
+    /// # Errors
+    ///
+    /// See [`SecurityApi::get_security_settings`].
+    pub async fn set_ipv6_upstream(
+        &self,
+        network_id: &str,
+        enabled: bool,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        self.put_settings_class(
+            network_id,
+            json!({ "ipv6_upstream": enabled }),
+            parent,
+            "set IPv6 upstream for network",
+        )
+        .await
+    }
+
     /// Configures multiple security settings in one call — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/security.py:299-374` (`SecurityAPI.configure_security`).
+    /// Ported from `eero-api src/eero/api/security.py:360-438` (`SecurityAPI.configure_security`).
     /// Builds a body from only the arguments actually supplied — `{"wpa3": ...}`,
     /// `{"band_steering": ...}`, `{"upnp": ...}` only when their argument is `Some`
-    /// (`security.py:338-349`), `{"ipv6_upstream": ..., "ipv6_downstream": ...}` both set from
-    /// `ipv6` when it is `Some` (the same one-flag-two-keys fan-out as [`SecurityApi::set_ipv6`]).
+    /// (`security.py:407-414`), `{"ipv6_upstream": ..., "ipv6_downstream": ...}` both set from
+    /// `ipv6` when it is `Some` (the same one-flag-two-keys fan-out as [`SecurityApi::set_ipv6`];
+    /// use [`SecurityApi::set_ipv6_upstream`] to change the upstream flag alone).
     /// **`thread` is not a parameter of this method** — the settings endpoint never accepted a
     /// `thread` field; that write moved to [`crate::endpoints::thread::ThreadApi::set_thread_enabled`]
     /// in v8.0.0, and `SecurityAPI.configure_security`'s `thread=` keyword was removed alongside it
@@ -194,11 +231,11 @@ impl SecurityApi {
     /// Returns `Error::Validation { field: "settings", message: "at least one of wpa3,
     /// band_steering, upnp, ipv6 must be supplied" }` if every argument is `None`, before any
     /// request is sent. This is a **deliberate, permanent divergence** from Python, which instead
-    /// fabricates a local `{"meta": {"code": 400}, "data": {}}` response (`security.py:356-358`)
+    /// fabricates a local `{"meta": {"code": 400}, "data": {}}` response (`security.py:420-422`)
     /// — a response that never actually came from the wire. `SecurityApi::configure_security`
     /// diverged from that shape before v8.0.4 already (raising rather than fabricating),
     /// consistent with [`DnsApi::set_dns_mode`](crate::endpoints::dns::DnsApi::set_dns_mode)'s own
-    /// documented divergence; this port keeps it (g5 brief §3 note 7, §6 open question 3).
+    /// documented divergence; this port keeps it.
     /// Otherwise see [`SecurityApi::get_security_settings`].
     #[allow(clippy::too_many_arguments)]
     pub async fn configure_security(
@@ -242,14 +279,16 @@ impl SecurityApi {
 
     /// Sets the network's MLO (Multi-Link Operation) mode — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/security.py:376-425` (`SecurityAPI.set_mlo_mode`).
+    /// Ported from `eero-api src/eero/api/security.py:440-489` (`SecurityAPI.set_mlo_mode`).
     /// Issues a JSON PUT to the network's `mlo_mode` sub-resource with `{"mlo_mode": mode}`
-    /// (`security.py:424`).
+    /// (`security.py:489`).
     ///
     /// # Errors
     ///
     /// Returns `Error::Validation { field: "mode", .. }` if `mode` is not one of
-    /// [`MLO_MODES`] (`security.py:418-420`), before any request is sent. Otherwise see
+    /// [`MLO_MODES`] (`security.py:476-479`), before any request is sent; the message is
+    /// Python's `repr()` rendering (`must be one of ['disabled', 'multi', 'single'], got 'x'`).
+    /// Otherwise see
     /// [`SecurityApi::get_security_settings`].
     pub async fn set_mlo_mode(
         &self,
@@ -260,7 +299,11 @@ impl SecurityApi {
         if !MLO_MODES.contains(&mode) {
             return Err(Error::validation(
                 "mode",
-                format!("must be one of {MLO_MODES:?}, got {mode:?}"),
+                format!(
+                    "must be one of {}, got {}",
+                    py_list(MLO_MODES),
+                    py_quote(mode)
+                ),
             ));
         }
         let url = routes::security::SET_MLO_MODE.resolve(
@@ -283,7 +326,7 @@ impl SecurityApi {
 
     /// Gets the network's 802.11r fast-transition setting — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/security.py:427-460` (`SecurityAPI.get_fast_transition`).
+    /// Ported from `eero-api src/eero/api/security.py:491-524` (`SecurityAPI.get_fast_transition`).
     /// GETs the network's `fast_transition` sub-resource. A verified read.
     ///
     /// # Errors
@@ -307,9 +350,9 @@ impl SecurityApi {
 
     /// Sets the network's 802.11r fast-transition setting — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/security.py:462-502` (`SecurityAPI.set_fast_transition`).
+    /// Ported from `eero-api src/eero/api/security.py:526-566` (`SecurityAPI.set_fast_transition`).
     /// Issues a JSON PUT to the network's `fast_transition` sub-resource with
-    /// `{"fast_transition": enabled}` (`security.py:501`). Unverified upstream.
+    /// `{"fast_transition": enabled}` (`security.py:566`). Unverified upstream.
     ///
     /// # Errors
     ///
@@ -338,7 +381,7 @@ impl SecurityApi {
 
     /// Enables or disables Passpoint — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/security.py:504-541` (`SecurityAPI.set_passpoint_enabled`).
+    /// Ported from `eero-api src/eero/api/security.py:568-605` (`SecurityAPI.set_passpoint_enabled`).
     /// Issues a JSON PUT to the network's `passpoint/enabled` sub-resource with
     /// `{"enabled": enabled}`. Unverified upstream.
     ///
@@ -369,7 +412,7 @@ impl SecurityApi {
 
     /// Enables or disables proxied nodes — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/security.py:543-581` (`SecurityAPI.set_proxied_nodes`).
+    /// Ported from `eero-api src/eero/api/security.py:607-645` (`SecurityAPI.set_proxied_nodes`).
     /// Issues a JSON PUT to the network's `proxied_nodes` sub-resource with
     /// `{"enabled": enabled}`. Unverified upstream.
     ///
@@ -400,7 +443,8 @@ impl SecurityApi {
 
     /// Shared `PUT /2.2/networks/{id}/settings` call site behind
     /// [`SecurityApi::set_wpa3`]/[`SecurityApi::set_band_steering`]/[`SecurityApi::set_upnp`]/
-    /// [`SecurityApi::set_ipv6`]/[`SecurityApi::configure_security`] — the five writers that share
+    /// [`SecurityApi::set_ipv6`]/[`SecurityApi::set_ipv6_upstream`]/
+    /// [`SecurityApi::configure_security`] — the six writers that share
     /// [`crate::routes::security::SECURITY_PUT_SETTINGS`] and the "-- may reboot every eero, like
     /// the confirmed DNS write path" warning suffix.
     async fn put_settings_class(

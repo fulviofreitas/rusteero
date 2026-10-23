@@ -1,26 +1,40 @@
 //! Data Usage API: `eero-api`'s `DataUsageAPI`.
 //!
-//! Ported from `eero-api src/eero/api/data_usage.py` at `v8.0.4`
-//! (`.claude/tasks/briefs/v8/g3-devices.md`). The whole module was rewritten in `05a2b07`
-//! (v8.0.0): the pre-8.0.0 shape this crate previously shipped — one `get_data_usage(payload:
-//! Value, resource: Option<&str>)` method that attached an arbitrary JSON body to a `GET`
-//! request — is gone entirely, replaced by eleven distinct, **query-params-only** methods, one
-//! per resource. `data_usage.py`'s own module docstring is explicit: "None of these endpoints
-//! accept a request body; the API rejects a body-bearing `GET` with a `400`"
-//! (`data_usage.py:10-11`).
+//! Ported from `eero-api src/eero/api/data_usage.py` at `v8.4.1`; every line citation in this
+//! module is to that version. The whole module was rewritten in `05a2b07` (v8.0.0): the pre-8.0.0
+//! shape this crate previously shipped — one `get_data_usage(payload: Value, resource:
+//! Option<&str>)` method that attached an arbitrary JSON body to a `GET` request — is gone
+//! entirely, replaced by eleven distinct, **query-params-only** reads, one per resource, plus
+//! the one JSON write `set_report_settings`. `data_usage.py`'s own module docstring is explicit:
+//! "None of these endpoints accept a request body; the API rejects a body-bearing `GET` with a
+//! `400`" (`data_usage.py:9-10`).
 //!
-//! Every method resolves its network segment via the same "prefer `parent`'s own `self_url`,
-//! else the bare `network_id` template" rule as [`crate::params::resolve_network_url`] — see
-//! `DataUsageApi::network_id_or_self_url` for why this is implemented locally rather than by
-//! threading `parent` through [`crate::routes::Resource::resolve`] itself.
+//! Every method resolves its network base through [`crate::params::resolve_network_url`] — the
+//! "prefer `parent`'s own `self_url`, else the bare `network_id` template" rule of Python's
+//! `_get_usage` (`data_usage.py:156-157`) — and then appends the route's literal suffix (the
+//! template text after `{id}`, e.g. `/data_usage/breakdown`). A published `self_url` is therefore
+//! only shape-checked, never fed back through [`crate::links::resource_url`] as if a caller had
+//! typed it, so it is not confined to the `networks/{id}` family; only a caller-supplied
+//! `network_id` is. See `DataUsageApi::route_url`.
 //!
-//! `cadence` is required on six of the eleven methods (`get_data_usage`, `get_device_usage`,
-//! `get_eeros_summary`, `get_eero_usage`, `get_profile_usage`, `get_unprofiled_summary` — taking
-//! `cadence: &str`) and optional on the other three (`get_breakdown`, `get_devices_usage`,
-//! `get_unprofiled_devices` — taking `cadence: Option<&str>`); `get_report_settings` takes no
-//! query parameters at all. Every method here funnels through [`crate::transport::Transport`],
-//! which already implements the "not authenticated" precondition and every status-to-error
-//! mapping a response can produce.
+//! `cadence` is required on seven of the twelve methods (`get_data_usage`, `get_device_usage`,
+//! `get_eeros_summary`, `get_eeros_usage`, `get_eero_usage`, `get_profile_usage`,
+//! `get_unprofiled_summary` — taking `cadence: &str`) and optional on three more
+//! (`get_breakdown`, `get_devices_usage`, `get_unprofiled_devices` — taking `cadence:
+//! Option<&str>`); `get_report_settings` takes no query parameters at all, and
+//! `set_report_settings` is the one write. Every method here funnels through
+//! [`crate::transport::Transport`], which already implements the "not authenticated"
+//! precondition and every status-to-error mapping a response can produce.
+//!
+//! # Per-call timeout
+//!
+//! All ten time-windowed reads (everything except `get_report_settings`/`set_report_settings`)
+//! take `timeout: Option<RequestTimeout>` immediately before `parent` (`data_usage.py:111,
+//! 159-160`, where the keyword-only `timeout` is forwarded only when supplied).
+//! `Some(timeout)` replaces the transport default (30 s total, 10 s read, unless the builder
+//! changed them) for that one request, wholesale: a field left unset is unbounded and does not
+//! fall back to the default. `None` keeps the default. A large time window can take the server
+//! longer than the default allows, which is what this is for.
 
 use std::sync::Arc;
 
@@ -33,7 +47,7 @@ use crate::error::Error;
 use crate::params;
 use crate::routes;
 use crate::routes::Resource;
-use crate::transport::{RequestBody, Transport};
+use crate::transport::{RequestBody, RequestTimeout, Transport};
 
 /// `eero-api`'s `DataUsageAPI` (`src/eero/api/data_usage.py`).
 ///
@@ -53,9 +67,12 @@ impl DataUsageApi {
 
     /// `GET /2.2/networks/{network_id}/data_usage` — network-wide data-usage statistics.
     ///
-    /// Ported from `DataUsageAPI.get_data_usage` (`data_usage.py:155-197`). `start`/`end` are
+    /// Ported from `DataUsageAPI.get_data_usage` (`data_usage.py:162-209`). `start`/`end` are
     /// required; `cadence` is required (`cadence_required=True`); `timezone` is optional,
     /// included only when supplied.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -63,6 +80,7 @@ impl DataUsageApi {
     /// `"daily"`, or if `parent`'s own `url` field (when present) is malformed, before any
     /// request is sent. Returns `Error::Authentication("Not authenticated")` if no valid session
     /// is configured, or whatever other status-mapped [`Error`] the request produces otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_data_usage(
         &self,
         network_id: &str,
@@ -70,6 +88,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
@@ -80,6 +99,7 @@ impl DataUsageApi {
             end,
             Some(cadence),
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -87,12 +107,16 @@ impl DataUsageApi {
 
     /// `GET /2.2/networks/{network_id}/data_usage/breakdown` — data-usage breakdown by category.
     ///
-    /// Ported from `DataUsageAPI.get_breakdown` (`data_usage.py:199-236`). `cadence` is
+    /// Ported from `DataUsageAPI.get_breakdown` (`data_usage.py:211-253`). `cadence` is
     /// optional, validated only when supplied.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_breakdown(
         &self,
         network_id: &str,
@@ -100,6 +124,7 @@ impl DataUsageApi {
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence_opt(cadence)?;
@@ -110,6 +135,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -118,8 +144,11 @@ impl DataUsageApi {
     /// `GET /2.2/networks/{network_id}/data_usage/devices` — data-usage statistics for every
     /// device on a network, optionally filtered by `profile_id`.
     ///
-    /// Ported from `DataUsageAPI.get_devices_usage` (`data_usage.py:238-280`). `cadence` and
+    /// Ported from `DataUsageAPI.get_devices_usage` (`data_usage.py:255-302`). `cadence` and
     /// `profile_id` are both optional, each included only when supplied.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -133,31 +162,34 @@ impl DataUsageApi {
         cadence: Option<&str>,
         timezone: Option<&str>,
         profile_id: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence_opt(cadence)?;
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = routes::data_usage::GET_DEVICES_DATA_USAGE.resolve(
-            self.transport.api_host(),
-            &id_or_url,
-            None,
+        let url = self.route_url(
+            &routes::data_usage::GET_DEVICES_DATA_USAGE,
+            network_id,
+            parent,
         )?;
         let mut query = usage_query(start, end, cadence, timezone);
         if let Some(profile_id) = profile_id {
             query.push(("profile_id", profile_id.to_owned()));
         }
         self.transport
-            .request(Method::GET, url, &query, RequestBody::None)
+            .request_with_timeout(Method::GET, url, &query, RequestBody::None, timeout)
             .await
     }
 
     /// `GET /2.2/networks/{network_id}/data_usage/devices/{device_mac}` — data-usage statistics
     /// for a single device.
     ///
-    /// Ported from `DataUsageAPI.get_device_usage` (`data_usage.py:282-325`): the collection URL
+    /// Ported from `DataUsageAPI.get_device_usage` (`data_usage.py:304-352`): the collection URL
     /// ([`crate::routes::data_usage::GET_DEVICES_DATA_USAGE`]) with `device_mac` literal-appended
-    /// after `validate_identifier` — never a second `.format()` call (`data_usage.py:317`).
+    /// after `validate_identifier` — never a second `.format()` call (`data_usage.py:343`).
     /// `cadence` is required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -173,6 +205,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         self.get_child_usage(
@@ -183,6 +216,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -191,12 +225,16 @@ impl DataUsageApi {
     /// `GET /2.2/networks/{network_id}/data_usage/eeros/summary` — aggregated data-usage summary
     /// across every eero on a network.
     ///
-    /// Ported from `DataUsageAPI.get_eeros_summary` (`data_usage.py:327-368`). `cadence` is
+    /// Ported from `DataUsageAPI.get_eeros_summary` (`data_usage.py:406-452`). `cadence` is
     /// required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_eeros_summary(
         &self,
         network_id: &str,
@@ -204,6 +242,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
@@ -214,6 +253,48 @@ impl DataUsageApi {
             end,
             Some(cadence),
             timezone,
+            timeout,
+            parent,
+        )
+        .await
+    }
+
+    /// `GET /2.2/networks/{network_id}/data_usage/eeros` — data-usage statistics for every eero
+    /// on a network.
+    ///
+    /// Ported from `DataUsageAPI.get_eeros_usage` (`data_usage.py:354-404`). The API
+    /// requires `start`, `end` and `cadence` on this endpoint, so `cadence` is required. The
+    /// path is not in the observed spec; it is used by a downstream integration and exposed here
+    /// on that basis. Distinct from [`DataUsageApi::get_eeros_summary`]
+    /// (`.../data_usage/eeros/summary`) and from [`DataUsageApi::get_eero_usage`]
+    /// (`.../data_usage/eeros/{eero_id}`).
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
+    ///
+    /// # Errors
+    ///
+    /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_eeros_usage(
+        &self,
+        network_id: &str,
+        start: &str,
+        end: &str,
+        cadence: &str,
+        timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
+        parent: Option<&Value>,
+    ) -> Result<Envelope, Error> {
+        let cadence = validated_cadence(cadence)?;
+        self.get_usage(
+            &routes::data_usage::GET_EEROS_DATA_USAGE,
+            network_id,
+            start,
+            end,
+            Some(cadence),
+            timezone,
+            timeout,
             parent,
         )
         .await
@@ -222,8 +303,11 @@ impl DataUsageApi {
     /// `GET /2.2/networks/{network_id}/data_usage/eeros/{eero_id}` — data-usage statistics for a
     /// single eero.
     ///
-    /// Ported from `DataUsageAPI.get_eero_usage` (`data_usage.py:370-413`). `cadence` is
+    /// Ported from `DataUsageAPI.get_eero_usage` (`data_usage.py:454-502`). `cadence` is
     /// required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -237,6 +321,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         self.get_child_usage(
@@ -247,6 +332,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -255,8 +341,11 @@ impl DataUsageApi {
     /// `GET /2.2/networks/{network_id}/data_usage/profiles/{profile_id}` — data-usage statistics
     /// for a single profile.
     ///
-    /// Ported from `DataUsageAPI.get_profile_usage` (`data_usage.py:415-458`). `cadence` is
+    /// Ported from `DataUsageAPI.get_profile_usage` (`data_usage.py:504-552`). `cadence` is
     /// required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
@@ -270,6 +359,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         self.get_child_usage(
@@ -280,6 +370,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -288,12 +379,16 @@ impl DataUsageApi {
     /// `GET /2.2/networks/{network_id}/data_usage/unprofiled/devices` — data-usage statistics
     /// for devices with no profile.
     ///
-    /// Ported from `DataUsageAPI.get_unprofiled_devices` (`data_usage.py:460-497`). `cadence` is
+    /// Ported from `DataUsageAPI.get_unprofiled_devices` (`data_usage.py:554-596`). `cadence` is
     /// optional.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_unprofiled_devices(
         &self,
         network_id: &str,
@@ -301,6 +396,7 @@ impl DataUsageApi {
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence_opt(cadence)?;
@@ -311,6 +407,7 @@ impl DataUsageApi {
             end,
             cadence,
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -319,12 +416,16 @@ impl DataUsageApi {
     /// `GET /2.2/networks/{network_id}/data_usage/unprofiled/summary` — aggregated data-usage
     /// summary for unprofiled devices.
     ///
-    /// Ported from `DataUsageAPI.get_unprofiled_summary` (`data_usage.py:499-540`). `cadence` is
+    /// Ported from `DataUsageAPI.get_unprofiled_summary` (`data_usage.py:598-644`). `cadence` is
     /// required.
+    ///
+    /// `timeout`, when `Some`, replaces the transport default for this request only (see
+    /// [`RequestTimeout`]); `None` keeps it.
     ///
     /// # Errors
     ///
     /// See [`DataUsageApi::get_data_usage`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_unprofiled_summary(
         &self,
         network_id: &str,
@@ -332,6 +433,7 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
@@ -342,6 +444,7 @@ impl DataUsageApi {
             end,
             Some(cadence),
             timezone,
+            timeout,
             parent,
         )
         .await
@@ -350,7 +453,7 @@ impl DataUsageApi {
     /// `GET /2.2/networks/{network_id}/data_usage/report_settings` — the network's data-usage
     /// report settings. No query parameters at all.
     ///
-    /// Ported from `DataUsageAPI.get_report_settings` (`data_usage.py:542-566`).
+    /// Ported from `DataUsageAPI.get_report_settings` (`data_usage.py:646-670`).
     ///
     /// # Errors
     ///
@@ -362,11 +465,10 @@ impl DataUsageApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = routes::data_usage::GET_DATA_USAGE_REPORT_SETTINGS.resolve(
-            self.transport.api_host(),
-            &id_or_url,
-            None,
+        let url = self.route_url(
+            &routes::data_usage::GET_DATA_USAGE_REPORT_SETTINGS,
+            network_id,
+            parent,
         )?;
         self.transport
             .request(Method::GET, url, &[], RequestBody::None)
@@ -376,12 +478,12 @@ impl DataUsageApi {
     /// `PUT /2.2/networks/{network_id}/data_usage/report_settings` — set the network's
     /// data-usage report settings.
     ///
-    /// Ported from `DataUsageAPI.set_report_settings` (`data_usage.py:568-621`), the only write
+    /// Ported from `DataUsageAPI.set_report_settings` (`data_usage.py:672-720`), the only write
     /// in this module: JSON body `{"cadence": cadence, "notification_day": notification_day}`
-    /// (`data_usage.py:620`). `cadence` is validated before this crate's own "not authenticated"
-    /// precondition even runs (`data_usage.py:614`) — matched here by validating it before the
-    /// underlying [`Transport::request`] call. Logs the fixed uncharacterised-write warning
-    /// before issuing the request (`data_usage.py:616`).
+    /// (`data_usage.py:719-720`). `cadence` is validated before this crate's own "not
+    /// authenticated" precondition even runs (`data_usage.py:710`) — matched here by validating
+    /// it before the underlying [`Transport::request`] call. Logs the fixed uncharacterised-write
+    /// warning before issuing the request (`data_usage.py:712`).
     ///
     /// # Errors
     ///
@@ -395,11 +497,10 @@ impl DataUsageApi {
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let cadence = validated_cadence(cadence)?;
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = routes::data_usage::SET_DATA_USAGE_REPORT_SETTINGS.resolve(
-            self.transport.api_host(),
-            &id_or_url,
-            None,
+        let url = self.route_url(
+            &routes::data_usage::SET_DATA_USAGE_REPORT_SETTINGS,
+            network_id,
+            parent,
         )?;
         crate::links::warn_uncharacterised_write("set data usage report settings for network");
         self.transport
@@ -426,26 +527,25 @@ impl DataUsageApi {
         end: &str,
         cadence: Option<&str>,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let url = route.resolve(self.transport.api_host(), &id_or_url, None)?;
+        let url = self.route_url(route, network_id, parent)?;
         let query = usage_query(start, end, cadence, timezone);
         self.transport
-            .request(Method::GET, url, &query, RequestBody::None)
+            .request_with_timeout(Method::GET, url, &query, RequestBody::None, timeout)
             .await
     }
 
     /// Shared GET-with-query-only request builder for every per-item (device/eero/profile)
     /// resource in this module: resolves `route`'s collection URL, then literal-appends `child`
     /// after validating it as a single path-segment identifier.
-    #[allow(clippy::too_many_arguments)]
     ///
     /// Validates `child` (a bare id) **before** `cadence` — mirroring Python's own evaluation
-    /// order at every one of this method's three call sites (`data_usage.py:317,405,450`), where
+    /// order at every one of this method's three call sites (`data_usage.py:343,493,543`), where
     /// `_validate_child_id(...)` is embedded directly in the f-string argument expression handed
-    /// to `_get_usage`, so it raises before `_get_usage`'s own `cadence` check ever runs
-    /// (phase-G fix list item 15).
+    /// to `_get_usage`, so it raises before `_get_usage`'s own `cadence` check ever runs.
+    #[allow(clippy::too_many_arguments)]
     async fn get_child_usage(
         &self,
         route: &Resource,
@@ -455,47 +555,64 @@ impl DataUsageApi {
         end: &str,
         cadence: &str,
         timezone: Option<&str>,
+        timeout: Option<RequestTimeout>,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
         let validated_child = crate::links::validate_identifier(child)?;
         let cadence = validated_cadence(cadence)?;
-        let id_or_url = self.network_id_or_self_url(network_id, parent)?;
-        let collection = route.resolve(self.transport.api_host(), &id_or_url, None)?;
+        let collection = self.route_url(route, network_id, parent)?;
         let url = append_path(&collection, validated_child)?;
         let query = usage_query(start, end, Some(cadence), timezone);
         self.transport
-            .request(Method::GET, url, &query, RequestBody::None)
+            .request_with_timeout(Method::GET, url, &query, RequestBody::None, timeout)
             .await
     }
 
-    /// Resolves `network_id`'s id-or-self-url for use as a [`Resource`]'s `id_or_url`: prefers
-    /// `parent`'s own published `url` ([`crate::links::self_url`]) when present, falling back to
-    /// the bare `network_id` unchanged.
+    /// Resolves `route`'s absolute URL for `network_id`: the network base from
+    /// [`params::resolve_network_url`] (`parent`'s own published `url` when present, else the
+    /// `networks/{id}` template at the route's API version), then the route's literal suffix.
     ///
-    /// Every `DataUsageAPI` method resolves its network segment via
-    /// `resolve_network_url(network_id, parent)` (`data_usage.py:97-153`'s shared `_get_usage`),
-    /// which prefers `parent`'s own `self_url` over the `network_id` template exactly like
-    /// [`crate::params::resolve_network_url`] does. `Resource::resolve`'s own `parent` argument
-    /// only supports a *named* link inside a *different* resource's `resources` map
-    /// (`sub_resource_url`), not "prefer this same resource's own `url`" — so this helper performs
-    /// that preference itself, up front, and hands the result to `Resource::resolve` as a bare
-    /// `id_or_url` with `parent: None`: when `parent`'s `self_url` is present, the returned string
-    /// is an absolute `http(s)://` URL on this transport's host, which `Resource::resolve`'s
-    /// underlying `resource_url` already knows how to validate and append a template's suffix
-    /// onto (the same branch an API-returned absolute URL takes) — so no separate "self-url
-    /// preferred" branch needs to exist inside `Resource`/`Nested` itself.
-    fn network_id_or_self_url(
+    /// Every `DataUsageAPI` method does exactly this (`data_usage.py:156-157`:
+    /// `base_url = resolve_network_url(network, parent)` and
+    /// `f"{base_url}/data_usage/{path}"`), so the suffix comes from [`Resource::template`], the
+    /// single source of each path, as the text after `{id}`.
+    ///
+    /// One deliberate difference: a trailing `/` on the base is dropped before the suffix is
+    /// appended, where Python's f-string doubles it (`…//data_usage`) for a published url that
+    /// ends in `/`; see `PARITY.md`.
+    ///
+    /// A published `url` is returned by `resolve_network_url` after a plain shape check only
+    /// (field `link`), and must stay that way: handing it back to [`Resource::resolve`] as if it
+    /// were a caller-typed `id_or_url` would subject it to the caller-path family check, which
+    /// rejects any parent whose url is not `/<version>/networks/<id>` — something Python never
+    /// does to a published link. Only the template fallback, built from the caller's
+    /// `network_id`, is checked as a caller-supplied id.
+    fn route_url(
         &self,
+        route: &Resource,
         network_id: &str,
         parent: Option<&Value>,
-    ) -> Result<String, Error> {
-        if let Some(parent) = parent
-            && let Some(self_url) = crate::links::self_url(self.transport.api_host(), parent)?
-        {
-            return Ok(self_url.to_string());
-        }
-        Ok(network_id.to_owned())
+    ) -> Result<Url, Error> {
+        let base = params::resolve_network_url(
+            self.transport.api_host(),
+            network_id,
+            parent,
+            route.version,
+        )?;
+        let joined = format!(
+            "{}{}",
+            base.as_str().trim_end_matches('/'),
+            route_suffix(route.template)
+        );
+        Url::parse(&joined)
+            .map_err(|err| Error::validation("url", format!("not a valid URL: {err}")))
     }
+}
+
+/// The literal path text after a route template's `{id}` placeholder (`/data_usage/breakdown` for
+/// `networks/{id}/data_usage/breakdown`).
+fn route_suffix(template: &str) -> &str {
+    template.split_once("{id}").map_or("", |(_, suffix)| suffix)
 }
 
 /// Validates a required `cadence` value against [`params::CADENCE_VALUES`] (`"hourly"`/
@@ -531,4 +648,55 @@ fn usage_query(
 fn append_path(base: &Url, child: &str) -> Result<Url, Error> {
     let joined = format!("{}/{child}", base.as_str().trim_end_matches('/'));
     Url::parse(&joined).map_err(|err| Error::validation("url", format!("not a valid URL: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_suffix;
+    use crate::routes::data_usage as routes;
+
+    /// Each route's literal suffix is the text after `{id}`, and it is what `route_url`
+    /// appends: every data-usage template hangs `/data_usage[/..]` off `networks/{id}`.
+    #[test]
+    fn route_suffix_is_the_template_text_after_the_id_placeholder() {
+        for (template, suffix) in [
+            (routes::V8_GET_DATA_USAGE.template, "/data_usage"),
+            (
+                routes::GET_DATA_USAGE_BREAKDOWN.template,
+                "/data_usage/breakdown",
+            ),
+            (
+                routes::GET_DEVICES_DATA_USAGE.template,
+                "/data_usage/devices",
+            ),
+            (
+                routes::GET_EEROS_DATA_USAGE_SUMMARY.template,
+                "/data_usage/eeros/summary",
+            ),
+            (routes::GET_EEROS_DATA_USAGE.template, "/data_usage/eeros"),
+            (
+                routes::GET_PROFILES_DATA_USAGE.template,
+                "/data_usage/profiles",
+            ),
+            (
+                routes::GET_UNPROFILED_DEVICES_DATA_USAGE.template,
+                "/data_usage/unprofiled/devices",
+            ),
+            (
+                routes::GET_UNPROFILED_DATA_USAGE_SUMMARY.template,
+                "/data_usage/unprofiled/summary",
+            ),
+            (
+                routes::GET_DATA_USAGE_REPORT_SETTINGS.template,
+                "/data_usage/report_settings",
+            ),
+            (
+                routes::SET_DATA_USAGE_REPORT_SETTINGS.template,
+                "/data_usage/report_settings",
+            ),
+        ] {
+            assert!(template.starts_with("networks/{id}/"), "{template}");
+            assert_eq!(route_suffix(template), suffix, "{template}");
+        }
+    }
 }

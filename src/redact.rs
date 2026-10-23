@@ -1,7 +1,7 @@
 //! Redaction of sensitive keys in a [`serde_json::Value`].
 //!
-//! Ported from `eero-api`'s `src/eero/logging.py` at `v8.0.4`: [`redact_sensitive`] mirrors the
-//! module-level `redact_sensitive`, backed by private helpers ported from `_redact_dict`,
+//! Ported from `eero-api`'s `src/eero/logging.py` at `v8.4.1`: [`redact_sensitive`] mirrors the
+//! module-level `redact_sensitive`, backed by private helpers ported from `_redact`,
 //! `_redact_value` and `_is_sensitive_key`.
 //!
 //! `logging.py` also defines `SecureLoggerAdapter` and `get_secure_logger`, a
@@ -90,6 +90,21 @@ const ZERO_VISIBILITY_PATTERNS: &[&str] = &[
 /// port fixes it as a constant rather than threading an unused parameter through the public API.
 const VISIBLE_CHARS: usize = 4;
 
+/// Containers nested this deep or deeper are replaced wholesale by [`UNTRAVERSABLE_PLACEHOLDER`]
+/// instead of being walked.
+///
+/// Ported from `_MAX_REDACTION_DEPTH` (`logging.py:79-83`). The top-level argument is depth `0`
+/// and every child is one deeper, so a container at depth `16` is the first one replaced. The cap
+/// keeps a pathological value from exhausting the stack and keeps a sensitive key from being
+/// smuggled past the redactor by sitting below the point where it stops looking.
+const MAX_REDACTION_DEPTH: usize = 16;
+
+/// Fixed text that replaces a container nested at or beyond [`MAX_REDACTION_DEPTH`].
+///
+/// Ported from `_UNTRAVERSABLE_PLACEHOLDER` (`logging.py:85-88`). It never depends on the content
+/// it replaces. Python uses the same text for a reference cycle, which a [`Value`] cannot form.
+const UNTRAVERSABLE_PLACEHOLDER: &str = "[REDACTED:cyclic-or-too-deep]";
+
 /// Returns `true` if `key`, matched case-insensitively as a substring, indicates sensitive data.
 ///
 /// Ported from `_is_sensitive_key`.
@@ -125,9 +140,16 @@ fn redact_value(value: &Value, visible_chars: usize) -> Value {
         Value::Number(_) => return Value::String("[REDACTED:number]".to_string()),
         Value::String(s) => s.clone(),
         // Python's fallback branch runs `str(value)`, which for a dict/list produces a
-        // Python-repr string (e.g. "{'a': 1}"). No Eero wire response ever nests an object or
-        // array under a sensitive key, and no upstream test exercises this path, so this port
-        // approximates with compact JSON instead of reproducing Python's repr syntax exactly.
+        // Python-repr string (e.g. "{'a': 1}"). A container under a sensitive key does occur on
+        // the wire: the account envelope's `email` is `{"address": ..., "verified": true}`. This
+        // port measures compact JSON instead of reproducing Python's repr syntax, so for a
+        // container value the reported length (and, for an identifier-shaped key, the visible
+        // prefix) can differ from Python: that `email` object is `46chars` here and `49chars`
+        // in Python, and `{"token": {"a": 1}}` is `7chars` here and `8chars` in Python. How much
+        // of the container reaches the output is what Python shows: under a credential-shaped key
+        // (`visible_chars == 0`) nothing of it; under an identifier-shaped key the first
+        // `VISIBLE_CHARS` characters of its text (`str(value)[:4]` in Python), so
+        // `{"emails": ["ab@x.io"]}` shows `["ab...`, which is part of the address.
         Value::Array(_) | Value::Object(_) => value.to_string(),
     };
 
@@ -144,16 +166,14 @@ fn redact_value(value: &Value, visible_chars: usize) -> Value {
     Value::String(format!("{visible}...[REDACTED:{length}chars]"))
 }
 
-/// Recursively redacts sensitive keys in a JSON object.
+/// Recursively redacts sensitive keys in a JSON object that sits at `depth`.
 ///
-/// Ported from `_redact_dict`: a sensitive key's value is replaced by [`redact_value`]'s output
-/// (with `visible_chars` set to `0` for a zero-visibility key, [`VISIBLE_CHARS`] otherwise)
-/// regardless of its type; a non-sensitive key whose value is itself an object recurses; a
-/// non-sensitive key whose value is an array is walked element-wise via [`redact_nested`], which
-/// recurses through arbitrarily deep object/array nesting (not just one array level — security
-/// finding 7: a value such as `[[{"token": "x"}]]` under a non-sensitive key must still have its
-/// doubly-nested `token` redacted); every other value is copied through untouched.
-fn redact_object(map: &Map<String, Value>) -> Value {
+/// Ported from the mapping branch of `_redact` (`logging.py:205-217`): a sensitive key's value is
+/// replaced by [`redact_value`]'s output (with `visible_chars` set to `0` for a zero-visibility
+/// key, [`VISIBLE_CHARS`] otherwise) regardless of its type, and **before** any depth check, so a
+/// deep container under a sensitive key is length-redacted rather than replaced by the
+/// placeholder; every other value goes through [`redact_nested`] one level deeper.
+fn redact_object(map: &Map<String, Value>, depth: usize) -> Value {
     let mut result = Map::with_capacity(map.len());
     for (key, value) in map {
         let redacted = if is_sensitive_key(key) {
@@ -164,37 +184,52 @@ fn redact_object(map: &Map<String, Value>) -> Value {
             };
             redact_value(value, visible_chars)
         } else {
-            redact_nested(value)
+            redact_nested(value, depth + 1)
         };
         result.insert(key.clone(), redacted);
     }
     Value::Object(result)
 }
 
-/// Recurses through arbitrarily deep [`Value::Object`]/[`Value::Array`] nesting under a
-/// non-sensitive key, redacting any sensitive key it finds at any depth. Every other JSON type is
-/// copied through unchanged.
+/// Builds a redacted copy of `value`, which sits at `depth` (`0` for the top-level argument).
 ///
-/// This is what makes [`redact_object`] recurse past a single array level (security finding 7):
-/// an array of arrays of objects — or any deeper mix of the two — is walked all the way down,
-/// not just one level of `Value::Array` as the original single-level `.map(...)` implementation
-/// did.
-fn redact_nested(value: &Value) -> Value {
+/// Ported from `_redact` (`logging.py:171-220`). A scalar is cloned unchanged at any depth: the
+/// container check runs before the depth check. An object or array (an empty one included) at
+/// [`MAX_REDACTION_DEPTH`] or deeper is replaced wholesale by [`UNTRAVERSABLE_PLACEHOLDER`], which
+/// hides its non-sensitive siblings as well. Anything shallower is rebuilt, keeping the
+/// container kind, with every sensitive key found on the way redacted.
+fn redact_nested(value: &Value, depth: usize) -> Value {
     match value {
-        Value::Object(nested) => redact_object(nested),
-        Value::Array(items) => Value::Array(items.iter().map(redact_nested).collect()),
+        Value::Object(_) | Value::Array(_) if depth >= MAX_REDACTION_DEPTH => {
+            Value::String(UNTRAVERSABLE_PLACEHOLDER.to_string())
+        }
+        Value::Object(map) => redact_object(map, depth),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_nested(item, depth + 1))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
 
 /// Redacts sensitive data from a JSON value for safe logging.
 ///
-/// Ported from `redact_sensitive` (`logging.py:125-146`). Only [`Value::Object`] is processed
-/// (recursively, via the private `redact_object`); every other JSON type is returned unchanged —
-/// including a *top-level* array. This asymmetry is a direct, intentional port of the Python
-/// behaviour: `redact_sensitive` only special-cases `isinstance(value, dict)`, so an object
-/// nested inside another object's array value gets recursed into, but that very same array
-/// passed as the top-level input is returned as-is, sensitive keys and all.
+/// Ported from `redact_sensitive` (`logging.py:223-248`). Objects and arrays are walked to any
+/// mix of nesting, a top-level array included, and come back as the same kind of container; a
+/// sensitive key's whole value is replaced by its redacted form whatever the value's type, using
+/// its text form for the length (and, for an identifier-shaped key, the four-character prefix).
+/// Every other JSON value (a string, number, bool or null) is returned unchanged, because there
+/// is no key to match.
+///
+/// Recursion stops at 16 levels of nesting. The top-level argument is level 0, and a container
+/// at level 16 or deeper (an empty one too) is replaced by the fixed string
+/// `"[REDACTED:cyclic-or-too-deep]"` instead of being walked, together with everything inside it.
+/// A scalar below that depth still passes through, and so does a sensitive key's value, which is
+/// redacted by length before any depth is checked.
+///
+/// The argument is never modified; the result is always a new value.
 ///
 /// # Examples
 ///
@@ -207,20 +242,22 @@ fn redact_nested(value: &Value) -> Value {
 /// // "user_token" is credential-shaped (zero-visibility): no leading characters survive.
 /// assert_eq!(redacted["user_token"], "[REDACTED:9chars]");
 ///
-/// // Non-object top-level values pass through untouched.
+/// // A top-level array is walked element by element.
+/// let redacted = redact_sensitive(&json!([{"token": "abc123456", "name": "John"}]));
+/// assert_eq!(redacted[0]["name"], "John");
+/// assert_eq!(redacted[0]["token"], "[REDACTED:9chars]");
+///
+/// // Non-container top-level values pass through untouched.
 /// assert_eq!(redact_sensitive(&json!("hello")), json!("hello"));
 /// ```
 pub fn redact_sensitive(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => redact_object(map),
-        other => other.clone(),
-    }
+    redact_nested(value, 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{is_sensitive_key, is_zero_visibility_key, redact_sensitive, redact_value};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     // ===================== _is_sensitive_key (TestIsSensitiveKey) =====================
 
@@ -449,7 +486,7 @@ mod tests {
 
     #[test]
     fn handles_nested_list_of_lists_of_dicts() {
-        // Security finding 7: recursion through an array must not stop after one level.
+        // Recursion through an array must not stop after one level.
         let result = redact_sensitive(&json!({
             "outer": [[{"token": "abc123"}]]
         }));
@@ -505,10 +542,152 @@ mod tests {
     }
 
     #[test]
-    fn top_level_array_is_not_recursed() {
-        // Quirk ported verbatim: redact_sensitive only special-cases dict at the top level, so
-        // a bare top-level array is returned unchanged even though it contains a sensitive key.
-        let input = json!([{"token": "abc123"}]);
-        assert_eq!(redact_sensitive(&input), input);
+    fn passes_through_scalars_and_strings_unchanged() {
+        // A bare string has no key to match, so it is not redacted even when it looks like a
+        // credential.
+        assert_eq!(redact_sensitive(&json!("s=abc")), json!("s=abc"));
+        assert_eq!(redact_sensitive(&json!(true)), json!(true));
+    }
+
+    const CANARY: &str = "CANARY-tok-5b2e";
+
+    /// Wraps `leaf` in `levels` single-element arrays, built iteratively so the helper itself
+    /// cannot overflow the stack.
+    fn nest(levels: usize, leaf: Value) -> Value {
+        (0..levels).fold(leaf, |inner, _| Value::Array(vec![inner]))
+    }
+
+    /// The value reached by indexing `[0]` `levels` times.
+    fn descend(value: &Value, levels: usize) -> &Value {
+        (0..levels).fold(value, |current, _| &current[0])
+    }
+
+    #[test]
+    fn top_level_array_of_objects_is_redacted() {
+        let result = redact_sensitive(&json!([{"token": CANARY, "name": "n"}]));
+        assert!(result.is_array());
+        assert_eq!(result[0]["name"], "n");
+        assert_eq!(result[0]["token"], "[REDACTED:15chars]");
+        assert!(!result.to_string().contains(CANARY));
+    }
+
+    #[test]
+    fn top_level_array_of_arrays_is_redacted() {
+        let result = redact_sensitive(&json!([[{"password": CANARY}]]));
+        assert!(result.is_array());
+        assert!(result[0].is_array());
+        assert!(result[0][0].is_object());
+        assert!(!result.to_string().contains(CANARY));
+    }
+
+    #[test]
+    fn array_in_array_in_object_keeps_every_container_kind() {
+        let result = redact_sensitive(&json!({"outer": [[{"token": CANARY}]]}));
+        assert!(result["outer"].is_array());
+        assert!(result["outer"][0].is_array());
+        assert!(result["outer"][0][0].is_object());
+        assert!(!result.to_string().contains(CANARY));
+    }
+
+    #[test]
+    fn argument_is_unchanged_after_redaction() {
+        let input = json!({"token": CANARY, "items": [{"password": CANARY}]});
+        let snapshot = input.clone();
+        let _ = redact_sensitive(&input);
+        assert_eq!(input, snapshot);
+        assert_eq!(input["token"], CANARY);
+    }
+
+    #[test]
+    fn sensitive_key_with_container_value_is_fully_redacted() {
+        let result = redact_sensitive(&json!({"token": {"a": 1}}));
+        let redacted = result["token"].as_str().unwrap();
+        assert!(redacted.starts_with("[REDACTED:"));
+        assert!(!redacted.contains('{'));
+        // Compact JSON is measured, not Python's `str()` (which is one character longer here).
+        assert_eq!(redacted, "[REDACTED:7chars]");
+    }
+
+    #[test]
+    fn account_email_object_is_replaced_with_its_json_length() {
+        let result = redact_sensitive(&json!({
+            "email": {"address": "user@example.com", "verified": true}
+        }));
+        assert_eq!(result["email"], "{\"ad...[REDACTED:46chars]");
+    }
+
+    /// An identifier-shaped key shows the first four characters of a container's text, as
+    /// Python's `str(value)[:4]` does, which can be part of what the container holds; a
+    /// credential-shaped key shows none.
+    #[test]
+    fn a_container_shows_a_prefix_only_under_an_identifier_shaped_key() {
+        let result = redact_sensitive(&json!({
+            "emails": ["ab@x.io"],
+            "token": ["abcdefgh"],
+        }));
+        assert_eq!(result["emails"], "[\"ab...[REDACTED:11chars]");
+        assert_eq!(result["token"], "[REDACTED:12chars]");
+    }
+
+    // ===================== depth cap (_MAX_REDACTION_DEPTH) =====================
+
+    #[test]
+    fn nesting_at_the_cap_is_still_walked() {
+        let result = redact_sensitive(&nest(15, json!({"token": CANARY, "name": "n"})));
+        let text = result.to_string();
+        assert!(text.contains("\"name\":\"n\""));
+        assert!(!text.contains("cyclic-or-too-deep"));
+        assert!(!text.contains(CANARY));
+        assert_eq!(descend(&result, 15)["token"], "[REDACTED:15chars]");
+    }
+
+    #[test]
+    fn nesting_beyond_the_cap_is_replaced_by_placeholder() {
+        let result = redact_sensitive(&nest(16, json!({"token": CANARY, "note": CANARY})));
+        assert_eq!(descend(&result, 16), "[REDACTED:cyclic-or-too-deep]");
+        assert!(!result.to_string().contains(CANARY));
+    }
+
+    #[test]
+    fn empty_container_beyond_the_cap_is_replaced() {
+        for leaf in [json!({}), json!([])] {
+            let result = redact_sensitive(&nest(16, leaf));
+            assert_eq!(descend(&result, 16), "[REDACTED:cyclic-or-too-deep]");
+        }
+    }
+
+    #[test]
+    fn scalar_beyond_the_cap_passes_through() {
+        let result = redact_sensitive(&nest(16, json!("plain")));
+        assert_eq!(descend(&result, 16), "plain");
+    }
+
+    #[test]
+    fn sensitive_key_value_at_the_cap_is_length_redacted_not_replaced() {
+        // The object sits at depth 15 and the token's container value at depth 16: the sensitive
+        // key is handled before any depth check, so the value is measured, not replaced.
+        let result = redact_sensitive(&nest(15, json!({"token": [[1]]})));
+        assert_eq!(descend(&result, 15)["token"], "[REDACTED:5chars]");
+    }
+
+    #[test]
+    fn mixed_object_array_nesting_beyond_the_cap_hides_the_canary() {
+        let mut value = json!({"token": CANARY, "note": CANARY});
+        for _ in 0..64 {
+            value = json!({ "n": [value] });
+        }
+        let text = redact_sensitive(&value).to_string();
+        assert!(text.contains("[REDACTED:cyclic-or-too-deep]"));
+        assert!(!text.contains(CANARY));
+    }
+
+    #[test]
+    fn very_deep_nesting_terminates() {
+        // 2000 levels, not more: dropping the input is itself recursive, and the test thread
+        // has a 2 MiB stack.
+        let value = nest(2000, json!({"token": CANARY}));
+        let text = redact_sensitive(&value).to_string();
+        assert!(text.contains("[REDACTED:cyclic-or-too-deep]"));
+        assert!(!text.contains(CANARY));
     }
 }

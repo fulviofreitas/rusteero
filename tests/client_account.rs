@@ -2,19 +2,24 @@
 //! `wiremock` server per the crate's testing conventions.
 //!
 //! Every write here is unverified against a live account (see `src/endpoints/account.rs`); these
-//! tests pin the request shape and the `account`-bucket cache-invalidation contract from
-//! `.claude/tasks/briefs/v8/client.md` §4 ("account (`AccountAPI`...)"), not live behaviour.
+//! tests pin the request shape and the `account`-bucket cache-invalidation contract, not live
+//! behaviour. The read, `Client::get_account`, goes through `AccountApi::get_account`, and
+//! `Client::get_networks` falls back to it when `/networks` lists nothing; the tests for both
+//! are at the end of this file.
 
 mod common;
 
-use serde_json::json;
-use wiremock::matchers::{method, path};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use wiremock::matchers::{body_string, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, session_cookie};
+use common::{MockEero, TEST_TOKEN, session_cookie, user_token_header};
 use rusteero::auth::Session;
 use rusteero::cache::CacheKey;
 use rusteero::client::Client;
+use rusteero::error::Error;
 
 async fn client(mock: &MockEero) -> Client {
     Client::builder()
@@ -223,4 +228,366 @@ fn cache_key_account_is_a_unit_variant() {
     // `set_account_consents` to keep invalidating it with `&CacheKey::Account`. A `const` (rather
     // than a `let` binding) keeps this a pure compile-time check with no runtime no-op binding.
     const _CHECK: CacheKey = CacheKey::Account;
+}
+
+// ===================== get_account goes through AccountApi =====================
+
+fn account_body() -> Value {
+    json!({"meta": {"code": 200}, "data": {"networks": {"data": []}}})
+}
+
+/// Mounts `GET /2.2/account` with both credentials required. Mounts answer in order: `once`
+/// limits one to a single request.
+async fn mount_account(mock: &MockEero, response: ResponseTemplate, times: u64, once: bool) {
+    let mut mount = Mock::given(method("GET"))
+        .and(path("/2.2/account"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(response)
+        .expect(times);
+    if once {
+        mount = mount.up_to_n_times(1);
+    }
+    mount.mount(&mock.server).await;
+}
+
+/// A `401 error.session.refresh` is refreshed once and replayed, and the replayed envelope is
+/// what gets cached: the second `get_account` makes no request (the mock counts say so).
+#[tokio::test]
+async fn get_account_refreshes_on_a_session_refresh_signal_replays_and_caches() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    mount_account(
+        &mock,
+        ResponseTemplate::new(401)
+            .set_body_json(json!({"meta": {"code": 401, "error": "error.session.refresh"}})),
+        1,
+        true,
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/login/refresh"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .and(body_string("\"\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope()))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    mount_account(
+        &mock,
+        ResponseTemplate::new(200).set_body_json(account_body()),
+        1,
+        false,
+    )
+    .await;
+
+    let client = client(&mock).await;
+    let first = client.get_account(false).await?;
+    let second = client.get_account(false).await?;
+
+    assert_eq!(first.as_value(), &account_body());
+    assert_eq!(second.as_value(), &account_body());
+    Ok(())
+}
+
+/// With no session the call fails before any request and nothing is cached, so a second call
+/// fails the same way instead of being served an entry.
+#[tokio::test]
+async fn get_account_without_a_session_sends_nothing_and_caches_nothing() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_account(
+        &mock,
+        ResponseTemplate::new(200).set_body_json(account_body()),
+        0,
+        false,
+    )
+    .await;
+    let client = Client::builder()
+        .base_url(mock.uri())
+        .session(None)
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL");
+
+    for _ in 0..2 {
+        let err = client
+            .get_account(false)
+            .await
+            .expect_err("there is no session");
+        assert!(
+            matches!(err, Error::Authentication { ref message, .. } if message == "Not authenticated"),
+            "{err:?}"
+        );
+    }
+    Ok(())
+}
+
+// ===================== get_networks: the /account fallback =====================
+
+fn empty_networks_body() -> Value {
+    json!({"meta": {"code": 200}, "data": {"networks": []}})
+}
+
+async fn mount_networks(mock: &MockEero, times: u64) {
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks"))
+        .and(user_token_header())
+        .and(session_cookie())
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_networks_body()))
+        .expect(times)
+        .mount(&mock.server)
+        .await;
+}
+
+fn synthesised_networks_body() -> Value {
+    json!({"meta": {"code": 200}, "data": {"networks": [{"url": "/2.2/networks/77"}]}})
+}
+
+/// When `/account` itself fails, `get_networks` returns that error, caches nothing in either
+/// bucket and selects no network, so every call retries.
+#[tokio::test]
+async fn get_networks_account_fallback_failure_propagates_and_caches_nothing() -> anyhow::Result<()>
+{
+    type Check = fn(&Error) -> bool;
+    let cases: [(&str, u16, Check); 3] = [
+        ("401", 401, |err| {
+            matches!(err, Error::Authentication { .. })
+        }),
+        ("429", 429, |err| matches!(err, Error::RateLimit { .. })),
+        ("500", 500, |err| {
+            matches!(err, Error::Api { status: 500, .. })
+        }),
+    ];
+
+    for (label, status, expected) in cases {
+        let mock = MockEero::start().await;
+        mount_networks(&mock, 2).await;
+        mount_account(
+            &mock,
+            ResponseTemplate::new(status).set_body_json(json!({"meta": {"code": status}})),
+            3,
+            false,
+        )
+        .await;
+        let client = client(&mock).await;
+
+        for attempt in 1..=2 {
+            let err = client
+                .get_networks(false)
+                .await
+                .expect_err("the fallback failure propagates");
+            assert!(expected(&err), "{label} attempt {attempt}: {err:?}");
+        }
+        // Nothing was cached in the account bucket either, so this goes to the network too.
+        let err = client
+            .get_account(false)
+            .await
+            .expect_err("the account read fails");
+        assert!(expected(&err), "{label}: {err:?}");
+        assert_eq!(client.preferred_network_id(), None, "{label}");
+    }
+    Ok(())
+}
+
+/// Bounds for the timeout test below, the same values the data-usage suite uses: the client-wide
+/// bound applies to every request, including the undelayed `/networks` reads, so it is not made
+/// shorter than 250 ms (each call still has to reach its mock before it expires), and the
+/// held `/account` response outlives it by a wide margin.
+const ACCOUNT_HOLD: Duration = Duration::from_millis(2000);
+const CLIENT_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[tokio::test]
+async fn get_networks_account_fallback_timeout_propagates_and_caches_nothing() -> anyhow::Result<()>
+{
+    let mock = MockEero::start().await;
+    mount_networks(&mock, 2).await;
+    mount_account(
+        &mock,
+        ResponseTemplate::new(200)
+            .set_body_json(account_body())
+            .set_delay(ACCOUNT_HOLD),
+        3,
+        false,
+    )
+    .await;
+    // A short client-level timeout, so the held `/account` response times out.
+    let client = Client::builder()
+        .http_builder(reqwest::Client::builder().timeout(CLIENT_TIMEOUT))
+        .base_url(mock.uri())
+        .session(Some(Session::from_token(TEST_TOKEN)))
+        .build()
+        .await
+        .expect("a MockServer's own URI is always a valid base URL");
+
+    for _ in 0..2 {
+        let err = client
+            .get_networks(false)
+            .await
+            .expect_err("the fallback times out");
+        assert!(matches!(err, Error::Timeout), "{err:?}");
+    }
+    let err = client
+        .get_account(false)
+        .await
+        .expect_err("the account read times out");
+    assert!(matches!(err, Error::Timeout), "{err:?}");
+    assert_eq!(client.preferred_network_id(), None);
+    Ok(())
+}
+
+/// A `2xx` `/account` body that is not a JSON object is an error from the transport, so the
+/// fallback propagates it like any other `/account` failure: nothing is cached in either bucket,
+/// no network is selected and every call goes back to both endpoints.
+#[tokio::test]
+async fn get_networks_account_fallback_with_a_non_object_body_propagates_and_caches_nothing()
+-> anyhow::Result<()> {
+    for body in ["[]", "null", "\"text\"", "7"] {
+        let mock = MockEero::start().await;
+        mount_networks(&mock, 2).await;
+        mount_account(
+            &mock,
+            ResponseTemplate::new(200).set_body_string(body),
+            3,
+            false,
+        )
+        .await;
+        let client = client(&mock).await;
+
+        let is_rejected_body = |err: &Error| {
+            matches!(
+                err,
+                Error::Api { status: 200, message, .. }
+                    if message == "Unexpected JSON response: expected an object"
+            )
+        };
+        for attempt in 1..=2 {
+            let err = client
+                .get_networks(false)
+                .await
+                .expect_err("a non-object fallback body is an error");
+            assert!(is_rejected_body(&err), "{body} attempt {attempt}: {err:?}");
+        }
+        // Nothing was cached in the account bucket either, so this goes to the network too.
+        let err = client
+            .get_account(false)
+            .await
+            .expect_err("the account read fails");
+        assert!(is_rejected_body(&err), "{body}: {err:?}");
+        assert_eq!(client.preferred_network_id(), None, "{body}");
+    }
+    Ok(())
+}
+
+/// Nothing was cached by the failed attempt, so the next call reads both endpoints again and, if
+/// `/account` now lists networks, returns the synthesised envelope and selects the first one.
+#[tokio::test]
+async fn get_networks_recovers_after_a_failed_account_fallback() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    mount_networks(&mock, 2).await;
+    mount_account(
+        &mock,
+        ResponseTemplate::new(429).set_body_json(json!({"meta": {"code": 429}})),
+        1,
+        true,
+    )
+    .await;
+    mount_account(
+        &mock,
+        ResponseTemplate::new(200).set_body_json(
+            json!({"meta": {"code": 200}, "data": {"networks": {"data": [{"url": "/2.2/networks/77"}]}}}),
+        ),
+        1,
+        false,
+    )
+    .await;
+    let client = client(&mock).await;
+
+    let err = client
+        .get_networks(false)
+        .await
+        .expect_err("the first fallback is rate limited");
+    assert!(matches!(err, Error::RateLimit { .. }), "{err:?}");
+    assert_eq!(client.preferred_network_id(), None);
+
+    let recovered = client.get_networks(false).await?;
+
+    assert_eq!(recovered.as_value(), &synthesised_networks_body());
+    assert_eq!(client.preferred_network_id().as_deref(), Some("77"));
+    Ok(())
+}
+
+/// Networks found on `/account`, bare or wrapped in `{"data": [...]}`, are returned in the
+/// synthesised envelope, cached and selected.
+#[tokio::test]
+async fn get_networks_uses_account_networks_and_caches_them() -> anyhow::Result<()> {
+    for account_data in [
+        json!({"networks": [{"url": "/2.2/networks/77"}]}),
+        json!({"networks": {"data": [{"url": "/2.2/networks/77"}]}}),
+    ] {
+        let mock = MockEero::start().await;
+        mount_networks(&mock, 1).await;
+        mount_account(
+            &mock,
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"meta": {"code": 200}, "data": account_data})),
+            1,
+            false,
+        )
+        .await;
+        let client = client(&mock).await;
+
+        let first = client.get_networks(false).await?;
+        let second = client.get_networks(false).await?;
+
+        assert_eq!(
+            first.as_value(),
+            &synthesised_networks_body(),
+            "{account_data}"
+        );
+        assert_eq!(
+            second, first,
+            "{account_data}: the second call is a cache hit"
+        );
+        assert_eq!(
+            client.preferred_network_id().as_deref(),
+            Some("77"),
+            "{account_data}"
+        );
+    }
+    Ok(())
+}
+
+/// Only a successful fallback that finds no networks gives a cacheable empty result: the
+/// original `/networks` envelope, cached, with no network selected.
+#[tokio::test]
+async fn get_networks_caches_an_empty_successful_account_fallback() -> anyhow::Result<()> {
+    let account_bodies = [
+        json!({"meta": {"code": 200}, "data": {"networks": {"data": []}}}),
+        json!({"meta": {"code": 200}, "data": {"networks": []}}),
+        json!({"meta": {"code": 200}, "data": {}}),
+        json!({"meta": {"code": 200}, "data": null}),
+        json!({"meta": {"code": 200}, "data": {"networks": "unexpected"}}),
+    ];
+
+    for account_body in account_bodies {
+        let mock = MockEero::start().await;
+        mount_networks(&mock, 1).await;
+        mount_account(
+            &mock,
+            ResponseTemplate::new(200).set_body_json(&account_body),
+            1,
+            false,
+        )
+        .await;
+        let client = client(&mock).await;
+
+        let first = client.get_networks(false).await?;
+        let second = client.get_networks(false).await?;
+
+        assert_eq!(first.as_value(), &empty_networks_body(), "{account_body}");
+        assert_eq!(second.as_value(), &empty_networks_body(), "{account_body}");
+        assert_eq!(client.preferred_network_id(), None, "{account_body}");
+    }
+    Ok(())
 }

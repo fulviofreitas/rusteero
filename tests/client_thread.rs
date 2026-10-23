@@ -67,7 +67,7 @@ async fn set_thread_enabled_ignores_the_cached_network_and_targets_the_literal_v
     Mock::given(method("PUT"))
         .and(path("/2.2/networks/network-0001/thread"))
         .and(session_cookie())
-        .and(body_string(json!({ "enabled": true }).to_string()))
+        .and(body_string(json!({ "thread_enable": true }).to_string()))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(json!({"meta": {"code": 200}, "data": {}}).to_string()),

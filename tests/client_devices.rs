@@ -3,14 +3,18 @@
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not
-//! testing caching at all (the crate's testing conventions' "Assertion Patterns").
+//! testing caching at all.
 
 mod common;
 
-use wiremock::matchers::{method, path, query_param};
+use serde_json::json;
+use tracing::Level;
+use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use common::{MockEero, TEST_TOKEN, fixture, fixture_json, session_cookie};
+use common::{
+    MockEero, TEST_TOKEN, capture_logs, fixture, fixture_json, session_cookie, user_token_header,
+};
 use rusteero::auth::Session;
 use rusteero::client::Client;
 use rusteero::error::Error;
@@ -34,6 +38,7 @@ async fn get_devices_caches_the_unfiltered_response() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(1)
         .mount(&mock.server)
@@ -53,6 +58,8 @@ async fn get_devices_caches_the_unfiltered_response() -> anyhow::Result<()> {
 async fn get_devices_with_a_filter_never_reads_or_writes_the_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .and(query_param("thread", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
@@ -86,6 +93,7 @@ async fn set_device_nickname_reaches_the_v2_3_device_put_endpoint() -> anyhow::R
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
         .mount(&mock.server)
@@ -107,6 +115,7 @@ async fn pause_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
@@ -114,6 +123,7 @@ async fn pause_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
         .mount(&mock.server)
@@ -136,12 +146,16 @@ async fn pause_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
 async fn block_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("POST"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/blacklist"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -165,12 +179,16 @@ async fn block_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
 async fn unblock_device_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("DELETE"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/blacklist/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .expect(1)
@@ -197,12 +215,16 @@ async fn update_device_via_link_invalidates_every_cached_profile_only_when_profi
     let profiles_body =
         serde_json::json!({"meta": {"code": 200}, "data": [{"id": "profile-0001"}]});
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/profiles"))
         .respond_with(ResponseTemplate::new(200).set_body_string(profiles_body.to_string()))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -227,7 +249,7 @@ async fn update_device_via_link_invalidates_every_cached_profile_only_when_profi
 }
 
 /// `Client::update_device_via_link` calling `self.cache.invalidate_bucket(Bucket::Profiles,
-/// ..)` (`client.py:832-867`'s `profile is not None` branch, §2.6 of `client.md`) drops **every**
+/// ..)` (`client.py:832-867`'s `profile is not None` branch) drops **every**
 /// cached profile entry for the network — not just the `profiles` list bucket a plain
 /// `invalidate_profile_cache` would leave alone. A single-profile entry cached via `get_profile`
 /// beforehand must be gone afterward too.
@@ -236,12 +258,16 @@ async fn update_device_via_link_drops_single_profile_entries_too_when_profile_su
 -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("profile.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -278,12 +304,16 @@ async fn update_device_via_link_leaves_profiles_cached_when_profile_is_none() ->
     let profiles_body =
         serde_json::json!({"meta": {"code": 200}, "data": [{"id": "profile-0001"}]});
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/profiles"))
         .respond_with(ResponseTemplate::new(200).set_body_string(profiles_body.to_string()))
         .expect(1)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -321,6 +351,7 @@ async fn update_device_via_link_passes_the_cached_device_url_as_parent() -> anyh
     Mock::given(method("GET"))
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(device_on_v23.to_string()))
         .expect(1)
         .mount(&mock.server)
@@ -334,6 +365,7 @@ async fn update_device_via_link_passes_the_cached_device_url_as_parent() -> anyh
     Mock::given(method("PUT"))
         .and(path("/2.3/networks/network-0001/devices/device-0001"))
         .and(session_cookie())
+        .and(user_token_header())
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
         .mount(&mock.server)
@@ -359,12 +391,16 @@ async fn update_device_via_link_passes_the_cached_device_url_as_parent() -> anyh
 async fn set_device_type_invalidates_the_devices_bucket() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("devices.json")))
         .expect(2)
         .mount(&mock.server)
         .await;
     Mock::given(method("PUT"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(1)
@@ -388,6 +424,8 @@ async fn set_device_type_invalidates_the_devices_bucket() -> anyhow::Result<()> 
 async fn get_device_priority_never_touches_the_devices_cache() -> anyhow::Result<()> {
     let mock = MockEero::start().await;
     Mock::given(method("GET"))
+        .and(session_cookie())
+        .and(user_token_header())
         .and(path("/2.2/networks/network-0001/devices/device-0001"))
         .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
         .expect(2)
@@ -418,5 +456,143 @@ async fn get_device_priority_resolves_the_network_without_auto_discovery() -> an
         .await
         .expect_err("no network_id and no preferred network must fail without auto-discovery");
     assert!(matches!(err, Error::MissingNetworkId));
+    Ok(())
+}
+
+// ===================== version pins =====================
+
+/// A network given as a 2.2 path is re-pinned to 2.3 by the two device writes that need it.
+#[tokio::test]
+async fn device_writes_pin_v2_3_for_a_path_form_network() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/devices/device-0001"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock.server)
+        .await;
+    for body in [json!({ "nickname": "desk" }), json!({ "paused": true })] {
+        Mock::given(method("PUT"))
+            .and(path("/2.3/networks/network-0001/devices/device-0001"))
+            .and(session_cookie())
+            .and(user_token_header())
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
+            .expect(1)
+            .mount(&mock.server)
+            .await;
+    }
+
+    let client = client(&mock).await;
+    let network = Some("/2.2/networks/network-0001");
+    client
+        .set_device_nickname("device-0001", "desk", network)
+        .await?;
+    client.pause_device("device-0001", true, network).await?;
+    Ok(())
+}
+
+// ===================== the caller's own id spelling =====================
+
+/// Only the cache key is canonicalised: a request carries the device id exactly as the caller
+/// wrote it, upper case and colons included.
+#[tokio::test]
+async fn device_requests_carry_the_callers_id_spelling() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("GET"))
+        .and(path("/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/2.3/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(json!({ "paused": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(fixture("device.json")))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .get_device("AA:BB:CC:DD:EE:FF", Some("network-0001"), false)
+        .await?;
+    client
+        .pause_device("AA:BB:CC:DD:EE:FF", true, Some("network-0001"))
+        .await?;
+    Ok(())
+}
+
+/// `set_profile_devices` sends the device urls exactly as given; the cache invalidation around
+/// it never rewrites or canonicalises them.
+#[tokio::test]
+async fn set_profile_devices_sends_the_device_urls_as_given() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/2.2/networks/network-0001/profiles/profile-0001"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(body_json(json!({
+            "devices": [{ "url": "/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF" }],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    client
+        .set_profile_devices(
+            "profile-0001",
+            &["/2.2/networks/network-0001/devices/AA:BB:CC:DD:EE:FF"],
+            Some("network-0001"),
+        )
+        .await?;
+    Ok(())
+}
+
+// ===================== block_device: verified, no warning =====================
+
+/// `Client::block_device` goes through the blacklist add, which is live-verified: no
+/// uncharacterised-write warning. An explicit network id means no discovery `GET`.
+#[tokio::test]
+async fn block_device_does_not_log_the_uncharacterised_write_warning() -> anyhow::Result<()> {
+    let mock = MockEero::start().await;
+    Mock::given(method("POST"))
+        .and(path("/2.2/networks/network-0001/blacklist"))
+        .and(session_cookie())
+        .and(user_token_header())
+        .and(wiremock::matchers::header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        ))
+        .and(wiremock::matchers::body_string(
+            "mac=aa%3Abb%3Acc%3A00%3A00%3A01",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&mock.server)
+        .await;
+
+    let client = client(&mock).await;
+    let (_guard, logs) = capture_logs();
+    client
+        .block_device("aa:bb:cc:00:00:01", Some("network-0001"))
+        .await?;
+
+    assert!(
+        logs.warnings().is_empty(),
+        "block_device must not warn, got {:?}",
+        logs.warnings()
+    );
+
+    // Positive control: the same capture does see the warning when one is emitted, so the
+    // negative assertion above cannot pass vacuously.
+    rusteero::links::warn_uncharacterised_write("probe");
+    assert_eq!(logs.count(Level::WARN, "not been fully characterised"), 1);
     Ok(())
 }

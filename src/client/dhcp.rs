@@ -10,9 +10,19 @@ impl Client {
 
     /// Sets the network's DHCP configuration — returns the raw Eero API response.
     ///
-    /// Ported from `set_dhcp` (`eero-api src/eero/client.py:2682-2703`). `auto_discover =
+    /// Ported from `set_dhcp` (`eero-api src/eero/client.py:3488-3512`). `auto_discover =
     /// false`. Passes the network's cached envelope (if fresh) as `parent`. Invalidates
     /// `network[{nid}]` unconditionally after the write.
+    ///
+    /// `mode` is `"automatic"`, `"manual"` or `"custom"`; `"manual"` is sent as `"custom"`, the
+    /// wire value the API accepts (see [`crate::endpoints::dhcp::DhcpApi::set_dhcp`]).
+    ///
+    /// # Warning
+    ///
+    /// A settings-class write confirmed (`eero-api` issue #136) to restart every eero on the
+    /// mesh — roughly an eight-minute outage each time, the same as the confirmed DNS write on
+    /// this endpoint. Read the network first and skip the write when it is unchanged; never
+    /// retry.
     ///
     /// # Errors
     ///
@@ -38,7 +48,7 @@ impl Client {
 
     /// Sets the network's WAN connection mode — returns the raw Eero API response.
     ///
-    /// Ported from `set_connection_mode` (`eero-api src/eero/client.py:2706-2714`).
+    /// Ported from `set_connection_mode` (`eero-api src/eero/client.py:3514-3523`).
     /// `auto_discover = false`. Passes the network's cached envelope (if fresh) as `parent`.
     /// Invalidates `network[{nid}]` unconditionally after the write.
     ///
@@ -64,7 +74,7 @@ impl Client {
 
     /// Sets NAT port randomization — returns the raw Eero API response.
     ///
-    /// Ported from `set_nat_port_randomization` (`eero-api src/eero/client.py:2717-2725`).
+    /// Ported from `set_nat_port_randomization` (`eero-api src/eero/client.py:3525-3534`).
     /// `auto_discover = false`. Passes the network's cached envelope (if fresh) as `parent`.
     /// Invalidates `network[{nid}]` unconditionally after the write.
     ///
@@ -89,7 +99,7 @@ impl Client {
 
     /// Sets `PPPoE` credentials on an eero — returns the raw Eero API response.
     ///
-    /// Ported from `set_pppoe` (`eero-api src/eero/client.py:2728-2734`). Not network-scoped —
+    /// Ported from `set_pppoe` (`eero-api src/eero/client.py:3536-3541`). Not network-scoped —
     /// no `_ensure_network_id` call, no cache interaction — `eero_serial_or_id` addresses the
     /// eero directly.
     ///

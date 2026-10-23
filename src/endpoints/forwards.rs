@@ -1,6 +1,6 @@
 //! Forwards API: `eero-api`'s `ForwardsAPI`.
 //!
-//! Ported from `eero-api src/eero/api/forwards.py` (v8.0.4): `ForwardsAPI.get_forwards`,
+//! Ported from `eero-api src/eero/api/forwards.py` (v8.4.1): `ForwardsAPI.get_forwards`,
 //! `create_forward`, `update_forward` and `delete_forward`.
 //!
 //! Every method here funnels through [`crate::transport::Transport::resource`]/
@@ -17,7 +17,7 @@
 //!
 //! Python's `update_forward(forward: Any, data, *, network=None)` accepts either a bare id, a
 //! host-relative path / absolute URL, or the forward's own cached envelope (a `Mapping`) for
-//! `forward` (`forwards.py:26-63`, the free function `_resolve_forward_url`). This port keeps
+//! `forward` (`forwards.py:26-62`, the free function `_resolve_forward_url`). This port keeps
 //! the same three-way dispatch but expresses it across two parameters instead of one
 //! dynamically-typed one: [`ForwardsApi::update_forward`] takes `forward: &str` (a bare id, a
 //! host-relative path, or an absolute API URL) plus an optional `parent: Option<&Value>` that
@@ -33,7 +33,7 @@ use url::Url;
 use crate::envelope::Envelope;
 use crate::error::Error;
 use crate::links;
-use crate::routes;
+use crate::routes::{self, ApiVersion};
 use crate::transport::{RequestBody, Transport};
 
 /// `eero-api`'s `ForwardsAPI` (`src/eero/api/forwards.py`).
@@ -54,10 +54,15 @@ impl ForwardsApi {
 
     /// Gets the port forwards configured on a network — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/forwards.py:80-105` (v8.0.4,
-    /// `ForwardsAPI.get_forwards`). Sends `GET` [`crate::routes::forwards::FORWARDS_GET`],
-    /// preferring `parent`'s published `forwards` link over the `networks/{id}/forwards`
-    /// template when supplied.
+    /// Ported from `eero-api src/eero/api/forwards.py:80-119` (`ForwardsAPI.get_forwards`). Sends
+    /// `GET` [`crate::routes::forwards::FORWARDS_GET`], preferring `parent`'s published `forwards`
+    /// link over the `networks/{id}/forwards` template when supplied, and always on API version
+    /// 2.2: the resolved URL is re-pinned with [`crate::links::rewrite_version`] whichever form
+    /// `network_id` takes and whatever version the published link names. The API publishes the
+    /// link on 2.3 for a current `User-Agent`; the response shape is the same on both versions,
+    /// so the pin is for safety, the same as for `get_support` and `get_routing`.
+    /// [`ForwardsApi::create_forward`], [`ForwardsApi::update_forward`] and
+    /// [`ForwardsApi::delete_forward`] are not pinned.
     ///
     /// # Errors
     ///
@@ -68,11 +73,16 @@ impl ForwardsApi {
         network_id: &str,
         parent: Option<&Value>,
     ) -> Result<Envelope, Error> {
+        let url = routes::forwards::FORWARDS_GET.resolve(
+            self.transport.api_host(),
+            network_id,
+            parent,
+        )?;
+        let url = links::rewrite_version(&url, ApiVersion::V2_2);
         self.transport
-            .resource(
-                &routes::forwards::FORWARDS_GET,
-                network_id,
-                parent,
+            .request(
+                routes::forwards::FORWARDS_GET.method.clone(),
+                url,
                 &[],
                 RequestBody::None,
             )
@@ -81,8 +91,8 @@ impl ForwardsApi {
 
     /// Creates a port forward on a network — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/forwards.py:113-151` (v8.0.4,
-    /// `ForwardsAPI.create_forward`). Sends `POST`
+    /// Ported from `eero-api src/eero/api/forwards.py:121-159` (`ForwardsAPI.create_forward`).
+    /// Sends `POST`
     /// [`crate::routes::forwards::FORWARDS_CREATE`] with `forward_data` attached as the
     /// request's JSON body exactly as given — neither Python nor this port validates or
     /// reshapes it. Logs [`crate::links::warn_uncharacterised_write`] (`"create forward for
@@ -116,14 +126,14 @@ impl ForwardsApi {
 
     /// Updates a port forward via its own URL — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/forwards.py:153-184` (v8.0.4,
-    /// `ForwardsAPI.update_forward`, via the free function `_resolve_forward_url`). See the
+    /// Ported from `eero-api src/eero/api/forwards.py:161-192` (`ForwardsAPI.update_forward`, via
+    /// the free function `_resolve_forward_url`). See the
     /// module docs for how the id-or-path-or-URL-or-envelope dispatch maps onto this method's
     /// `forward`/`network`/`parent` parameters. Sends `PUT` to the resolved URL with `data`
     /// attached as the request's JSON body exactly as given. Logs
     /// [`crate::links::warn_uncharacterised_write`] with the operation string `"update_forward"`
     /// — the literal method name, **not** a human-readable phrase like every other write in this
-    /// module; this is an intentional quirk of the Python source (`forwards.py:181`), preserved
+    /// module; this is an intentional quirk of the Python source (`forwards.py:190`), preserved
     /// verbatim rather than "fixed" to match its neighbours.
     ///
     /// # Errors
@@ -149,8 +159,8 @@ impl ForwardsApi {
 
     /// Deletes a port forward from a network — returns the raw Eero API response.
     ///
-    /// Ported from `eero-api src/eero/api/forwards.py:186-203` (v8.0.4,
-    /// `ForwardsAPI.delete_forward`). Sends `DELETE`
+    /// Ported from `eero-api src/eero/api/forwards.py:194-215` (`ForwardsAPI.delete_forward`).
+    /// Sends `DELETE`
     /// [`crate::routes::forwards::FORWARDS_DELETE`] with `network_id` (required, unlike
     /// `update_forward`) and `forward` (a bare id, path, or absolute URL) resolved via
     /// `resolve_nested_url`'s dispatch, and no body. Logs
@@ -181,7 +191,7 @@ impl ForwardsApi {
 
     /// Resolves a forward's absolute URL from a bare id, a path/URL, or a cached envelope.
     ///
-    /// Ported from `_resolve_forward_url` (`eero-api src/eero/api/forwards.py:26-63`); see the
+    /// Ported from `_resolve_forward_url` (`eero-api src/eero/api/forwards.py:26-62`); see the
     /// module docs for how the three Python branches map onto `forward`/`network`/`parent`.
     fn resolve_forward_url(
         &self,

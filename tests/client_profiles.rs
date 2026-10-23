@@ -3,7 +3,7 @@
 //!
 //! Every invalidation test asserts on the wiremock `.expect(n)` call count of the underlying
 //! `GET`, never just the returned envelope — a caching test that only checks the value is not
-//! testing caching at all (the crate's testing conventions' "Assertion Patterns").
+//! testing caching at all.
 
 mod common;
 

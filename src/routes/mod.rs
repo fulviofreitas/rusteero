@@ -10,7 +10,7 @@
 //! `networks/{network}/{prefix}/{child}{suffix}` shape. Both resolve against an explicit `host`
 //! `Url` (see each type's own `resolve` docs) via [`crate::links`]/[`crate::params`], so a
 //! server-side path rename or version bump is a single-line edit with one wiremock test to match,
-//! instead of a grep-and-replace across two dozen endpoint modules (port plan §7.1).
+//! instead of a grep-and-replace across two dozen endpoint modules.
 //!
 //! ## Path traversal
 //!
@@ -20,11 +20,23 @@
 //! strict single-path-segment whitelist (`^[A-Za-z0-9][A-Za-z0-9._:-]*$`, plus an explicit `".."`
 //! rejection) — an empty, `"."`, `".."`, control-character-bearing, or separator-bearing value is
 //! rejected outright, before any request is sent, rather than silently percent-encoded or
-//! (worse) collapsed onto a parent collection. `validate_segment`/`SegmentError` below are a
+//! (worse) collapsed onto a parent collection.
+//!
+//! An id-or-url argument that is a *path or URL* instead of a bare id is held to two more rules,
+//! also applied before any request: it must be a plain path (no whitespace or control character,
+//! query, fragment, dot segment, `%2e` or backslash), and it must name one resource of the family
+//! the route's template addresses. A [`Resource`] whose template is `eeros/{id}/reboot` accepts
+//! `/2.2/eeros/9` but not `/2.2/networks/123` or `/2.2/account`, and a [`Nested`] route accepts
+//! only a child under the addressed network's own `prefix` collection (see
+//! [`crate::links::resource_url`] and [`crate::links::require_family_path`]). A link the API
+//! published on a parent envelope is not confined: it may name any resource on any version, and
+//! only the plain-path rule applies to it.
+//!
+//! `validate_segment`/`SegmentError` below are a
 //! second, narrower rule used only where a candidate identifier is *not* going through
 //! `resource_url`/`child_url` — currently [`crate::client`]'s network-id auto-discovery
 //! (`extract_network_id`), which reads a candidate id straight out of an untrusted `/networks`
-//! response body (security finding F3).
+//! response body.
 
 use crate::error::Error;
 use reqwest::Method;
@@ -217,7 +229,7 @@ impl std::error::Error for SegmentError {}
 ///
 /// Used directly by [`crate::client`]'s network-id auto-discovery (`extract_network_id`), which
 /// reads a candidate network id straight out of an untrusted `/networks` response body before any
-/// [`Resource`]/[`Nested`] resolution ever sees it (security finding F3) — every other identifier
+/// [`Resource`]/[`Nested`] resolution ever sees it — every other identifier
 /// in this crate is validated by [`crate::links::validate_identifier`] instead, at the point it is
 /// substituted into a resolved URL. Validating the *raw* value here, rather than trusting the
 /// `url` crate's own encoder to make any value safe, is deliberate: the encoder strips ASCII
@@ -257,15 +269,13 @@ pub(crate) fn validate_segment(value: &str) -> Result<(), SegmentError> {
 
 // =====================================================================================
 // Domain routes. Every wire endpoint from the Python `eero-api` package gets one
-// `Resource`/`Nested` constant per unique (verb, version, path) combination. Banners
-// below follow the module order of the port plan's endpoint catalogue (§1.7). Several
+// `Resource`/`Nested` constant per unique (verb, version, path) combination. Several
 // Python methods across different modules turn out to hit the exact same wire endpoint
 // (same verb, version and path) — those are modelled as an alias constant (`pub const
 // ALIAS: Resource = CANONICAL;`) rather than a second literal, so a server-side path
 // change is still a one-line fix.
 //
-// Deliberately NOT ported here (see the port plan §1.7 and this crate's lessons
-// learned in `CLAUDE.md`):
+// Deliberately NOT ported here:
 // - `ActivityAPI` (`activity.py`): all five methods (`get_activity`,
 //   `get_activity_clients`, `get_activity_for_device`, `get_activity_history`,
 //   `get_activity_categories`) target `networks/{id}/activity*` paths that return 404 on
@@ -276,7 +286,7 @@ pub(crate) fn validate_segment(value: &str) -> Result<(), SegmentError> {
 //   Giving it its own route would misleadingly suggest a working endpoint.
 // =====================================================================================
 
-// One file per Python domain module (port plan §1.7); each declares its own `Resource`/
+// One file per Python domain module; each declares its own `Resource`/
 // `Nested` constants (or aliases of a constant declared in another domain file, for
 // endpoints that share a wire resource) and is re-exported flat here so every existing
 // `crate::routes::CONSTANT` path keeps resolving unchanged.
@@ -319,13 +329,9 @@ pub mod updates;
 pub mod wan;
 pub mod wpa3;
 
-// The 14 modules new in v8.0.0 (`account`, `backup_access_points`, `ddns`, `dhcp`,
-// `dns_policies`, `entitlements`, `events`, `members`, `notifications`, `permissions`,
-// `power_saving`, `subnets`, `wan`, `wpa3`) are currently empty — no `Resource`/`Nested`
-// constant is declared until the domain port (phase G) lands one. A glob `pub use` of an empty
-// module is legal (it re-exports nothing) but triggers `unused_imports` until the first constant
-// exists, so each is marked `#[allow(unused_imports)]` individually rather than widened to a
-// blanket module-level allow that would also hide a real future regression.
+// A glob `pub use` of a module with no constant is legal (it re-exports nothing) but triggers
+// `unused_imports`, so such a module is marked `#[allow(unused_imports)]` individually rather
+// than widened to a blanket module-level allow that would also hide a real future regression.
 pub use ac_compat::*;
 pub use account::*;
 pub use auth::*;
@@ -409,14 +415,14 @@ mod tests {
         use super::{LOGIN, LOGIN_VERIFY};
         use url::Url;
 
-        let host = Url::parse("https://api-user.e2ro.com").unwrap();
+        let host = Url::parse("http://mock.test:1234").unwrap();
         assert_eq!(
             LOGIN.resolve(&host, "", None).unwrap().as_str(),
-            "https://api-user.e2ro.com/2.2/login"
+            "http://mock.test:1234/2.2/login"
         );
         assert_eq!(
             LOGIN_VERIFY.resolve(&host, "", None).unwrap().as_str(),
-            "https://api-user.e2ro.com/2.2/login/verify"
+            "http://mock.test:1234/2.2/login/verify"
         );
     }
 
@@ -492,8 +498,10 @@ mod tests {
     use super::{Nested, Resource};
     use url::Url;
 
+    /// A host that is not the production one, so a resolution that compared against (or built
+    /// from) `consts::API_HOST` instead of its `host` argument cannot pass.
     fn fake_host() -> Url {
-        Url::parse("https://api-user.e2ro.com").unwrap()
+        Url::parse("http://mock.test:1234").unwrap()
     }
 
     #[test]
@@ -505,7 +513,7 @@ mod tests {
             link: None,
         };
         let url = resource.resolve(&fake_host(), "100", None).unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/networks/100");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/networks/100");
     }
 
     #[test]
@@ -517,7 +525,7 @@ mod tests {
             link: None,
         };
         let url = resource.resolve(&fake_host(), "ignored", None).unwrap();
-        assert_eq!(url.as_str(), "https://api-user.e2ro.com/2.2/account");
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.2/account");
     }
 
     #[test]
@@ -534,7 +542,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.4/networks/100/settings"
+            "http://mock.test:1234/2.4/networks/100/settings"
         );
     }
 
@@ -549,7 +557,7 @@ mod tests {
         let url = resource.resolve(&fake_host(), "100", None).unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/settings"
+            "http://mock.test:1234/2.2/networks/100/settings"
         );
     }
 
@@ -565,7 +573,7 @@ mod tests {
         let url = nested.resolve(&fake_host(), "100", "p1", None).unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.2/networks/100/profiles/p1"
+            "http://mock.test:1234/2.2/networks/100/profiles/p1"
         );
     }
 
@@ -584,7 +592,101 @@ mod tests {
             .unwrap();
         assert_eq!(
             url.as_str(),
-            "https://api-user.e2ro.com/2.5/networks/100/profiles/p1/schedules"
+            "http://mock.test:1234/2.5/networks/100/profiles/p1/schedules"
         );
+    }
+
+    // ----------------------- path or URL arguments are confined to the family -----------------------
+
+    fn settings_resource() -> Resource {
+        Resource {
+            method: Method::PUT,
+            version: ApiVersion::V2_2,
+            template: "networks/{id}/settings",
+            link: Some("settings"),
+        }
+    }
+
+    #[test]
+    fn resource_accepts_a_path_or_url_in_its_family_and_keeps_the_callers_version() {
+        let resource = settings_resource();
+        for supplied in [
+            "/2.3/networks/100",
+            "/2.3/networks/100/",
+            "http://mock.test:1234/2.3/networks/100",
+        ] {
+            let url = resource.resolve(&fake_host(), supplied, None).unwrap();
+            assert_eq!(
+                url.as_str(),
+                "http://mock.test:1234/2.3/networks/100/settings",
+                "{supplied}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_rejects_a_path_or_url_from_another_family() {
+        let resource = settings_resource();
+        for supplied in [
+            "/2.2/account",
+            "/2.2/eeros/9",
+            "/2.2/networks/100/devices",
+            "/2.2/networks/100//",
+            "/2.2/networks/../account",
+            "/2.2/networks/%2e%2e/account",
+            "/2.2/networks/100?x=1",
+            "/2.2/networks/100\n",
+            "http://mock.test:1234/2.2/account",
+            // In the family, but on another origin: the production host is not this one.
+            "https://api-user.e2ro.com/2.3/networks/100",
+        ] {
+            let err = resource.resolve(&fake_host(), supplied, None).unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Validation { .. }),
+                "{supplied:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_does_not_confine_the_parents_published_link() {
+        let parent = serde_json::json!({"resources": {"settings": "/2.4/account/other"}});
+        let url = settings_resource()
+            .resolve(&fake_host(), "100", Some(&parent))
+            .unwrap();
+        assert_eq!(url.as_str(), "http://mock.test:1234/2.4/account/other");
+    }
+
+    #[test]
+    fn nested_accepts_only_a_child_under_the_addressed_networks_collection() {
+        let nested = Nested {
+            method: Method::DELETE,
+            version: ApiVersion::V2_2,
+            prefix: "profiles",
+            suffix: "",
+            link: None,
+        };
+        let url = nested
+            .resolve(&fake_host(), "100", "/2.2/networks/100/profiles/p1/", None)
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://mock.test:1234/2.2/networks/100/profiles/p1"
+        );
+        for child in [
+            "/2.2/networks/200/profiles/p1",
+            "/2.2/networks/100/profiles/..",
+            "/2.2/networks/100/profiles/p1/../p2",
+            "/2.2/account",
+            "/2.2/networks/100/profiles",
+        ] {
+            let err = nested
+                .resolve(&fake_host(), "100", child, None)
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::Validation { .. }),
+                "{child:?}"
+            );
+        }
     }
 }

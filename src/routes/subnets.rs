@@ -37,7 +37,7 @@ pub const SUBNETS_SET_CONFIG: Resource = Resource {
 ///
 /// Ported from `eero-api src/eero/api/subnets.py:113-141` (`SubnetsAPI.delete_subnet`):
 /// `child_url(resource_url(network_id, "networks/{id}/subnets_config"), subnet_type)`.
-/// **Deliberately not a [`Nested`]** (orchestrator decision, phase-G fix list item 12): a
+/// **Deliberately not a [`Nested`]**: a
 /// `Nested`'s `child` accepts a path/URL as well as a bare id (`crate::params::resolve_nested_url`
 /// treats anything starting with `/`/`http(s)://` as an already-resolved nested path to verify),
 /// but Python's `child_url` is stricter — `subnet_type` must always be a bare single-segment
