@@ -56,7 +56,7 @@
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "echo ${nextRelease.version} > VERSION && sed -i '0,/^version = \"[^\"]*\"/s//version = \"${nextRelease.version}\"/' Cargo.toml && sed -i 's/^version: \"[^\"]*\"/version: \"${nextRelease.version}\"/' CITATION.cff && sed -i \"s/^date-released: .*/date-released: \\\"$(date -u +%Y-%m-%d)\\\"/\" CITATION.cff && cargo update -p rusteero --offline"
+        "prepareCmd": "echo ${nextRelease.version} > VERSION && sed -i '0,/^version = \"[^\"]*\"/s//version = \"${nextRelease.version}\"/' Cargo.toml && sed -i 's/^version: .*/version: \"${nextRelease.version}\"/' CITATION.cff && sed -i \"s/^date-released: .*/date-released: \\\"$(date -u +%Y-%m-%d)\\\"/\" CITATION.cff && cargo update -p rusteero --offline"
       }
     ],
     [
