@@ -93,10 +93,12 @@ jobs:
       id-token: write # crates.io Trusted Publishing (OIDC)
       contents: read
     steps:
+      # Build the tagged release commit, not whatever master points at by the time this job
+      # starts (or by the time it is re-run).
       - name: 📥 Checkout repository
         uses: actions/checkout@v7
         with:
-          ref: master
+          ref: v${{ needs.release.outputs.version }}
           fetch-depth: 1
       - name: 🦀 Setup Rust
         uses: dtolnay/rust-toolchain@stable
