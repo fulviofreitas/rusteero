@@ -1,8 +1,15 @@
 # ============================================================================
 # 🚀 Automated Semantic Release
 # ============================================================================
-# Chain: CI → Release (tag + GitHub release + Cargo.toml bump) → crates.io publish
-# (via the `crates-io` environment and Trusted Publishing; no registry token is stored here)
+# Chain: CI → Release (tag + GitHub release + Cargo.toml bump) → a `workflow_dispatch` run of
+# this same workflow with `publish_version` set → crates.io publish (via the `crates-io`
+# environment and Trusted Publishing; no registry token is stored here).
+#
+# The publish step cannot run in the `workflow_run`-triggered release run itself: crates.io
+# refuses Trusted Publishing tokens from `workflow_run` (and `pull_request_target`) runs. The
+# dispatched run is a `workflow_dispatch` on master, which crates.io accepts and the
+# `crates-io` environment's master-only branch policy allows. `GITHUB_TOKEN` may create
+# `workflow_dispatch` events, unlike most others.
 # ============================================================================
 
 name: 🚀 Release
@@ -15,16 +22,23 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "🧪 Dry-run mode (no actual release)"
+        description: "🧪 Dry-run mode (no actual release; with publish_version, `cargo publish --dry-run`)"
         required: false
         default: "false"
         type: choice
         options:
           - "false"
           - "true"
+      publish_version:
+        description: "📦 Publish the existing tag v<version> to crates.io instead of releasing (e.g. 3.0.1)"
+        required: false
+        default: ""
+        type: string
 
+# A publish run gets its own group: it is dispatched while the release run that dispatched it
+# still holds `release`, and a pending run in a group is cancelled when another one queues.
 concurrency:
-  group: release
+  group: ${{ github.event.inputs.publish_version && format('publish-{0}', github.event.inputs.publish_version) || 'release' }}
   cancel-in-progress: false
 
 permissions:
@@ -38,13 +52,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: |
-      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'workflow_dispatch' && !github.event.inputs.publish_version) ||
       (github.event.workflow_run.conclusion == 'success' &&
       !contains(github.event.workflow_run.head_commit.message, '[skip ci]') &&
       !contains(github.event.workflow_run.head_commit.message, 'chore(release)'))
     # The arsenal action reports a release by comparing the `VERSION` file before and after
     # semantic-release runs; `.releaserc.json`'s prepareCmd rewrites it. Without that file it
-    # reports `released=false` with an empty version, and the publish job is skipped.
+    # reports `released=false` with an empty version, and the publish is never dispatched.
     outputs:
       released: ${{ steps.release.outputs.released }}
       version: ${{ steps.release.outputs.version }}
@@ -69,15 +83,32 @@ jobs:
       # `bytes`". Populate the cache first and the offline update resolves from it.
       - name: 📦 Prime the cargo registry cache
         run: cargo fetch --locked
+      - name: 📍 Record HEAD before semantic-release
+        id: before
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: 🚀 Run semantic-release
         id: release
         uses: fulviofreitas/workflow-arsenal/.github/actions/semantic-release@master
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           dry-run: ${{ github.event.inputs.dry_run || 'false' }}
+      # @semantic-release/git commits the release locally before pushing it, so HEAD moves exactly
+      # when a release is cut. If the action still reports no release, the publish would be
+      # skipped without any failure, which is how v3.0.0 never reached crates.io.
+      - name: 🛑 Fail if a release was cut but not reported
+        if: github.event.inputs.dry_run != 'true'
+        env:
+          BEFORE: ${{ steps.before.outputs.sha }}
+          RELEASED: ${{ steps.release.outputs.released }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$BEFORE" ] && [ "$RELEASED" != "true" ]; then
+            echo "::error::A release was cut but the action reported released='$RELEASED'." \
+              "Dispatch this workflow with publish_version to publish the new tag."
+            exit 1
+          fi
 
-  publish-crates-io:
-    name: 📦 Publish to crates.io
+  dispatch-publish:
+    name: 📨 Dispatch the crates.io publish
     runs-on: ubuntu-latest
     needs: release
     if: |
@@ -85,6 +116,28 @@ jobs:
       needs.release.outputs.released == 'true' &&
       needs.release.outputs.version != '' &&
       github.event.inputs.dry_run != 'true'
+    timeout-minutes: 5
+    permissions:
+      actions: write # create the workflow_dispatch event
+    steps:
+      - name: 📨 Dispatch this workflow with publish_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          jq -n --arg v "$VERSION" '{ref: "master", inputs: {publish_version: $v}}' |
+            curl --fail-with-body --silent --show-error -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              --data @- \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/dispatches"
+          echo "Dispatched the publish of v${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+
+  publish-crates-io:
+    name: 📦 Publish to crates.io
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_version != ''
     timeout-minutes: 15
     environment:
       name: crates-io
@@ -92,20 +145,43 @@ jobs:
     permissions:
       id-token: write # crates.io Trusted Publishing (OIDC)
       contents: read
+    env:
+      VERSION: ${{ github.event.inputs.publish_version }}
     steps:
-      # Build the tagged release commit, not whatever master points at by the time this job
-      # starts (or by the time it is re-run).
-      - name: 📥 Checkout repository
+      - name: 🔎 Validate publish_version
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::publish_version must be a bare semver version such as 3.0.1 (no leading v)."
+            exit 1
+          fi
+      # Build the tagged release commit, never whatever master points at.
+      - name: 📥 Checkout v${{ github.event.inputs.publish_version }}
         uses: actions/checkout@v7
         with:
-          ref: v${{ needs.release.outputs.version }}
+          ref: v${{ github.event.inputs.publish_version }}
           fetch-depth: 1
+          persist-credentials: false
+      - name: 🔎 Check the tag's crate version
+        run: |
+          tagged=$(sed -n '0,/^version = /s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ "$tagged" != "$VERSION" ]; then
+            echo "::error::Cargo.toml at v$VERSION says version \"$tagged\"."
+            exit 1
+          fi
       - name: 🦀 Setup Rust
         uses: dtolnay/rust-toolchain@stable
+      # Also runs on a dry run: the token exchange is the step that proves the Trusted Publishing
+      # entry matches, and the action revokes the short-lived token when the job ends.
       - name: 🔑 Authenticate with crates.io (Trusted Publishing)
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: 📤 cargo publish
-        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            cargo publish --locked --dry-run
+          else
+            cargo publish --locked
+          fi
