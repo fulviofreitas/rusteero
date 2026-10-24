@@ -1,6 +1,6 @@
 [package]
 name = "rusteero"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2024"
 rust-version = "1.96"
 description = "Async Rust client for the Eero (Amazon) mesh Wi-Fi cloud API — a port of the Python eero-api library"

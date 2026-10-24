@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1](https://github.com/fulviofreitas/rusteero/compare/v3.0.0...v3.0.1) (2026-10-24)
+
+### 🐛 Bug Fixes
+
+* **deps:** require tokio 1.53.3 or later, past RUSTSEC-2026-0386 ([41e3aab](https://github.com/fulviofreitas/rusteero/commit/41e3aabace3fde500c044f4e8079c6a7e3b9f7e9))
+
+### 📚 Documentation
+
+* cite the tokio 1.54.1 sources in the storage task-failure notes ([3db37c3](https://github.com/fulviofreitas/rusteero/commit/3db37c3b8c84159dd40c15ae9615c6e5c9843207))
+
 ## [3.0.0](https://github.com/fulviofreitas/rusteero/compare/v2.0.0...v3.0.0) (2026-10-23)
 
 ### ⚠ BREAKING CHANGES
