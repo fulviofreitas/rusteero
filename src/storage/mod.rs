@@ -216,9 +216,10 @@ pub(crate) fn is_task_failure(err: &StorageError) -> bool {
 /// [`tokio::task::JoinError::is_panic`] and [`tokio::task::JoinError::is_cancelled`] — **never**
 /// `join_err`'s own `Display`. A previous version of this function interpolated `join_err`
 /// directly, on the premise that `JoinError`'s `Display` never carries a credential; that premise
-/// is false for the tokio version this crate pins (1.53.1), whose `JoinError::Display` renders a
-/// panicking task's payload verbatim (`task {id} panicked with message {panic_str:?}`,
-/// `tokio-1.53.1/src/runtime/task/error.rs:139-146`). `CredentialStore` is a public,
+/// is false for the tokio this crate builds against (checked on 1.54.1), whose
+/// `JoinError::Display` renders a panicking task's payload verbatim
+/// (`task {id} panicked with message {panic_str:?}`,
+/// `tokio-1.54.1/src/runtime/task/error.rs:139-146`). `CredentialStore` is a public,
 /// third-party-implementable trait, so a backend that panics via `unwrap()`/`expect()` on a value
 /// carrying the serialized session would put that text straight into this error's `message`,
 /// which this crate may log at WARN or return to a caller. Interpolating the `Display` here would
@@ -240,7 +241,7 @@ fn join_error_to_storage_error(join_err: &JoinError) -> StorageError {
 ///
 /// `tokio::task::spawn_blocking` panics when it cannot start the task: the OS refused to create a
 /// worker thread and no blocking-pool thread is alive to take the work (`OS can't spawn worker
-/// thread: ..`, `tokio-1.53.1/src/runtime/blocking/pool.rs:324-326`), or it is called outside a
+/// thread: ..`, `tokio-1.54.1/src/runtime/blocking/pool.rs:385-387`), or it is called outside a
 /// runtime. A save that cannot start must stay a handled storage failure (`save()` never raises
 /// in `eero-api`, `auth_storage.py:262-280`), so the panic is caught here. The message is fixed
 /// and never interpolates the panic payload. The default panic hook still prints the original

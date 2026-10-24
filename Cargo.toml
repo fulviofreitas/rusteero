@@ -12,7 +12,7 @@ readme = "README.md"
 keywords = ["eero", "mesh", "wifi", "router", "api-client"]
 categories = ["api-bindings", "network-programming"]
 publish = true
-exclude = ["/.github", "/wiki", "/PARITY.md", "/PARITY-REPORT-v8.4.1.md", "/CHANGELOG.md", "/commitlint.config.js", "/.releaserc.json"]
+exclude = ["/.github", "/wiki", "/PARITY.md", "/PARITY-REPORT-v8.4.1.md", "/CHANGELOG.md", "/commitlint.config.js", "/.releaserc.json", "/VERSION"]
 
 [features]
 default = ["keyring"]

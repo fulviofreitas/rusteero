@@ -72,6 +72,11 @@ jobs:
           components: rustfmt, clippy
       - name: 💾 Cache cargo
         uses: Swatinem/rust-cache@v2
+      # The other cargo steps silently re-lock a stale Cargo.lock, so a Cargo.toml-only change
+      # (a Renovate PR whose lockfile update failed) would pass CI and only break the release
+      # job's `cargo fetch --locked` and `cargo publish --locked` after the merge.
+      - name: 🔒 Cargo.lock matches Cargo.toml
+        run: cargo metadata --locked --format-version 1 > /dev/null
       - name: 🎨 rustfmt
         run: cargo fmt --all -- --check
       - name: 🧹 clippy (all features)
