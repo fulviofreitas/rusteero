@@ -65,18 +65,20 @@ jobs:
     steps:
       - name: 🔑 Generate GitHub App token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3
         with:
           client-id: ${{ secrets.RENOVATE_APP_ID }}
           private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
       - name: 📥 Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
           token: ${{ steps.app-token.outputs.token }}
       - name: 🦀 Setup Rust (for `cargo update` in prepareCmd)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master @ 2026-11-15
+        with:
+          toolchain: stable
       # semantic-release's prepareCmd runs `cargo update -p rusteero --offline` to refresh the
       # lockfile after it rewrites the version. `--offline` keeps that deterministic, but a fresh
       # runner has no registry index, so resolution fails with "no matching package named
@@ -88,7 +90,7 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: 🚀 Run semantic-release
         id: release
-        uses: fulviofreitas/workflow-arsenal/.github/actions/semantic-release@master
+        uses: fulviofreitas/workflow-arsenal/.github/actions/semantic-release@c62cf10d0a378d6308b62a40677b3dabfc83808b # master
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           dry-run: ${{ github.event.inputs.dry_run || 'false' }}
@@ -176,7 +178,7 @@ jobs:
       # Build the tagged release commit, never whatever master points at. `refs/tags/` keeps a
       # branch that happens to be named `v<version>` from being checked out instead.
       - name: 📥 Checkout v${{ github.event.inputs.publish_version }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: refs/tags/v${{ github.event.inputs.publish_version }}
           fetch-depth: 0
@@ -200,7 +202,7 @@ jobs:
           fi
       # This job can mint a crates.io token, so its third-party actions are pinned to commits.
       - name: 🦀 Setup Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-24
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master @ 2026-11-15
         with:
           toolchain: stable
       # Also runs on a dry run: the token exchange is the step that proves the Trusted Publishing
