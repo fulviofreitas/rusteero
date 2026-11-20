@@ -65,6 +65,9 @@ jobs:
     name: 🔄 Renovate
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read # the arsenal action restores Renovate's cache artifact from earlier runs
 
     steps:
       - name: 📥 Checkout repository
@@ -72,7 +75,7 @@ jobs:
 
       - name: 📋 Log trigger info
         run: |
-          echo "🎯 Trigger: ${{ github.event_name }}"
+          echo "🎯 Trigger: ${GITHUB_EVENT_NAME}"
 
       # ========================================================================
       # 🔄 Run Renovate
@@ -92,14 +95,16 @@ jobs:
       # ========================================================================
       - name: 📝 Generate summary
         if: always()
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << EOF
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## 🔄 Renovate Summary
 
           | Property | Value |
           |:---------|:------|
-          | 📦 Repository | [\`${{ github.repository }}\`](https://github.com/${{ github.repository }}) |
-          | 🎯 Trigger | \`${{ github.event_name }}\` |
-          | 🧪 Dry Run | \`${{ github.event.inputs.dry_run || 'false' }}\` |
+          | 📦 Repository | [\`${GITHUB_REPOSITORY}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}) |
+          | 🎯 Trigger | \`${GITHUB_EVENT_NAME}\` |
+          | 🧪 Dry Run | \`${DRY_RUN}\` |
 
           EOF

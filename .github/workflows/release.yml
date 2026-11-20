@@ -15,7 +15,11 @@
 name: 🚀 Release
 
 on:
-  workflow_run:
+  # Safe here: the jobs check out master (or a tag on master), never the triggering run's code,
+  # and use none of its artifacts; the release job also requires a push to master of this
+  # repository, because the branch filter alone matches a fork's pull request from a branch
+  # named master.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: ["🧪 CI Pipeline"]
     types: [completed]
     branches: [master]
@@ -41,10 +45,10 @@ concurrency:
   group: ${{ github.event.inputs.publish_version && format('publish-{0}', github.event.inputs.publish_version) || 'release' }}
   cancel-in-progress: false
 
+# The release commit, tag, GitHub release and issue/PR comments are all made with the App
+# token, so GITHUB_TOKEN stays read-only except where a job widens it.
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
+  contents: read
 
 jobs:
   release:
@@ -53,7 +57,10 @@ jobs:
     timeout-minutes: 15
     if: |
       (github.event_name == 'workflow_dispatch' && !github.event.inputs.publish_version) ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       !contains(github.event.workflow_run.head_commit.message, '[skip ci]') &&
       !contains(github.event.workflow_run.head_commit.message, 'chore(release)'))
     # The arsenal action reports a release by comparing the `VERSION` file before and after
@@ -69,6 +76,10 @@ jobs:
         with:
           client-id: ${{ secrets.RENOVATE_APP_ID }}
           private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+          # Push the release commit and tag, create the release, comment on released issues/PRs.
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
       - name: 📥 Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
