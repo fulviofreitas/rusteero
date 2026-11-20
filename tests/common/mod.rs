@@ -60,6 +60,8 @@ pub struct MockEero {
 impl MockEero {
     /// Starts a fresh wiremock server bound to an ephemeral local port.
     pub async fn start() -> Self {
+        // Before any library code runs in this test: see `install_tracing_anchors`.
+        install_tracing_anchors();
         Self {
             server: MockServer::start().await,
         }
@@ -409,19 +411,45 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
 ///
 /// # Parallel tests
 ///
-/// `tracing-core` keeps one process-wide interest cache per callsite. While only one dispatcher
-/// exists it decides a newly hit callsite against the *calling* thread's default alone, so a
-/// parallel test thread with no subscriber can cache "never" for a library callsite before this
-/// capture is installed, and the capture then misses that event. An always-live anchor
-/// dispatcher, registered once per test binary, keeps every interest decision consulting all
-/// live dispatchers, this capture included.
+/// `tracing-core` keeps one process-wide interest cache per callsite, which can race with
+/// parallel tests. [`install_tracing_anchors`] has the details and the fix. It runs here and in
+/// [`MockEero::start`].
 #[must_use]
 pub fn capture_logs() -> (LogGuard, LogCapture) {
-    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    ANCHOR.get_or_init(|| tracing::Dispatch::new(registry()));
+    install_tracing_anchors();
     let capture = LogCapture::default();
     let subscriber = registry().with(CaptureLayer {
         records: Arc::clone(&capture.records),
     });
     (tracing::subscriber::set_default(subscriber), capture)
+}
+
+/// Registers two never-dropped `tracing` dispatchers, once per test binary, so that
+/// [`capture_logs`] cannot miss an event because of a stale per-callsite interest.
+///
+/// `tracing-core` caches one `Interest` per callsite for the whole process. While **at most
+/// one** dispatcher has ever been registered (`Dispatchers::has_just_one`), it decides a newly
+/// hit callsite against the *calling thread's* default alone. A parallel test with no capture
+/// runs on a thread whose default is `NoSubscriber`, so that decision is "never".
+///
+/// Registering is not atomic with that decision. Thread A pushes the callsite and reads
+/// `has_just_one == true`. Thread B's `capture_logs` registers its dispatcher and rebuilds every
+/// interest to "always". Thread A then stores its stale "never" over it. B's next event at that
+/// callsite is skipped by the macro and the capture records nothing. A single anchor was not
+/// enough: one registered dispatcher still leaves `has_just_one` true.
+///
+/// Registering two dispatchers up front clears `has_just_one` for good. Every later callsite
+/// registration then takes the interest of every live dispatcher, captures included. The
+/// `OnceLock` blocks concurrent callers until both are registered. Any thread that reaches
+/// library code after `MockEero::start` or `capture_logs` returns therefore sees the multi-
+/// dispatcher path. The race is timing-only (Windows CI hit it on
+/// `set_preferred_update_hour_warns_once_after_validation`), not platform behaviour.
+pub fn install_tracing_anchors() {
+    static ANCHORS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    ANCHORS.get_or_init(|| {
+        [
+            tracing::Dispatch::new(registry()),
+            tracing::Dispatch::new(registry()),
+        ]
+    });
 }
