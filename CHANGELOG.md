@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.2](https://github.com/fulviofreitas/rusteero/compare/v3.0.1...v3.0.2) (2026-11-22)
+
+### 🐛 Bug Fixes
+
+* **deps:** move off yanked async-executor 1.14.0 ([f686a62](https://github.com/fulviofreitas/rusteero/commit/f686a62aab44fa22702511cd7b76f4b7e9cc3087))
+
 ## [3.0.1](https://github.com/fulviofreitas/rusteero/compare/v3.0.0...v3.0.1) (2026-10-24)
 
 ### 🐛 Bug Fixes
