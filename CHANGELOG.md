@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.4](https://github.com/fulviofreitas/rusteero/compare/v3.0.3...v3.0.4) (2026-11-24)
+
+### 🐛 Bug Fixes
+
+* **deps:** drop reqwest's dead webpki-roots feature ([#20](https://github.com/fulviofreitas/rusteero/issues/20)) ([b26089e](https://github.com/fulviofreitas/rusteero/commit/b26089ec26dd46efff1338f1ae5daed2a3d91803))
+
 ## [3.0.3](https://github.com/fulviofreitas/rusteero/compare/v3.0.2...v3.0.3) (2026-11-23)
 
 ### 🐛 Bug Fixes
