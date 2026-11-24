@@ -228,7 +228,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: 🔎 Read rust-version
         id: msrv
-        run: echo "version=$(grep -E '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')" >> "$GITHUB_OUTPUT"
+        # rust-toolchain.toml (channel = "stable") outranks rustup's default toolchain, so the
+        # setup step alone would leave every later step (cache key included) on stable.
+        # RUSTUP_TOOLCHAIN outranks the file; export it for the rest of the job.
+        run: |
+          version=$(grep -E '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=${version}" >> "$GITHUB_ENV"
       - name: 🦀 Setup Rust ${{ steps.msrv.outputs.version }}
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master @ 2026-11-15
         with:
@@ -236,7 +242,9 @@ jobs:
       - name: 💾 Cache cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: 🧱 cargo check on MSRV
-        run: cargo check --all-features
+        run: |
+          rustc --version
+          cargo check --all-features
 
   # ============================================================================
   # 4️⃣ CI Success Gate
